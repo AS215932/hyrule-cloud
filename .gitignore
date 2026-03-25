@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Venv
+.venv/
+venv/
+
+# Tools
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Env / secrets
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docker
+pgdata/

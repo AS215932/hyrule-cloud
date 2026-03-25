@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: hyrule
+      POSTGRES_PASSWORD: hyrule
+      POSTGRES_DB: hyrule
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hyrule"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    ports:
+      - "8402:8402"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # Override DB URL to point at compose Postgres
+      HYRULE_DATABASE_URL: postgresql+asyncpg://hyrule:hyrule@postgres/hyrule
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn hyrule_cloud.app:app --host :: --port 8402"
+
+volumes:
+  pgdata:
