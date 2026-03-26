@@ -60,6 +60,8 @@ def render_cloud_init(
     cloud_config: dict = {
         "hostname": hostname,
         "manage_etc_hosts": True,
+        "ssh_deletekeys": True,
+        "ssh_genkeytypes": ["ed25519", "rsa"],
         "users": [
             {
                 "name": "root",

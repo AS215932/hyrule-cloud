@@ -88,11 +88,26 @@ alembic/
 ## Development
 
 ```bash
-docker compose up -d postgres
+# Postgres runs in an Incus container (not Docker)
+# If not already running:
+#   incus launch images:debian/13 hyrule-postgres
+#   incus exec hyrule-postgres -- apt install -y postgresql
+#   incus exec hyrule-postgres -- sudo -u postgres createuser -s hyrule
+#   incus exec hyrule-postgres -- sudo -u postgres createdb -O hyrule hyrule
+#   incus exec hyrule-postgres -- sudo -u postgres psql -c "ALTER USER hyrule PASSWORD 'hyrule';"
+#   # Edit pg_hba.conf to allow md5 auth from host network
+
 cp .env.example .env  # fill in credentials
+# Set HYRULE_DATABASE_URL=postgresql+asyncpg://hyrule:hyrule@<incus-ip>/hyrule
+
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
 alembic upgrade head
-uvicorn hyrule_cloud.app:app --host :: --port 8402
+uvicorn hyrule_cloud.app:app --host :: --port 8402 --reload
+
+# Dev payment bypass: set PAYMENT_DEV_BYPASS_SECRET in .env, then pass
+# X-DEV-BYPASS: <secret> header to skip x402 payment verification.
 ```
 
 ## What's Not Yet Built

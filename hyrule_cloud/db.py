@@ -46,11 +46,11 @@ class VMRow(Base):
 
     # VM configuration
     status: Mapped[str] = mapped_column(
-        Enum(VMStatus, name="vm_status", create_constraint=True),
+        Enum(VMStatus, name="vm_status", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
         default=VMStatus.PROVISIONING,
     )
     size: Mapped[str] = mapped_column(
-        Enum(VMSize, name="vm_size", create_constraint=True),
+        Enum(VMSize, name="vm_size", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
         default=VMSize.XS,
     )
     os: Mapped[str] = mapped_column(String(64), default="debian-13")
@@ -69,7 +69,7 @@ class VMRow(Base):
 
     # Domain
     domain_mode: Mapped[str] = mapped_column(
-        Enum(DomainMode, name="domain_mode", create_constraint=True),
+        Enum(DomainMode, name="domain_mode", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
         default=DomainMode.AUTO,
     )
     domain: Mapped[str | None] = mapped_column(String(256))

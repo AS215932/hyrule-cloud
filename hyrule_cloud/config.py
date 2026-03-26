@@ -21,6 +21,10 @@ class XCPNGConfig(BaseSettings):
     password: str = ""
     verify_ssl: bool = False
 
+    # Xen Orchestra (handles VM creation, cloud-init, disk management)
+    xo_url: str = "wss://xcp-ng.internal/api/"
+    xo_token: str = ""
+
     default_sr_uuid: str = ""
     default_network_uuid: str = ""
     templates: dict[str, str] = Field(default_factory=dict)
@@ -55,6 +59,10 @@ class PaymentConfig(BaseSettings):
     price_vm_lg: Decimal = Decimal("0.40")
     price_vpn: Decimal = Decimal("0.02")
     price_domain_markup: Decimal = Decimal("1.00")
+
+    # Dev bypass: set to a non-empty string to allow skipping payment
+    # via X-DEV-BYPASS header. NEVER set in production.
+    dev_bypass_secret: str = ""
 
 
 class HyruleConfig(BaseSettings):

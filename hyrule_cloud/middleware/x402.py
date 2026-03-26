@@ -16,6 +16,7 @@ back either a 402 Response or the verified payment details.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 from decimal import Decimal
 from typing import Any
@@ -68,7 +69,7 @@ class PaymentGate:
         )
 
         # Build the accepts array per x402 v2 spec
-        accepts = [payment_option.model_dump()]
+        accepts = [dataclasses.asdict(payment_option)]
 
         payment_required = {
             "x402Version": 2,
@@ -115,6 +116,14 @@ class PaymentGate:
                 return result
             wallet_address = result
         """
+        # Dev bypass for testing (never enable in production)
+        if self.config.dev_bypass_secret:
+            bypass = request.headers.get("X-DEV-BYPASS")
+            if bypass == self.config.dev_bypass_secret:
+                log.warning("dev_bypass_payment", amount=str(amount))
+                request.state.payment_tx = "dev_bypass_0x0"
+                return "0xDEV_TEST_WALLET"
+
         payment_header = (
             request.headers.get("X-PAYMENT")
             or request.headers.get("x-payment")

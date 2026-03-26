@@ -1,8 +1,8 @@
 """
 DNS provider for managing records on the authoritative nameserver.
 
-Uses RFC 2136 (DNS UPDATE) via the `nsupdate` command, authenticated
-with TSIG. This works with BIND, Knot, PowerDNS, and NSD.
+Uses RFC 2136 (DNS UPDATE) via dnspython, authenticated with TSIG.
+Works with BIND, Knot, PowerDNS, and NSD.
 
 For the auto-subdomain case (*.deploy.hyrule.cloud), we create AAAA
 records pointing to the VM's IPv6 address.
@@ -11,8 +11,13 @@ records pointing to the VM's IPv6 address.
 from __future__ import annotations
 
 import asyncio
-import tempfile
+from functools import partial
 
+import dns.name
+import dns.rdatatype
+import dns.tsigkeyring
+import dns.update
+import dns.query
 import structlog
 
 from hyrule_cloud.config import HyruleConfig
@@ -21,76 +26,67 @@ log = structlog.get_logger()
 
 
 class DNSProvider:
-    """Manage DNS records via nsupdate (RFC 2136)."""
+    """Manage DNS records via RFC 2136 dynamic updates."""
 
     def __init__(self, config: HyruleConfig) -> None:
         self.config = config
         self.server = config.dns_server
-        self.tsig_key = config.dns_tsig_key
-        self.tsig_algo = config.dns_tsig_algo
         self.zone = config.deploy_domain
+        self.keyring = dns.tsigkeyring.from_text({
+            "hyrule-dns": config.dns_tsig_key,
+        })
+        self.tsig_algo = config.dns_tsig_algo
 
-    async def _nsupdate(self, commands: list[str]) -> None:
-        """
-        Execute nsupdate commands.
+    def _make_update(self, commands: list[tuple[str, ...]]) -> dns.update.Update:
+        """Build a dns.update.Update message from a list of command tuples."""
+        update = dns.update.Update(
+            self.zone,
+            keyring=self.keyring,
+            keyalgorithm=self.tsig_algo,
+        )
+        for cmd in commands:
+            action, *args = cmd
+            if action == "delete":
+                update.delete(*args)
+            elif action == "add":
+                update.add(*args)
+        return update
 
-        Writes a temporary script and runs nsupdate with TSIG auth.
-        """
-        script_lines = [
-            f"server {self.server}",
-            f"zone {self.zone}",
-            *commands,
-            "send",
-            "quit",
-        ]
-        script = "\n".join(script_lines) + "\n"
+    async def _send(self, commands: list[tuple[str, ...]]) -> None:
+        """Build and send an RFC 2136 update over TCP."""
+        if not self.server:
+            log.warning("dns_update_skipped", reason="no dns_server configured")
+            return
 
-        log.debug("nsupdate_script", commands=commands)
+        update = self._make_update(commands)
+        log.debug("dns_update", commands=commands)
 
-        # Write TSIG key file
-        key_content = (
-            f"key \"hyrule-dns\" {{\n"
-            f"  algorithm {self.tsig_algo};\n"
-            f"  secret \"{self.tsig_key}\";\n"
-            f"}};\n"
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None, partial(dns.query.tcp, update, self.server, timeout=10)
         )
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".key", delete=True) as kf:
-            kf.write(key_content)
-            kf.flush()
+        rcode = response.rcode()
+        if rcode != dns.rcode.NOERROR:
+            log.error("dns_update_failed", rcode=dns.rcode.to_text(rcode))
+            raise RuntimeError(f"DNS update failed: {dns.rcode.to_text(rcode)}")
 
-            proc = await asyncio.create_subprocess_exec(
-                "nsupdate", "-k", kf.name,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _stdout, stderr = await proc.communicate(script.encode())
-
-        if proc.returncode != 0:
-            log.error(
-                "nsupdate_failed",
-                returncode=proc.returncode,
-                stderr=stderr.decode(),
-            )
-            raise RuntimeError(f"nsupdate failed: {stderr.decode()}")
-
-        log.info("nsupdate_success", commands=commands)
+        log.info("dns_update_success", commands=commands)
 
     async def create_aaaa(self, subdomain: str, ipv6_address: str, ttl: int = 300) -> None:
         """Create an AAAA record under the deploy zone."""
         fqdn = f"{subdomain}.{self.zone}"
-        await self._nsupdate([
-            f"update delete {fqdn} AAAA",
-            f"update add {fqdn} {ttl} AAAA {ipv6_address}",
+        await self._send([
+            ("delete", fqdn, dns.rdatatype.AAAA),
+            ("add", fqdn, ttl, dns.rdatatype.AAAA, ipv6_address),
         ])
         log.info("dns_aaaa_created", fqdn=fqdn, ipv6=ipv6_address)
 
     async def delete_aaaa(self, subdomain: str) -> None:
         """Remove AAAA record for a subdomain."""
         fqdn = f"{subdomain}.{self.zone}"
-        await self._nsupdate([
-            f"update delete {fqdn} AAAA",
+        await self._send([
+            ("delete", fqdn, dns.rdatatype.AAAA),
         ])
         log.info("dns_aaaa_deleted", fqdn=fqdn)
 
@@ -101,16 +97,16 @@ class DNSProvider:
         value: str,
         ttl: int = 300,
     ) -> None:
-        """Create an arbitrary DNS record. Used for custom domain DNS management."""
-        # For custom domains, the zone will be different.
-        # This is a simplified version; production would need zone detection.
-        await self._nsupdate([
-            f"update delete {fqdn} {rtype}",
-            f"update add {fqdn} {ttl} {rtype} {value}",
+        """Create an arbitrary DNS record."""
+        rdtype = dns.rdatatype.from_text(rtype)
+        await self._send([
+            ("delete", fqdn, rdtype),
+            ("add", fqdn, ttl, rdtype, value),
         ])
 
     async def delete_record(self, fqdn: str, rtype: str) -> None:
         """Delete a DNS record."""
-        await self._nsupdate([
-            f"update delete {fqdn} {rtype}",
+        rdtype = dns.rdatatype.from_text(rtype)
+        await self._send([
+            ("delete", fqdn, rdtype),
         ])
