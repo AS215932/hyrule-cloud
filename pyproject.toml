@@ -16,10 +16,16 @@ dependencies = [
     "apscheduler>=3.10",
     # x402 official SDK (Coinbase)
     "x402[fastapi,evm]>=2.0",
+    # DNS (RFC 2136 dynamic updates)
+    "dnspython>=2.6",
+    # XO WebSocket JSON-RPC
+    "websockets>=13.0",
     # Database
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.30",
     "alembic>=1.14",
+    # MCP server
+    "mcp>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +36,9 @@ dev = [
     "mypy>=1.13",
     "aiosqlite>=0.20",
 ]
+
+[project.scripts]
+hyrule-mcp = "hyrule_cloud.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["hyrule_cloud*"]

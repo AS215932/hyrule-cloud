@@ -113,9 +113,7 @@ class OpenproviderClient:
         Uses the contact handles from config. Sets nameservers to our
         authoritative NS.
         """
-        nameservers = [
-            {"name": ns} for ns in self.config.nameservers
-        ]
+        nameservers = [{"name": ns} for ns in self.config.nameservers]
 
         data = await self._request(
             "POST",
@@ -145,6 +143,104 @@ class OpenproviderClient:
             f"/domains/{domain_id}",
             json={"name_servers": ns_list},
         )
+
+    # --- DNS Zone Management ---
+
+    async def create_zone(self, name: str) -> dict:
+        """
+        Create a DNS zone on Openprovider's nameservers.
+
+        The zone must correspond to a domain registered with Openprovider,
+        or the domain must have its nameservers pointed to Openprovider.
+        """
+        data = await self._request(
+            "POST",
+            "/dns/zones",
+            json={
+                "domain": {"name": name},
+                "type": "master",
+                "is_active": True,
+            },
+        )
+        log.info("dns_zone_created", zone=name)
+        return data
+
+    async def get_zone(self, name: str) -> dict | None:
+        """Get a DNS zone by domain name. Returns None if not found."""
+        try:
+            return await self._request("GET", f"/dns/zones/{name}")
+        except (httpx.HTTPStatusError, OpenproviderError):
+            return None
+
+    async def list_zone_records(self, zone_name: str) -> list[dict]:
+        """List all DNS records in a zone."""
+        data = await self._request("GET", f"/dns/zones/{zone_name}/records")
+        return data.get("results", [])
+
+    async def create_zone_record(
+        self,
+        zone_name: str,
+        name: str,
+        rtype: str,
+        value: str,
+        ttl: int = 300,
+        prio: int | None = None,
+    ) -> dict:
+        """
+        Create a DNS record in an Openprovider-managed zone.
+
+        For records at the zone apex, use name="".
+        """
+        record: dict = {
+            "name": name,
+            "type": rtype,
+            "value": value,
+            "ttl": ttl,
+        }
+        if prio is not None:
+            record["prio"] = prio
+
+        # Openprovider zone record API: PUT replaces all records.
+        # We fetch existing records, append the new one, and PUT the full set.
+        existing = await self.list_zone_records(zone_name)
+        records = [
+            {k: r[k] for k in ("name", "type", "value", "ttl", "prio") if k in r} for r in existing
+        ]
+        records.append(record)
+
+        data = await self._request(
+            "PUT",
+            f"/dns/zones/{zone_name}",
+            json={"records": records},
+        )
+        log.info("zone_record_created", zone=zone_name, name=name, type=rtype, value=value)
+        return data
+
+    async def delete_zone_record(
+        self,
+        zone_name: str,
+        name: str,
+        rtype: str,
+    ) -> dict:
+        """
+        Delete a DNS record from an Openprovider-managed zone.
+
+        Removes all records matching the given name and type.
+        """
+        existing = await self.list_zone_records(zone_name)
+        records = [
+            {k: r[k] for k in ("name", "type", "value", "ttl", "prio") if k in r}
+            for r in existing
+            if not (r.get("name") == name and r.get("type") == rtype)
+        ]
+
+        data = await self._request(
+            "PUT",
+            f"/dns/zones/{zone_name}",
+            json={"records": records},
+        )
+        log.info("zone_record_deleted", zone=zone_name, name=name, type=rtype)
+        return data
 
     async def close(self) -> None:
         await self._http.aclose()

@@ -41,7 +41,7 @@ class OpenproviderConfig(BaseSettings):
     tech_handle: str = ""
     billing_handle: str = ""
     nameservers: list[str] = Field(
-        default_factory=lambda: ["ns1.hyrule.cloud", "ns2.hyrule.cloud"]
+        default_factory=lambda: ["ns1.servify.network", "ns2.servify.network"]
     )
 
 
@@ -68,7 +68,7 @@ class PaymentConfig(BaseSettings):
 class HyruleConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="HYRULE_", env_file=".env", extra="ignore")
 
-    deploy_domain: str = "deploy.hyrule.cloud"
+    deploy_domain: str = "deploy.servify.network"
 
     # DNS (RFC 2136)
     dns_server: str = ""

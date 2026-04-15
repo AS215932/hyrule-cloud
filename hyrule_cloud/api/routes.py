@@ -58,7 +58,7 @@ async def get_pricing(request: Request) -> PricingResponse:
             "md (2vCPU/2GB/40GB)": f"${cfg.payment.price_vm_md}/day",
             "lg (4vCPU/4GB/80GB)": f"${cfg.payment.price_vm_lg}/day",
         },
-        domain_auto="$0.00 (subdomain under deploy.hyrule.cloud)",
+        domain_auto="$0.00 (subdomain under deploy.servify.network)",
         vpn_per_day=f"${cfg.payment.price_vpn}/day",
     )
 
@@ -272,4 +272,156 @@ async def register_domain(request: Request):
         "status": "registered",
         "nameservers": cfg.openprovider.nameservers,
         "tx_hash": getattr(request.state, "payment_tx", None),
+    }
+
+
+# --- DNS Zone endpoints ---
+
+
+@router.get("/zone/check")
+async def check_zone(name: str, extension: str, request: Request):
+    """Check if a DNS zone (domain) is available for purchase."""
+    orch = _orch(request)
+    check = await orch.openprovider.check_domain(name, extension)
+    return {
+        "zone": f"{name}.{extension}",
+        "status": check["status"],
+        "price": str(check.get("price")) if check.get("price") else None,
+        "is_premium": check.get("is_premium", False),
+        "currency": check.get("currency", "USD"),
+    }
+
+
+@router.post("/zone/buy")
+async def buy_zone(request: Request):
+    """
+    Buy a DNS zone: register the domain via Openprovider and create an
+    authoritative DNS zone. After purchase, the agent can manage records
+    via POST /v1/zone/record and DELETE /v1/zone/record.
+    """
+    cfg = _cfg(request)
+    orch = _orch(request)
+    gate = _gate(request)
+
+    body = await request.json()
+    name = body.get("name")
+    extension = body.get("extension")
+
+    if not name or not extension:
+        raise HTTPException(400, "name and extension required")
+
+    check = await orch.openprovider.check_domain(name, extension)
+    if check["status"] != "free":
+        raise HTTPException(409, f"Domain {name}.{extension} is not available")
+
+    op_price = check.get("price") or Decimal("10")
+    total = op_price + cfg.payment.price_domain_markup
+
+    result = await gate.check_payment(
+        request,
+        amount=total,
+        description=f"Buy DNS zone {name}.{extension}",
+        extra_body={
+            "zone": f"{name}.{extension}",
+            "registrar_cost": str(op_price),
+            "markup": str(cfg.payment.price_domain_markup),
+            "includes": "domain registration + authoritative DNS zone",
+        },
+    )
+
+    if isinstance(result, Response):
+        return result
+
+    # Register the domain with our nameservers
+    await orch.openprovider.register_domain(name, extension)
+
+    # Create DNS zone on Openprovider
+    fqdn = f"{name}.{extension}"
+    try:
+        await orch.openprovider.create_zone(fqdn)
+    except Exception:
+        log.warning("zone_create_fallback", zone=fqdn, exc_info=True)
+        # Zone may already exist if domain was previously registered
+
+    return {
+        "zone": fqdn,
+        "status": "active",
+        "nameservers": cfg.openprovider.nameservers,
+        "tx_hash": getattr(request.state, "payment_tx", None),
+    }
+
+
+@router.post("/zone/record")
+async def create_zone_record(request: Request):
+    """Create a DNS record in a zone managed by Hyrule Cloud."""
+    orch = _orch(request)
+
+    body = await request.json()
+    zone = body.get("zone")
+    name = body.get("name", "")
+    rtype = body.get("type")
+    value = body.get("value")
+    ttl = body.get("ttl", 300)
+
+    if not zone or not rtype or not value:
+        raise HTTPException(400, "zone, type, and value are required")
+
+    # Validate record type
+    allowed_types = {"A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA"}
+    if rtype.upper() not in allowed_types:
+        raise HTTPException(400, f"Unsupported record type: {rtype}. Allowed: {allowed_types}")
+
+    try:
+        prio = body.get("prio") or body.get("priority")
+        await orch.openprovider.create_zone_record(
+            zone_name=zone,
+            name=name,
+            rtype=rtype.upper(),
+            value=value,
+            ttl=ttl,
+            prio=int(prio) if prio is not None else None,
+        )
+    except Exception as e:
+        log.error("zone_record_create_failed", zone=zone, error=str(e), exc_info=True)
+        raise HTTPException(500, f"Failed to create record: {e}")
+
+    fqdn = f"{name}.{zone}" if name else zone
+    return {
+        "fqdn": fqdn,
+        "type": rtype.upper(),
+        "value": value,
+        "ttl": ttl,
+        "status": "created",
+    }
+
+
+@router.delete("/zone/record")
+async def delete_zone_record(
+    zone: str,
+    name: str,
+    type: str,
+    request: Request,
+):
+    """Delete a DNS record from a zone managed by Hyrule Cloud."""
+    orch = _orch(request)
+
+    allowed_types = {"A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA"}
+    if type.upper() not in allowed_types:
+        raise HTTPException(400, f"Unsupported record type: {type}. Allowed: {allowed_types}")
+
+    try:
+        await orch.openprovider.delete_zone_record(
+            zone_name=zone,
+            name=name,
+            rtype=type.upper(),
+        )
+    except Exception as e:
+        log.error("zone_record_delete_failed", zone=zone, error=str(e), exc_info=True)
+        raise HTTPException(500, f"Failed to delete record: {e}")
+
+    fqdn = f"{name}.{zone}" if name else zone
+    return {
+        "fqdn": fqdn,
+        "type": type.upper(),
+        "status": "deleted",
     }

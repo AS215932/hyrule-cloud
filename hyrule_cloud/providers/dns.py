@@ -4,7 +4,7 @@ DNS provider for managing records on the authoritative nameserver.
 Uses RFC 2136 (DNS UPDATE) via dnspython, authenticated with TSIG.
 Works with BIND, Knot, PowerDNS, and NSD.
 
-For the auto-subdomain case (*.deploy.hyrule.cloud), we create AAAA
+For the auto-subdomain case (*.deploy.servify.network), we create AAAA
 records pointing to the VM's IPv6 address.
 """
 
