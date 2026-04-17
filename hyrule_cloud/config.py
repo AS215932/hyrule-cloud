@@ -16,14 +16,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class XCPNGConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="XCPNG_", env_file=".env", extra="ignore")
 
-    host: str = "https://xcp-ng.internal:443"
-    username: str = "root"
-    password: str = ""
-    verify_ssl: bool = False
-
-    # Xen Orchestra (handles VM creation, cloud-init, disk management)
+    # Xen Orchestra — all XCP-NG operations go through XO JSON-RPC.
+    # XO has mgmt-side access to XAPI (dom0 10.0.0.1); dom0 stays underlay-only.
     xo_url: str = "wss://xcp-ng.internal/api/"
     xo_token: str = ""
+    xo_verify_ssl: bool = False
 
     default_sr_uuid: str = ""
     default_network_uuid: str = ""

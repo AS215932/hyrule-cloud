@@ -253,12 +253,7 @@ class Orchestrator:
             if row.status == VMStatus.SUSPENDED and row.xcpng_uuid:
                 power = await self.xcpng.get_vm_power_state(row.xcpng_uuid)
                 if power == "Halted":
-                    vm_ref = await self.xcpng._call(
-                        "VM.get_by_uuid", self.xcpng.session, row.xcpng_uuid
-                    )
-                    await self.xcpng._call(
-                        "VM.start", self.xcpng.session, vm_ref, False, True
-                    )
+                    await self.xcpng.start_vm(row.xcpng_uuid)
                 row.status = VMStatus.RUNNING
 
             await session.commit()
