@@ -10,19 +10,30 @@ from __future__ import annotations
 from decimal import Decimal
 
 import structlog
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response, Depends
 
 from hyrule_cloud.middleware.x402 import PaymentGate
+from hyrule_cloud.state import get_app_state, AppState
 from hyrule_cloud.models import (
     VM_SPECS,
     DomainMode,
     FirewallState,
+    NetworkRequest,
+    NetworkResponse,
     OSListResponse,
     OSTemplate,
     PricingResponse,
+    ProxyMode,
     VMCreateRequest,
     VMCreateResponse,
     VMExtendRequest,
+    VMLogEvent,
+    VMLogsResponse,
+    GenericActionResponse,
+    DomainCheckResponse,
+    DomainRegisterRequest,
+    DNSRecord,
+    DNSRecordType,
     VMSize,
     VMStatus,
     VMStatusResponse,
@@ -33,24 +44,24 @@ log = structlog.get_logger()
 router = APIRouter(prefix="/v1")
 
 
-def _orch(request: Request):
-    return request.app.state.orchestrator
+def get_orch(app_state: AppState = Depends(get_app_state)):
+    return app_state.orchestrator
 
+def get_cfg(app_state: AppState = Depends(get_app_state)):
+    return app_state.config
 
-def _cfg(request: Request):
-    return request.app.state.config
+def get_gate(app_state: AppState = Depends(get_app_state)):
+    return app_state.payment_gate
 
-
-def _gate(request: Request) -> PaymentGate:
-    return request.app.state.payment_gate
+def get_network(app_state: AppState = Depends(get_app_state)):
+    return app_state.network_provider
 
 
 # --- Free endpoints ---
 
 
 @router.get("/pricing", response_model=PricingResponse)
-async def get_pricing(request: Request) -> PricingResponse:
-    cfg = _cfg(request)
+async def get_pricing(cfg = Depends(get_cfg)) -> PricingResponse:
     return PricingResponse(
         vm_prices={
             "xs (1vCPU/512MB/10GB)": f"${cfg.payment.price_vm_xs}/day",
@@ -60,12 +71,16 @@ async def get_pricing(request: Request) -> PricingResponse:
         },
         domain_auto="$0.00 (subdomain under deploy.servify.network)",
         vpn_per_day=f"${cfg.payment.price_vpn}/day",
+        proxy_prices={
+            "direct": f"${cfg.payment.price_proxy_direct}/request",
+            "tor": f"${cfg.payment.price_proxy_tor}/request",
+            "residential": f"${cfg.payment.price_proxy_residential}/request",
+        } if hasattr(PricingResponse, '__annotations__') and 'proxy_prices' in PricingResponse.__annotations__ else {}
     )
 
 
 @router.get("/os/list", response_model=OSListResponse)
-async def list_os_templates(request: Request) -> OSListResponse:
-    cfg = _cfg(request)
+async def list_os_templates(cfg = Depends(get_cfg)) -> OSListResponse:
     templates = [
         OSTemplate(name=name, description=f"OS template: {name}", default=(name == "debian-13"))
         for name in cfg.xcpng.templates
@@ -80,8 +95,8 @@ async def list_os_templates(request: Request) -> OSListResponse:
 
 
 @router.get("/vm/{vm_id}", response_model=VMStatusResponse)
-async def get_vm_status(vm_id: str, request: Request) -> VMStatusResponse:
-    row = await _orch(request).get_vm(vm_id)
+async def get_vm_status(vm_id: str, orch = Depends(get_orch)) -> VMStatusResponse:
+    row = await orch.get_vm(vm_id)
     if not row:
         raise HTTPException(404, "VM not found")
 
@@ -103,30 +118,26 @@ async def get_vm_status(vm_id: str, request: Request) -> VMStatusResponse:
     )
 
 
-@router.get("/vm/{vm_id}/logs")
-async def get_vm_logs(vm_id: str, request: Request):
-    row = await _orch(request).get_vm(vm_id)
+@router.get("/vm/{vm_id}/logs", response_model=VMLogsResponse)
+async def get_vm_logs(vm_id: str, orch = Depends(get_orch)) -> VMLogsResponse:
+    row = await orch.get_vm(vm_id)
     if not row:
         raise HTTPException(404, "VM not found")
-    return {
-        "vm_id": vm_id,
-        "status": row.status,
-        "events": [
-            {"ts": row.created_at.isoformat(), "event": "provisioning_started"},
+    return VMLogsResponse(
+        vm_id=vm_id,
+        status=row.status,
+        events=[
+            VMLogEvent(ts=row.created_at.isoformat(), event="provisioning_started"),
         ],
-        "error": row.error,
-    }
+        error=row.error,
+    )
 
 
 # --- x402-gated endpoints ---
 
 
 @router.post("/vm/create")
-async def create_vm(body: VMCreateRequest, request: Request):
-    orch = _orch(request)
-    cfg = _cfg(request)
-    gate = _gate(request)
-
+async def create_vm(body: VMCreateRequest, request: Request, orch = Depends(get_orch), cfg = Depends(get_cfg), gate = Depends(get_gate)):
     if body.domain_mode == DomainMode.CUSTOM and not body.domain:
         raise HTTPException(400, "domain required when domain_mode=custom")
 
@@ -165,11 +176,7 @@ async def create_vm(body: VMCreateRequest, request: Request):
 
 
 @router.post("/vm/{vm_id}/extend")
-async def extend_vm(vm_id: str, body: VMExtendRequest, request: Request):
-    orch = _orch(request)
-    cfg = _cfg(request)
-    gate = _gate(request)
-
+async def extend_vm(vm_id: str, body: VMExtendRequest, request: Request, orch = Depends(get_orch), cfg = Depends(get_cfg), gate = Depends(get_gate)):
     row = await orch.get_vm(vm_id)
     if not row:
         raise HTTPException(404, "VM not found")
@@ -207,36 +214,38 @@ async def extend_vm(vm_id: str, body: VMExtendRequest, request: Request):
     }
 
 
-@router.post("/vm/{vm_id}/reboot")
-async def reboot_vm(vm_id: str, request: Request):
-    if not await _orch(request).reboot_vm(vm_id):
+@router.post("/vm/{vm_id}/reboot", response_model=GenericActionResponse)
+async def reboot_vm(vm_id: str, orch = Depends(get_orch)) -> GenericActionResponse:
+    if not await orch.reboot_vm(vm_id):
         raise HTTPException(404, "VM not found or not running")
-    return {"vm_id": vm_id, "status": "rebooting"}
+    return GenericActionResponse(status="ok", message=f"VM {vm_id} is rebooting")
 
 
-@router.delete("/vm/{vm_id}")
-async def destroy_vm(vm_id: str, request: Request):
-    if not await _orch(request).destroy_vm(vm_id):
+@router.delete("/vm/{vm_id}", response_model=GenericActionResponse)
+async def destroy_vm(vm_id: str, orch = Depends(get_orch)) -> GenericActionResponse:
+    if not await orch.destroy_vm(vm_id):
         raise HTTPException(404, "VM not found")
-    return {"vm_id": vm_id, "status": "destroyed"}
+    return GenericActionResponse(status="ok", message=f"VM {vm_id} destroyed")
 
 
-@router.get("/domain/check")
-async def check_domain(name: str, extension: str, request: Request):
-    return await _orch(request).openprovider.check_domain(name, extension)
+@router.get("/domain/check", response_model=DomainCheckResponse)
+async def check_domain(name: str, extension: str, orch = Depends(get_orch)) -> DomainCheckResponse:
+    """Check if a DNS zone (domain) is available for purchase."""
+    check = await orch.openprovider.check_domain(name, extension)
+    return DomainCheckResponse(
+        domain=f"{name}.{extension}",
+        available=(check.get("status") == "free"),
+        price=str(check.get("price")) if check.get("price") else None,
+    )
 
 
-@router.post("/domain/register")
-async def register_domain(request: Request):
-    cfg = _cfg(request)
-    orch = _orch(request)
-    gate = _gate(request)
-
-    body = await request.json()
-    name = body.get("name")
-    extension = body.get("extension")
-    ipv6 = body.get("ipv6")
-
+@router.post("/domain/register", response_model=GenericActionResponse)
+async def register_domain(body: DomainRegisterRequest, name: str, extension: str, ipv6: str | None = None, request: Request=None, orch = Depends(get_orch), cfg = Depends(get_cfg), gate = Depends(get_gate)):
+    """
+    Buy a DNS zone: register the domain via Openprovider and create an
+    authoritative DNS zone. After purchase, the agent can manage records
+    via POST /v1/zone/record and DELETE /v1/zone/record.
+    """
     if not name or not extension:
         raise HTTPException(400, "name and extension required")
 
@@ -261,167 +270,97 @@ async def register_domain(request: Request):
     if isinstance(result, Response):
         return result
 
-    await orch.openprovider.register_domain(name, extension)
+    try:
+        await orch.openprovider.register_domain(name, extension)
+    except Exception as e:
+        log.error("domain_registration_failed", error=str(e))
+        raise HTTPException(500, f"Domain registration failed: {e}")
 
-    if ipv6:
-        fqdn = f"{name}.{extension}"
-        await orch.dns.create_record(fqdn, "AAAA", ipv6)
-
-    return {
-        "domain": f"{name}.{extension}",
-        "status": "registered",
-        "nameservers": cfg.openprovider.nameservers,
-        "tx_hash": getattr(request.state, "payment_tx", None),
-    }
-
-
-# --- DNS Zone endpoints ---
-
-
-@router.get("/zone/check")
-async def check_zone(name: str, extension: str, request: Request):
-    """Check if a DNS zone (domain) is available for purchase."""
-    orch = _orch(request)
-    check = await orch.openprovider.check_domain(name, extension)
-    return {
-        "zone": f"{name}.{extension}",
-        "status": check["status"],
-        "price": str(check.get("price")) if check.get("price") else None,
-        "is_premium": check.get("is_premium", False),
-        "currency": check.get("currency", "USD"),
-    }
-
-
-@router.post("/zone/buy")
-async def buy_zone(request: Request):
-    """
-    Buy a DNS zone: register the domain via Openprovider and create an
-    authoritative DNS zone. After purchase, the agent can manage records
-    via POST /v1/zone/record and DELETE /v1/zone/record.
-    """
-    cfg = _cfg(request)
-    orch = _orch(request)
-    gate = _gate(request)
-
-    body = await request.json()
-    name = body.get("name")
-    extension = body.get("extension")
-
-    if not name or not extension:
-        raise HTTPException(400, "name and extension required")
-
-    check = await orch.openprovider.check_domain(name, extension)
-    if check["status"] != "free":
-        raise HTTPException(409, f"Domain {name}.{extension} is not available")
-
-    op_price = check.get("price") or Decimal("10")
-    total = op_price + cfg.payment.price_domain_markup
-
-    result = await gate.check_payment(
-        request,
-        amount=total,
-        description=f"Buy DNS zone {name}.{extension}",
-        extra_body={
-            "zone": f"{name}.{extension}",
-            "registrar_cost": str(op_price),
-            "markup": str(cfg.payment.price_domain_markup),
-            "includes": "domain registration + authoritative DNS zone",
-        },
-    )
-
-    if isinstance(result, Response):
-        return result
-
-    # Register the domain with our nameservers
-    await orch.openprovider.register_domain(name, extension)
-
-    # Create DNS zone on Openprovider
     fqdn = f"{name}.{extension}"
     try:
         await orch.openprovider.create_zone(fqdn)
     except Exception:
-        log.warning("zone_create_fallback", zone=fqdn, exc_info=True)
-        # Zone may already exist if domain was previously registered
+        log.warning("zone_create_fallback", zone=fqdn)
+        
+    if ipv6:
+        await orch.dns.create_record(fqdn, "AAAA", ipv6)
 
-    return {
-        "zone": fqdn,
-        "status": "active",
-        "nameservers": cfg.openprovider.nameservers,
-        "tx_hash": getattr(request.state, "payment_tx", None),
-    }
+    return GenericActionResponse(status="ok", message=f"Domain {fqdn} registered")
 
 
-@router.post("/zone/record")
-async def create_zone_record(request: Request):
+@router.post("/zone/record", response_model=GenericActionResponse)
+async def create_zone_record(zone: str, body: DNSRecord, orch = Depends(get_orch)) -> GenericActionResponse:
     """Create a DNS record in a zone managed by Hyrule Cloud."""
-    orch = _orch(request)
-
-    body = await request.json()
-    zone = body.get("zone")
-    name = body.get("name", "")
-    rtype = body.get("type")
-    value = body.get("value")
-    ttl = body.get("ttl", 300)
-
-    if not zone or not rtype or not value:
-        raise HTTPException(400, "zone, type, and value are required")
-
-    # Validate record type
-    allowed_types = {"A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA"}
-    if rtype.upper() not in allowed_types:
-        raise HTTPException(400, f"Unsupported record type: {rtype}. Allowed: {allowed_types}")
-
     try:
-        prio = body.get("prio") or body.get("priority")
         await orch.openprovider.create_zone_record(
             zone_name=zone,
-            name=name,
-            rtype=rtype.upper(),
-            value=value,
-            ttl=ttl,
-            prio=int(prio) if prio is not None else None,
+            name=body.name,
+            rtype=body.type.value,
+            value=body.value,
+            ttl=body.ttl,
+            prio=body.prio,
         )
     except Exception as e:
         log.error("zone_record_create_failed", zone=zone, error=str(e), exc_info=True)
         raise HTTPException(500, f"Failed to create record: {e}")
 
-    fqdn = f"{name}.{zone}" if name else zone
-    return {
-        "fqdn": fqdn,
-        "type": rtype.upper(),
-        "value": value,
-        "ttl": ttl,
-        "status": "created",
-    }
+    fqdn = f"{body.name}.{zone}" if body.name else zone
+    return GenericActionResponse(status="ok", message=f"Record {body.type.value} created for {fqdn}")
 
 
-@router.delete("/zone/record")
+@router.delete("/zone/record", response_model=GenericActionResponse)
 async def delete_zone_record(
     zone: str,
     name: str,
     type: str,
-    request: Request,
+    orch = Depends(get_orch),
 ):
     """Delete a DNS record from a zone managed by Hyrule Cloud."""
-    orch = _orch(request)
-
-    allowed_types = {"A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA"}
-    if type.upper() not in allowed_types:
-        raise HTTPException(400, f"Unsupported record type: {type}. Allowed: {allowed_types}")
+    from hyrule_cloud.models import DNSRecordType
+    try:
+        rtype = DNSRecordType(type.upper())
+    except ValueError:
+        raise HTTPException(400, f"Unsupported record type: {type}")
 
     try:
         await orch.openprovider.delete_zone_record(
             zone_name=zone,
             name=name,
-            rtype=type.upper(),
+            rtype=rtype.value,
         )
     except Exception as e:
         log.error("zone_record_delete_failed", zone=zone, error=str(e), exc_info=True)
         raise HTTPException(500, f"Failed to delete record: {e}")
 
     fqdn = f"{name}.{zone}" if name else zone
-    return {
-        "fqdn": fqdn,
-        "type": type.upper(),
-        "status": "deleted",
+    return GenericActionResponse(status="ok", message=f"Record {rtype.value} deleted for {fqdn}")
+
+@router.post("/network/request", response_model=NetworkResponse)
+async def proxy_network_request(body: NetworkRequest, request: Request, cfg = Depends(get_cfg), gate = Depends(get_gate), provider = Depends(get_network)):
+    price_map = {
+        ProxyMode.DIRECT: cfg.payment.price_proxy_direct,
+        ProxyMode.TOR: cfg.payment.price_proxy_tor,
+        ProxyMode.RESIDENTIAL: cfg.payment.price_proxy_residential,
     }
+    amount = price_map[body.proxy_mode]
+
+    result = await gate.check_payment(
+        request,
+        amount=amount,
+        description=f"Network Proxy Request ({body.proxy_mode.value}) to {body.url}",
+        extra_body={
+            "url": body.url,
+            "proxy_mode": body.proxy_mode.value,
+        }
+    )
+
+    if isinstance(result, Response):
+        return result
+
+    # payment valid, proceed
+    resp = await provider.execute_request(body)
+    
+    if resp.error and resp.status_code in [400, 403, 501]:
+        raise HTTPException(resp.status_code, resp.error)
+        
+    return resp

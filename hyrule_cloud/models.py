@@ -35,6 +35,11 @@ class DomainMode(enum.StrEnum):
     CUSTOM = "custom"  # register via Openprovider
 
 
+class ProxyMode(enum.StrEnum):
+    DIRECT = "direct"
+    TOR = "tor"
+    RESIDENTIAL = "residential"
+
 # --- VM Size Specifications ---
 
 
@@ -108,6 +113,7 @@ class PricingResponse(BaseModel):
     vm_prices: dict[str, str]  # size -> $/day
     domain_auto: str
     vpn_per_day: str
+    proxy_prices: dict[str, str] | None = None
     currency: str = "USDC"
     network: str = "Base (eip155:8453)"
 
@@ -120,6 +126,24 @@ class OSTemplate(BaseModel):
     name: str
     description: str
     default: bool = False
+
+
+class NetworkRequest(BaseModel):
+    url: str = Field(description="The full URL to fetch")
+    method: str = Field(default="GET", description="HTTP method (GET, POST, etc)")
+    headers: dict[str, str] | None = Field(default=None, description="Custom headers")
+    body: str | None = Field(default=None, description="Request body")
+    proxy_mode: ProxyMode = Field(default=ProxyMode.DIRECT, description="Routing mode")
+    timeout_seconds: int = Field(default=15, ge=1, le=60, description="Request timeout")
+
+
+class NetworkResponse(BaseModel):
+    status_code: int
+    headers: dict[str, str]
+    body: str
+    elapsed_seconds: float
+    proxy_mode: ProxyMode
+    error: str | None = None
 
 
 # --- Internal State (DB-backed) ---
@@ -151,3 +175,43 @@ class VMRecord(BaseModel):
 
 # Forward ref resolution
 VMStatusResponse.model_rebuild()
+
+class GenericActionResponse(BaseModel):
+    status: str
+    message: str | None = None
+
+class DomainCheckResponse(BaseModel):
+    domain: str
+    available: bool
+    price: str | None = None
+
+class DomainRegisterRequest(BaseModel):
+    duration_years: int = Field(default=1, ge=1, le=10)
+
+class DNSRecordType(enum.StrEnum):
+    A = "A"
+    AAAA = "AAAA"
+    CNAME = "CNAME"
+    TXT = "TXT"
+    MX = "MX"
+    NS = "NS"
+    SRV = "SRV"
+
+class DNSRecord(BaseModel):
+    type: DNSRecordType
+    name: str
+    value: str
+    ttl: int = 3600
+    prio: int | None = None
+
+class VMLogEvent(BaseModel):
+    ts: str
+    event: str
+
+class VMLogsResponse(BaseModel):
+    vm_id: str
+    status: str
+    events: list[VMLogEvent]
+    error: str | None = None
+
+# Rebuild all refs if needed

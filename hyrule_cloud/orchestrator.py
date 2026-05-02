@@ -151,26 +151,35 @@ class Orchestrator:
                 row = await session.get(VMRow, vm_id)
                 if not row:
                     return
+                os_name = row.os
+                size = row.size
+                ssh_pubkey = row.ssh_pubkey
+                open_ports = list(row.open_ports)
+                setup_script = row.setup_script
 
-                template_uuid = self.config.xcpng.templates.get(row.os)
-                if not template_uuid:
-                    raise ValueError(f"Unknown OS template: {row.os}")
+            template_uuid = self.config.xcpng.templates.get(os_name)
+            if not template_uuid:
+                raise ValueError(f"Unknown OS template: {os_name}")
 
-                cloud_config = render_cloud_init(
-                    hostname=self._generate_hostname(vm_id),
-                    ssh_pubkey=row.ssh_pubkey,
-                    open_ports=list(row.open_ports),
-                    setup_script=row.setup_script,
-                )
+            cloud_config = render_cloud_init(
+                hostname=self._generate_hostname(vm_id),
+                ssh_pubkey=ssh_pubkey,
+                open_ports=open_ports,
+                setup_script=setup_script,
+            )
 
-                xcpng_uuid = await self.xcpng.create_vm(
-                    template_uuid=template_uuid,
-                    name_label=f"hyrule-{vm_id}",
-                    size=VMSize(row.size),
-                    cloud_init_config=cloud_config,
-                )
-                row.xcpng_uuid = xcpng_uuid
-                await session.commit()
+            xcpng_uuid = await self.xcpng.create_vm(
+                template_uuid=template_uuid,
+                name_label=f"hyrule-{vm_id}",
+                size=VMSize(size),
+                cloud_init_config=cloud_config,
+            )
+            
+            async with self.db() as session:
+                row = await session.get(VMRow, vm_id)
+                if row:
+                    row.xcpng_uuid = xcpng_uuid
+                    await session.commit()
 
             # Wait for IPv6 (outside DB session to avoid long-held connections)
             ipv6 = await self._wait_for_ipv6(xcpng_uuid, timeout=120)
@@ -249,24 +258,36 @@ class Orchestrator:
             now = _now()
             base = max(row.expires_at, now)
             row.expires_at = base + timedelta(days=days)
-
-            if row.status == VMStatus.SUSPENDED and row.xcpng_uuid:
-                power = await self.xcpng.get_vm_power_state(row.xcpng_uuid)
-                if power == "Halted":
-                    await self.xcpng.start_vm(row.xcpng_uuid)
-                row.status = VMStatus.RUNNING
+            
+            suspend_status = (row.status == VMStatus.SUSPENDED)
+            xcpng_uuid = row.xcpng_uuid
 
             await session.commit()
             await session.refresh(row)
-            log.info("vm_extended", vm_id=vm_id, new_expiry=row.expires_at.isoformat())
-            return row
+            
+        if suspend_status and xcpng_uuid:
+            power = await self.xcpng.get_vm_power_state(xcpng_uuid)
+            if power == "Halted":
+                await self.xcpng.start_vm(xcpng_uuid)
+                
+            async with self.db() as session:
+                row = await session.get(VMRow, vm_id)
+                if row:
+                    row.status = VMStatus.RUNNING
+                    await session.commit()
+                    await session.refresh(row)
+
+        log.info("vm_extended", vm_id=vm_id, new_expiry=row.expires_at.isoformat() if row.expires_at else "none")
+        return row
 
     async def reboot_vm(self, vm_id: str) -> bool:
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if not row or not row.xcpng_uuid:
                 return False
-        await self.xcpng.reboot_vm(row.xcpng_uuid)
+            xcpng_uuid = row.xcpng_uuid
+            
+        await self.xcpng.reboot_vm(xcpng_uuid)
         return True
 
     async def destroy_vm(self, vm_id: str) -> bool:
@@ -274,20 +295,25 @@ class Orchestrator:
             row = await session.get(VMRow, vm_id)
             if not row:
                 return False
+            xcpng_uuid = row.xcpng_uuid
+            hostname = row.hostname
 
-            if row.xcpng_uuid:
-                await self.xcpng.destroy_vm(row.xcpng_uuid)
+        if xcpng_uuid:
+            await self.xcpng.destroy_vm(xcpng_uuid)
 
-            if row.hostname:
-                subdomain = self._generate_hostname(vm_id)
-                try:
-                    await self.dns.delete_aaaa(subdomain)
-                except Exception:
-                    log.warning("dns_cleanup_failed", vm_id=vm_id, exc_info=True)
+        if hostname:
+            subdomain = self._generate_hostname(vm_id)
+            try:
+                await self.dns.delete_aaaa(subdomain)
+            except Exception:
+                log.warning("dns_cleanup_failed", vm_id=vm_id, exc_info=True)
 
-            row.status = VMStatus.DESTROYED
-            row.destroyed_at = _now()
-            await session.commit()
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row:
+                row.status = VMStatus.DESTROYED
+                row.destroyed_at = _now()
+                await session.commit()
 
         log.info("vm_destroyed", vm_id=vm_id)
         return True
@@ -307,26 +333,33 @@ class Orchestrator:
                     VMRow.expires_at < now,
                 )
             )
-            expired_rows = result.scalars().all()
+            expired_vms = []
+            for r in result.scalars().all():
+                expired_vms.append({
+                    "vm_id": r.vm_id,
+                    "expires_at": r.expires_at,
+                    "status": r.status,
+                    "xcpng_uuid": r.xcpng_uuid
+                })
 
-        for row in expired_rows:
-            if not row.expires_at:
+        for vm in expired_vms:
+            if not vm["expires_at"]:
                 continue
 
-            if now > row.expires_at + grace:
-                log.info("vm_expiry_destroy", vm_id=row.vm_id)
-                await self.destroy_vm(row.vm_id)
-            elif row.status != VMStatus.SUSPENDED:
-                log.info("vm_expiry_suspend", vm_id=row.vm_id)
-                if row.xcpng_uuid:
+            if now > vm["expires_at"] + grace:
+                log.info("vm_expiry_destroy", vm_id=vm["vm_id"])
+                await self.destroy_vm(vm["vm_id"])
+            elif vm["status"] != VMStatus.SUSPENDED:
+                log.info("vm_expiry_suspend", vm_id=vm["vm_id"])
+                if vm["xcpng_uuid"]:
                     try:
-                        await self.xcpng.suspend_vm(row.xcpng_uuid)
+                        await self.xcpng.suspend_vm(vm["xcpng_uuid"])
                     except Exception:
-                        log.warning("suspend_failed", vm_id=row.vm_id, exc_info=True)
+                        log.warning("suspend_failed", vm_id=vm["vm_id"], exc_info=True)
                 async with self.db() as session:
                     await session.execute(
                         update(VMRow)
-                        .where(VMRow.vm_id == row.vm_id)
+                        .where(VMRow.vm_id == vm["vm_id"])
                         .values(status=VMStatus.SUSPENDED)
                     )
                     await session.commit()

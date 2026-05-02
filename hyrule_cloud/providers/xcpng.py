@@ -21,22 +21,23 @@ import websockets
 
 from hyrule_cloud.config import XCPNGConfig
 from hyrule_cloud.models import VM_SPECS, VMSize
+from hyrule_cloud.providers.base import Provider, ProviderError
 
 log = structlog.get_logger()
 
 _xo_req_id = count(1)
 
 
-class XOError(Exception):
+class XOError(ProviderError):
     """Raised when XO JSON-RPC returns an error."""
 
     def __init__(self, method: str, error: dict) -> None:
         self.method = method
         self.error = error
-        super().__init__(f"XO {method} failed: {error}")
+        super().__init__("XCPNG", method, str(error))
 
 
-class XCPNGProvider:
+class XCPNGProvider(Provider):
     """XO JSON-RPC client for XCP-NG VM lifecycle."""
 
     def __init__(self, config: XCPNGConfig) -> None:
@@ -87,6 +88,17 @@ class XCPNGProvider:
     async def _xo_objects(self, **filter_: Any) -> dict[str, dict]:
         """Query XO's object cache. Returns {uuid: record}."""
         return await self._xo_call("xo.getAllObjects", filter=filter_)
+
+    async def health_check(self) -> bool:
+        """Check if connection to XO is alive."""
+        try:
+            if not self._xo_ws:
+                await self._xo_connect()
+            # A simple call to verify it's reachable and working
+            await self._xo_call("system.getInfo")
+            return True
+        except Exception:
+            return False
 
     async def _xo_get_object(self, uuid: str) -> dict | None:
         objs = await self._xo_objects(id=uuid)

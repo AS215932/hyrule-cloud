@@ -29,6 +29,8 @@ structlog.configure(
 log = structlog.get_logger()
 
 
+from hyrule_cloud.state import AppState
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config = HyruleConfig()
@@ -41,14 +43,21 @@ async def lifespan(app: FastAPI):
     # Payment gate (official x402 SDK)
     payment_gate = PaymentGate(config.payment)
 
+    # Network client
+    from hyrule_cloud.providers.network_client import NetworkProvider
+    network_provider = NetworkProvider()
+
     # Orchestrator
     orchestrator = Orchestrator(config, session_factory)
     await orchestrator.startup()
 
     # Wire up app state
-    app.state.config = config
-    app.state.orchestrator = orchestrator
-    app.state.payment_gate = payment_gate
+    app.state._typed_state = AppState(
+        config=config,
+        orchestrator=orchestrator,
+        payment_gate=payment_gate,
+        network_provider=network_provider,
+    )
 
     # Expiry scheduler
     scheduler = AsyncIOScheduler()
@@ -65,6 +74,7 @@ async def lifespan(app: FastAPI):
 
     scheduler.shutdown()
     await orchestrator.shutdown()
+    await network_provider.close()
     await engine.dispose()
     log.info("hyrule_cloud_stopped")
 
@@ -92,7 +102,7 @@ async def health():
 @app.get("/.well-known/x402.json")
 async def x402_manifest():
     """x402 service manifest for agent discovery."""
-    config: HyruleConfig = app.state.config
+    config: HyruleConfig = app.state._typed_state.config
     return {
         "x402Version": 2,
         "name": "Hyrule Cloud",
@@ -119,10 +129,10 @@ async def x402_manifest():
                 "network": config.payment.network,
             },
             {
-                "path": "/v1/zone/buy",
+                "path": "/v1/network/request",
                 "method": "POST",
-                "description": "Buy a DNS zone (domain + authoritative DNS)",
-                "minPrice": str(config.payment.price_domain_markup + 5),
+                "description": "Make a micro-proxy network request (Clearnet/Tor)",
+                "minPrice": str(config.payment.price_proxy_direct),
                 "asset": config.payment.asset,
                 "network": config.payment.network,
             },

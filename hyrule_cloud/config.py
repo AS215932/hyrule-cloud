@@ -56,6 +56,10 @@ class PaymentConfig(BaseSettings):
     price_vm_lg: Decimal = Decimal("0.40")
     price_vpn: Decimal = Decimal("0.02")
     price_domain_markup: Decimal = Decimal("1.00")
+    
+    price_proxy_direct: Decimal = Decimal("0.01")
+    price_proxy_tor: Decimal = Decimal("0.05")
+    price_proxy_residential: Decimal = Decimal("0.20")
 
     # Dev bypass: set to a non-empty string to allow skipping payment
     # via X-DEV-BYPASS header. NEVER set in production.

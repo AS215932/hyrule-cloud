@@ -18,14 +18,16 @@ import dns.rdatatype
 import dns.tsigkeyring
 import dns.update
 import dns.query
+import dns.message
 import structlog
 
 from hyrule_cloud.config import HyruleConfig
+from hyrule_cloud.providers.base import Provider, ProviderError
 
 log = structlog.get_logger()
 
 
-class DNSProvider:
+class DNSProvider(Provider):
     """Manage DNS records via RFC 2136 dynamic updates."""
 
     def __init__(self, config: HyruleConfig) -> None:
@@ -51,6 +53,25 @@ class DNSProvider:
             elif action == "add":
                 update.add(*args)
         return update
+
+    async def health_check(self) -> bool:
+        """Check if DNS server is reachable."""
+        if not self.server:
+            return False
+            
+        try:
+            loop = asyncio.get_running_loop()
+            q = dns.message.make_query(self.zone, dns.rdatatype.SOA)
+            response = await loop.run_in_executor(
+                None, partial(dns.query.udp, q, self.server, timeout=2)
+            )
+            return response.rcode() == dns.rcode.NOERROR
+        except Exception:
+            return False
+
+    async def close(self) -> None:
+        """DNS operations using dnspython typically do not require connection closure."""
+        pass
 
     async def _send(self, commands: list[tuple[str, ...]]) -> None:
         """Build and send an RFC 2136 update over TCP."""

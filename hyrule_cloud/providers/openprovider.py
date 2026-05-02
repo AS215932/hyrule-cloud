@@ -17,14 +17,15 @@ from hyrule_cloud.config import OpenproviderConfig
 log = structlog.get_logger()
 
 
-class OpenproviderError(Exception):
+from hyrule_cloud.providers.base import Provider, ProviderError
+
+class OpenproviderError(ProviderError):
     def __init__(self, code: int, desc: str) -> None:
-        self.code = code
+        self.openprovider_code = code
         self.desc = desc
-        super().__init__(f"Openprovider error {code}: {desc}")
+        super().__init__("Openprovider", str(code), desc, retryable=(code == 401))
 
-
-class OpenproviderClient:
+class OpenproviderClient(Provider):
     """Async client for the Openprovider REST API."""
 
     def __init__(self, config: OpenproviderConfig) -> None:
@@ -241,6 +242,14 @@ class OpenproviderClient:
         )
         log.info("zone_record_deleted", zone=zone_name, name=name, type=rtype)
         return data
+
+    async def health_check(self) -> bool:
+        try:
+            # Simple check if api is responding
+            resp = await self._http.get("/auth/login")
+            return resp.status_code in [400, 401, 405]
+        except httpx.RequestError:
+            return False
 
     async def close(self) -> None:
         await self._http.aclose()
