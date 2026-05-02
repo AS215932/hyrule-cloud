@@ -14,8 +14,8 @@ dependencies = [
     "jinja2>=3.1",
     "structlog>=24.4",
     "apscheduler>=3.10",
-    # x402 official SDK (Coinbase)
-    "x402[fastapi,evm]>=2.0",
+    # x402 official SDK (x402-foundation)
+    "x402[fastapi,evm]>=2.9",
     # DNS (RFC 2136 dynamic updates)
     "dnspython>=2.6",
     # XO WebSocket JSON-RPC
