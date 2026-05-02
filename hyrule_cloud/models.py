@@ -40,6 +40,11 @@ class ProxyMode(enum.StrEnum):
     TOR = "tor"
     RESIDENTIAL = "residential"
 
+class CryptoIntentStatus(enum.StrEnum):
+    PENDING = "pending"
+    PAID = "paid"
+    EXPIRED = "expired"
+
 # --- VM Size Specifications ---
 
 
@@ -144,6 +149,19 @@ class NetworkResponse(BaseModel):
     elapsed_seconds: float
     proxy_mode: ProxyMode
     error: str | None = None
+
+
+class CryptoIntentRequest(BaseModel):
+    asset: str = Field(description="Asset symbol (BTC, XMR)")
+    amount_usd: str = Field(description="USD amount to be converted")
+
+class CryptoIntentResponse(BaseModel):
+    intent_id: str
+    asset: str
+    amount_crypto: str
+    address: str
+    status: CryptoIntentStatus
+    expires_at: datetime
 
 
 # --- Internal State (DB-backed) ---

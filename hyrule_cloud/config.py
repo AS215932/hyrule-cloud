@@ -47,8 +47,14 @@ class PaymentConfig(BaseSettings):
 
     receiver_address: str = ""
     facilitator_url: str = "https://x402.org/facilitator"
-    network: str = "eip155:8453"
-    asset: str = "USDC"
+    networks: list[dict[str, str]] = Field(
+        default_factory=lambda: [
+            {"network": "eip155:8453", "asset": "USDC", "scheme": "exact"}
+        ]
+    )
+
+    btc_xpub: str = ""
+    xmr_viewkey: str = ""
 
     price_vm_xs: Decimal = Decimal("0.05")
     price_vm_sm: Decimal = Decimal("0.10")

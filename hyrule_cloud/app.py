@@ -85,7 +85,7 @@ app = FastAPI(
         "Agentic VPS hosting with x402 payments. "
         "Deploy bare VMs with SSH access, automatic DNS, and "
         "IPv6-native networking on AS215932. "
-        "Payment via USDC on Base."
+        "Payment via USDC across EVM, Solana, Hyperliquid, or native crypto (BTC, XMR)."
     ),
     version="0.1.0",
     lifespan=lifespan,
@@ -109,7 +109,7 @@ async def x402_manifest():
         "description": (
             "Bare VM hosting for AI agents. Deploy VMs with SSH access, "
             "automatic HTTPS subdomains, and IPv6-native networking. "
-            "Pay with USDC on Base."
+            "Pay with multi-chain USDC or native un-smart contracts."
         ),
         "resources": [
             {
@@ -117,24 +117,21 @@ async def x402_manifest():
                 "method": "POST",
                 "description": "Provision a bare VM with SSH access",
                 "minPrice": str(config.payment.price_vm_xs),
-                "asset": config.payment.asset,
-                "network": config.payment.network,
+                "networks": config.payment.networks,
             },
             {
                 "path": "/v1/domain/register",
                 "method": "POST",
                 "description": "Register a domain via Openprovider",
                 "minPrice": str(config.payment.price_domain_markup + 5),
-                "asset": config.payment.asset,
-                "network": config.payment.network,
+                "networks": config.payment.networks,
             },
             {
                 "path": "/v1/network/request",
                 "method": "POST",
                 "description": "Make a micro-proxy network request (Clearnet/Tor)",
                 "minPrice": str(config.payment.price_proxy_direct),
-                "asset": config.payment.asset,
-                "network": config.payment.network,
+                "networks": config.payment.networks,
             },
         ],
         "facilitator": config.payment.facilitator_url,

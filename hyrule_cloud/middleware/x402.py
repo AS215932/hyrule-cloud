@@ -47,7 +47,10 @@ class PaymentGate:
             FacilitatorConfig(url=config.facilitator_url)
         )
         self.server = x402ResourceServer(self.facilitator)
-        self.server.register(config.network, ExactEvmServerScheme())
+        for net_cfg in self.config.networks:
+            # We assume ExactEvmServerScheme works out of the box for these during Phase 1
+            # (In production, Solana would use an ExactSolanaServerScheme)
+            self.server.register(net_cfg["network"], ExactEvmServerScheme())
 
     def build_402_response(
         self,
@@ -61,15 +64,14 @@ class PaymentGate:
         The response includes both the standard x402 header and a
         JSON body with application-specific metadata (cost breakdown, etc).
         """
-        payment_option = PaymentOption(
-            scheme="exact",
-            network=self.config.network,
-            price=f"${amount}",
-            pay_to=self.config.receiver_address,
-        )
-
-        # Build the accepts array per x402 v2 spec
-        accepts = [dataclasses.asdict(payment_option)]
+        accepts = []
+        for net_cfg in self.config.networks:
+            accepts.append({
+                "scheme": net_cfg["scheme"],
+                "network": net_cfg["network"],
+                "price": f"${amount}",
+                "pay_to": self.config.receiver_address,
+            })
 
         payment_required = {
             "x402Version": 2,
@@ -84,8 +86,7 @@ class PaymentGate:
         body = extra_body or {}
         body["payment_required"] = True
         body["amount"] = str(amount)
-        body["currency"] = self.config.asset
-        body["network"] = self.config.network
+        body["networks"] = self.config.networks
 
         return Response(
             status_code=402,
@@ -134,13 +135,23 @@ class PaymentGate:
         if not payment_header:
             return self.build_402_response(amount, description, extra_body)
 
+        try:
+            decoded_header = json.loads(base64.b64decode(payment_header).decode())
+            req_network = (
+                decoded_header.get("payload", {}).get("authorization", {}).get("asset", {}).get("network")
+                or decoded_header.get("network")
+                or self.config.networks[0]["network"]
+            )
+        except (ValueError, TypeError, json.JSONDecodeError):
+            req_network = self.config.networks[0]["network"]
+
         # Use SDK server to verify the payment
         try:
             verification = await self.server.verify(
                 payment_header,
                 {
                     "scheme": "exact",
-                    "network": self.config.network,
+                    "network": req_network,
                     "maxAmountRequired": str(int(amount * 10**6)),  # USDC 6 decimals
                     "resource": self.config.receiver_address,
                 },
@@ -159,7 +170,7 @@ class PaymentGate:
                 payment_header,
                 {
                     "scheme": "exact",
-                    "network": self.config.network,
+                    "network": req_network,
                     "maxAmountRequired": str(int(amount * 10**6)),
                     "resource": self.config.receiver_address,
                 },

@@ -364,3 +364,79 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
         raise HTTPException(resp.status_code, resp.error)
         
     return resp
+
+from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
+from hyrule_cloud.db import CryptoIntentRow
+from sqlalchemy import select
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import uuid
+
+@router.post("/intent/create", response_model=CryptoIntentResponse)
+async def create_crypto_intent(body: CryptoIntentRequest, orch = Depends(get_orch), cfg = Depends(get_cfg)):
+    if body.asset.upper() not in ["BTC", "XMR"]:
+        raise HTTPException(400, "Unsupported asset. Use BTC or XMR.")
+    
+    amount_usd = Decimal(body.amount_usd)
+    from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
+    provider = NativeCryptoProvider(cfg)
+    rate = provider.get_exchange_rate(body.asset)
+    amount_crypto = amount_usd / rate
+    
+    intent_id = str(uuid.uuid4())
+    bip32_index = None
+    if body.asset.upper() == "BTC":
+        async with orch.db() as session:
+            # Simple simulation for MAX index logic
+            from sqlalchemy import func
+            res = await session.execute(select(func.max(CryptoIntentRow.bip32_index)).where(CryptoIntentRow.asset == "BTC"))
+            max_idx = res.scalar() or 0
+            bip32_index = max_idx + 1
+        address = provider.generate_btc_address(bip32_index)
+    elif body.asset.upper() == "XMR":
+        address, bip32_index = provider.generate_xmr_address()
+        
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=60)
+    
+    row = CryptoIntentRow(
+        intent_id=intent_id,
+        asset=body.asset.upper(),
+        amount_usd=amount_usd,
+        amount_crypto=amount_crypto,
+        address=address,
+        bip32_index=bip32_index,
+        expires_at=expires_at,
+        status=CryptoIntentStatus.PENDING
+    )
+    
+    async with orch.db() as session:
+        session.add(row)
+        await session.commit()
+    
+    return CryptoIntentResponse(
+        intent_id=row.intent_id,
+        asset=row.asset,
+        amount_crypto=str(row.amount_crypto),
+        address=row.address,
+        status=CryptoIntentStatus.PENDING,
+        expires_at=row.expires_at
+    )
+
+@router.get("/intent/{intent_id}", response_model=CryptoIntentResponse)
+async def get_crypto_intent_status(intent_id: str, orch = Depends(get_orch)):
+    async with orch.db() as session:
+        q = select(CryptoIntentRow).where(CryptoIntentRow.intent_id == intent_id)
+        res = await session.execute(q)
+        row = res.scalar_one_or_none()
+    
+    if not row:
+        raise HTTPException(404, "Intent not found")
+        
+    return CryptoIntentResponse(
+        intent_id=row.intent_id,
+        asset=row.asset,
+        amount_crypto=str(row.amount_crypto),
+        address=row.address,
+        status=CryptoIntentStatus(row.status),
+        expires_at=row.expires_at
+    )

@@ -23,7 +23,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from hyrule_cloud.models import DomainMode, VMSize, VMStatus
+from hyrule_cloud.models import DomainMode, VMSize, VMStatus, CryptoIntentStatus
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -135,6 +135,34 @@ class VPNTunnelRow(Base):
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     payment_tx: Mapped[str | None] = mapped_column(String(128))
+
+
+class CryptoIntentRow(Base):
+    """Tracking for native crypto payment intents."""
+
+    __tablename__ = "crypto_intents"
+
+    intent_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    asset: Mapped[str] = mapped_column(String(8))
+    amount_crypto: Mapped[Decimal] = mapped_column(Numeric(24, 12))
+    amount_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    address: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(
+        Enum(CryptoIntentStatus, name="crypto_intent_status", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
+        default=CryptoIntentStatus.PENDING,
+    )
+    bip32_index: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tx_hash: Mapped[str | None] = mapped_column(String(128))
+
+    __table_args__ = (
+        Index("ix_crypto_intents_status_expires", "status", "expires_at"),
+    )
 
 
 # --- Session factory ---
