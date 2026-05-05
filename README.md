@@ -101,9 +101,10 @@ does an offline native prep step before first boot:
    `fsck_ffs` against the unmounted secondary disk;
 5. detach the VDI and boot the customer VM normally.
 
-Configure the builder with `XCPNG_OPENBSD_BUILDER_*` variables. The customer API
-still exposes the same size tiers as Debian; the OpenBSD-specific work is hidden
-inside provisioning.
+Configure the builder with `XCPNG_OPENBSD_BUILDER_*` variables. The default SSH
+user is `svag`; it must be in `wheel` with passwordless `doas` for the resize
+command. The customer API still exposes the same size tiers as Debian; the
+OpenBSD-specific work is hidden inside provisioning.
 
 ## Network
 

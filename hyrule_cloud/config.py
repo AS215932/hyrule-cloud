@@ -31,7 +31,7 @@ class XCPNGConfig(BaseSettings):
     # VM before first boot and grows it with native OpenBSD tools.
     openbsd_builder_vm_uuid: str = ""
     openbsd_builder_ssh_host: str = ""
-    openbsd_builder_ssh_user: str = "root"
+    openbsd_builder_ssh_user: str = "svag"
     openbsd_builder_ssh_key_path: str = ""
     openbsd_builder_disk_device: str = "sd1"
     openbsd_builder_attach_position: str = "1"

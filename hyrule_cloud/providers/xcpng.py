@@ -366,7 +366,10 @@ growfs -y "/dev/r${disk}a"
 fsck_ffs -fy "/dev/r${disk}a"
 disklabel "$disk"
 """
-        await self._run_ssh(["sh", "-s", "--", disk_device], stdin=script.encode())
+        command = ["sh", "-s", "--", disk_device]
+        if self.config.openbsd_builder_ssh_user != "root":
+            command = ["doas", *command]
+        await self._run_ssh(command, stdin=script.encode())
 
     async def _run_ssh(
         self,

@@ -37,6 +37,7 @@ class BuilderProvider(XCPNGProvider):
             XCPNGConfig(
                 openbsd_builder_vm_uuid="builder-vm",
                 openbsd_builder_ssh_host="builder.example",
+                openbsd_builder_ssh_user="svag",
                 openbsd_builder_disk_device="sd1",
             )
         )
@@ -79,8 +80,24 @@ class BuilderProvider(XCPNGProvider):
     async def _wait_for_openbsd_builder_ssh(self) -> None:
         self.calls.append(("wait_builder_ssh", {}))
 
-    async def _run_openbsd_builder_prep(self, disk_device: str) -> None:
-        self.calls.append(("run_prep", {"disk_device": disk_device}))
+    async def _run_ssh(
+        self,
+        remote_command: list[str],
+        *,
+        stdin: bytes | None = None,
+        timeout: int = 300,
+    ):
+        self.calls.append(
+            (
+                "ssh",
+                {
+                    "remote_command": remote_command,
+                    "has_stdin": stdin is not None,
+                    "timeout": timeout,
+                },
+            )
+        )
+        return "", ""
 
 
 @pytest.mark.asyncio
@@ -137,7 +154,14 @@ async def test_openbsd_builder_attaches_runs_and_detaches_target_vdi():
         ),
         ("vm.start", {"id": "builder-vm"}),
         ("wait_builder_ssh", {}),
-        ("run_prep", {"disk_device": "sd1"}),
+        (
+            "ssh",
+            {
+                "remote_command": ["doas", "sh", "-s", "--", "sd1"],
+                "has_stdin": True,
+                "timeout": 300,
+            },
+        ),
         ("vm.stop", {"id": "builder-vm", "force": True}),
         ("vbd.disconnect", {"id": "vbd-prep"}),
         ("vbd.delete", {"id": "vbd-prep"}),
