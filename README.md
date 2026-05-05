@@ -73,7 +73,7 @@ docker compose up
 ## XCP-NG Template Preparation
 
 Templates are managed via Xen Orchestra. Each template needs cloud-init
-and xe-guest-utilities pre-installed:
+and guest tooling pre-installed:
 
 ```bash
 # On a Debian 12 VM that will become a template:
@@ -85,8 +85,25 @@ systemctl enable cloud-init
 Add the template UUID to your `.env`:
 
 ```
-XCPNG_TEMPLATES={"debian-12": "<uuid>"}
+XCPNG_TEMPLATES={"debian-13": "<uuid>", "openbsd-7.8": "<uuid>"}
 ```
+
+### OpenBSD root disk sizing
+
+Linux templates grow their root filesystem on first boot after the root VDI is
+resized. OpenBSD cannot safely grow a mounted root filesystem, so Hyrule Cloud
+does an offline native prep step before first boot:
+
+1. clone the OpenBSD template;
+2. resize the clone's root VDI to the selected size tier;
+3. attach that VDI to a dedicated halted OpenBSD builder VM;
+4. boot the builder and run native `fdisk`, `disklabel`, `growfs`, and
+   `fsck_ffs` against the unmounted secondary disk;
+5. detach the VDI and boot the customer VM normally.
+
+Configure the builder with `XCPNG_OPENBSD_BUILDER_*` variables. The customer API
+still exposes the same size tiers as Debian; the OpenBSD-specific work is hidden
+inside provisioning.
 
 ## Network
 

@@ -14,6 +14,7 @@ import asyncio
 import json
 import ssl
 from itertools import count
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -51,6 +52,8 @@ class XCPNGProvider(Provider):
                 self._xo_ssl.verify_mode = ssl.CERT_NONE
         else:
             self._xo_ssl = None
+
+        self._openbsd_builder_lock = asyncio.Lock()
 
     # --- XO JSON-RPC ---
 
@@ -119,6 +122,7 @@ class XCPNGProvider(Provider):
         *,
         template_uuid: str,
         name_label: str,
+        os_name: str = "debian-13",
         size: VMSize,
         cloud_init_config: str,
     ) -> str:
@@ -145,7 +149,13 @@ class XCPNGProvider(Provider):
         log.info("vm_cloned", uuid=vm_uuid)
 
         try:
-            await self._resize_vm(vm_uuid, specs)
+            root_vdi_uuid, disk_bytes = await self._resize_vm(vm_uuid, specs)
+            if self._is_openbsd_template(os_name):
+                await self._prepare_openbsd_root_disk(
+                    vm_uuid=vm_uuid,
+                    root_vdi_uuid=root_vdi_uuid,
+                    disk_bytes=disk_bytes,
+                )
             await self._xo_call("vm.start", id=vm_uuid)
             log.info("vm_created", uuid=vm_uuid, size=size.value, name=name_label)
             return vm_uuid
@@ -158,8 +168,12 @@ class XCPNGProvider(Provider):
                 log.error("vm_cleanup_failed", uuid=vm_uuid, exc_info=True)
             raise
 
-    async def _resize_vm(self, vm_uuid: str, specs: dict) -> None:
-        """Set CPU, memory, and disk to match a size tier via XO."""
+    async def _resize_vm(self, vm_uuid: str, specs: dict) -> tuple[str, int]:
+        """Set CPU, memory, and disk to match a size tier via XO.
+
+        Returns the root VDI UUID and requested disk size in bytes. OpenBSD uses
+        that VDI in an offline builder pass before the VM is first started.
+        """
         vcpu = specs["vcpu"]
         memory_bytes = specs["memory_mb"] * 1024 * 1024
 
@@ -185,7 +199,216 @@ class XCPNGProvider(Provider):
                 continue
             if int(vdi.get("size", 0)) < disk_bytes:
                 await self._xo_call("vdi.set", id=vdi_uuid, size=disk_bytes)
-            break
+            return vdi_uuid, disk_bytes
+
+        raise XOError("_resize_vm", {"message": f"No root VDI found for VM {vm_uuid}"})
+
+    @staticmethod
+    def _is_openbsd_template(os_name: str) -> bool:
+        return os_name.lower().startswith("openbsd")
+
+    async def _prepare_openbsd_root_disk(
+        self,
+        *,
+        vm_uuid: str,
+        root_vdi_uuid: str,
+        disk_bytes: int,
+    ) -> None:
+        """Grow an OpenBSD root filesystem offline before first boot.
+
+        OpenBSD growfs cannot safely grow a mounted root filesystem. Instead, we
+        attach the target VM's halted root VDI to a dedicated OpenBSD builder VM,
+        boot the builder, run native OpenBSD fdisk/disklabel/growfs/fsck against
+        the secondary disk, then detach the VDI and start the target VM.
+        """
+        cfg = self.config
+        if not cfg.openbsd_builder_vm_uuid:
+            raise XOError(
+                "openbsd.prepare",
+                {"message": "XCPNG_OPENBSD_BUILDER_VM_UUID is required for OpenBSD VMs"},
+            )
+        if not cfg.openbsd_builder_ssh_host:
+            raise XOError(
+                "openbsd.prepare",
+                {"message": "XCPNG_OPENBSD_BUILDER_SSH_HOST is required for OpenBSD VMs"},
+            )
+
+        async with self._openbsd_builder_lock:
+            builder_uuid = cfg.openbsd_builder_vm_uuid
+            attach_vbd_uuid: str | None = None
+            log.info(
+                "openbsd_prepare_start",
+                vm=vm_uuid,
+                builder=builder_uuid,
+                root_vdi=root_vdi_uuid,
+                disk_bytes=disk_bytes,
+            )
+
+            try:
+                await self._ensure_vm_halted(builder_uuid)
+                await self._xo_call(
+                    "vm.attachDisk",
+                    vm=builder_uuid,
+                    vdi=root_vdi_uuid,
+                    position=str(cfg.openbsd_builder_attach_position),
+                    mode="RW",
+                    bootable=False,
+                )
+                attach_vbd_uuid = await self._find_vbd(builder_uuid, root_vdi_uuid)
+
+                await self._xo_call("vm.start", id=builder_uuid)
+                await self._wait_for_vm_power_state(builder_uuid, "Running", timeout=60)
+                await self._wait_for_openbsd_builder_ssh()
+                await self._run_openbsd_builder_prep(cfg.openbsd_builder_disk_device)
+
+                log.info("openbsd_prepare_done", vm=vm_uuid, root_vdi=root_vdi_uuid)
+
+            finally:
+                try:
+                    await self._ensure_vm_halted(builder_uuid)
+                finally:
+                    if attach_vbd_uuid:
+                        await self._delete_vbd(attach_vbd_uuid)
+
+    async def _ensure_vm_halted(self, vm_uuid: str) -> None:
+        vm = await self._xo_get_object(vm_uuid)
+        if vm and vm.get("power_state") != "Halted":
+            await self._xo_call("vm.stop", id=vm_uuid, force=True)
+            await self._wait_for_vm_power_state(vm_uuid, "Halted", timeout=120)
+
+    async def _wait_for_vm_power_state(
+        self,
+        vm_uuid: str,
+        expected: str,
+        *,
+        timeout: int,
+    ) -> None:
+        elapsed = 0
+        while elapsed < timeout:
+            vm = await self._xo_get_object(vm_uuid)
+            if vm and vm.get("power_state") == expected:
+                return
+            await asyncio.sleep(2)
+            elapsed += 2
+        raise XOError(
+            "vm.waitPowerState",
+            {"message": f"VM {vm_uuid} did not reach {expected} within {timeout}s"},
+        )
+
+    async def _find_vbd(self, vm_uuid: str, vdi_uuid: str) -> str:
+        vbds = await self._xo_objects(type="VBD", VM=vm_uuid)
+        for vbd_uuid, vbd in vbds.items():
+            if vbd.get("VDI") == vdi_uuid:
+                return vbd_uuid
+        raise XOError(
+            "vbd.find",
+            {"message": f"No VBD found for VM {vm_uuid} and VDI {vdi_uuid}"},
+        )
+
+    async def _delete_vbd(self, vbd_uuid: str) -> None:
+        try:
+            await self._xo_call("vbd.disconnect", id=vbd_uuid)
+        except Exception:
+            pass
+        await self._xo_call("vbd.delete", id=vbd_uuid)
+
+    async def _wait_for_openbsd_builder_ssh(self) -> None:
+        timeout = self.config.openbsd_builder_ssh_timeout_seconds
+        elapsed = 0
+        while elapsed < timeout:
+            try:
+                await self._run_ssh(["true"], timeout=10)
+                return
+            except Exception:
+                await asyncio.sleep(5)
+                elapsed += 5
+        raise XOError(
+            "openbsd.builder.ssh",
+            {"message": f"OpenBSD builder SSH was not ready within {timeout}s"},
+        )
+
+    async def _run_openbsd_builder_prep(self, disk_device: str) -> None:
+        script = r"""
+set -eu
+disk="$1"
+
+case "$disk" in
+  sd[0-9]|wd[0-9]) ;;
+  *) echo "unsupported OpenBSD disk device: $disk" >&2; exit 64 ;;
+esac
+
+cd /dev
+sh MAKEDEV "$disk" >/dev/null 2>&1 || true
+cd /
+
+if mount | grep -Eq "/dev/${disk}[a-p][[:space:]]"; then
+  echo "refusing to resize mounted disk ${disk}" >&2
+  mount >&2
+  exit 65
+fi
+
+total_sectors=$(disklabel "$disk" | awk '/total sectors:/ { print $3; exit }')
+if [ -z "$total_sectors" ]; then
+  echo "could not read total sectors for ${disk}" >&2
+  exit 66
+fi
+
+# Expand the outer OpenBSD MBR partition to the end of the VDI. The default
+# answers preserve the existing A6 type, non-CHS mode, and offset, then '*'
+# selects all remaining sectors.
+printf 'edit 3\n\n\n\n*\nwrite\nquit\n' | fdisk -e "$disk"
+
+# Expand the OpenBSD disklabel boundary and root partition a to the MBR end.
+# The blank answers preserve the current offset/fstype/fsize/bsize/cpg.
+printf 'b\n\n*\nm a\n\n*\n\n\n\n\nw\nq\n' | disklabel -E "$disk"
+
+growfs -y "/dev/r${disk}a"
+fsck_ffs -fy "/dev/r${disk}a"
+disklabel "$disk"
+"""
+        await self._run_ssh(["sh", "-s", "--", disk_device], stdin=script.encode())
+
+    async def _run_ssh(
+        self,
+        remote_command: list[str],
+        *,
+        stdin: bytes | None = None,
+        timeout: int = 300,
+    ) -> tuple[str, str]:
+        cfg = self.config
+        ssh_target = f"{cfg.openbsd_builder_ssh_user}@{cfg.openbsd_builder_ssh_host}"
+        cmd = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "IdentitiesOnly=yes",
+        ]
+        if cfg.openbsd_builder_ssh_key_path:
+            cmd.extend(["-i", str(Path(cfg.openbsd_builder_ssh_key_path).expanduser())])
+        cmd.append(ssh_target)
+        cmd.extend(remote_command)
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
+        out = stdout.decode(errors="replace")
+        err = stderr.decode(errors="replace")
+        if proc.returncode != 0:
+            raise XOError(
+                "openbsd.builder.ssh",
+                {
+                    "message": f"SSH command failed with exit {proc.returncode}",
+                    "stderr": err[-4000:],
+                },
+            )
+        return out, err
 
     async def get_vm_ipv6(self, vm_uuid: str) -> str | None:
         """

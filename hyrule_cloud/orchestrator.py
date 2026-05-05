@@ -162,6 +162,7 @@ class Orchestrator:
                 raise ValueError(f"Unknown OS template: {os_name}")
 
             cloud_config = render_cloud_init(
+                os_name=os_name,
                 hostname=self._generate_hostname(vm_id),
                 ssh_pubkey=ssh_pubkey,
                 open_ports=open_ports,
@@ -171,6 +172,7 @@ class Orchestrator:
             xcpng_uuid = await self.xcpng.create_vm(
                 template_uuid=template_uuid,
                 name_label=f"hyrule-{vm_id}",
+                os_name=os_name,
                 size=VMSize(size),
                 cloud_init_config=cloud_config,
             )
@@ -277,7 +279,11 @@ class Orchestrator:
                     await session.commit()
                     await session.refresh(row)
 
-        log.info("vm_extended", vm_id=vm_id, new_expiry=row.expires_at.isoformat() if row.expires_at else "none")
+        log.info(
+            "vm_extended",
+            vm_id=vm_id,
+            new_expiry=row.expires_at.isoformat() if row.expires_at else "none",
+        )
         return row
 
     async def reboot_vm(self, vm_id: str) -> bool:

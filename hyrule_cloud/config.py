@@ -26,6 +26,17 @@ class XCPNGConfig(BaseSettings):
     default_network_uuid: str = ""
     templates: dict[str, str] = Field(default_factory=dict)
 
+    # OpenBSD root disks cannot be grown while mounted. For OpenBSD templates,
+    # the provider attaches the newly cloned root VDI to this dedicated builder
+    # VM before first boot and grows it with native OpenBSD tools.
+    openbsd_builder_vm_uuid: str = ""
+    openbsd_builder_ssh_host: str = ""
+    openbsd_builder_ssh_user: str = "root"
+    openbsd_builder_ssh_key_path: str = ""
+    openbsd_builder_disk_device: str = "sd1"
+    openbsd_builder_attach_position: str = "1"
+    openbsd_builder_ssh_timeout_seconds: int = 120
+
 
 class OpenproviderConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENPROVIDER_", env_file=".env", extra="ignore")
