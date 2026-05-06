@@ -37,7 +37,7 @@ class NetworkProvider(Provider):
     def __init__(self, tor_proxy_url: str = "socks5://tor:9050"):
         self.tor_proxy_url = tor_proxy_url
         self._direct_client = httpx.AsyncClient(timeout=30.0)
-        self._tor_client = httpx.AsyncClient(proxies=self.tor_proxy_url, timeout=60.0)
+        self._tor_client = httpx.AsyncClient(proxy=self.tor_proxy_url, timeout=60.0)
 
     async def health_check(self) -> bool:
         try:
