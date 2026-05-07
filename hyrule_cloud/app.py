@@ -6,6 +6,8 @@ Agentic VPS hosting on AS215932 with x402 payments.
 
 from __future__ import annotations
 
+import logging
+import sys
 from contextlib import asynccontextmanager
 
 import structlog
@@ -18,15 +20,23 @@ from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
 from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
 
+# Newline-delimited JSON to stdout per AS215932's application logging
+# contract (hyrule-infra/docs/application-logging.md). systemd-journald
+# captures it; the host's Vector agent ships to Loki.
 structlog.configure(
     processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.add_log_level,
-        structlog.dev.ConsoleRenderer(),
+        structlog.processors.TimeStamper(fmt="iso", utc=True, key="ts"),
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.dict_tracebacks,
+        structlog.processors.JSONRenderer(),
     ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+    cache_logger_on_first_use=True,
 )
 
-log = structlog.get_logger()
+log = structlog.get_logger().bind(service="hyrule-cloud")
 
 
 from hyrule_cloud.state import AppState
