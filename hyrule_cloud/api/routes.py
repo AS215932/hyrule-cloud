@@ -374,8 +374,8 @@ import uuid
 
 @router.post("/intent/create", response_model=CryptoIntentResponse)
 async def create_crypto_intent(body: CryptoIntentRequest, orch = Depends(get_orch), cfg = Depends(get_cfg)):
-    if body.asset.upper() not in ["BTC", "XMR"]:
-        raise HTTPException(400, "Unsupported asset. Use BTC or XMR.")
+    if body.asset.upper() not in ["BTC", "XMR", "ZEC"]:
+        raise HTTPException(400, "Unsupported asset. Use BTC, XMR, or ZEC.")
     
     amount_usd = Decimal(body.amount_usd)
     from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
