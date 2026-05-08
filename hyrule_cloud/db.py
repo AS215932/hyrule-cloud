@@ -1,3 +1,4 @@
+from __future__ import annotations
 
 import secrets
 import string
@@ -10,14 +11,6 @@ class AccountRow(Base):
     account_id: Mapped[str] = mapped_column(String(10), primary_key=True, default=generate_account_id)
     api_key: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-"""
-Database models and session management.
-
-Uses SQLAlchemy 2.0 async with asyncpg for Postgres.
-"""
-
-from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
