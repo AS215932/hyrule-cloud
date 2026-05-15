@@ -4,7 +4,7 @@ Thin async Python client for the Hyrule Cloud API.
 Usage:
     from hyrule_cloud.client import HyruleClient
 
-    async with HyruleClient("https://cloud.servify.network") as hc:
+    async with HyruleClient("https://cloud.hyrule.host") as hc:
         # Check pricing
         pricing = await hc.pricing()
 
@@ -46,7 +46,7 @@ class HyruleClient:
 
     def __init__(
         self,
-        base_url: str = "https://cloud.servify.network",
+        base_url: str = "https://cloud.hyrule.host",
         *,
         payment_header: str | None = None,
         dev_bypass: str | None = None,

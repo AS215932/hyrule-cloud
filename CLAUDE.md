@@ -10,6 +10,13 @@ The operator holds AS215932 (RIPE), runs XCP-NG hypervisors, uses Openprovider a
 
 TODO: Hosted OpenClaw instances, with a custom web interface for management
 
+## Domain Policy
+
+`AGENTS.md` is the canonical domain-policy reference for this repo. Keep
+customer-facing Hyrule Cloud identity under `hyrule.host`, infrastructure
+identity under `servify.network`, and AS215932 overlay/routing identity under
+`as215932.net`.
+
 ## Stack
 
 - Python 3.12, FastAPI, Pydantic v2
@@ -34,7 +41,7 @@ Agent --> POST /v1/vm/create (no payment) --> 402 + pricing
       --> ssh root@<hostname> --> agent owns the VM
 ```
 
-The API server coordinates: XCP-NG XAPI (clone template, set CPU/RAM/disk, inject cloud-init, start VM), DNS (create AAAA record under deploy.servify.network), and optionally Openprovider (register custom domain).
+The API server coordinates: XCP-NG XAPI (clone template, set CPU/RAM/disk, inject cloud-init, start VM), DNS (create AAAA record under deploy.hyrule.host), and optionally Openprovider (register custom domain).
 
 ## Key Design Decisions
 
@@ -42,7 +49,7 @@ The API server coordinates: XCP-NG XAPI (clone template, set CPU/RAM/disk, injec
 - **Agent manages its own firewall.** Cloud-init sets defaults (deny inbound except 22/80/443, block outbound SMTP 25/465/587). After boot, the agent modifies UFW via SSH. There is no firewall management API endpoint.
 - **Dynamic pricing.** The x402 SDK's `PaymentMiddlewareASGI` only supports static per-route prices. Our `PaymentGate` class wraps the SDK's lower-level primitives (`x402ResourceServer`, `ExactEvmServerScheme`, `HTTPFacilitatorClient`) to compute prices dynamically based on VM size * duration.
 - **Async provisioning.** VM creation returns 202 immediately. A background task clones the template, waits for IPv6 via XAPI guest metrics, creates DNS, and updates DB. The agent polls `GET /v1/vm/{id}` until status is `ready`.
-- **Auto subdomains for short-lived deployments.** `<sha256prefix>.deploy.servify.network` with AAAA pointing to VM IPv6. Custom domains via Openprovider for persistent deployments.
+- **Auto subdomains for short-lived deployments.** `<sha256prefix>.deploy.hyrule.host` with AAAA pointing to VM IPv6. Custom domains via Openprovider for persistent deployments.
 - **Prepaid model.** x402 exact scheme charges upfront for N days. `POST /v1/vm/{id}/extend` adds time. Expired VMs are suspended, destroyed after 48h grace period.
 - **XCP-NG templates managed via Xen Orchestra.** Templates need cloud-init + xe-guest-utilities pre-installed. Template UUIDs are configured via env vars.
 
@@ -130,7 +137,7 @@ MCP server config for Claude/Cursor:
         "hyrule-cloud": {
             "command": "hyrule-mcp",
             "env": {
-                "HYRULE_API_URL": "https://cloud.servify.network"
+                "HYRULE_API_URL": "https://cloud.hyrule.host"
             }
         }
     }

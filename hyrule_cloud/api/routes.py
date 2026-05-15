@@ -69,7 +69,7 @@ async def get_pricing(cfg = Depends(get_cfg)) -> PricingResponse:
             "md (2vCPU/2GB/40GB)": f"${cfg.payment.price_vm_md}/day",
             "lg (4vCPU/4GB/80GB)": f"${cfg.payment.price_vm_lg}/day",
         },
-        domain_auto="$0.00 (subdomain under deploy.servify.network)",
+        domain_auto=f"$0.00 (subdomain under {cfg.deploy_domain})",
         vpn_per_day=f"${cfg.payment.price_vpn}/day",
         proxy_prices={
             "direct": f"${cfg.payment.price_proxy_direct}/request",

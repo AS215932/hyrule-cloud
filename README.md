@@ -117,6 +117,13 @@ via SSH -- the API does not interfere with in-VM configuration.
 
 Outbound SMTP (25, 465, 587) is blocked at provisioning time.
 
+## Domain Policy
+
+`AGENTS.md` is the canonical domain-policy reference for this repo. In short:
+`hyrule.host` is customer-facing Hyrule Cloud identity, `servify.network` is
+infrastructure identity, and `as215932.net` is AS215932 overlay/routing identity
+only.
+
 ## Payment
 
 x402 exact scheme, USDC on Base (eip155:8453). Uses the official Coinbase

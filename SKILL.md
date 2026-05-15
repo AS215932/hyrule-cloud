@@ -13,7 +13,7 @@ Use this skill when:
 ## API Base
 
 ```
-https://cloud.servify.network
+https://cloud.hyrule.host
 ```
 
 Service discovery: `GET /.well-known/x402.json`
@@ -32,7 +32,7 @@ The 402 response body includes `cost_breakdown`, `specs`, and the facilitator UR
 ```python
 from hyrule_cloud.client import HyruleClient
 
-async with HyruleClient("https://cloud.servify.network") as hc:
+async with HyruleClient("https://cloud.hyrule.host") as hc:
     result = await hc.create_vm(duration_days=7, size="sm", ssh_pubkey="ssh-ed25519 ...")
 ```
 
@@ -53,7 +53,7 @@ Returns current prices for all resources.
     "md (2vCPU/2GB/40GB)": "$0.20/day",
     "lg (4vCPU/4GB/80GB)": "$0.40/day"
   },
-  "domain_auto": "$0.00 (subdomain under deploy.servify.network)",
+  "domain_auto": "$0.00 (subdomain under deploy.hyrule.host)",
   "vpn_per_day": "$0.02/day",
   "currency": "USDC",
   "network": "Base (eip155:8453)"
@@ -81,8 +81,8 @@ Get VM status, IP, hostname, SSH command, and expiry.
   "vm_id": "vm_a1b2c3d4e5f6",
   "status": "ready",
   "ipv6": "2001:db8::1",
-  "hostname": "ab12cd34.deploy.servify.network",
-  "ssh": "ssh root@ab12cd34.deploy.servify.network",
+  "hostname": "ab12cd34.deploy.hyrule.host",
+  "ssh": "ssh root@ab12cd34.deploy.hyrule.host",
   "expires_at": "2026-04-08T00:00:00Z",
   "firewall": {"inbound_allow": [22, 80, 443], "policy": "deny"}
 }
@@ -123,7 +123,7 @@ Provision a bare VM with SSH access. Returns 202 with a status URL to poll.
 {
   "vm_id": "vm_a1b2c3d4e5f6",
   "status": "provisioning",
-  "status_url": "https://cloud.servify.network/v1/vm/vm_a1b2c3d4e5f6",
+  "status_url": "https://cloud.hyrule.host/v1/vm/vm_a1b2c3d4e5f6",
   "estimated_ready_seconds": 60
 }
 ```
@@ -131,7 +131,7 @@ Provision a bare VM with SSH access. Returns 202 with a status URL to poll.
 **Sizes:** `xs` (1vCPU/512MB/10GB), `sm` (1vCPU/1GB/20GB), `md` (2vCPU/2GB/40GB), `lg` (4vCPU/4GB/80GB)
 
 **Domain modes:**
-- `auto` — free subdomain `<hash>.deploy.servify.network` (default)
+- `auto` — free subdomain `<hash>.deploy.hyrule.host` (default)
 - `custom` — requires `domain` field, registers via Openprovider (extra cost)
 
 **Workflow:**
@@ -200,7 +200,7 @@ Get provisioning log for a VM.
 ## Infrastructure Details
 
 - **Network:** IPv6-only (NAT64/DNS64 for IPv4 destinations). All VMs get a public IPv6 address.
-- **DNS:** Auto subdomains under `deploy.servify.network`. Custom domains via Openprovider with Hyrule Cloud nameservers.
+- **DNS:** Auto subdomains under `deploy.hyrule.host`. Custom domains via Openprovider with Hyrule Cloud nameservers.
 - **Firewall:** Cloud-init sets UFW defaults (deny all inbound except 22/80/443, block outbound SMTP). Modify via SSH after boot.
 - **Expiry:** Prepaid model. VMs suspended at expiry, destroyed after 48h grace period. Extend with `/v1/vm/{id}/extend`.
 - **ASN:** AS215932 (RIPE)

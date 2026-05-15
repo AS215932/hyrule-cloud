@@ -26,6 +26,7 @@ class MockConfig:
 
     payment = Payment()
     xcpng = XCPNG()
+    deploy_domain = "deploy.hyrule.host"
     blocked_ports = [25]
 
 class MockOrchestrator:
@@ -35,7 +36,7 @@ class MockOrchestrator:
                 vm_id = "vm_test123"
                 status = VMStatus.READY
                 ipv6 = "2001:db8::1"
-                hostname = "test.deploy.servify.network"
+                hostname = "test.deploy.hyrule.host"
                 expires_at = datetime.utcnow()
                 error = None
                 open_ports = [22, 80]
@@ -58,13 +59,14 @@ class MockNetworkProvider:
 def override_state():
     from hyrule_cloud.state import AppState
     og_state = getattr(app.state, "_typed_state", None)
-    app.state._typed_state = AppState(
+    app_state = AppState(
         config=MockConfig(),
         orchestrator=MockOrchestrator(),
         payment_gate=MockGate(),
         network_provider=MockNetworkProvider()
     )
-    yield
+    app.state._typed_state = app_state
+    yield app_state
     if og_state:
         app.state._typed_state = og_state
 
@@ -75,6 +77,16 @@ async def test_get_pricing(override_state):
         assert res.status_code == 200
         data = res.json()
         assert data["vm_prices"]["xs (1vCPU/512MB/10GB)"] == "$0.05/day"
+        assert data["domain_auto"] == "$0.00 (subdomain under deploy.hyrule.host)"
+
+@pytest.mark.asyncio
+async def test_get_pricing_uses_configured_deploy_domain(override_state):
+    override_state.config.deploy_domain = "custom.example.com"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.get("/v1/pricing")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["domain_auto"] == "$0.00 (subdomain under custom.example.com)"
 
 @pytest.mark.asyncio
 async def test_get_os_list(override_state):
