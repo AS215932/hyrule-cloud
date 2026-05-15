@@ -117,6 +117,12 @@ via SSH -- the API does not interfere with in-VM configuration.
 
 Outbound SMTP (25, 465, 587) is blocked at provisioning time.
 
+## Domain Policy
+
+- `hyrule.host` is customer-facing Hyrule Cloud/product identity. Public API clients use `https://cloud.hyrule.host`; automatic VM hostnames live under `deploy.hyrule.host`.
+- `servify.network` is infrastructure identity for nameservers, underlay and management references, provider relationships, internal UIs, and partner-facing hostnames.
+- `as215932.net` is AS215932 overlay/routing identity only. DNS records in this zone must point only at prefixes owned by AS215932.
+
 ## Payment
 
 x402 exact scheme, USDC on Base (eip155:8453). Uses the official Coinbase

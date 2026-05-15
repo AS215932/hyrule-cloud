@@ -31,7 +31,7 @@ class VMStatus(enum.StrEnum):
 
 
 class DomainMode(enum.StrEnum):
-    AUTO = "auto"      # subdomain under deploy.servify.network
+    AUTO = "auto"      # subdomain under deploy.hyrule.host
     CUSTOM = "custom"  # register via Openprovider
 
 

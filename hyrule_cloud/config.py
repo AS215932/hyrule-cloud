@@ -86,7 +86,7 @@ class PaymentConfig(BaseSettings):
 class HyruleConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="HYRULE_", env_file=".env", extra="ignore")
 
-    deploy_domain: str = "deploy.servify.network"
+    deploy_domain: str = "deploy.hyrule.host"
 
     # DNS (RFC 2136)
     dns_server: str = ""

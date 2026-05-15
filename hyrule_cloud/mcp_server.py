@@ -14,7 +14,7 @@ Or use as an MCP server config:
                 "command": "python",
                 "args": ["-m", "hyrule_cloud.mcp_server"],
                 "env": {
-                    "HYRULE_API_URL": "https://cloud.servify.network",
+                    "HYRULE_API_URL": "https://cloud.hyrule.host",
                     "HYRULE_DEV_BYPASS": ""
                 }
             }
@@ -38,7 +38,7 @@ mcp = FastMCP(
     ),
 )
 
-_api_url = os.environ.get("HYRULE_API_URL", "https://cloud.servify.network")
+_api_url = os.environ.get("HYRULE_API_URL", "https://cloud.hyrule.host")
 _dev_bypass = os.environ.get("HYRULE_DEV_BYPASS", "")
 
 

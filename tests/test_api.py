@@ -26,6 +26,7 @@ class MockConfig:
 
     payment = Payment()
     xcpng = XCPNG()
+    deploy_domain = "deploy.hyrule.host"
     blocked_ports = [25]
 
 class MockOrchestrator:
@@ -35,7 +36,7 @@ class MockOrchestrator:
                 vm_id = "vm_test123"
                 status = VMStatus.READY
                 ipv6 = "2001:db8::1"
-                hostname = "test.deploy.servify.network"
+                hostname = "test.deploy.hyrule.host"
                 expires_at = datetime.utcnow()
                 error = None
                 open_ports = [22, 80]
@@ -75,6 +76,7 @@ async def test_get_pricing(override_state):
         assert res.status_code == 200
         data = res.json()
         assert data["vm_prices"]["xs (1vCPU/512MB/10GB)"] == "$0.05/day"
+        assert data["domain_auto"] == "$0.00 (subdomain under deploy.hyrule.host)"
 
 @pytest.mark.asyncio
 async def test_get_os_list(override_state):
