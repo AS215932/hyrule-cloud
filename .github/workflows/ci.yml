@@ -36,7 +36,11 @@ jobs:
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
       - name: Sync deps (system python)
-        run: ~/.local/bin/uv sync --frozen
+        # `--extra dev` pulls in pytest/pytest-asyncio/ruff/mypy from
+        # `[project.optional-dependencies].dev` in pyproject.toml.
+        # hyrule-web uses `--group dev` because it declares deps under
+        # `[dependency-groups]`; the flag differs by where the group lives.
+        run: ~/.local/bin/uv sync --frozen --extra dev
 
       # Ruff is gated on touched files only — the 101 pre-existing errors
       # in this repo are tracked under a separate cleanup PR. Full-tree
