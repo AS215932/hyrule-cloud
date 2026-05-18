@@ -61,6 +61,14 @@ jobs:
 
       # Mypy strict similarly gated on touched files. Cleanup PR will flip
       # to full-tree.
+      #
+      # `|| true` is deliberate and TEMPORARY: the existing tree has
+      # pre-A0 type holes (~100 errors from baseline 0f0d765) that don't
+      # block A0's correctness. The mypy output is still surfaced in CI
+      # logs for signal. Removal criteria: once the dedicated mypy-cleanup
+      # PR lands (companion to the ruff cleanup PR, both scheduled
+      # immediately after the Wave 1 A0 hotfix), drop the `|| true` here
+      # and add this step as a required check in branch protection.
       - name: Mypy (touched files only, strict)
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -70,6 +78,8 @@ jobs:
           fi
           CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE"...HEAD -- 'hyrule_cloud/**/*.py' || true)
           if [ -n "$CHANGED" ]; then
+            # TODO(post-A0 cleanup): remove `|| true` after the type-cleanup
+            # PR lands so mypy failures gate merges.
             ~/.local/bin/uv run mypy --strict $CHANGED || true
           else
             echo "No hyrule_cloud Python files changed; skipping mypy."
