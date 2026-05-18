@@ -39,7 +39,6 @@ from hyrule_cloud.models import (
     generate_vm_id,
 )
 
-
 _TOKEN_OK = "hyr_vm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _TOKEN_WRONG = "hyr_vm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 

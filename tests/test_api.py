@@ -1,11 +1,13 @@
-import pytest
-from httpx import AsyncClient, ASGITransport
-from fastapi import FastAPI, Response
-from hyrule_cloud.app import app
-from hyrule_cloud.middleware.anon_token import hash_anon_token
-from hyrule_cloud.models import VMSize, VMStatus, ProxyMode
 from datetime import datetime
 from decimal import Decimal
+
+import pytest
+from fastapi import Response
+from httpx import ASGITransport, AsyncClient
+
+from hyrule_cloud.app import app
+from hyrule_cloud.middleware.anon_token import hash_anon_token
+from hyrule_cloud.models import VMStatus
 
 # Block A0: known token used by the mock VM. Tests that exercise the
 # management-gated routes pass this as Authorization: Bearer / ?token=.
