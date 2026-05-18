@@ -16,15 +16,17 @@ back either a 402 Response or the verified payment details.
 from __future__ import annotations
 
 import base64
-import dataclasses
 import json
 from decimal import Decimal
 from typing import Any
 
 import structlog
 from fastapi import Request, Response
-from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
+from x402.http import FacilitatorConfig, HTTPFacilitatorClient
+from x402.http.utils import decode_payment_signature_header
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
+from x402.mechanisms.svm.exact.register import register_exact_svm_server
+from x402.schemas import PaymentRequirements
 from x402.server import x402ResourceServer
 
 from hyrule_cloud.config import PaymentConfig
@@ -47,10 +49,20 @@ class PaymentGate:
             FacilitatorConfig(url=config.facilitator_url)
         )
         self.server = x402ResourceServer(self.facilitator)
-        for net_cfg in self.config.networks:
-            # We assume ExactEvmServerScheme works out of the box for these during Phase 1
-            # (In production, Solana would use an ExactSolanaServerScheme)
-            self.server.register(net_cfg["network"], ExactEvmServerScheme())
+        # `self.server._initialized` is the SDK's own one-shot guard for the
+        # facilitator.get_supported() HTTP fetch. We read it directly rather
+        # than mirror it onto the wrapper.
+        # Block C: register EVM exact scheme per eip155 network.
+        # Block H: register the SVM exact scheme once (V2-only; the SDK helper
+        # iterates the SVM networks it supports). We only register SVM if any
+        # solana:* network is enabled to avoid a wildcard registration when the
+        # operator hasn't opted in.
+        svm_caip2s = [n.caip2 for n in self.config.networks if n.family == "svm"]
+        for net in self.config.networks:
+            if net.family == "evm":
+                self.server.register(net.caip2, ExactEvmServerScheme())
+        if svm_caip2s:
+            register_exact_svm_server(self.server, networks=svm_caip2s)
 
     def build_402_response(
         self,
@@ -65,13 +77,26 @@ class PaymentGate:
         JSON body with application-specific metadata (cost breakdown, etc).
         """
         accepts = []
-        for net_cfg in self.config.networks:
-            accepts.append({
-                "scheme": net_cfg["scheme"],
-                "network": net_cfg["network"],
+        for net in self.config.networks:
+            entry: dict[str, Any] = {
+                "scheme": "exact",
+                "network": net.caip2,
                 "price": f"${amount}",
                 "pay_to": self.config.receiver_address,
-            })
+                "token_address": net.token_address,
+                "token_decimals": net.token_decimals,
+                "family": net.family,
+            }
+            if net.family == "evm":
+                # EVM signs EIP-3009 via EIP-712; the browser needs the domain.
+                entry["chain_id"] = net.chain_id
+                entry["eip712_domain"] = {
+                    "name": net.eip712_domain_name,
+                    "version": net.eip712_domain_version,
+                }
+            # Solana doesn't need extra metadata: the facilitator builds the
+            # unsigned SPL transfer for the wallet to sign on the client retry.
+            accepts.append(entry)
 
         payment_required = {
             "x402Version": 2,
@@ -86,7 +111,16 @@ class PaymentGate:
         body = extra_body or {}
         body["payment_required"] = True
         body["amount"] = str(amount)
-        body["networks"] = self.config.networks
+        body["networks"] = [
+            {
+                "key": n.key,
+                "display_name": n.display_name,
+                "caip2": n.caip2,
+                "chain_id": n.chain_id,
+                "asset": n.asset,
+            }
+            for n in self.config.networks
+        ]
 
         return Response(
             status_code=402,
@@ -135,61 +169,96 @@ class PaymentGate:
         if not payment_header:
             return self.build_402_response(amount, description, extra_body)
 
+        # Parse the X-PAYMENT header into a typed PaymentPayload using the
+        # SDK's canonical helper. Prior to this fix the gate decoded the header
+        # by hand and called `self.server.verify(header, dict)` — but the SDK
+        # exposes `verify_payment(payload, requirements)` with typed args, so
+        # the prior call always raised AttributeError and the gate only ever
+        # succeeded via the dev_bypass branch. Test:
+        # test_check_payment_uses_typed_verify_settle covers this regression.
         try:
-            decoded_header = json.loads(base64.b64decode(payment_header).decode())
-            req_network = (
-                decoded_header.get("payload", {}).get("authorization", {}).get("asset", {}).get("network")
-                or decoded_header.get("network")
-                or self.config.networks[0]["network"]
-            )
-        except (ValueError, TypeError, json.JSONDecodeError):
-            req_network = self.config.networks[0]["network"]
-
-        # Use SDK server to verify the payment
-        try:
-            verification = await self.server.verify(
-                payment_header,
-                {
-                    "scheme": "exact",
-                    "network": req_network,
-                    "maxAmountRequired": str(int(amount * 10**6)),  # USDC 6 decimals
-                    "resource": self.config.receiver_address,
-                },
+            payment_payload = decode_payment_signature_header(payment_header)
+        except Exception:
+            log.warning("payment_header_decode_failed", exc_info=True)
+            return Response(
+                status_code=402,
+                content=json.dumps({"error": "Malformed X-PAYMENT header"}),
+                headers={"Content-Type": "application/json"},
             )
 
-            if not verification or not verification.get("isValid"):
-                log.warning("payment_verification_failed", verification=verification)
+        req_network = payment_payload.get_network()
+
+        # Find the matching network for the asset / decimals lookup so the
+        # `amount` field is encoded in the on-chain integer unit.
+        net_match = next(
+            (n for n in self.config.networks if n.caip2 == req_network), None
+        )
+        if net_match is None:
+            log.warning(
+                "payment_unknown_network",
+                req_network=req_network,
+                enabled=[n.caip2 for n in self.config.networks],
+            )
+            return Response(
+                status_code=402,
+                content=json.dumps({"error": f"Unsupported network: {req_network}"}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        requirements = PaymentRequirements(
+            scheme="exact",
+            network=req_network,
+            asset=net_match.token_address,
+            amount=str(int(amount * 10**net_match.token_decimals)),
+            pay_to=self.config.receiver_address,
+            max_timeout_seconds=60,
+            extra={},
+        )
+
+        # Use SDK server to verify + settle the payment.
+        try:
+            if not self.server._initialized:
+                # SDK only ships a sync `initialize` (one-shot HTTP GET to the
+                # facilitator's /supported endpoint). Off-load to a worker
+                # thread so the first paid request doesn't block the loop.
+                import asyncio as _asyncio
+                await _asyncio.to_thread(self.server.initialize)
+
+            verification = await self.server.verify_payment(payment_payload, requirements)
+
+            if not verification.is_valid:
+                log.warning(
+                    "payment_verification_failed",
+                    reason=verification.invalid_reason,
+                    message=verification.invalid_message,
+                )
                 return Response(
                     status_code=402,
                     content=json.dumps({"error": "Payment verification failed"}),
                     headers={"Content-Type": "application/json"},
                 )
 
-            # Settle the payment
-            settlement = await self.server.settle(
-                payment_header,
-                {
-                    "scheme": "exact",
-                    "network": req_network,
-                    "maxAmountRequired": str(int(amount * 10**6)),
-                    "resource": self.config.receiver_address,
-                },
-            )
+            settlement = await self.server.settle_payment(payment_payload, requirements)
 
-            if not settlement:
-                log.error("payment_settlement_failed")
+            if not settlement.success:
+                log.error(
+                    "payment_settlement_failed",
+                    reason=settlement.error_reason,
+                    message=settlement.error_message,
+                )
                 return Response(
                     status_code=502,
                     content=json.dumps({"error": "Payment settlement failed"}),
                     headers={"Content-Type": "application/json"},
                 )
 
-            wallet = self._extract_wallet(payment_header)
-            tx_hash = settlement.get("txHash", "")
+            wallet = settlement.payer or verification.payer
+            tx_hash = settlement.transaction or ""
 
             log.info(
                 "payment_settled",
                 wallet=wallet,
+                network=req_network,
                 amount=str(amount),
                 tx_hash=tx_hash,
             )
@@ -205,17 +274,3 @@ class PaymentGate:
                 content=json.dumps({"error": "Payment processing error"}),
                 headers={"Content-Type": "application/json"},
             )
-
-    @staticmethod
-    def _extract_wallet(payment_header: str) -> str | None:
-        """Extract payer wallet address from the payment header."""
-        try:
-            decoded = base64.b64decode(payment_header)
-            payload = json.loads(decoded)
-            # x402 exact scheme: the 'from' field in the authorization
-            return (
-                payload.get("payload", {}).get("authorization", {}).get("from")
-                or payload.get("from")
-            )
-        except Exception:
-            return None

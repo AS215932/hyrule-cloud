@@ -5,13 +5,96 @@ Domain models for Hyrule Cloud resources.
 from __future__ import annotations
 
 import enum
+import hashlib
+import hmac
+import secrets
+import string
 import uuid
 from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
+# --- ID generation (centralized; do not inline secrets.token_hex / uuid.uuid4 elsewhere) ---
+
+_ID_ALPHABET = string.ascii_letters + string.digits  # 62 chars
+
+
+def generate_vm_id() -> str:
+    """vm_<22 base62> ≈ 131 bits. The caller is responsible for uniqueness retry on collision."""
+    return "vm_" + "".join(secrets.choice(_ID_ALPHABET) for _ in range(22))
+
+
+def generate_anon_management_token() -> str:
+    """hyr_vm_<32 base62> ≈ 190 bits. Shown ONCE to the user; sha256-hashed at rest."""
+    return "hyr_vm_" + "".join(secrets.choice(_ID_ALPHABET) for _ in range(32))
+
+
+def hash_anon_management_token(token: str) -> str:
+    """sha256 hex digest. Token entropy is high enough that a fast hash is fine."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def verify_anon_management_token(token: str | None, expected_hash: str | None) -> bool:
+    """Constant-time compare of sha256(token) against expected_hash. Both None → False."""
+    if not token or not expected_hash:
+        return False
+    return hmac.compare_digest(hash_anon_management_token(token), expected_hash)
+
+
+def generate_api_key() -> str:
+    """hyr_sk_<32 base62> ≈ 190 bits. Shown ONCE at creation; sha256-hashed at rest.
+
+    Distinct prefix from hyr_vm_ (anon management) so the auth middleware can
+    route by prefix without ambiguity.
+    """
+    return "hyr_sk_" + "".join(secrets.choice(_ID_ALPHABET) for _ in range(32))
+
+
+def hash_api_key(token: str) -> str:
+    """sha256 hex digest. Same rationale as hash_anon_management_token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 # --- Enums ---
+
+
+class ApiKeyScope(enum.StrEnum):
+    """Explicit, never wildcard. Default at creation is the operator-safe subset.
+
+    Routes look up by string value (so JSONB storage stays human-readable in
+    psql), but the enum is the source of truth for what's a valid scope.
+    Adding a new scope here is the only way new permissions ship.
+    """
+    VM_READ        = "vm:read"
+    VM_POWER       = "vm:power"       # reboot/start/stop
+    VM_EXTEND      = "vm:extend"      # still requires x402 payment
+    VM_DESTROY     = "vm:destroy"
+    VM_LOGS        = "vm:logs"
+    VM_CREATE      = "vm:create"      # still requires x402 payment
+    API_KEYS_READ  = "api_keys:read"
+    API_KEYS_WRITE = "api_keys:write" # subject to no-escalation rule
+    ACCOUNT_READ   = "account:read"
+
+
+# Default scope set granted to a freshly-created key when the client doesn't
+# specify scopes. Anything not in this list (vm:destroy, vm:create, api_keys:*)
+# must be opted into explicitly.
+DEFAULT_API_KEY_SCOPES: tuple[ApiKeyScope, ...] = (
+    ApiKeyScope.VM_READ,
+    ApiKeyScope.VM_POWER,
+    ApiKeyScope.VM_EXTEND,
+    ApiKeyScope.VM_LOGS,
+    ApiKeyScope.ACCOUNT_READ,
+)
+
+
+def all_api_key_scopes() -> set[str]:
+    """All known scope strings — used for validating client-supplied scope lists."""
+    return {s.value for s in ApiKeyScope}
+
+
+
 
 
 class VMSize(enum.StrEnum):
@@ -41,9 +124,31 @@ class ProxyMode(enum.StrEnum):
     RESIDENTIAL = "residential"
 
 class CryptoIntentStatus(enum.StrEnum):
+    """Block E: full payment-intent state machine for BTC/XMR.
+
+    Happy path:  CREATED → WAITING_PAYMENT → SETTLED → PROVISIONING → PROVISIONED
+    Error/edge:  UNDERPAID | OVERPAID | LATE_PAID | EXPIRED | FAILED | REFUND_MANUAL
+
+    LENIENT policy (decided at plan review): OVERPAID and qualifying LATE_PAID
+    auto-advance to PROVISIONING. UNDERPAID always flips to REFUND_MANUAL
+    for operator action. See providers/native_crypto.py for the rules.
+    """
+    # Pre-Block-E values kept as aliases so any in-flight intent rows still
+    # round-trip cleanly through the StrEnum on read.
     PENDING = "pending"
     PAID = "paid"
-    EXPIRED = "expired"
+
+    CREATED = "CREATED"
+    WAITING_PAYMENT = "WAITING_PAYMENT"
+    UNDERPAID = "UNDERPAID"
+    OVERPAID = "OVERPAID"
+    LATE_PAID = "LATE_PAID"
+    SETTLED = "SETTLED"
+    EXPIRED = "EXPIRED"
+    PROVISIONING = "PROVISIONING"
+    PROVISIONED = "PROVISIONED"
+    FAILED = "FAILED"
+    REFUND_MANUAL = "REFUND_MANUAL"
 
 # --- VM Size Specifications ---
 
@@ -84,8 +189,48 @@ class VMCreateResponse(BaseModel):
     status: VMStatus
     status_url: str
     estimated_ready_seconds: int = 60
+    # Anon-checkout management secret. Returned ONCE on VM creation, sha256-hashed at rest.
+    # Required for /logs, /reboot, /extend, DELETE on any VM not owned by an account.
+    # The caller MUST save management_token (or management_url) — it cannot be reissued.
+    management_token: str | None = None
+    management_url: str | None = None
 
 
+class VMPublicStatusResponse(BaseModel):
+    """Sanitized public status view. No SSH pubkey, no open-port list, no payment trail."""
+    vm_id: str
+    status: VMStatus
+    os: str | None = None
+    ipv6: str | None = None
+    hostname: str | None = None
+    ssh: str | None = None
+    expires_at: datetime | None = None
+    error: str | None = None
+
+
+class VMDetailResponse(BaseModel):
+    """Full detail view, management-gated. Includes ownership and config secrets."""
+    vm_id: str
+    status: VMStatus
+    os: str | None = None
+    ipv6: str | None = None
+    hostname: str | None = None
+    ssh: str | None = None
+    ssh_pubkey: str | None = None
+    expires_at: datetime | None = None
+    created_at: datetime | None = None
+    firewall: FirewallState | None = None
+    error: str | None = None
+    cost_breakdown: CostBreakdown | None = None
+    cost_total: str | None = None
+    owner_wallet: str | None = None
+    payment_tx: str | None = None
+    has_anon_management_token: bool = False
+    is_legacy: bool = False  # True for VMs created before A0 (no management token issued)
+
+
+# Back-compat alias. Kept so existing imports don't break during migration to the new pair.
+# Prefer VMPublicStatusResponse or VMDetailResponse in new code.
 class VMStatusResponse(BaseModel):
     vm_id: str
     status: VMStatus
@@ -152,16 +297,44 @@ class NetworkResponse(BaseModel):
 
 
 class CryptoIntentRequest(BaseModel):
-    asset: str = Field(description="Asset symbol (BTC, XMR)")
-    amount_usd: str = Field(description="USD amount to be converted")
+    """Block E: payment-intent creation. `order_payload` carries the full VM
+    spec so the orchestrator can provision on settlement without re-asking
+    the client. `client_order_id` is the idempotency key."""
+
+    asset: str = Field(description="Asset symbol: BTC or XMR")
+    order_payload: VMCreateRequest = Field(
+        description="The VM spec to provision once the payment settles."
+    )
+    client_order_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Idempotency key. Repeated POSTs with the same key return the same intent.",
+    )
+
 
 class CryptoIntentResponse(BaseModel):
+    """Block E intent shape returned by both /v1/intent/create and /v1/intent/{id}.
+
+    Once status == PROVISIONED, `vm_id`, `management_token`, `management_url`
+    mirror the A0 anon-checkout response so the frontend can stash the token
+    identically.
+    """
+
     intent_id: str
     asset: str
-    amount_crypto: str
     address: str
+    amount_crypto: str
+    amount_usd: str | None = None
+    rate_snapshot: str | None = None
+    rate_valid_until: datetime | None = None
     status: CryptoIntentStatus
+    confirmations: int = 0
+    amount_received_crypto: str | None = None
+    qr_code_uri: str | None = None   # bitcoin:<addr>?amount=<x> or monero:<addr>?tx_amount=<x>
     expires_at: datetime
+    vm_id: str | None = None
+    management_token: str | None = None
+    management_url: str | None = None
 
 
 # --- Internal State (DB-backed) ---
@@ -193,6 +366,8 @@ class VMRecord(BaseModel):
 
 # Forward ref resolution
 VMStatusResponse.model_rebuild()
+VMPublicStatusResponse.model_rebuild()
+VMDetailResponse.model_rebuild()
 
 class GenericActionResponse(BaseModel):
     status: str

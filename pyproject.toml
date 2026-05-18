@@ -14,8 +14,9 @@ dependencies = [
     "jinja2>=3.1",
     "structlog>=24.4",
     "apscheduler>=3.10",
-    # x402 official SDK (x402-foundation)
-    "x402[fastapi,evm]>=2.9",
+    # x402 official SDK (x402-foundation) — v2 protocol; svm extra pulls in
+    # solana + solders for the Solana exact scheme (Block H)
+    "x402[fastapi,evm,svm]>=2.9",
     # DNS (RFC 2136 dynamic updates)
     "dnspython>=2.6",
     # XO WebSocket JSON-RPC
@@ -26,6 +27,19 @@ dependencies = [
     "alembic>=1.14",
     # MCP server
     "mcp>=1.0",
+    # Auth (Block A1): argon2id password + recovery-code hashing
+    "argon2-cffi>=23.1",
+    # TTL caches for rate limiting + metrics
+    "cachetools>=5.5",
+    # ecrecover for EVM wallet-signature claim/recovery (Block A1 claim, Block F recovery)
+    "eth-account>=0.13",
+    # Block E: pure-Python BIP32/BIP84 derivation for BTC HD addresses
+    # Pin <2.10 + explicit coincurve<21 — coincurve 21.x has a hatchling
+    # LICENSE-file build bug that prevents source builds on this environment.
+    "bip-utils>=2.9,<2.10",
+    "coincurve>=20.0,<21.0",
+    # Block E: server-side QR-code generation (SVG output, ~10kb runtime)
+    "segno>=1.6",
 ]
 
 [project.optional-dependencies]
@@ -53,3 +67,8 @@ select = ["E", "F", "I", "N", "UP", "RUF"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+
+[dependency-groups]
+dev = [
+    "respx>=0.23.1",
+]

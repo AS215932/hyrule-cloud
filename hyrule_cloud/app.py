@@ -6,6 +6,7 @@ Agentic VPS hosting on AS215932 with x402 payments.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -14,11 +15,16 @@ import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
+from hyrule_cloud.api.auth import router as auth_router
 from hyrule_cloud.api.routes import router
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
+from hyrule_cloud.middleware.metrics import install_metrics
 from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
+from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
+from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.services.intents import scan_pending_intents
 
 # Newline-delimited JSON to stdout per AS215932's application logging
 # contract (hyrule-infra/docs/application-logging.md). systemd-journald
@@ -61,18 +67,46 @@ async def lifespan(app: FastAPI):
     orchestrator = Orchestrator(config, session_factory)
     await orchestrator.startup()
 
+    # Block E: native crypto (BTC/XMR) intent engine + rate provider
+    rate_provider = RateProvider()
+    await rate_provider.start()
+    native_crypto = NativeCryptoProvider(config.payment)
+    await native_crypto.start()
+
     # Wire up app state
     app.state._typed_state = AppState(
         config=config,
         orchestrator=orchestrator,
         payment_gate=payment_gate,
         network_provider=network_provider,
+        native_crypto=native_crypto,
+        rate_provider=rate_provider,
+        session_factory=session_factory,
     )
 
     # Expiry scheduler
     scheduler = AsyncIOScheduler()
     scheduler.add_job(orchestrator.check_expiries, "interval", minutes=5)
     scheduler.start()
+
+    # Block E: background intent poller. Single worker; coordinated via
+    # exactly-once atomic SQL trigger in services/intents.py.
+    async def _intent_poller_loop() -> None:
+        while True:
+            try:
+                await scan_pending_intents(
+                    session_factory=session_factory,
+                    provider=native_crypto,
+                    rates=rate_provider,
+                    orch=orchestrator,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("intent_poller_iteration_failed")
+            await asyncio.sleep(15)
+
+    poller_task = asyncio.create_task(_intent_poller_loop())
 
     log.info(
         "hyrule_cloud_started",
@@ -83,7 +117,14 @@ async def lifespan(app: FastAPI):
     yield
 
     scheduler.shutdown()
+    poller_task.cancel()
+    try:
+        await poller_task
+    except (asyncio.CancelledError, Exception):
+        pass
     await orchestrator.shutdown()
+    await native_crypto.close()
+    await rate_provider.close()
     await network_provider.close()
     await engine.dispose()
     log.info("hyrule_cloud_stopped")
@@ -101,7 +142,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Block B: per-process rolling-window latency recorder. Mounted before the
+# routers so it sees every request. The /v1/stats/runtime endpoint reads
+# this back to publish a live p50.
+install_metrics(app)
+
 app.include_router(router)
+app.include_router(auth_router)
 
 
 @app.get("/health")
@@ -113,6 +160,10 @@ async def health():
 async def x402_manifest():
     """x402 service manifest for agent discovery."""
     config: HyruleConfig = app.state._typed_state.config
+    networks_summary = [
+        {"caip2": n.caip2, "asset": n.asset, "scheme": "exact"}
+        for n in config.payment.networks
+    ]
     return {
         "x402Version": 2,
         "name": "Hyrule Cloud",
@@ -127,21 +178,21 @@ async def x402_manifest():
                 "method": "POST",
                 "description": "Provision a bare VM with SSH access",
                 "minPrice": str(config.payment.price_vm_xs),
-                "networks": config.payment.networks,
+                "networks": networks_summary,
             },
             {
                 "path": "/v1/domain/register",
                 "method": "POST",
                 "description": "Register a domain via Openprovider",
                 "minPrice": str(config.payment.price_domain_markup + 5),
-                "networks": config.payment.networks,
+                "networks": networks_summary,
             },
             {
                 "path": "/v1/network/request",
                 "method": "POST",
                 "description": "Make a micro-proxy network request (Clearnet/Tor)",
                 "minPrice": str(config.payment.price_proxy_direct),
-                "networks": config.payment.networks,
+                "networks": networks_summary,
             },
         ],
         "facilitator": config.payment.facilitator_url,

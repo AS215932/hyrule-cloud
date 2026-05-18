@@ -23,6 +23,9 @@ from hyrule_cloud.models import (
     VMCreateRequest,
     VMSize,
     VMStatus,
+    generate_anon_management_token,
+    generate_vm_id,
+    hash_anon_management_token,
 )
 from hyrule_cloud.providers.cloudinit import render_cloud_init
 from hyrule_cloud.providers.dns import DNSProvider
@@ -103,44 +106,66 @@ class Orchestrator:
         self,
         request: VMCreateRequest,
         owner_wallet: str,
-    ) -> VMRow:
-        """Create a VM record in DB and start background provisioning."""
-        import uuid
+        owner_account_id: str | None = None,
+    ) -> tuple[VMRow, str]:
+        """Create a VM record in DB and start background provisioning.
 
-        vm_id = f"vm_{uuid.uuid4().hex[:12]}"
-        hostname_prefix = self._generate_hostname(vm_id)
-        hostname = f"{hostname_prefix}.{self.config.deploy_domain}"
+        Returns (row, anon_management_token). The token cleartext is shown
+        ONCE to the caller and sha256-hashed at rest. When `owner_account_id`
+        is supplied (logged-in checkout), the token is still issued (handy for
+        operator support / detach-on-account-delete) but the API caller does
+        not need it — account auth supersedes.
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        anon_token = generate_anon_management_token()
+        anon_token_hash = hash_anon_management_token(anon_token)
         expires_at = _now() + timedelta(days=request.duration_days)
         total, _ = self.compute_price(request)
 
-        row = VMRow(
-            vm_id=vm_id,
-            owner_wallet=owner_wallet,
-            status=VMStatus.PROVISIONING,
-            size=request.size,
-            os=request.os,
-            ipv6=None,
-            hostname=hostname,
-            ssh_pubkey=request.ssh_pubkey,
-            open_ports=[22] + [p for p in request.open_ports if p != 22],
-            setup_script=request.setup_script,
-            domain_mode=request.domain_mode,
-            domain=request.domain,
-            expires_at=expires_at,
-            cost_total=total,
-        )
+        # Retry on (vanishingly unlikely) vm_id collision. 131 bits of entropy
+        # means a single retry is more than enough — but bound the loop anyway.
+        for _attempt in range(5):
+            vm_id = generate_vm_id()
+            hostname_prefix = self._generate_hostname(vm_id)
+            hostname = f"{hostname_prefix}.{self.config.deploy_domain}"
 
-        async with self.db() as session:
-            session.add(row)
-            await session.commit()
-            # Refresh to get server defaults
-            await session.refresh(row)
+            row = VMRow(
+                vm_id=vm_id,
+                owner_wallet=owner_wallet,
+                owner_account_id=owner_account_id,
+                anon_management_token_hash=anon_token_hash,
+                status=VMStatus.PROVISIONING,
+                size=request.size,
+                os=request.os,
+                ipv6=None,
+                hostname=hostname,
+                ssh_pubkey=request.ssh_pubkey,
+                open_ports=[22] + [p for p in request.open_ports if p != 22],
+                setup_script=request.setup_script,
+                domain_mode=request.domain_mode,
+                domain=request.domain,
+                expires_at=expires_at,
+                cost_total=total,
+            )
+
+            try:
+                async with self.db() as session:
+                    session.add(row)
+                    await session.commit()
+                    await session.refresh(row)
+                break
+            except IntegrityError:
+                log.warning("vm_id_collision_retry", attempt=_attempt)
+                continue
+        else:
+            raise RuntimeError("vm_id collision retry exhausted")
 
         task = asyncio.create_task(self._provision_vm(vm_id))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-        return row
+        return row, anon_token
 
     async def _provision_vm(self, vm_id: str) -> None:
         """Background provisioning: create VM, wait for IPv6, configure DNS."""
@@ -199,6 +224,9 @@ class Orchestrator:
                     return
                 row.ipv6 = ipv6
                 row.status = VMStatus.READY
+                # Block B: stamped here so /v1/stats/runtime can compute
+                # avg(provisioned_at - created_at) across recent READY rows.
+                row.provisioned_at = _now()
 
                 if row.domain_mode == DomainMode.CUSTOM and row.domain:
                     await self._register_custom_domain(row)

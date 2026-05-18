@@ -35,12 +35,17 @@ class MockOrchestrator:
             class MockRow:
                 vm_id = "vm_test123"
                 status = VMStatus.READY
+                os = "debian-13"
                 ipv6 = "2001:db8::1"
                 hostname = "test.deploy.hyrule.host"
                 expires_at = datetime.utcnow()
                 error = None
                 open_ports = [22, 80]
                 created_at = datetime.utcnow()
+                # Block A0 fields. None values keep this in the legacy / no-account branch
+                # which is fine — these tests only exercise the public /status endpoint.
+                anon_management_token_hash = None
+                owner_account_id = None
             return MockRow()
         return None
 
@@ -98,13 +103,15 @@ async def test_get_os_list(override_state):
 
 @pytest.mark.asyncio
 async def test_get_vm_status(override_state):
+    """After Block A0, public status moved to /v1/vm/{id}/status. The legacy
+    /v1/vm/{id} is now management-gated (covered in test_authz.py)."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        res = await client.get("/v1/vm/vm_test123")
+        res = await client.get("/v1/vm/vm_test123/status")
         assert res.status_code == 200
         data = res.json()
         assert data["ipv6"] == "2001:db8::1"
-        
-        res_404 = await client.get("/v1/vm/vm_missing")
+
+        res_404 = await client.get("/v1/vm/vm_missing/status")
         assert res_404.status_code == 404
 
 @pytest.mark.asyncio

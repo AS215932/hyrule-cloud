@@ -50,6 +50,7 @@ class HyruleClient:
         *,
         payment_header: str | None = None,
         dev_bypass: str | None = None,
+        api_key: str | None = None,
         timeout: float = 60.0,
     ) -> None:
         headers: dict[str, str] = {}
@@ -57,6 +58,11 @@ class HyruleClient:
             headers["X-PAYMENT"] = payment_header
         if dev_bypass:
             headers["X-DEV-BYPASS"] = dev_bypass
+        if api_key:
+            # Bearer hyr_sk_<...> — Block D scoped API key. Session cookies
+            # are handled by httpx's cookie jar; the bearer takes precedence
+            # in the server's auth middleware.
+            headers["Authorization"] = f"Bearer {api_key}"
 
         self._http = httpx.AsyncClient(
             base_url=base_url,
@@ -120,6 +126,36 @@ class HyruleClient:
         return await self._request(
             "GET", "/v1/zone/check", params={"name": name, "extension": extension}
         )
+
+    # -- Block H: payment surface discovery + crypto intent flow --
+
+    async def payment_networks(self) -> dict[str, Any]:
+        """List currently-enabled payment networks (EVM + Solana with family tag)."""
+        return await self._request("GET", "/v1/payments/networks")
+
+    async def create_crypto_intent(
+        self,
+        *,
+        asset: str,
+        amount_usd: str,
+        order_payload: dict[str, Any],
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Open a BTC or XMR payment intent. Returns deposit address + QR + rate
+        snapshot. Use client_order_id for idempotent retries (Block E)."""
+        body: dict[str, Any] = {
+            "asset": asset,
+            "amount_usd": amount_usd,
+            "order_payload": order_payload,
+        }
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+        return await self._request("POST", "/v1/intent/create", json=body)
+
+    async def get_crypto_intent(self, intent_id: str) -> dict[str, Any]:
+        """Poll a previously-created crypto intent. Returns status, confirmations,
+        and once PROVISIONED, the resulting vm_id + management token."""
+        return await self._request("GET", f"/v1/intent/{intent_id}")
 
     # -- Paid endpoints --
 
@@ -223,6 +259,66 @@ class HyruleClient:
             "/v1/zone/record",
             params={"zone": zone, "name": name, "type": rtype},
         )
+
+    # -- Account / auth (Block A1, D) --
+
+    async def register(
+        self,
+        password: str,
+        *,
+        with_api_key: bool = False,
+        api_key_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an account. If `with_api_key`, the response also contains
+        a cleartext `api_key` (one-time reveal) with default scopes — the
+        agent-bootstrap path that lets an MCP-only client mint its own key
+        without ever holding a browser session.
+        """
+        body: dict[str, Any] = {"password": password, "with_api_key": with_api_key}
+        if api_key_name is not None:
+            body["api_key_name"] = api_key_name
+        return await self._request("POST", "/v1/auth/register", json=body)
+
+    async def me(self) -> dict[str, Any]:
+        """Profile: account_id, vm_count, created_at, last_login_at."""
+        return await self._request("GET", "/v1/me")
+
+    async def my_vms(self) -> dict[str, Any]:
+        """List VMs owned by the caller."""
+        return await self._request("GET", "/v1/me/vms")
+
+    async def claim_vm_by_token(self, vm_id: str, token: str) -> dict[str, Any]:
+        """Attach an anon VM to the calling account using its management token."""
+        return await self._request(
+            "POST",
+            f"/v1/me/vms/{vm_id}/claim",
+            json={"proof": "management_token", "token": token},
+        )
+
+    # -- API keys (Block D) --
+
+    async def list_api_keys(self) -> dict[str, Any]:
+        """List the caller's API keys (cleartext bearers are never returned)."""
+        return await self._request("GET", "/v1/me/api-keys")
+
+    async def create_api_key(
+        self,
+        *,
+        name: str,
+        scopes: list[str] | None = None,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Mint a key. The response contains `key` (cleartext bearer) ONCE."""
+        body: dict[str, Any] = {"name": name}
+        if scopes is not None:
+            body["scopes"] = scopes
+        if expires_at is not None:
+            body["expires_at"] = expires_at
+        return await self._request("POST", "/v1/me/api-keys", json=body)
+
+    async def revoke_api_key(self, key_id: str) -> dict[str, Any]:
+        """Hard-delete a key. Scoped by the caller's account_id."""
+        return await self._request("DELETE", f"/v1/me/api-keys/{key_id}")
 
     # -- Discovery --
 

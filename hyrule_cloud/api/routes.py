@@ -7,17 +7,25 @@ either a 402 Response or the payer's wallet address.
 
 from __future__ import annotations
 
+from datetime import UTC
 from decimal import Decimal
+from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, Request, Response, Depends
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 
-from hyrule_cloud.middleware.x402 import PaymentGate
-from hyrule_cloud.state import get_app_state, AppState
+from hyrule_cloud.db import AccountRow, VMRow
+from hyrule_cloud.middleware.auth import current_account, enforce_api_key_scope
 from hyrule_cloud.models import (
     VM_SPECS,
+    ApiKeyScope,
+    DNSRecord,
+    DNSRecordType,
+    DomainCheckResponse,
     DomainMode,
+    DomainRegisterRequest,
     FirewallState,
+    GenericActionResponse,
     NetworkRequest,
     NetworkResponse,
     OSListResponse,
@@ -26,18 +34,16 @@ from hyrule_cloud.models import (
     ProxyMode,
     VMCreateRequest,
     VMCreateResponse,
+    VMDetailResponse,
     VMExtendRequest,
     VMLogEvent,
     VMLogsResponse,
-    GenericActionResponse,
-    DomainCheckResponse,
-    DomainRegisterRequest,
-    DNSRecord,
-    DNSRecordType,
+    VMPublicStatusResponse,
     VMSize,
     VMStatus,
-    VMStatusResponse,
+    verify_anon_management_token,
 )
+from hyrule_cloud.state import AppState, get_app_state
 
 log = structlog.get_logger()
 
@@ -57,7 +63,104 @@ def get_network(app_state: AppState = Depends(get_app_state)):
     return app_state.network_provider
 
 
+# --- Authorization helpers ---
+#
+# Two concepts, never collapsed: view (sanitized public status) vs management
+# (logs, reboot, extend, delete, full detail). See feedback_security_split.md.
+#
+# A0 introduced these with the `account` parameter stubbed. A1 wires it for
+# real via the `current_account` FastAPI dependency.
+
+
+def can_view_public_status(vm: VMRow, account: AccountRow | None = None) -> bool:
+    """Sanitized status view: vm_id, status, OS, expiry, hostname, IPv6, ssh hint."""
+    if getattr(vm, "owner_account_id", None) is None:
+        return True
+    if account is None:
+        return False
+    return (
+        account.account_id == vm.owner_account_id
+        or bool(account.is_admin)
+    )
+
+
+def can_manage_vm(
+    vm: VMRow,
+    account: AccountRow | None = None,
+    anon_token: str | None = None,
+) -> bool:
+    """Destructive or revealing: logs, reboot, extend, delete, full detail."""
+    if account is not None and (
+        account.account_id == getattr(vm, "owner_account_id", None)
+        or bool(account.is_admin)
+    ):
+        return True
+    # Anon-ownerless VM: management requires the one-time token issued at create.
+    # Legacy VMs (anon_management_token_hash IS NULL) cannot be managed until claimed.
+    if getattr(vm, "owner_account_id", None) is None:
+        return verify_anon_management_token(anon_token, vm.anon_management_token_hash)
+    return False
+
+
+def anon_management_token_dep(
+    authorization: str | None = Header(default=None),
+    token: str | None = Query(default=None),
+) -> str | None:
+    """Extract a hyr_vm_ token from Authorization: Bearer ... or ?token=...
+
+    Returns None if no token is present or if the bearer is not a hyr_vm_ token
+    (we ignore other bearer schemes here; auth bearers like hyr_sk_ are
+    handled by the account-auth dependency in A1).
+    """
+    if token and token.startswith("hyr_vm_"):
+        return token
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value.startswith("hyr_vm_"):
+            return value
+    return None
+
+
 # --- Free endpoints ---
+
+
+@router.get("/payments/networks")
+async def get_payment_networks(cfg = Depends(get_cfg)):
+    """Block C: single source of truth for the chain selector.
+
+    The frontend MUST read this rather than hardcoding networks client-side
+    (see feedback_verified_payment_chains.md). New chains land here only
+    after scripts/verify_facilitator.py passes against their facilitator URL.
+
+    Block H: EVM-only fields (chain_id, eip712_domain) are omitted for SVM
+    entries; the `family` field tells payment.js which adapter to dispatch to.
+    """
+    def _network_json(n):
+        entry = {
+            "key": n.key,
+            "display_name": n.display_name,
+            "caip2": n.caip2,
+            "family": n.family,
+            "asset": n.asset,
+            "token_address": n.token_address,
+            "token_decimals": n.token_decimals,
+            "rpc_url": n.rpc_url,
+            "block_explorer_url": n.block_explorer_url,
+            "testnet": n.testnet,
+        }
+        if n.family == "evm":
+            entry["chain_id"] = n.chain_id
+            entry["eip712_domain"] = {
+                "name": n.eip712_domain_name,
+                "version": n.eip712_domain_version,
+            }
+        return entry
+
+    return {
+        "networks": [_network_json(n) for n in cfg.payment.networks],
+        "receiver_address": cfg.payment.receiver_address,
+        "facilitator_url": cfg.payment.facilitator_url,
+    }
 
 
 @router.get("/pricing", response_model=PricingResponse)
@@ -94,35 +197,272 @@ async def list_os_templates(cfg = Depends(get_cfg)) -> OSListResponse:
     return OSListResponse(templates=templates)
 
 
-@router.get("/vm/{vm_id}", response_model=VMStatusResponse)
-async def get_vm_status(vm_id: str, orch = Depends(get_orch)) -> VMStatusResponse:
+# --- Block B: live runtime metrics ---
+#
+# Per-process p50 (from middleware/metrics.py), plus DB counts and an avg
+# provision time computed over the most recent N READY rows. Wrapped in a
+# 20s in-process TTL cache so the homepage can poll without thrashing the
+# DB. The `api_p50_source` field labels the latency number as per-process,
+# not fleet-wide; a real Prometheus-backed fleet metric is plan Block H.
+
+
+_RUNTIME_CACHE: dict[str, object] = {"value": None, "expires_at": 0.0}
+_RUNTIME_TTL_SECONDS = 20
+_RECENT_READY_SAMPLE = 50
+
+
+@router.get("/stats/runtime")
+async def get_runtime_stats(request: Request):
+    import time as _time
+    from datetime import datetime as _dt
+
+    from sqlalchemy import func as _func
+    from sqlalchemy import select as _select
+
+    now = _time.time()
+    cached = _RUNTIME_CACHE.get("value")
+    if cached is not None and now < float(_RUNTIME_CACHE["expires_at"]):
+        return cached
+
+    app_state: AppState = request.app.state._typed_state
+    recorder = getattr(request.app.state, "metrics", None)
+
+    # Latency: per-process rolling-window p50. None when there are no samples
+    # yet (cold start) — frontend will substitute a fallback.
+    api_p50 = recorder.percentile(0.5) if recorder is not None else None
+    sample_count = recorder.sample_count() if recorder is not None else 0
+
+    # Counts + avg-provision computed in one short transaction.
+    sess_factory = getattr(app_state, "session_factory", None)
+    if sess_factory is None and hasattr(app_state, "orchestrator"):
+        sess_factory = getattr(app_state.orchestrator, "db", None)
+
+    live_vms = 0
+    build_queue = 0
+    avg_provision_seconds: int | None = None
+
+    if sess_factory is not None:
+        async with sess_factory() as session:
+            # live = anything not destroyed and not failed
+            live_q = await session.execute(
+                _select(_func.count()).select_from(VMRow).where(
+                    VMRow.status.notin_([VMStatus.DESTROYED, VMStatus.FAILED])
+                )
+            )
+            live_vms = int(live_q.scalar() or 0)
+
+            queue_q = await session.execute(
+                _select(_func.count()).select_from(VMRow).where(
+                    VMRow.status == VMStatus.PROVISIONING
+                )
+            )
+            build_queue = int(queue_q.scalar() or 0)
+
+            # Avg over the most recent N rows that actually carry a
+            # provisioned_at timestamp. Older legacy rows without the column
+            # set simply don't contribute.
+            recent_q = await session.execute(
+                _select(VMRow.created_at, VMRow.provisioned_at)
+                .where(VMRow.provisioned_at.isnot(None))
+                .order_by(VMRow.provisioned_at.desc())
+                .limit(_RECENT_READY_SAMPLE)
+            )
+            durations: list[float] = []
+            for created_at, provisioned_at in recent_q.all():
+                if created_at is None or provisioned_at is None:
+                    continue
+                delta = (provisioned_at - created_at).total_seconds()
+                if delta > 0:
+                    durations.append(delta)
+            if durations:
+                avg_provision_seconds = int(round(sum(durations) / len(durations)))
+
+    body = {
+        "api_p50_ms": api_p50,
+        "api_p50_source": "api-process-local-rolling-window",
+        "api_p50_sample_count": sample_count,
+        "build_queue": build_queue,
+        "live_vms": live_vms,
+        "avg_provision_seconds": avg_provision_seconds,
+        "updated_at": _dt.now(UTC).isoformat(),
+    }
+    _RUNTIME_CACHE["value"] = body
+    _RUNTIME_CACHE["expires_at"] = now + _RUNTIME_TTL_SECONDS
+    return body
+
+
+# --- Block H: live fleet network stats from Prometheus on the `mon` VM ---
+#
+# Reads BGP peer / prefix / NAT64 metrics from the central Prometheus and
+# falls back to a static shape (with _source="fallback") if the scrape target
+# is unreachable, so the public /transparency page never serves a 500.
+# 30s TTL is enough — these change on the order of minutes.
+
+_NETWORK_CACHE: dict[str, object] = {"value": None, "expires_at": 0.0}
+_NETWORK_TTL_SECONDS = 30
+_NETWORK_STATIC_FALLBACK: dict[str, Any] = {
+    # Hard-coded fleet truth as of the last operator review. Drifts slowly;
+    # update this dict via PR if BGP topology or transit set changes.
+    "bgp_peers_established": None,
+    "ipv6_prefixes_announced": 3,
+    "nat64_sessions_active": None,
+    "transit_providers": ["AS34872", "AS210233"],
+}
+
+
+@router.get("/stats/network")
+async def get_network_stats(request: Request):
+    import time as _time
+    from datetime import datetime as _dt
+
+    now = _time.time()
+    cached = _NETWORK_CACHE.get("value")
+    if cached is not None and now < float(_NETWORK_CACHE["expires_at"]):
+        return cached
+
+    app_state: AppState = request.app.state._typed_state
+    cfg = app_state.config
+    prom_url = getattr(cfg, "prometheus_url", "") or ""
+
+    body: dict[str, Any] = {
+        "bgp_peers_established": _NETWORK_STATIC_FALLBACK["bgp_peers_established"],
+        "ipv6_prefixes_announced": _NETWORK_STATIC_FALLBACK["ipv6_prefixes_announced"],
+        "nat64_sessions_active": _NETWORK_STATIC_FALLBACK["nat64_sessions_active"],
+        "transit_providers": list(_NETWORK_STATIC_FALLBACK["transit_providers"]),
+        "_source": "fallback",
+        "updated_at": _dt.now(UTC).isoformat(),
+    }
+
+    if prom_url:
+        from hyrule_cloud.providers.prometheus import PrometheusClient
+
+        client = PrometheusClient(prom_url)
+        # PromQL queries — written so a missing exporter cleanly returns None
+        # rather than raising; the endpoint then keeps the static fallback for
+        # that one field while still labelling _source live for the rest.
+        bgp = await client.query_scalar('count(bgp_peer_state == 1)')
+        if bgp is None:
+            # FRR exporter alternative metric name
+            bgp = await client.query_scalar('count(frr_bgp_peer_state{state="Established"})')
+        prefixes = await client.query_scalar('count(count by (prefix) (bgp_prefix_received))')
+        nat64 = await client.query_scalar('sum(nat64_sessions_active)')
+
+        live_count = 0
+        if bgp is not None:
+            body["bgp_peers_established"] = int(bgp)
+            live_count += 1
+        if prefixes is not None:
+            body["ipv6_prefixes_announced"] = int(prefixes)
+            live_count += 1
+        if nat64 is not None:
+            body["nat64_sessions_active"] = int(nat64)
+            live_count += 1
+
+        if live_count > 0:
+            body["_source"] = f"prometheus-{prom_url}"
+
+    _NETWORK_CACHE["value"] = body
+    _NETWORK_CACHE["expires_at"] = now + _NETWORK_TTL_SECONDS
+    return body
+
+
+@router.get("/vm/{vm_id}/status", response_model=VMPublicStatusResponse)
+async def get_vm_public_status(
+    vm_id: str,
+    request: Request,
+    orch = Depends(get_orch),
+    account: AccountRow | None = Depends(current_account),
+) -> VMPublicStatusResponse:
+    """Public sanitized status. Anon-owned VMs are visible by vm_id (preserves
+    one-shot anon checkout UX). Account-owned VMs require the owning account —
+    to a non-owner the response is indistinguishable from a missing VM.
+    """
     row = await orch.get_vm(vm_id)
     if not row:
         raise HTTPException(404, "VM not found")
+    if not can_view_public_status(row, account=account):
+        # 404 not 403 — do not leak existence of account-owned VMs
+        raise HTTPException(404, "VM not found")
+    enforce_api_key_scope(request, ApiKeyScope.VM_READ.value)
+
+    is_ready = row.hostname and row.status == VMStatus.READY
+    return VMPublicStatusResponse(
+        vm_id=row.vm_id,
+        status=VMStatus(row.status),
+        os=row.os,
+        ipv6=row.ipv6,
+        hostname=row.hostname,
+        ssh=f"ssh root@{row.hostname}" if is_ready else None,
+        expires_at=row.expires_at,
+        error=row.error,
+    )
+
+
+@router.get("/vm/{vm_id}", response_model=VMDetailResponse)
+async def get_vm_detail(
+    vm_id: str,
+    request: Request,
+    orch = Depends(get_orch),
+    anon_token: str | None = Depends(anon_management_token_dep),
+    account: AccountRow | None = Depends(current_account),
+) -> VMDetailResponse:
+    """Full VM detail. Management-gated. Anon VMs require the one-time token,
+    account-owned VMs require the matching session/API key.
+
+    Legacy VMs (no anon_management_token_hash) return 404 — they must be claimed
+    via the A1 claim flow to regain management visibility.
+    """
+    row = await orch.get_vm(vm_id)
+    if not row:
+        raise HTTPException(404, "VM not found")
+    if not can_manage_vm(row, account=account, anon_token=anon_token):
+        raise HTTPException(404, "VM not found")
+    # Detail view is a management read. vm:read is sufficient; we treat the
+    # extra fields (firewall, pubkey, payment_tx) as "details for owners",
+    # not as separately-scoped data.
+    enforce_api_key_scope(request, ApiKeyScope.VM_READ.value)
 
     firewall = None
     if row.open_ports:
         firewall = FirewallState(inbound_allow=list(row.open_ports))
 
     is_ready = row.hostname and row.status == VMStatus.READY
+    is_legacy = row.anon_management_token_hash is None and getattr(row, "owner_account_id", None) is None
 
-    return VMStatusResponse(
+    return VMDetailResponse(
         vm_id=row.vm_id,
         status=VMStatus(row.status),
+        os=row.os,
         ipv6=row.ipv6,
         hostname=row.hostname,
         ssh=f"ssh root@{row.hostname}" if is_ready else None,
+        ssh_pubkey=row.ssh_pubkey or None,
         expires_at=row.expires_at,
+        created_at=row.created_at,
         firewall=firewall,
         error=row.error,
+        cost_total=f"${row.cost_total}" if row.cost_total is not None else None,
+        owner_wallet=row.owner_wallet or None,
+        payment_tx=row.payment_tx,
+        has_anon_management_token=row.anon_management_token_hash is not None,
+        is_legacy=is_legacy,
     )
 
 
 @router.get("/vm/{vm_id}/logs", response_model=VMLogsResponse)
-async def get_vm_logs(vm_id: str, orch = Depends(get_orch)) -> VMLogsResponse:
+async def get_vm_logs(
+    vm_id: str,
+    request: Request,
+    orch = Depends(get_orch),
+    anon_token: str | None = Depends(anon_management_token_dep),
+    account: AccountRow | None = Depends(current_account),
+) -> VMLogsResponse:
     row = await orch.get_vm(vm_id)
     if not row:
         raise HTTPException(404, "VM not found")
+    if not can_manage_vm(row, account=account, anon_token=anon_token):
+        raise HTTPException(404, "VM not found")
+    enforce_api_key_scope(request, ApiKeyScope.VM_LOGS.value)
     return VMLogsResponse(
         vm_id=vm_id,
         status=row.status,
@@ -137,7 +477,19 @@ async def get_vm_logs(vm_id: str, orch = Depends(get_orch)) -> VMLogsResponse:
 
 
 @router.post("/vm/create")
-async def create_vm(body: VMCreateRequest, request: Request, orch = Depends(get_orch), cfg = Depends(get_cfg), gate = Depends(get_gate)):
+async def create_vm(
+    body: VMCreateRequest,
+    request: Request,
+    orch = Depends(get_orch),
+    cfg = Depends(get_cfg),
+    gate = Depends(get_gate),
+    account: AccountRow | None = Depends(current_account),
+):
+    # vm:create gate runs before payment so an under-scoped key 403s without
+    # ever being asked to settle x402. (The plan's x402-vs-key model: key
+    # proves "this account"; x402 proves "you paid". Both still required.)
+    enforce_api_key_scope(request, ApiKeyScope.VM_CREATE.value)
+
     if body.domain_mode == DomainMode.CUSTOM and not body.domain:
         raise HTTPException(400, "domain required when domain_mode=custom")
 
@@ -163,23 +515,52 @@ async def create_vm(body: VMCreateRequest, request: Request, orch = Depends(get_
         return result
 
     wallet = result
-    row = await orch.create_vm(body, owner_wallet=wallet)
+    row, anon_token = await orch.create_vm(
+        body,
+        owner_wallet=wallet,
+        owner_account_id=(account.account_id if account is not None else None),
+    )
     row.payment_tx = getattr(request.state, "payment_tx", None)
 
     base_url = str(request.base_url).rstrip("/")
+    # Logged-in orders don't need an anon token — the dashboard is the management surface.
+    # We only return the token to anon orders so the user can save it.
+    if account is not None:
+        return VMCreateResponse(
+            vm_id=row.vm_id,
+            status=VMStatus(row.status),
+            status_url=f"{base_url}/v1/vm/{row.vm_id}/status",
+            estimated_ready_seconds=60,
+        )
     return VMCreateResponse(
         vm_id=row.vm_id,
         status=VMStatus(row.status),
-        status_url=f"{base_url}/v1/vm/{row.vm_id}",
+        status_url=f"{base_url}/v1/vm/{row.vm_id}/status",
+        management_token=anon_token,
+        management_url=f"{base_url}/v1/vm/{row.vm_id}?token={anon_token}",
         estimated_ready_seconds=60,
     )
 
 
 @router.post("/vm/{vm_id}/extend")
-async def extend_vm(vm_id: str, body: VMExtendRequest, request: Request, orch = Depends(get_orch), cfg = Depends(get_cfg), gate = Depends(get_gate)):
+async def extend_vm(
+    vm_id: str,
+    body: VMExtendRequest,
+    request: Request,
+    orch = Depends(get_orch),
+    cfg = Depends(get_cfg),
+    gate = Depends(get_gate),
+    anon_token: str | None = Depends(anon_management_token_dep),
+    account: AccountRow | None = Depends(current_account),
+):
     row = await orch.get_vm(vm_id)
     if not row:
         raise HTTPException(404, "VM not found")
+    # Require management proof (account session OR anon token) BEFORE accepting
+    # payment. Otherwise a stranger could pay to keep a malicious VM alive.
+    if not can_manage_vm(row, account=account, anon_token=anon_token):
+        raise HTTPException(404, "VM not found")
+    enforce_api_key_scope(request, ApiKeyScope.VM_EXTEND.value)
 
     price_map = {
         VMSize.XS: cfg.payment.price_vm_xs,
@@ -215,14 +596,38 @@ async def extend_vm(vm_id: str, body: VMExtendRequest, request: Request, orch = 
 
 
 @router.post("/vm/{vm_id}/reboot", response_model=GenericActionResponse)
-async def reboot_vm(vm_id: str, orch = Depends(get_orch)) -> GenericActionResponse:
+async def reboot_vm(
+    vm_id: str,
+    request: Request,
+    orch = Depends(get_orch),
+    anon_token: str | None = Depends(anon_management_token_dep),
+    account: AccountRow | None = Depends(current_account),
+) -> GenericActionResponse:
+    row = await orch.get_vm(vm_id)
+    if not row:
+        raise HTTPException(404, "VM not found")
+    if not can_manage_vm(row, account=account, anon_token=anon_token):
+        raise HTTPException(404, "VM not found")
+    enforce_api_key_scope(request, ApiKeyScope.VM_POWER.value)
     if not await orch.reboot_vm(vm_id):
         raise HTTPException(404, "VM not found or not running")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} is rebooting")
 
 
 @router.delete("/vm/{vm_id}", response_model=GenericActionResponse)
-async def destroy_vm(vm_id: str, orch = Depends(get_orch)) -> GenericActionResponse:
+async def destroy_vm(
+    vm_id: str,
+    request: Request,
+    orch = Depends(get_orch),
+    anon_token: str | None = Depends(anon_management_token_dep),
+    account: AccountRow | None = Depends(current_account),
+) -> GenericActionResponse:
+    row = await orch.get_vm(vm_id)
+    if not row:
+        raise HTTPException(404, "VM not found")
+    if not can_manage_vm(row, account=account, anon_token=anon_token):
+        raise HTTPException(404, "VM not found")
+    enforce_api_key_scope(request, ApiKeyScope.VM_DESTROY.value)
     if not await orch.destroy_vm(vm_id):
         raise HTTPException(404, "VM not found")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} destroyed")
@@ -316,7 +721,6 @@ async def delete_zone_record(
     orch = Depends(get_orch),
 ):
     """Delete a DNS record from a zone managed by Hyrule Cloud."""
-    from hyrule_cloud.models import DNSRecordType
     try:
         rtype = DNSRecordType(type.upper())
     except ValueError:
@@ -362,81 +766,142 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
     
     if resp.error and resp.status_code in [400, 403, 501]:
         raise HTTPException(resp.status_code, resp.error)
-        
+
     return resp
 
-from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
-from hyrule_cloud.db import CryptoIntentRow
-from sqlalchemy import select
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
-import uuid
+
+# --- Block E: native crypto intents (BTC / XMR) ---
+
+from sqlalchemy import update as _sql_update  # noqa: E402
+
+from hyrule_cloud.db import CryptoIntentRow  # noqa: E402
+from hyrule_cloud.models import (  # noqa: E402
+    CryptoIntentRequest,
+    CryptoIntentResponse,
+    CryptoIntentStatus,
+)
+from hyrule_cloud.services.intents import IntentExistsError, create_intent  # noqa: E402
+
+
+def _intent_to_response(row: CryptoIntentRow, request: Request | None = None) -> CryptoIntentResponse:
+    """Render a CryptoIntentRow as the public response. Builds management_url
+    from request.base_url when the one-shot cleartext is present."""
+    from hyrule_cloud.providers.native_crypto import NativeCryptoProvider as _NCP
+
+    qr_uri = None
+    try:
+        qr_uri = _NCP.build_uri(row.asset, row.address, row.amount_crypto)
+    except Exception:
+        pass
+
+    mgmt_url = None
+    if row.vm_id and row.anon_token_cleartext and request is not None:
+        base = str(request.base_url).rstrip("/")
+        mgmt_url = f"{base}/v1/vm/{row.vm_id}?token={row.anon_token_cleartext}"
+
+    return CryptoIntentResponse(
+        intent_id=row.intent_id,
+        asset=row.asset,
+        address=row.address,
+        amount_crypto=str(row.amount_crypto),
+        amount_usd=str(row.amount_usd) if row.amount_usd is not None else None,
+        rate_snapshot=str(row.rate_snapshot) if row.rate_snapshot is not None else None,
+        rate_valid_until=row.rate_valid_until,
+        status=CryptoIntentStatus(row.status),
+        confirmations=row.confirmations or 0,
+        amount_received_crypto=(
+            str(row.amount_received_crypto) if row.amount_received_crypto is not None else None
+        ),
+        qr_code_uri=qr_uri,
+        expires_at=row.expires_at,
+        vm_id=row.vm_id,
+        management_token=row.anon_token_cleartext,
+        management_url=mgmt_url,
+    )
+
 
 @router.post("/intent/create", response_model=CryptoIntentResponse)
-async def create_crypto_intent(body: CryptoIntentRequest, orch = Depends(get_orch), cfg = Depends(get_cfg)):
-    if body.asset.upper() not in ["BTC", "XMR", "ZEC"]:
-        raise HTTPException(400, "Unsupported asset. Use BTC, XMR, or ZEC.")
-    
-    amount_usd = Decimal(body.amount_usd)
-    from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
-    provider = NativeCryptoProvider(cfg)
-    rate = provider.get_exchange_rate(body.asset)
-    amount_crypto = amount_usd / rate
-    
-    intent_id = str(uuid.uuid4())
-    bip32_index = None
-    if body.asset.upper() == "BTC":
-        async with orch.db() as session:
-            # Simple simulation for MAX index logic
-            from sqlalchemy import func
-            res = await session.execute(select(func.max(CryptoIntentRow.bip32_index)).where(CryptoIntentRow.asset == "BTC"))
-            max_idx = res.scalar() or 0
-            bip32_index = max_idx + 1
-        address = provider.generate_btc_address(bip32_index)
-    elif body.asset.upper() == "XMR":
-        address, bip32_index = provider.generate_xmr_address()
-        
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=60)
-    
-    row = CryptoIntentRow(
-        intent_id=intent_id,
-        asset=body.asset.upper(),
-        amount_usd=amount_usd,
-        amount_crypto=amount_crypto,
-        address=address,
-        bip32_index=bip32_index,
-        expires_at=expires_at,
-        status=CryptoIntentStatus.PENDING
-    )
-    
-    async with orch.db() as session:
-        session.add(row)
-        await session.commit()
-    
-    return CryptoIntentResponse(
-        intent_id=row.intent_id,
-        asset=row.asset,
-        amount_crypto=str(row.amount_crypto),
-        address=row.address,
-        status=CryptoIntentStatus.PENDING,
-        expires_at=row.expires_at
-    )
+async def create_crypto_intent(
+    body: CryptoIntentRequest,
+    request: Request,
+    orch = Depends(get_orch),
+    cfg = Depends(get_cfg),
+    account: AccountRow | None = Depends(current_account),
+) -> CryptoIntentResponse:
+    """Block E: open a payment intent for BTC or XMR.
+
+    Idempotent on `client_order_id`: repeated POSTs with the same key return
+    the existing intent unchanged (no second deposit address is allocated).
+    """
+    asset = body.asset.upper()
+    if asset not in ("BTC", "XMR"):
+        raise HTTPException(400, "Unsupported asset. Use BTC or XMR.")
+
+    if body.order_payload.domain_mode.value == "custom" and not body.order_payload.domain:
+        raise HTTPException(400, "domain required when domain_mode=custom")
+    for port in body.order_payload.open_ports:
+        if port in cfg.blocked_ports:
+            raise HTTPException(400, f"Port {port} is blocked by policy")
+
+    total, _ = orch.compute_price(body.order_payload)
+
+    app_state: AppState = get_app_state(request)
+    provider = getattr(app_state, "native_crypto", None)
+    rates = getattr(app_state, "rate_provider", None)
+    if provider is None or rates is None:
+        raise HTTPException(503, "Native crypto provider not configured")
+
+    try:
+        row = await create_intent(
+            session_factory=orch.db,
+            provider=provider,
+            rates=rates,
+            asset=asset,
+            order_payload=body.order_payload,
+            amount_usd=total,
+            client_order_id=body.client_order_id,
+            owner_account_id=(account.account_id if account is not None else None),
+        )
+    except IntentExistsError as exc:
+        # Idempotent replay: return the existing intent verbatim
+        return _intent_to_response(exc.existing, request)
+    except RuntimeError as exc:
+        log.error("intent_create_failed", error=str(exc))
+        raise HTTPException(503, "Could not create payment intent")
+
+    return _intent_to_response(row, request)
+
 
 @router.get("/intent/{intent_id}", response_model=CryptoIntentResponse)
-async def get_crypto_intent_status(intent_id: str, orch = Depends(get_orch)):
+async def get_crypto_intent_status(
+    intent_id: str,
+    request: Request,
+    orch = Depends(get_orch),
+    account: AccountRow | None = Depends(current_account),
+) -> CryptoIntentResponse:
+    """Returns current intent state. On the first GET after PROVISIONED, the
+    one-shot `anon_token_cleartext` column is included in the response AND
+    immediately nulled so subsequent GETs cannot re-reveal it."""
     async with orch.db() as session:
-        q = select(CryptoIntentRow).where(CryptoIntentRow.intent_id == intent_id)
-        res = await session.execute(q)
-        row = res.scalar_one_or_none()
-    
-    if not row:
-        raise HTTPException(404, "Intent not found")
-        
-    return CryptoIntentResponse(
-        intent_id=row.intent_id,
-        asset=row.asset,
-        amount_crypto=str(row.amount_crypto),
-        address=row.address,
-        status=CryptoIntentStatus(row.status),
-        expires_at=row.expires_at
-    )
+        row = await session.get(CryptoIntentRow, intent_id)
+        if row is None:
+            raise HTTPException(404, "Intent not found")
+        # Account-owned intents are only visible to the owner (or admin) —
+        # 404 (not 403) to avoid leaking existence.
+        if row.owner_account_id is not None:
+            if account is None or (
+                account.account_id != row.owner_account_id and not account.is_admin
+            ):
+                raise HTTPException(404, "Intent not found")
+        # One-shot reveal: snapshot cleartext, then NULL it.
+        revealed = row.anon_token_cleartext
+        if revealed is not None:
+            await session.execute(
+                _sql_update(CryptoIntentRow)
+                .where(CryptoIntentRow.intent_id == intent_id)
+                .values(anon_token_cleartext=None)
+            )
+            await session.commit()
+            row.anon_token_cleartext = revealed  # local copy for the response
+
+    return _intent_to_response(row, request)
