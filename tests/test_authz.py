@@ -385,7 +385,7 @@ class _OrchForCreate:
             vm_cost="$1.00", domain_cost="$0.00", total="$1.00",
         )
 
-    async def create_vm(self, request, owner_wallet):
+    async def create_vm(self, request, owner_wallet, owner_account_id=None):
         from hyrule_cloud.models import generate_anon_management_token, generate_vm_id
 
         class _Row:

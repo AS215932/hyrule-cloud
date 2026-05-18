@@ -107,6 +107,21 @@ class HyruleConfig(BaseSettings):
     # Database (Postgres)
     database_url: str = "postgresql+asyncpg://hyrule:hyrule@localhost/hyrule"
 
+    # --- Block A1 / B (Wave 2): auth + metrics ---
+    # 32-byte hex; if blank, sessions still work but per-IP pepper is
+    # process-local (rotates on restart). Vault populates in production.
+    ip_prefix_pepper: str = ""
+
+    # --- Feature flags: Wave 2 schema lands ahead of feature code, gated
+    # by these so the dormant code paths can't accidentally activate.
+    # Flipped to true in the Wave that ships the corresponding feature:
+    #   HYR_FEATURES_API_KEYS         — Wave 3 (Block D)
+    #   HYR_FEATURES_INTENT_ENGINE    — Wave 4 (Block E)
+    #   HYR_FEATURES_WALLET_RECOVERY  — Wave 5 (Block F)
+    features_api_keys: bool = False
+    features_intent_engine: bool = False
+    features_wallet_recovery: bool = False
+
     # Sub-configs
     xcpng: XCPNGConfig = Field(default_factory=XCPNGConfig)
     openprovider: OpenproviderConfig = Field(default_factory=OpenproviderConfig)

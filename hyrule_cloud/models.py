@@ -61,9 +61,32 @@ class ProxyMode(enum.StrEnum):
     RESIDENTIAL = "residential"
 
 class CryptoIntentStatus(enum.StrEnum):
+    """Block E: full payment-intent state machine for BTC/XMR.
+
+    Wave 2 ships the enum values up-front (matches alembic 004 dead
+    schema). The intent-engine code that actually transitions through
+    these states is gated behind HYR_FEATURES_INTENT_ENGINE and lands
+    in Wave 4.
+
+    Happy path:  CREATED → WAITING_PAYMENT → SETTLED → PROVISIONING → PROVISIONED
+    Error/edge:  UNDERPAID | OVERPAID | LATE_PAID | EXPIRED | FAILED | REFUND_MANUAL
+    """
+    # Pre-Block-E values kept as aliases so any in-flight intent rows still
+    # round-trip cleanly through the StrEnum on read.
     PENDING = "pending"
     PAID = "paid"
-    EXPIRED = "expired"
+
+    CREATED = "CREATED"
+    WAITING_PAYMENT = "WAITING_PAYMENT"
+    UNDERPAID = "UNDERPAID"
+    OVERPAID = "OVERPAID"
+    LATE_PAID = "LATE_PAID"
+    SETTLED = "SETTLED"
+    EXPIRED = "EXPIRED"
+    PROVISIONING = "PROVISIONING"
+    PROVISIONED = "PROVISIONED"
+    FAILED = "FAILED"
+    REFUND_MANUAL = "REFUND_MANUAL"
 
 # --- VM Size Specifications ---
 

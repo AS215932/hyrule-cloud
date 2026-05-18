@@ -1,8 +1,9 @@
 """
 Base protocols and unified errors for all providers.
 """
-from typing import Protocol
 from abc import abstractmethod
+from typing import Protocol
+
 
 class ProviderError(Exception):
     """Unified error type for all providers."""

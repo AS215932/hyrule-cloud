@@ -106,6 +106,7 @@ class Orchestrator:
         self,
         request: VMCreateRequest,
         owner_wallet: str,
+        owner_account_id: str | None = None,
     ) -> tuple[VMRow, str]:
         """Create a VM record in DB and start background provisioning.
 
@@ -114,6 +115,11 @@ class Orchestrator:
         stored, only the sha256 lands on the row. Caller (POST
         /v1/vm/create) must surface it in the response body so the
         operator can save the management URL.
+
+        Block A1 (Wave 2): `owner_account_id` is set when the caller has
+        a session cookie. The VM still gets a management token — the
+        token + the account both authorize management, redundancy is
+        intentional so the operator can claim/transfer later.
         """
         vm_id = generate_vm_id()
         hostname_prefix = self._generate_hostname(vm_id)
@@ -125,6 +131,7 @@ class Orchestrator:
         row = VMRow(
             vm_id=vm_id,
             owner_wallet=owner_wallet,
+            owner_account_id=owner_account_id,
             status=VMStatus.PROVISIONING,
             anon_management_token_hash=hash_anon_token(anon_token),
             size=request.size,
@@ -209,6 +216,10 @@ class Orchestrator:
                     return
                 row.ipv6 = ipv6
                 row.status = VMStatus.READY
+                # Block B (Wave 2): timestamp the READY transition so
+                # /v1/stats/runtime can roll a rolling avg over recent
+                # provisioning durations.
+                row.provisioned_at = _now()
 
                 if row.domain_mode == DomainMode.CUSTOM and row.domain:
                     await self._register_custom_domain(row)

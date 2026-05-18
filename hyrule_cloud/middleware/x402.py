@@ -16,14 +16,13 @@ back either a 402 Response or the verified payment details.
 from __future__ import annotations
 
 import base64
-import dataclasses
 import json
 from decimal import Decimal
 from typing import Any
 
 import structlog
 from fastapi import Request, Response
-from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
+from x402.http import FacilitatorConfig, HTTPFacilitatorClient
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
 from x402.server import x402ResourceServer
 

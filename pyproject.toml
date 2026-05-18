@@ -26,6 +26,10 @@ dependencies = [
     "alembic>=1.14",
     # MCP server
     "mcp>=1.0",
+    # Block A1 (Wave 2): argon2id for passwords + recovery codes
+    "argon2-cffi>=23.1",
+    # Block A1 (Wave 2): TTL cache for per-IP rate-limit buckets
+    "cachetools>=5.5",
 ]
 
 [project.optional-dependencies]
