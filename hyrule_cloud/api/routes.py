@@ -10,18 +10,21 @@ from __future__ import annotations
 from decimal import Decimal
 
 import structlog
-from fastapi import APIRouter, HTTPException, Request, Response, Depends
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from hyrule_cloud.middleware.anon_token import (
     anon_management_token,
     can_manage_vm,
 )
-from hyrule_cloud.middleware.x402 import PaymentGate
-from hyrule_cloud.state import get_app_state, AppState
 from hyrule_cloud.models import (
     VM_SPECS,
+    DNSRecord,
+    DNSRecordType,
+    DomainCheckResponse,
     DomainMode,
+    DomainRegisterRequest,
     FirewallState,
+    GenericActionResponse,
     NetworkRequest,
     NetworkResponse,
     OSListResponse,
@@ -33,16 +36,12 @@ from hyrule_cloud.models import (
     VMExtendRequest,
     VMLogEvent,
     VMLogsResponse,
-    GenericActionResponse,
-    DomainCheckResponse,
-    DomainRegisterRequest,
-    DNSRecord,
-    DNSRecordType,
     VMPublicStatusResponse,
     VMSize,
     VMStatus,
     VMStatusResponse,
 )
+from hyrule_cloud.state import AppState, get_app_state
 
 log = structlog.get_logger()
 
@@ -387,7 +386,6 @@ async def delete_zone_record(
     orch = Depends(get_orch),
 ):
     """Delete a DNS record from a zone managed by Hyrule Cloud."""
-    from hyrule_cloud.models import DNSRecordType
     try:
         rtype = DNSRecordType(type.upper())
     except ValueError:
@@ -436,12 +434,14 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
         
     return resp
 
-from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
-from hyrule_cloud.db import CryptoIntentRow
-from sqlalchemy import select
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 import uuid
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import select
+
+from hyrule_cloud.db import CryptoIntentRow
+from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
+
 
 @router.post("/intent/create", response_model=CryptoIntentResponse)
 async def create_crypto_intent(body: CryptoIntentRequest, orch = Depends(get_orch), cfg = Depends(get_cfg)):
@@ -467,7 +467,7 @@ async def create_crypto_intent(body: CryptoIntentRequest, orch = Depends(get_orc
     elif body.asset.upper() == "XMR":
         address, bip32_index = provider.generate_xmr_address()
         
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=60)
+    expires_at = datetime.now(UTC) + timedelta(minutes=60)
     
     row = CryptoIntentRow(
         intent_id=intent_id,

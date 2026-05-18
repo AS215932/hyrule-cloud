@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-
-
 from datetime import datetime
 from decimal import Decimal
 
@@ -19,7 +17,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from hyrule_cloud.models import DomainMode, VMSize, VMStatus, CryptoIntentStatus
+from hyrule_cloud.models import CryptoIntentStatus, DomainMode, VMSize, VMStatus
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -201,6 +199,7 @@ async def init_db(engine) -> None:
 
 import secrets
 import string
+
 
 def generate_account_id():
     return ''.join(secrets.choice(string.ascii_uppercase) for _ in range(10))

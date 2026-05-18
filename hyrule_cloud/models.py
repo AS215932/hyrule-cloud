@@ -7,7 +7,6 @@ from __future__ import annotations
 import enum
 import secrets
 import string
-import uuid
 from datetime import datetime
 from decimal import Decimal
 
