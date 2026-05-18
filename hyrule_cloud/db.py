@@ -85,6 +85,15 @@ class VMRow(Base):
     payment_tx: Mapped[str | None] = mapped_column(String(128))
     cost_total: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
 
+    # Block A0: sha256 of the cleartext anon management token. NULL for
+    # legacy pre-A0 rows (those are status-only — management routes refuse
+    # them until claimed). Indexed for the rare lookup-by-token reverse
+    # path (we always lookup by vm_id; token-only lookup would be ambiguous
+    # and is not implemented).
+    anon_management_token_hash: Mapped[str | None] = mapped_column(
+        String(64), index=True,
+    )
+
     # Extensible metadata
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB)
 
