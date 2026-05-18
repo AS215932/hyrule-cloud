@@ -267,6 +267,10 @@ async def test_management_routes_404_without_token(_state_ok, path, method):
         res = await c.request(method, path)
     # 404 (NOT 403) — vm_id existence must not leak to random guessers.
     assert res.status_code == 404
+    # No orchestrator side effects on rejection. A 404 with rebooted/
+    # destroyed still mutated would be the worst-of-both-worlds outcome.
+    assert _state_ok.orchestrator.rebooted == []
+    assert _state_ok.orchestrator.destroyed == []
 
 
 @pytest.mark.parametrize("path,method", [
@@ -283,6 +287,8 @@ async def test_management_routes_404_with_wrong_token(_state_ok, path, method):
             headers={"Authorization": f"Bearer {_TOKEN_WRONG}"},
         )
     assert res.status_code == 404
+    assert _state_ok.orchestrator.rebooted == []
+    assert _state_ok.orchestrator.destroyed == []
 
 
 @pytest.mark.parametrize("path,method,want", [
@@ -302,12 +308,46 @@ async def test_management_routes_accept_bearer_token(_state_ok, path, method, wa
 
 
 @pytest.mark.asyncio
+async def test_reboot_route_records_orchestrator_call_on_success(_state_ok):
+    """Block A0: positive side-effect counterpart to the rejection tests
+    above. When the token is valid, the orchestrator actually receives
+    the call — proving that successful authorization is not a no-op."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        res = await c.post(
+            "/v1/vm/vm_abcDEF0123456789ABCDEF/reboot",
+            headers={"Authorization": f"Bearer {_TOKEN_OK}"},
+        )
+    assert res.status_code == 200
+    assert _state_ok.orchestrator.rebooted == ["vm_abcDEF0123456789ABCDEF"]
+    assert _state_ok.orchestrator.destroyed == []
+
+
+@pytest.mark.asyncio
 async def test_management_routes_accept_query_token(_state_ok):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         res = await c.get(
             f"/v1/vm/vm_abcDEF0123456789ABCDEF?token={_TOKEN_OK}",
         )
     assert res.status_code == 200
+
+
+@pytest.mark.parametrize("auth_header", [
+    f"bearer {_TOKEN_OK}",          # lowercase scheme (RFC 7235 §2.1)
+    f"BEARER {_TOKEN_OK}",          # uppercase scheme
+    f"BeArEr {_TOKEN_OK}",          # mixed case
+    f"  Bearer   {_TOKEN_OK}  ",    # surrounding + internal whitespace
+])
+@pytest.mark.asyncio
+async def test_management_accepts_case_insensitive_bearer(_state_ok, auth_header):
+    """Per RFC 7235 §2.1 the HTTP auth scheme is case-insensitive. Some
+    clients (curl variants, older proxies, embedded HTTP libs) send
+    'bearer' / 'BEARER' / mixed case. We must accept all of them."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        res = await c.get(
+            "/v1/vm/vm_abcDEF0123456789ABCDEF",
+            headers={"Authorization": auth_header},
+        )
+    assert res.status_code == 200, res.text
 
 
 @pytest.mark.parametrize("path,method", [

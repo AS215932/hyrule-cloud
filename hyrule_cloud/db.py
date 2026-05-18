@@ -87,11 +87,12 @@ class VMRow(Base):
 
     # Block A0: sha256 of the cleartext anon management token. NULL for
     # legacy pre-A0 rows (those are status-only — management routes refuse
-    # them until claimed). Indexed for the rare lookup-by-token reverse
-    # path (we always lookup by vm_id; token-only lookup would be ambiguous
-    # and is not implemented).
+    # them until claimed). The index is declared in alembic/versions/
+    # 002_security_hotfix.py (ix_vms_anon_management_token_hash); we do
+    # NOT pass `index=True` here so autogenerate never tries to create a
+    # second implicit index with a different name.
     anon_management_token_hash: Mapped[str | None] = mapped_column(
-        String(64), index=True,
+        String(64),
     )
 
     # Extensible metadata

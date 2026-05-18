@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from hyrule_cloud.db import VMRow
 
 
-_BEARER_PREFIX = "Bearer "
 _ANON_TOKEN_PREFIX = "hyr_vm_"
 
 
@@ -42,15 +41,20 @@ def anon_management_token(request: Request) -> str | None:
       - Authorization: Bearer hyr_vm_<...> (canonical, agent-friendly)
       - ?token=hyr_vm_<...> (UX-friendly, used by the post-order URL)
 
-    Returns the raw token string (with `hyr_vm_` prefix) or None if absent
-    or malformed. Does NOT verify against any row — that's `can_manage_vm`'s
-    job.
+    The HTTP auth scheme is case-insensitive per RFC 7235 §2.1, so
+    "bearer", "Bearer", "BEARER" and surrounding whitespace are all
+    accepted; the credential portion is unchanged and must still start
+    with `hyr_vm_`. Returns the raw token string (with prefix) or None
+    if absent or malformed. Does NOT verify against any row — that's
+    `can_manage_vm`'s job.
     """
-    auth = request.headers.get("authorization") or ""
-    if auth.startswith(_BEARER_PREFIX):
-        candidate = auth[len(_BEARER_PREFIX):].strip()
-        if candidate.startswith(_ANON_TOKEN_PREFIX):
-            return candidate
+    auth = (request.headers.get("authorization") or "").strip()
+    if auth:
+        scheme, _, credential = auth.partition(" ")
+        if scheme.lower() == "bearer":
+            candidate = credential.strip()
+            if candidate.startswith(_ANON_TOKEN_PREFIX):
+                return candidate
 
     query = request.query_params.get("token")
     if query and query.startswith(_ANON_TOKEN_PREFIX):
