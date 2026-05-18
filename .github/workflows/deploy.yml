@@ -1,0 +1,79 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Validation only, no apply
+        type: boolean
+        default: false
+      target_ref:
+        description: Optional ref/SHA to deploy (rollback)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Serialise production deploys. cancel-in-progress: false — never kill an
+# in-flight production deploy; let it finish, then run the next one.
+concurrency:
+  group: production-hyrule-cloud
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: [self-hosted, linux, x64, hyrule]
+    environment: production
+    timeout-minutes: 20
+    env:
+      ANSIBLE_FORCE_COLOR: "true"
+      # SSH key the github-runner user holds for reaching infra hosts as the
+      # `ci` deploy user (set up by hyrule-infra's ci_runner_key role).
+      ANSIBLE_PRIVATE_KEY_FILE: /var/lib/github-runner/.ssh/id_ci
+    steps:
+      - name: Checkout hyrule-infra (Ansible repo)
+        uses: actions/checkout@v4
+        with:
+          repository: AS215932/network-operations
+          ref: main
+          ssh-key: ${{ secrets.HYRULE_INFRA_DEPLOY_KEY }}
+          path: infra
+
+      - name: Source Vault-rendered secrets
+        run: |
+          # Vault Agent on `ci` renders /etc/github-runner/secrets.env. Source
+          # so playbooks pick up any env-var inputs they declare.
+          if [ -r /etc/github-runner/secrets.env ]; then
+            set -a; . /etc/github-runner/secrets.env; set +a
+            grep -E '^[A-Z_][A-Z0-9_]*=' /etc/github-runner/secrets.env >> "$GITHUB_ENV"
+          fi
+
+      - name: Validate (dry run)
+        if: ${{ inputs.dry_run == true }}
+        working-directory: infra/ansible
+        run: |
+          ansible-playbook playbooks/cloud.yml \
+            --tags validate \
+            --connection=local \
+            --skip-tags=snapshot \
+            -e hyrule_cloud_version="${{ inputs.target_ref || github.sha }}" \
+            --limit api
+
+      - name: Apply
+        if: ${{ inputs.dry_run != true }}
+        working-directory: infra/ansible
+        run: |
+          # SHA-pin the deploy. push events → github.sha. Manual dispatch with
+          # target_ref set → rollback to that ref. Never lets the target VM
+          # just `pull main` between CI success and the production approval.
+          TARGET_REF="${{ inputs.target_ref || github.sha }}"
+          ansible-playbook playbooks/cloud.yml \
+            --tags apply \
+            -e hyrule_cloud_apply=true \
+            -e "hyrule_cloud_version=$TARGET_REF" \
+            -e ansible_user=ci \
+            --limit api
