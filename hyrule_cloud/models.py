@@ -5,11 +5,32 @@ Domain models for Hyrule Cloud resources.
 from __future__ import annotations
 
 import enum
+import secrets
+import string
 import uuid
 from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field
+
+# Block A0: widen vm_id from 48-bit hex (vm_<12 hex>) to ~131-bit base62
+# (vm_<22 base62>). The legacy 48-bit space was borderline guessable; with
+# management routes gated on a separate anon token, guessability is no
+# longer the only defence, but a 131-bit id removes the surface entirely.
+_BASE62_ALPHABET = string.ascii_letters + string.digits
+
+
+def generate_vm_id() -> str:
+    """Generate a fresh `vm_<22 base62>` id (~131 bits)."""
+    return "vm_" + "".join(secrets.choice(_BASE62_ALPHABET) for _ in range(22))
+
+
+def generate_anon_management_token() -> str:
+    """Generate a one-time anon management token (`hyr_vm_<32 base62>`, ~190
+    bits). Returned in cleartext to the caller of POST /v1/vm/create and
+    NEVER stored — only the sha256 of it lands on the VM row.
+    """
+    return "hyr_vm_" + "".join(secrets.choice(_BASE62_ALPHABET) for _ in range(32))
 
 # --- Enums ---
 
@@ -84,6 +105,11 @@ class VMCreateResponse(BaseModel):
     status: VMStatus
     status_url: str
     estimated_ready_seconds: int = 60
+    # Block A0: one-time anon management token for ownerless VMs. Returned
+    # cleartext once at create time; only sha256 is stored. management_url
+    # is the convenience link that embeds the token as a query param.
+    management_token: str | None = None
+    management_url: str | None = None
 
 
 class VMStatusResponse(BaseModel):
@@ -96,6 +122,21 @@ class VMStatusResponse(BaseModel):
     firewall: FirewallState | None = None
     error: str | None = None
     cost_breakdown: CostBreakdown | None = None
+
+
+class VMPublicStatusResponse(BaseModel):
+    """Sanitized public view returned by `GET /v1/vm/{id}/status`.
+
+    Block A0: any caller (no token, no account) can fetch this for any
+    vm_id. Reveals only the fields needed for an order-status page —
+    NO ssh string, NO firewall config, NO provisioning error detail.
+    """
+
+    vm_id: str
+    status: VMStatus
+    ipv6: str | None = None
+    hostname: str | None = None
+    expires_at: datetime | None = None
 
 
 class FirewallState(BaseModel):
@@ -170,7 +211,7 @@ class CryptoIntentResponse(BaseModel):
 class VMRecord(BaseModel):
     """Internal record tracking a VM through its lifecycle."""
 
-    vm_id: str = Field(default_factory=lambda: f"vm_{uuid.uuid4().hex[:12]}")
+    vm_id: str = Field(default_factory=generate_vm_id)
     xcpng_uuid: str | None = None  # XCP-NG VM UUID once created
     owner_wallet: str = ""  # wallet address that paid
     status: VMStatus = VMStatus.PROVISIONING
