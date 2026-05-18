@@ -49,6 +49,20 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "RUF"]
+# E402 / E501 globally ignored: both are pre-A0 baseline noise (toy
+# AccountRow patches at the bottom of db.py force mid-file imports;
+# several SQLAlchemy Enum / route signatures sit at 100-200 chars).
+# The post-A0 cleanup PR will refactor db.py and reflow long lines;
+# until then, gating new touched files on these style rules would
+# block Wave 1 for cosmetic reasons that don't catch real bugs.
+ignore = ["E402", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# RUF012: mutable class defaults in test mock classes. Each test defines
+# fresh nested mock classes (MockOrchestrator, _OrchOK, etc.) and the
+# mutable-default pitfall (state bleeding across instances) doesn't
+# apply — they're per-test scaffolding. Suppressed only under tests/.
+"tests/*.py" = ["RUF012"]
 
 [tool.mypy]
 python_version = "3.12"

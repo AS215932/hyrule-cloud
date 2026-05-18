@@ -10,14 +10,21 @@ from __future__ import annotations
 from decimal import Decimal
 
 import structlog
-from fastapi import APIRouter, HTTPException, Request, Response, Depends
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from hyrule_cloud.middleware.x402 import PaymentGate
-from hyrule_cloud.state import get_app_state, AppState
+from hyrule_cloud.middleware.anon_token import (
+    anon_management_token,
+    can_manage_vm,
+)
 from hyrule_cloud.models import (
     VM_SPECS,
+    DNSRecord,
+    DNSRecordType,
+    DomainCheckResponse,
     DomainMode,
+    DomainRegisterRequest,
     FirewallState,
+    GenericActionResponse,
     NetworkRequest,
     NetworkResponse,
     OSListResponse,
@@ -29,15 +36,12 @@ from hyrule_cloud.models import (
     VMExtendRequest,
     VMLogEvent,
     VMLogsResponse,
-    GenericActionResponse,
-    DomainCheckResponse,
-    DomainRegisterRequest,
-    DNSRecord,
-    DNSRecordType,
+    VMPublicStatusResponse,
     VMSize,
     VMStatus,
     VMStatusResponse,
 )
+from hyrule_cloud.state import AppState, get_app_state
 
 log = structlog.get_logger()
 
@@ -94,12 +98,54 @@ async def list_os_templates(cfg = Depends(get_cfg)) -> OSListResponse:
     return OSListResponse(templates=templates)
 
 
-@router.get("/vm/{vm_id}", response_model=VMStatusResponse)
-async def get_vm_status(vm_id: str, orch = Depends(get_orch)) -> VMStatusResponse:
+# Block A0: Common dep that loads the VM and enforces management-token
+# gating in one place. Returns the row when the caller proves management
+# authority via `Authorization: Bearer hyr_vm_<...>` or `?token=`. Returns
+# 404 (not 403) on bad/absent token to avoid leaking VM existence to
+# random vm_id guessers — same shape as "VM not found".
+async def _vm_for_management(
+    vm_id: str,
+    request: Request,
+    orch = Depends(get_orch),
+):
     row = await orch.get_vm(vm_id)
     if not row:
         raise HTTPException(404, "VM not found")
+    presented = anon_management_token(request)
+    if not can_manage_vm(row, presented):
+        raise HTTPException(404, "VM not found")
+    return row
 
+
+# Block A0: public sanitized status view. Returns minimal fields needed
+# for an order-status page — NO ssh, NO firewall, NO error detail. Any
+# caller can fetch this for any vm_id; pre-A0 frontends keep working
+# because the legacy `/vm/{id}` URL is still in their templates and now
+# returns 404 unless the caller has a token. Status pages should switch
+# to `/status`.
+@router.get("/vm/{vm_id}/status", response_model=VMPublicStatusResponse)
+async def get_vm_public_status(
+    vm_id: str, orch = Depends(get_orch),
+) -> VMPublicStatusResponse:
+    row = await orch.get_vm(vm_id)
+    if not row:
+        raise HTTPException(404, "VM not found")
+    return VMPublicStatusResponse(
+        vm_id=row.vm_id,
+        status=VMStatus(row.status),
+        ipv6=row.ipv6,
+        hostname=row.hostname,
+        expires_at=row.expires_at,
+    )
+
+
+# Block A0: management-gated full view. Was the only `GET /vm/{id}` route
+# pre-A0 (open to anyone who knew the vm_id). Now requires the anon
+# management token.
+@router.get("/vm/{vm_id}", response_model=VMStatusResponse)
+async def get_vm_status(
+    row = Depends(_vm_for_management),
+) -> VMStatusResponse:
     firewall = None
     if row.open_ports:
         firewall = FirewallState(inbound_allow=list(row.open_ports))
@@ -119,12 +165,11 @@ async def get_vm_status(vm_id: str, orch = Depends(get_orch)) -> VMStatusRespons
 
 
 @router.get("/vm/{vm_id}/logs", response_model=VMLogsResponse)
-async def get_vm_logs(vm_id: str, orch = Depends(get_orch)) -> VMLogsResponse:
-    row = await orch.get_vm(vm_id)
-    if not row:
-        raise HTTPException(404, "VM not found")
+async def get_vm_logs(
+    row = Depends(_vm_for_management),
+) -> VMLogsResponse:
     return VMLogsResponse(
-        vm_id=vm_id,
+        vm_id=row.vm_id,
         status=row.status,
         events=[
             VMLogEvent(ts=row.created_at.isoformat(), event="provisioning_started"),
@@ -163,24 +208,39 @@ async def create_vm(body: VMCreateRequest, request: Request, orch = Depends(get_
         return result
 
     wallet = result
-    row = await orch.create_vm(body, owner_wallet=wallet)
+    row, management_token = await orch.create_vm(body, owner_wallet=wallet)
     row.payment_tx = getattr(request.state, "payment_tx", None)
 
     base_url = str(request.base_url).rstrip("/")
+    # Block A0: status_url is the public sanitized view; management_url
+    # embeds the one-time anon token. UI must surface management_url
+    # prominently with a save-this-once warning — it cannot be retrieved
+    # again.
     return VMCreateResponse(
         vm_id=row.vm_id,
         status=VMStatus(row.status),
-        status_url=f"{base_url}/v1/vm/{row.vm_id}",
+        status_url=f"{base_url}/v1/vm/{row.vm_id}/status",
         estimated_ready_seconds=60,
+        management_token=management_token,
+        management_url=(
+            f"{base_url}/v1/vm/{row.vm_id}?token={management_token}"
+        ),
     )
 
 
 @router.post("/vm/{vm_id}/extend")
-async def extend_vm(vm_id: str, body: VMExtendRequest, request: Request, orch = Depends(get_orch), cfg = Depends(get_cfg), gate = Depends(get_gate)):
-    row = await orch.get_vm(vm_id)
-    if not row:
-        raise HTTPException(404, "VM not found")
-
+async def extend_vm(
+    vm_id: str,
+    body: VMExtendRequest,
+    request: Request,
+    row = Depends(_vm_for_management),
+    orch = Depends(get_orch),
+    cfg = Depends(get_cfg),
+    gate = Depends(get_gate),
+):
+    # Block A0: row already loaded + management-gated by the dep above.
+    # vm_id (path param) is used downstream in the payment description /
+    # response shape.
     price_map = {
         VMSize.XS: cfg.payment.price_vm_xs,
         VMSize.SM: cfg.payment.price_vm_sm,
@@ -215,14 +275,24 @@ async def extend_vm(vm_id: str, body: VMExtendRequest, request: Request, orch = 
 
 
 @router.post("/vm/{vm_id}/reboot", response_model=GenericActionResponse)
-async def reboot_vm(vm_id: str, orch = Depends(get_orch)) -> GenericActionResponse:
+async def reboot_vm(
+    vm_id: str,
+    row = Depends(_vm_for_management),
+    orch = Depends(get_orch),
+) -> GenericActionResponse:
+    # Block A0: management dep ensures caller has the token.
     if not await orch.reboot_vm(vm_id):
         raise HTTPException(404, "VM not found or not running")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} is rebooting")
 
 
 @router.delete("/vm/{vm_id}", response_model=GenericActionResponse)
-async def destroy_vm(vm_id: str, orch = Depends(get_orch)) -> GenericActionResponse:
+async def destroy_vm(
+    vm_id: str,
+    row = Depends(_vm_for_management),
+    orch = Depends(get_orch),
+) -> GenericActionResponse:
+    # Block A0: management dep ensures caller has the token.
     if not await orch.destroy_vm(vm_id):
         raise HTTPException(404, "VM not found")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} destroyed")
@@ -316,7 +386,6 @@ async def delete_zone_record(
     orch = Depends(get_orch),
 ):
     """Delete a DNS record from a zone managed by Hyrule Cloud."""
-    from hyrule_cloud.models import DNSRecordType
     try:
         rtype = DNSRecordType(type.upper())
     except ValueError:
@@ -365,12 +434,14 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
         
     return resp
 
-from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
-from hyrule_cloud.db import CryptoIntentRow
-from sqlalchemy import select
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 import uuid
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import select
+
+from hyrule_cloud.db import CryptoIntentRow
+from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
+
 
 @router.post("/intent/create", response_model=CryptoIntentResponse)
 async def create_crypto_intent(body: CryptoIntentRequest, orch = Depends(get_orch), cfg = Depends(get_cfg)):
@@ -396,7 +467,7 @@ async def create_crypto_intent(body: CryptoIntentRequest, orch = Depends(get_orc
     elif body.asset.upper() == "XMR":
         address, bip32_index = provider.generate_xmr_address()
         
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=60)
+    expires_at = datetime.now(UTC) + timedelta(minutes=60)
     
     row = CryptoIntentRow(
         intent_id=intent_id,

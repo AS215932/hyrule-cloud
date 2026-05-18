@@ -17,12 +17,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import VMRow
+from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
     DomainMode,
     VMCreateRequest,
     VMSize,
     VMStatus,
+    generate_anon_management_token,
+    generate_vm_id,
 )
 from hyrule_cloud.providers.cloudinit import render_cloud_init
 from hyrule_cloud.providers.dns import DNSProvider
@@ -103,20 +106,27 @@ class Orchestrator:
         self,
         request: VMCreateRequest,
         owner_wallet: str,
-    ) -> VMRow:
-        """Create a VM record in DB and start background provisioning."""
-        import uuid
+    ) -> tuple[VMRow, str]:
+        """Create a VM record in DB and start background provisioning.
 
-        vm_id = f"vm_{uuid.uuid4().hex[:12]}"
+        Returns (row, anon_management_token). Block A0: the cleartext
+        token is returned to the caller exactly once — it is never
+        stored, only the sha256 lands on the row. Caller (POST
+        /v1/vm/create) must surface it in the response body so the
+        operator can save the management URL.
+        """
+        vm_id = generate_vm_id()
         hostname_prefix = self._generate_hostname(vm_id)
         hostname = f"{hostname_prefix}.{self.config.deploy_domain}"
         expires_at = _now() + timedelta(days=request.duration_days)
         total, _ = self.compute_price(request)
+        anon_token = generate_anon_management_token()
 
         row = VMRow(
             vm_id=vm_id,
             owner_wallet=owner_wallet,
             status=VMStatus.PROVISIONING,
+            anon_management_token_hash=hash_anon_token(anon_token),
             size=request.size,
             os=request.os,
             ipv6=None,
@@ -140,7 +150,7 @@ class Orchestrator:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-        return row
+        return row, anon_token
 
     async def _provision_vm(self, vm_id: str) -> None:
         """Background provisioning: create VM, wait for IPv6, configure DNS."""

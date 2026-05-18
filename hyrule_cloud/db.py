@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-
-
 from datetime import datetime
 from decimal import Decimal
 
@@ -19,7 +17,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from hyrule_cloud.models import DomainMode, VMSize, VMStatus, CryptoIntentStatus
+from hyrule_cloud.models import CryptoIntentStatus, DomainMode, VMSize, VMStatus
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -84,6 +82,16 @@ class VMRow(Base):
     # Payment
     payment_tx: Mapped[str | None] = mapped_column(String(128))
     cost_total: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+
+    # Block A0: sha256 of the cleartext anon management token. NULL for
+    # legacy pre-A0 rows (those are status-only — management routes refuse
+    # them until claimed). The index is declared in alembic/versions/
+    # 002_security_hotfix.py (ix_vms_anon_management_token_hash); we do
+    # NOT pass `index=True` here so autogenerate never tries to create a
+    # second implicit index with a different name.
+    anon_management_token_hash: Mapped[str | None] = mapped_column(
+        String(64),
+    )
 
     # Extensible metadata
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB)
@@ -191,6 +199,7 @@ async def init_db(engine) -> None:
 
 import secrets
 import string
+
 
 def generate_account_id():
     return ''.join(secrets.choice(string.ascii_uppercase) for _ in range(10))

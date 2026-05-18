@@ -1,10 +1,17 @@
-import pytest
-from httpx import AsyncClient, ASGITransport
-from fastapi import FastAPI, Response
-from hyrule_cloud.app import app
-from hyrule_cloud.models import VMSize, VMStatus, ProxyMode
 from datetime import datetime
 from decimal import Decimal
+
+import pytest
+from fastapi import Response
+from httpx import ASGITransport, AsyncClient
+
+from hyrule_cloud.app import app
+from hyrule_cloud.middleware.anon_token import hash_anon_token
+from hyrule_cloud.models import VMStatus
+
+# Block A0: known token used by the mock VM. Tests that exercise the
+# management-gated routes pass this as Authorization: Bearer / ?token=.
+_TEST_TOKEN = "hyr_vm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 class MockConfig:
     class Payment:
@@ -41,6 +48,9 @@ class MockOrchestrator:
                 error = None
                 open_ports = [22, 80]
                 created_at = datetime.utcnow()
+                # Block A0: matches _TEST_TOKEN, so the management routes
+                # accept the bearer header / ?token= param in tests.
+                anon_management_token_hash = hash_anon_token(_TEST_TOKEN)
             return MockRow()
         return None
 
@@ -98,13 +108,27 @@ async def test_get_os_list(override_state):
 
 @pytest.mark.asyncio
 async def test_get_vm_status(override_state):
+    """Block A0: the old `/v1/vm/{id}` URL is now management-gated. With
+    the correct anon token it still returns the full management view.
+    Without a token it returns 404 (not 403) so vm_id existence does not
+    leak to random guessers."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        res = await client.get("/v1/vm/vm_test123")
+        res = await client.get(
+            "/v1/vm/vm_test123",
+            headers={"Authorization": f"Bearer {_TEST_TOKEN}"},
+        )
         assert res.status_code == 200
         data = res.json()
         assert data["ipv6"] == "2001:db8::1"
-        
-        res_404 = await client.get("/v1/vm/vm_missing")
+
+        # Without the token: 404, same shape as "VM not found".
+        res_no_token = await client.get("/v1/vm/vm_test123")
+        assert res_no_token.status_code == 404
+
+        res_404 = await client.get(
+            "/v1/vm/vm_missing",
+            headers={"Authorization": f"Bearer {_TEST_TOKEN}"},
+        )
         assert res_404.status_code == 404
 
 @pytest.mark.asyncio
