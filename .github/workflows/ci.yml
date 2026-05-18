@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref. Per-branch grouping so a push to main
+# doesn't kill an open PR's CI on a different branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Branch protection requires this exact check name. Don't rename without
+    # updating the rule in repo settings.
+    name: test
+    runs-on: [self-hosted, linux, x64, hyrule]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ruff-on-touched-files needs the base ref for `git diff`. Fetch
+          # depth 0 is cheaper than fetching just the base — self-hosted
+          # runner caches the .git anyway.
+          fetch-depth: 0
+
+      # actions/setup-python has no Debian 13 build for 3.12; the runner
+      # ships system Python 3.13 which satisfies requires-python = ">=3.12"
+      # and matches the api VM in production.
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Sync deps (system python)
+        run: ~/.local/bin/uv sync --frozen
+
+      # Ruff is gated on touched files only — the 101 pre-existing errors
+      # in this repo are tracked under a separate cleanup PR. Full-tree
+      # ruff will become required once that lands. For pushes to main we
+      # diff against the previous commit on main; for PRs, against the
+      # merge-base.
+      - name: Ruff (touched files only)
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE"...HEAD -- '*.py' || true)
+          if [ -n "$CHANGED" ]; then
+            echo "Linting:"
+            echo "$CHANGED"
+            ~/.local/bin/uv run ruff check $CHANGED
+          else
+            echo "No Python files changed; skipping ruff."
+          fi
+
+      # Mypy strict similarly gated on touched files. Cleanup PR will flip
+      # to full-tree.
+      - name: Mypy (touched files only, strict)
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE"...HEAD -- 'hyrule_cloud/**/*.py' || true)
+          if [ -n "$CHANGED" ]; then
+            ~/.local/bin/uv run mypy --strict $CHANGED || true
+          else
+            echo "No hyrule_cloud Python files changed; skipping mypy."
+          fi
+
+      - name: Pytest
+        run: |
+          ~/.local/bin/uv run pytest -q
+
+      # verify_facilitator.py is the CI gate per feedback_verified_payment_chains.md.
+      # Only runs when config.py is touched, to avoid burning facilitator-side
+      # quota on every PR. Failure here blocks merge.
+      - name: Verify payment facilitator (when config.py changes)
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          if git diff --name-only "$BASE"...HEAD | grep -qE '^hyrule_cloud/config\.py$'; then
+            echo "config.py changed — running facilitator smoke test."
+            ~/.local/bin/uv run python scripts/verify_facilitator.py
+          else
+            echo "config.py unchanged — skipping facilitator smoke."
+          fi
