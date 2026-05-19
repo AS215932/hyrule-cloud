@@ -150,20 +150,9 @@ class PaymentConfig(BaseSettings):
     receiver_address: str = ""
     facilitator_url: str = "https://x402.org/facilitator"
 
-    # Legacy shape: list of {"network": "eip155:8453", "asset": "USDC", ...}.
-    # Kept so the x402 SDK's PaymentMiddlewareASGI initialisation keeps working
-    # unchanged. Block C (Wave 3) layers PaymentNetwork on top for the
-    # /v1/payments/networks endpoint and the frontend chain selector — see
-    # `enabled_networks()` below.
-    networks: list[dict[str, str]] = Field(
-        default_factory=lambda: [
-            {"network": n.caip2, "asset": n.asset, "scheme": "exact"}
-            for n in _DEFAULT_NETWORKS if n.enabled
-        ]
-    )
-
     # Block C (Wave 3): the rich PaymentNetwork list. Keyed list rather than a
-    # dict so iteration order matches the order operators set in Vault.
+    # dict so iteration order matches the order operators set in Vault. This
+    # is the SINGLE source of truth — `networks` below is derived.
     payment_networks: list[PaymentNetwork] = Field(
         default_factory=lambda: list(_DEFAULT_NETWORKS),
     )
@@ -173,6 +162,19 @@ class PaymentConfig(BaseSettings):
         off via Vault without redeploying — the frontend's chain selector
         picks up the change on the next /v1/payments/networks poll."""
         return [n for n in self.payment_networks if n.enabled]
+
+    @property
+    def networks(self) -> list[dict[str, str]]:
+        """Legacy shape: list of {"network": "eip155:8453", "asset": "USDC", ...}.
+        Kept so the x402 SDK's PaymentMiddlewareASGI initialisation keeps
+        working unchanged. Derived (not stored) so it cannot drift from
+        `payment_networks` — per Sourcery cloud#7 review: operators that
+        flip `enabled=False` on a chain should see the SDK config update
+        automatically without a second knob to flip."""
+        return [
+            {"network": n.caip2, "asset": n.asset, "scheme": "exact"}
+            for n in self.enabled_networks()
+        ]
 
     btc_xpub: str = ""
     xmr_viewkey: str = ""

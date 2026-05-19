@@ -119,10 +119,14 @@ async def create_api_key(
     scopes: list[str],
     expires_at: datetime | None = None,
 ) -> tuple[str, ApiKeyRow]:
-    """Mint a fresh key, persist, return (cleartext, row).
+    """Mint a fresh key, persist (caller commits), return (cleartext, row).
 
     Caller is responsible for surfacing the cleartext to the user exactly
-    once and then dropping the reference."""
+    once and then dropping the reference. Caller also owns the transaction
+    boundary — `flush` queues the INSERT and assigns the row's defaults
+    without ending the transaction, so the register flow can atomically
+    write the account + session + key together (per Sourcery cloud#7
+    review)."""
     cleartext = generate_api_key()
     row = ApiKeyRow(
         key_id=str(uuid.uuid4()),
@@ -133,7 +137,7 @@ async def create_api_key(
         expires_at=expires_at,
     )
     session.add(row)
-    await session.commit()
+    await session.flush()
     return cleartext, row
 
 
@@ -178,7 +182,10 @@ async def revoke_api_key(
 ) -> bool:
     """Revoke. Idempotent (revoking an already-revoked key is a no-op 200).
     Returns True if a row was found and account-scoped; False if the key_id
-    doesn't belong to this account (route surfaces a 404 in that case)."""
+    doesn't belong to this account (route surfaces a 404 in that case).
+
+    Caller commits — keeps the helper composable with any wider
+    transaction (per Sourcery cloud#7)."""
     row = await session.scalar(
         select(ApiKeyRow).where(ApiKeyRow.key_id == key_id)
     )
@@ -191,7 +198,7 @@ async def revoke_api_key(
         .where(ApiKeyRow.key_id == key_id)
         .values(revoked_at=datetime.now(UTC))
     )
-    await session.commit()
+    await session.flush()
     return True
 
 

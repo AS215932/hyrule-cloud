@@ -41,7 +41,6 @@ def upgrade() -> None:
             sa.String(11),
             sa.ForeignKey("accounts.account_id", ondelete="CASCADE"),
             nullable=False,
-            index=True,
         ),
         sa.Column("key_hash", sa.String(64), nullable=False, unique=True),
         sa.Column("name", sa.String(64), nullable=False),
@@ -56,9 +55,14 @@ def upgrade() -> None:
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
     )
+    # Explicit indices: alembic ignores `index=True` on sa.Column (only the
+    # SQLAlchemy declarative `Mapped[...]` form picks it up). Per Sourcery
+    # cloud#7 review.
+    op.create_index("ix_api_keys_account_id", "api_keys", ["account_id"])
     op.create_index("ix_api_keys_key_hash", "api_keys", ["key_hash"], unique=True)
 
 
 def downgrade() -> None:
     op.drop_index("ix_api_keys_key_hash", table_name="api_keys")
+    op.drop_index("ix_api_keys_account_id", table_name="api_keys")
     op.drop_table("api_keys")

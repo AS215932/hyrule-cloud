@@ -455,6 +455,14 @@ async def list_api_keys() -> str:
         return _err(e)
 
 
+def _scope_vocabulary() -> str:
+    """Render the live ApiKeyScope vocabulary so the create_api_key tool's
+    docstring (and any caller passing it through to an LLM) can't drift
+    from the enum — per Sourcery cloud#7 review."""
+    from hyrule_cloud.services.api_keys import ApiKeyScope as _Scope
+    return ", ".join(s.value for s in _Scope)
+
+
 @mcp.tool()
 async def create_api_key(
     name: str,
@@ -469,8 +477,8 @@ async def create_api_key(
     minted via an API key (not a session), the requested scopes must be
     a subset of the issuing key's scopes (no escalation).
 
-    Valid scopes: vm:read, vm:create, vm:reboot, vm:extend, vm:destroy,
-    intent:create, intent:read, domain:register, api_keys:read, api_keys:write.
+    Valid scopes are sourced live from the backend's ApiKeyScope enum;
+    call `list_api_keys` if you need to see what's currently advertised.
     """
     try:
         async with _client() as hc:

@@ -296,11 +296,14 @@ async def register(
             ip_prefix_hash=ip_hash,
         )
 
-        # Block D (Wave 3): mint a starter API key in the same transaction
-        # as the account creation when the caller asked for one. The starter
-        # scopes are intentionally narrow (vm:read/create, intent:read/create)
-        # so an agent's first key can't destroy a VM it never wrote — they
-        # have to mint a more powerful key from the dashboard to opt in.
+        # Block D (Wave 3): mint a starter API key alongside the account
+        # when the caller asked for one. The starter scopes are intentionally
+        # narrow (vm:read/create, intent:read/create) so an agent's first
+        # key can't destroy a VM it never wrote — they have to mint a wider
+        # key from the dashboard to opt in. svc_create_api_key flushes but
+        # does not commit; we commit once below so the key INSERT lands
+        # atomically with whatever else this transaction queued (Sourcery
+        # cloud#7 review).
         api_key_cleartext: str | None = None
         api_key_id: str | None = None
         api_key_scopes: list[str] | None = None
@@ -311,6 +314,7 @@ async def register(
                 name=(body.api_key_name or "agent-bootstrap")[:64],
                 scopes=[s.value for s in DEFAULT_BOOTSTRAP_SCOPES],
             )
+            await db.commit()
             api_key_cleartext = cleartext
             api_key_id = key_row.key_id
             api_key_scopes = list(key_row.scopes)
@@ -817,6 +821,7 @@ async def create_api_key_endpoint(
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        await db.commit()
 
     return ApiKeyCreateResponse(api_key=cleartext, key=_key_summary(row))
 
@@ -846,6 +851,7 @@ async def revoke_api_key_endpoint(
         raise HTTPException(503, "Database not available")
     async with factory() as db:
         found = await svc_revoke_key(db, account_id=account.account_id, key_id=key_id)
+        await db.commit()
     if not found:
         raise HTTPException(404, "API key not found")
     return {"key_id": key_id, "revoked": True}
