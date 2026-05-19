@@ -119,10 +119,22 @@ async def revoke_all_sessions_for(session: AsyncSession, account_id: str) -> int
 
 
 async def purge_expired_sessions(session: AsyncSession) -> int:
-    """Best-effort cleanup; safe to run on a schedule. Returns rows deleted."""
-    # Compare in DB-native time to avoid loading rows; this works on both PG and SQLite.
+    """Best-effort cleanup; safe to run on a schedule. Returns rows deleted.
+
+    Both sides of the comparison are explicit about timezone (per Sourcery
+    cloud#6 review): on Postgres `expires_at` is `timestamptz`, on SQLite it
+    becomes naive. We dispatch on the bind's dialect so the bound `_now()`
+    matches the column type — never mix aware-on-PG with naive-on-Python
+    silently.
+    """
+    bind = session.get_bind()
+    cutoff: datetime
+    if bind is not None and bind.dialect.name == "sqlite":
+        cutoff = _now().replace(tzinfo=None)
+    else:
+        cutoff = _now()
     result = await session.execute(
-        delete(SessionRow).where(SessionRow.expires_at < _now().replace(tzinfo=None))
+        delete(SessionRow).where(SessionRow.expires_at < cutoff)
     )
     await session.commit()
     return result.rowcount or 0
