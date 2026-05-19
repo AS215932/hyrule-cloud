@@ -12,14 +12,14 @@ scanning internal networks or metadata services via the proxy endpoint.
 from __future__ import annotations
 
 import socket
-import structlog
 import urllib.parse
 from ipaddress import ip_address
 
 import httpx
+import structlog
 
 from hyrule_cloud.models import NetworkRequest, NetworkResponse, ProxyMode
-from hyrule_cloud.providers.base import Provider, ProviderError
+from hyrule_cloud.providers.base import Provider
 
 log = structlog.get_logger()
 
@@ -94,4 +94,4 @@ class NetworkProvider(Provider):
         except httpx.RequestError as exc:
             elapsed = httpx._utils.time.perf_counter() - start_time
             log.warning("network_request_failed", exc=str(exc), url=req.url, proxy_mode=req.proxy_mode)
-            return NetworkResponse(status_code=502, headers={}, body="", elapsed_seconds=elapsed, proxy_mode=req.proxy_mode, error=f"Network error: {str(exc)}")
+            return NetworkResponse(status_code=502, headers={}, body="", elapsed_seconds=elapsed, proxy_mode=req.proxy_mode, error=f"Network error: {exc!s}")

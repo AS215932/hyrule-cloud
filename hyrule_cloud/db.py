@@ -4,8 +4,11 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    JSON,
+    Boolean,
     DateTime,
     Enum,
+    ForeignKey,
     Index,
     Integer,
     Numeric,
@@ -16,6 +19,13 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+# Portable JSON: PG gets ARRAY(Integer) / JSONB for performance; SQLite (tests
+# only — production is always Postgres) falls back to generic JSON columns.
+# This keeps production schema unchanged while letting unit tests use an
+# in-memory engine without testcontainers.
+_INT_ARRAY = ARRAY(Integer).with_variant(JSON(), "sqlite")
+_JSONB = JSONB().with_variant(JSON(), "sqlite")
 
 from hyrule_cloud.models import CryptoIntentStatus, DomainMode, VMSize, VMStatus
 
@@ -29,7 +39,8 @@ class VMRow(Base):
 
     __tablename__ = "vms"
 
-    # Primary key is our generated vm_id (e.g. "vm_a1b2c3d4e5f6")
+    # Primary key is our generated vm_id. New IDs: vm_<22 base62> (~131 bits).
+    # Legacy: vm_<12 hex>. Column width covers both.
     vm_id: Mapped[str] = mapped_column(String(32), primary_key=True)
 
     # XCP-NG reference
@@ -37,6 +48,18 @@ class VMRow(Base):
 
     # Ownership
     owner_wallet: Mapped[str] = mapped_column(String(64), index=True)
+
+    # Account ownership (Block A1). When set, account auth supersedes
+    # anon_management_token — the can_manage_vm helper checks account first.
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+
+    # Anon-checkout management token (sha256 hex of the cleartext secret).
+    # NULL on legacy VMs (created before A0) → management actions denied until claimed.
+    # When an account claims a VM, this is rotated to NULL (account ownership supersedes).
+    # When an account is detach-deleted, a fresh token is issued and shown to the user once.
+    anon_management_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
 
     # VM configuration
     status: Mapped[str] = mapped_column(
@@ -54,7 +77,7 @@ class VMRow(Base):
 
     # Firewall
     open_ports: Mapped[list[int]] = mapped_column(
-        ARRAY(Integer),
+        _INT_ARRAY,
         default=list,
     )
 
@@ -73,6 +96,11 @@ class VMRow(Base):
         DateTime(timezone=True),
         server_default=func.now(),
     )
+    # Block B: stamped by the orchestrator when status flips to READY. The
+    # /v1/stats/runtime endpoint averages (provisioned_at - created_at) over
+    # the most recent rows so the homepage can show a live "avg provision"
+    # number instead of a hardcoded ~60s.
+    provisioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     destroyed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -83,18 +111,8 @@ class VMRow(Base):
     payment_tx: Mapped[str | None] = mapped_column(String(128))
     cost_total: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
 
-    # Block A0: sha256 of the cleartext anon management token. NULL for
-    # legacy pre-A0 rows (those are status-only — management routes refuse
-    # them until claimed). The index is declared in alembic/versions/
-    # 002_security_hotfix.py (ix_vms_anon_management_token_hash); we do
-    # NOT pass `index=True` here so autogenerate never tries to create a
-    # second implicit index with a different name.
-    anon_management_token_hash: Mapped[str | None] = mapped_column(
-        String(64),
-    )
-
     # Extensible metadata
-    metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB)
+    metadata_: Mapped[dict | None] = mapped_column("metadata", _JSONB)
 
     __table_args__ = (
         Index("ix_vms_status_expires", "status", "expires_at"),
@@ -142,7 +160,12 @@ class VPNTunnelRow(Base):
 
 
 class CryptoIntentRow(Base):
-    """Tracking for native crypto payment intents."""
+    """Tracking for native crypto payment intents (BTC/XMR).
+
+    Block E expanded this from a simple PENDING/PAID/EXPIRED row to a full
+    state machine with idempotency, rate snapshots, and the order payload
+    carried through to provisioning.
+    """
 
     __tablename__ = "crypto_intents"
 
@@ -153,7 +176,7 @@ class CryptoIntentRow(Base):
     address: Mapped[str] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(
         Enum(CryptoIntentStatus, name="crypto_intent_status", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
-        default=CryptoIntentStatus.PENDING,
+        default=CryptoIntentStatus.CREATED,
     )
     bip32_index: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
@@ -164,8 +187,38 @@ class CryptoIntentRow(Base):
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     tx_hash: Mapped[str | None] = mapped_column(String(128))
 
+    # --- Block E additions ---
+    # Idempotency key from client; same key returns the same intent on POST.
+    client_order_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    # Full VM creation spec carried through to the orchestrator on settlement.
+    order_payload: Mapped[dict | None] = mapped_column(_JSONB)
+    # Rate at intent creation; payment must arrive before rate_valid_until OR
+    # qualify under the LENIENT re-quote rule (see providers/native_crypto.py).
+    rate_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
+    rate_valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    confirmations: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # What actually landed on-chain — may differ from amount_crypto (over/under-pay).
+    amount_received_crypto: Mapped[Decimal | None] = mapped_column(Numeric(24, 12))
+    # Exactly-once provisioning trigger: orchestrator pickup is gated by an
+    # atomic UPDATE ... WHERE provisioning_triggered_at IS NULL RETURNING.
+    provisioning_triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # XMR-specific: subaddress index inside the view-only wallet account.
+    xmr_subaddr_index: Mapped[int | None] = mapped_column(Integer, unique=True)
+    last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Account ownership (A1 parity) — set when intent was created from a logged-in session.
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+    # Once provisioned, link back to the VM created on settlement.
+    vm_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    # One-shot reveal: cleartext anon-management token created at provision time.
+    # The next successful GET /v1/intent/{id} returns this AND nulls the column,
+    # mirroring the A0 anon-checkout reveal pattern. Sha256 lives on VMRow.
+    anon_token_cleartext: Mapped[str | None] = mapped_column(String(64))
+
     __table_args__ = (
         Index("ix_crypto_intents_status_expires", "status", "expires_at"),
+        Index("ix_crypto_intents_asset_bip32", "asset", "bip32_index"),
     )
 
 
@@ -198,14 +251,85 @@ async def init_db(engine) -> None:
 
 
 import secrets
-import string
 
 
-def generate_account_id():
-    return ''.join(secrets.choice(string.ascii_uppercase) for _ in range(10))
+def generate_account_id() -> str:
+    """H<10 hex chars> ≈ 41 bits. Random, no PII, no username collisions across users.
+
+    Accounts are addressed by this opaque id; there is no concept of a chosen
+    handle in v1 (see plan: no PII, no name-squatting).
+    """
+    return "H" + secrets.token_hex(5).upper()
+
 
 class AccountRow(Base):
+    """Anonymous account. No email, no PII. Auth is account_id + password."""
+
     __tablename__ = "accounts"
-    account_id: Mapped[str] = mapped_column(String(10), primary_key=True, default=generate_account_id)
-    api_key: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    account_id: Mapped[str] = mapped_column(
+        String(11), primary_key=True, default=generate_account_id
+    )
+    # argon2id. Plain sha256 is rejected even for high-entropy secrets — recovery
+    # codes (see recovery_code_hash) get the same treatment.
+    password_hash: Mapped[str] = mapped_column(String(256))
+
+    # One-time recovery code (argon2id-hashed). Issued at signup, single-use,
+    # rotates on consumption. The cleartext is revealed ONCE; if the user
+    # loses it AND has never settled an x402 payment, the account is unrecoverable.
+    recovery_code_hash: Mapped[str | None] = mapped_column(String(256))
+    recovery_code_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recovery_code_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+
+
+class SessionRow(Base):
+    """Opaque session token. Server-side, revocable. Cookie value is sha256-hashed at rest."""
+
+    __tablename__ = "sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="CASCADE"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    user_agent: Mapped[str | None] = mapped_column(String(256))
+    # sha256(/64 IPv6 prefix + pepper). Abuse-only; we do not store full IPs.
+    ip_prefix_hash: Mapped[str | None] = mapped_column(String(64))
+
+
+# Block D (Wave 3) will add ApiKeyRow here. Wave 2 ships without it —
+# the scoped-API-key surface is intentionally separated so A1 can ship
+# without depending on alembic 006 / the bearer-key middleware path.
+
+
+class RecoveryAttemptRow(Base):
+    """Audit + rate-limit log for password recovery attempts (both code and wallet paths)."""
+
+    __tablename__ = "recovery_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str | None] = mapped_column(String(11), index=True)
+    method: Mapped[str] = mapped_column(String(16))  # "code" | "wallet"
+    success: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    ip_prefix_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+# Block F (Wave 5) will add RecoveryChallengeRow here for wallet-signature
+# password recovery. Wave 2 ships only the code-based recovery path, which
+# does not need a server-side nonce store.

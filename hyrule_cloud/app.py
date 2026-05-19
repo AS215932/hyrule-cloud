@@ -14,9 +14,11 @@ import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
+from hyrule_cloud.api.auth import router as auth_router
 from hyrule_cloud.api.routes import router
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
+from hyrule_cloud.middleware.metrics import install_metrics
 from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
 
@@ -40,6 +42,7 @@ log = structlog.get_logger().bind(service="hyrule-cloud")
 
 
 from hyrule_cloud.state import AppState
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -102,6 +105,13 @@ app = FastAPI(
 )
 
 app.include_router(router)
+# Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
+app.include_router(auth_router)
+
+# Block B (Wave 2): per-process request-latency middleware feeds
+# `/v1/stats/runtime`. Cheap (one perf_counter per request + O(1) deque
+# append) and bounded in memory.
+install_metrics(app)
 
 
 @app.get("/health")

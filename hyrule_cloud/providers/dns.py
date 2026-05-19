@@ -13,16 +13,16 @@ from __future__ import annotations
 import asyncio
 from functools import partial
 
+import dns.message
 import dns.name
+import dns.query
 import dns.rdatatype
 import dns.tsigkeyring
 import dns.update
-import dns.query
-import dns.message
 import structlog
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.providers.base import Provider, ProviderError
+from hyrule_cloud.providers.base import Provider
 
 log = structlog.get_logger()
 

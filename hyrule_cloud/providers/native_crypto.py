@@ -1,7 +1,8 @@
-import httpx
 import logging
 from decimal import Decimal
-from typing import Optional, Dict, Any
+
+import httpx
+
 from hyrule_cloud.config import PaymentConfig
 
 log = logging.getLogger(__name__)

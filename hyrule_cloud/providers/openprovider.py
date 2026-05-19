@@ -19,6 +19,7 @@ log = structlog.get_logger()
 
 from hyrule_cloud.providers.base import Provider, ProviderError
 
+
 class OpenproviderError(ProviderError):
     def __init__(self, code: int, desc: str) -> None:
         self.openprovider_code = code

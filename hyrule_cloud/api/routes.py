@@ -16,6 +16,7 @@ from hyrule_cloud.middleware.anon_token import (
     anon_management_token,
     can_manage_vm,
 )
+from hyrule_cloud.middleware.auth import current_account
 from hyrule_cloud.models import (
     VM_SPECS,
     DNSRecord,
@@ -61,6 +62,100 @@ def get_network(app_state: AppState = Depends(get_app_state)):
     return app_state.network_provider
 
 
+# --- Block B (Wave 2): runtime metrics ---
+
+# 20s TTL cache: the DB count + provisioned-at query is cheap but not free,
+# and the endpoint can be hit several times per page-load by polling
+# dashboards. Per-process; on a multi-worker deploy each worker has its own.
+# Tests reset this directly via `_RUNTIME_CACHE.clear()`.
+from cachetools import TTLCache as _TTLCache
+
+_RUNTIME_CACHE: _TTLCache = _TTLCache(maxsize=2, ttl=20)
+
+
+@router.get("/stats/runtime")
+async def get_runtime_stats(
+    request: Request,
+    orch = Depends(get_orch),
+) -> dict:
+    """Per-process live runtime metrics.
+
+    Source is labelled `api-process-local-rolling-window` because the
+    deque is per-worker (uvicorn runs one event loop per worker; we don't
+    aggregate). Fleet-wide stats land in Block H via Prometheus on `mon`.
+
+    Fields always present (with sensible fallbacks when no samples exist
+    yet):
+      - api_p50_ms: p50 of the last 1000 requests, milliseconds
+      - api_p50_source: provenance label
+      - sample_count: how many samples back the p50
+      - live_vms: VMs currently READY
+      - build_queue: VMs currently PROVISIONING
+      - avg_provision_seconds: rolling avg of (provisioned_at - created_at)
+        over the last 50 READY VMs (None if no provisioned_at data)
+      - updated_at: ISO8601 UTC when computed
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import func as sa_func
+    from sqlalchemy import select
+
+    from hyrule_cloud.db import VMRow
+    from hyrule_cloud.models import VMStatus
+
+    cached = _RUNTIME_CACHE.get("runtime")
+    if cached is not None:
+        return cached
+
+    metrics = getattr(request.app.state, "metrics", None)
+    p50 = metrics.percentile(0.5) if metrics is not None else None
+    sample_count = metrics.sample_count() if metrics is not None else 0
+
+    live_vms = 0
+    build_queue = 0
+    avg_provision_seconds = None
+    try:
+        async with orch.db() as db:
+            counts = await db.execute(
+                select(VMRow.status, sa_func.count()).group_by(VMRow.status)
+            )
+            for status, c in counts.all():
+                # `live_vms` counts everything that's not destroyed/failed —
+                # both READY and still-PROVISIONING contribute (a VM in the
+                # build queue still consumes hypervisor resources).
+                if status in (VMStatus.READY, VMStatus.PROVISIONING):
+                    live_vms += c
+                if status == VMStatus.PROVISIONING:
+                    build_queue = c
+            # Rolling avg over the last 50 provisioned VMs.
+            recent = await db.execute(
+                select(VMRow.created_at, VMRow.provisioned_at)
+                .where(VMRow.provisioned_at.is_not(None))
+                .order_by(VMRow.provisioned_at.desc())
+                .limit(50)
+            )
+            durations = [
+                (p - c).total_seconds()
+                for c, p in recent.all() if c is not None and p is not None
+            ]
+            if durations:
+                avg_provision_seconds = round(sum(durations) / len(durations), 1)
+    except Exception as exc:
+        log.warning("runtime_stats_db_failed", error=str(exc))
+
+    payload = {
+        "api_p50_ms": p50 if p50 is not None else 0,
+        "api_p50_source": "api-process-local-rolling-window",
+        "api_p50_sample_count": sample_count,
+        "live_vms": live_vms,
+        "build_queue": build_queue,
+        "avg_provision_seconds": avg_provision_seconds,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    _RUNTIME_CACHE["runtime"] = payload
+    return payload
+
+
 # --- Free endpoints ---
 
 
@@ -98,23 +193,35 @@ async def list_os_templates(cfg = Depends(get_cfg)) -> OSListResponse:
     return OSListResponse(templates=templates)
 
 
-# Block A0: Common dep that loads the VM and enforces management-token
-# gating in one place. Returns the row when the caller proves management
-# authority via `Authorization: Bearer hyr_vm_<...>` or `?token=`. Returns
-# 404 (not 403) on bad/absent token to avoid leaking VM existence to
+# Common dep that loads the VM and enforces management authority in one
+# place. Authority sources (in order of preference):
+#   - Block A1 (Wave 2): caller's session cookie resolves to an account
+#     that matches the VM's `owner_account_id` (or caller is admin).
+#   - Block A0 (Wave 1): caller presented a valid anon management token
+#     via `Authorization: Bearer hyr_vm_<...>` or `?token=`.
+# 404 (not 403) on bad/absent authority to avoid leaking VM existence to
 # random vm_id guessers — same shape as "VM not found".
 async def _vm_for_management(
     vm_id: str,
     request: Request,
     orch = Depends(get_orch),
+    account = Depends(current_account),
 ):
     row = await orch.get_vm(vm_id)
     if not row:
         raise HTTPException(404, "VM not found")
+    # Account-ownership path (A1).
+    if account is not None and row.owner_account_id is not None:
+        if account.account_id == row.owner_account_id or getattr(account, "is_admin", False):
+            return row
+    # Anon-token path (A0). Still valid for ownerless rows AND for
+    # account-owned rows — the management token is the bearer credential
+    # the order flow handed out; sessions add a second path, they don't
+    # remove the first.
     presented = anon_management_token(request)
-    if not can_manage_vm(row, presented):
-        raise HTTPException(404, "VM not found")
-    return row
+    if can_manage_vm(row, presented):
+        return row
+    raise HTTPException(404, "VM not found")
 
 
 # Block A0: public sanitized status view. Returns minimal fields needed
@@ -182,7 +289,18 @@ async def get_vm_logs(
 
 
 @router.post("/vm/create")
-async def create_vm(body: VMCreateRequest, request: Request, orch = Depends(get_orch), cfg = Depends(get_cfg), gate = Depends(get_gate)):
+async def create_vm(
+    body: VMCreateRequest,
+    request: Request,
+    orch = Depends(get_orch),
+    cfg = Depends(get_cfg),
+    gate = Depends(get_gate),
+    # Block A1 (Wave 2): if the caller has a session cookie, the new VM is
+    # attached to their account so it shows up on /dashboard immediately
+    # without a separate claim step. Anon callers (account=None) get the
+    # A0 management-token flow unchanged.
+    account = Depends(current_account),
+):
     if body.domain_mode == DomainMode.CUSTOM and not body.domain:
         raise HTTPException(400, "domain required when domain_mode=custom")
 
@@ -208,7 +326,10 @@ async def create_vm(body: VMCreateRequest, request: Request, orch = Depends(get_
         return result
 
     wallet = result
-    row, management_token = await orch.create_vm(body, owner_wallet=wallet)
+    row, management_token = await orch.create_vm(
+        body, owner_wallet=wallet,
+        owner_account_id=account.account_id if account else None,
+    )
     row.payment_tx = getattr(request.state, "payment_tx", None)
 
     base_url = str(request.base_url).rstrip("/")

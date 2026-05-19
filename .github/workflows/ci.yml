@@ -94,18 +94,20 @@ jobs:
           ~/.local/bin/uv run pytest -q
 
       # verify_facilitator.py is the CI gate per feedback_verified_payment_chains.md.
-      # Only runs when config.py is touched, to avoid burning facilitator-side
-      # quota on every PR. Failure here blocks merge.
-      - name: Verify payment facilitator (when config.py changes)
+      # Triggers only when PaymentConfig itself changes (not unrelated feature
+      # flags or other config edits) to avoid burning facilitator-side quota
+      # on every PR. Failure here blocks merge.
+      - name: Verify payment facilitator (when PaymentConfig changes)
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE="${{ github.event.pull_request.base.sha }}"
           else
             BASE="${{ github.event.before }}"
           fi
-          if git diff --name-only "$BASE"...HEAD | grep -qE '^hyrule_cloud/config\.py$'; then
-            echo "config.py changed — running facilitator smoke test."
-            ~/.local/bin/uv run python scripts/verify_facilitator.py
+          DIFF=$(git diff "$BASE"...HEAD -- hyrule_cloud/config.py || true)
+          if echo "$DIFF" | grep -qE '^[+-].*(class PaymentConfig|facilitator_url|networks[[:space:]]*[:=]|"network":|receiver_address)'; then
+            echo "PaymentConfig changed — running facilitator smoke test."
+            PYTHONPATH=. ~/.local/bin/uv run python scripts/verify_facilitator.py
           else
-            echo "config.py unchanged — skipping facilitator smoke."
+            echo "PaymentConfig unchanged — skipping facilitator smoke."
           fi
