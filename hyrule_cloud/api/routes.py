@@ -159,6 +159,44 @@ async def get_runtime_stats(
 # --- Free endpoints ---
 
 
+@router.get("/payments/networks")
+async def get_payment_networks(cfg = Depends(get_cfg)) -> dict:
+    """Block C (Wave 3): the canonical list of supported payment chains.
+
+    The frontend chain selector and any agent SDK that wants to know what
+    chains we accept reads from here — NEVER hardcodes the list client-side
+    (per feedback_verified_payment_chains.md). Operators can flip a chain
+    off via Vault (PAYMENT_PAYMENT_NETWORKS__N__enabled=false) and the
+    frontend picks it up on the next poll without a redeploy.
+
+    Shape: `{ networks: [...], receiver_address, facilitator_url }`. Each
+    network dict carries the CAIP-2 identifier (canonical for x402 v2), the
+    EIP-712 domain shape (so the wallet adapter doesn't have to bake one
+    in), and the explorer URL for the post-pay receipt link.
+    """
+    return {
+        "networks": [
+            {
+                "key": n.key,
+                "display_name": n.display_name,
+                "caip2": n.caip2,
+                "family": n.family,
+                "chain_id": n.chain_id,
+                "asset": n.asset,
+                "token_address": n.token_address,
+                "token_decimals": n.token_decimals,
+                "eip712_domain": n.eip712_domain,
+                "rpc_url": n.rpc_url,
+                "block_explorer_url": n.block_explorer_url,
+                "testnet": n.testnet,
+            }
+            for n in cfg.payment.enabled_networks()
+        ],
+        "receiver_address": cfg.payment.receiver_address,
+        "facilitator_url": cfg.payment.facilitator_url,
+    }
+
+
 @router.get("/pricing", response_model=PricingResponse)
 async def get_pricing(cfg = Depends(get_cfg)) -> PricingResponse:
     return PricingResponse(

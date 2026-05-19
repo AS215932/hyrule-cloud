@@ -310,9 +310,37 @@ class SessionRow(Base):
     ip_prefix_hash: Mapped[str | None] = mapped_column(String(64))
 
 
-# Block D (Wave 3) will add ApiKeyRow here. Wave 2 ships without it —
-# the scoped-API-key surface is intentionally separated so A1 can ship
-# without depending on alembic 006 / the bearer-key middleware path.
+class ApiKeyRow(Base):
+    """Scoped API key for programmatic VM management (Block D / Wave 3).
+
+    The cleartext bearer (`hyr_sk_<32 base62>`) is revealed exactly ONCE at
+    creation and never stored. `key_hash` is sha256(cleartext); high entropy
+    means a fast hash is fine (same rationale as anon management tokens).
+
+    Scopes are an explicit JSON list of `ApiKeyScope` values. The middleware
+    enforces them on every API-key-authed request; cookie sessions are
+    unrestricted (a session = full account access). API keys CANNOT be used
+    for password changes, recovery rotation, or account deletion — those are
+    browser-only via require_browser_session. See [[feedback_security_split]].
+    """
+
+    __tablename__ = "api_keys"
+
+    key_id: Mapped[str] = mapped_column(String(36), primary_key=True)  # uuid4
+    account_id: Mapped[str] = mapped_column(
+        String(11),
+        ForeignKey("accounts.account_id", ondelete="CASCADE"),
+        index=True,
+    )
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    scopes: Mapped[list] = mapped_column(_JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class RecoveryAttemptRow(Base):

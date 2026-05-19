@@ -44,6 +44,12 @@ class _MockPaymentConfig:
     price_proxy_tor = Decimal("0.05")
     price_proxy_residential = Decimal("0.20")
     dev_bypass_secret = ""
+    receiver_address = ""
+    facilitator_url = "https://x402.org/facilitator"
+    payment_networks: list = []
+
+    def enabled_networks(self) -> list:
+        return []
 
 
 class _MockXCPNG:
@@ -674,22 +680,40 @@ async def test_recovery_rate_limit_kicks_in(auth_state, client):
 
 
 @pytest.mark.asyncio
-async def test_register_with_api_key_flag_returns_400_for_now(auth_state, client):
-    """Wave 2 (per Sourcery cloud#6 review): with_api_key=true is the Block-D
-    agent-bootstrap path; it ships in Wave 3. Until then, the endpoint must
-    400 BEFORE creating any account/session state — locking that contract in
-    keeps a future contributor from accidentally enabling a half-implemented
-    path that would leak orphaned account rows.
+async def test_register_with_api_key_mints_starter_key(auth_state, client):
+    """Wave 3 (Block D): with_api_key=true returns a cleartext hyr_sk_
+    bearer alongside the recovery code. The starter key gets the
+    DEFAULT_BOOTSTRAP_SCOPES (vm:read/create, intent:read/create) — narrow
+    enough that an agent's first key can't destroy a VM by accident.
     """
     res = await client.post(
         "/v1/auth/register",
         json={"password": "nora long pw 12345678", "with_api_key": True},
     )
-    assert res.status_code == 400
-    assert "Wave 3" in res.json()["detail"]
-    # No cookie set — the rejection happens before /v1/auth/register would
-    # normally call response.set_cookie.
-    assert "hyr_sess" not in res.cookies
+    assert res.status_code == 200
+    body = res.json()
+    assert body["api_key"].startswith("hyr_sk_")
+    assert body["api_key_id"]
+    assert "vm:read" in body["api_key_scopes"]
+    assert "vm:create" in body["api_key_scopes"]
+    # Destructive scopes NOT in the bootstrap set.
+    assert "vm:destroy" not in body["api_key_scopes"]
+    # Session cookie still set — register also logs the caller in.
+    assert "hyr_sess" in res.cookies
+
+
+@pytest.mark.asyncio
+async def test_register_without_api_key_omits_key_fields(auth_state, client):
+    """Wave 3: with_api_key omitted/false → api_key fields stay None."""
+    res = await client.post(
+        "/v1/auth/register",
+        json={"password": "olive long pw 1234567"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["api_key"] is None
+    assert body["api_key_id"] is None
+    assert body["api_key_scopes"] is None
 
 
 # --- Test: /me/recovery-code rotation ---

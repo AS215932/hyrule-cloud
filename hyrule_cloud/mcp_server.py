@@ -40,10 +40,19 @@ mcp = FastMCP(
 
 _api_url = os.environ.get("HYRULE_API_URL", "https://cloud.hyrule.host")
 _dev_bypass = os.environ.get("HYRULE_DEV_BYPASS", "")
+# Wave 3 (Block D): agents bootstrap their first key via `register_account`
+# and persist it as HYRULE_API_KEY. Once set, every subsequent MCP call is
+# authenticated via that bearer (no x402 payment needed for free endpoints,
+# scope-gated for paid ones).
+_api_key = os.environ.get("HYRULE_API_KEY", "")
 
 
 def _client() -> HyruleClient:
-    return HyruleClient(_api_url, dev_bypass=_dev_bypass or None)
+    return HyruleClient(
+        _api_url,
+        dev_bypass=_dev_bypass or None,
+        api_key=_api_key or None,
+    )
 
 
 def _err(e: HyruleError) -> str:
@@ -323,6 +332,168 @@ async def delete_dns_record(zone: str, name: str, record_type: str) -> str:
             await hc.delete_record(zone, name, record_type)
             fqdn = f"{name}.{zone}" if name != "@" else zone
             return f"Record deleted: {fqdn} {record_type}"
+    except HyruleError as e:
+        return _err(e)
+
+
+# --- Block C + D (Wave 3): payments + accounts + API keys ---
+
+
+@mcp.tool()
+async def list_payment_networks() -> str:
+    """List the payment chains the backend currently accepts (Block C).
+
+    Use this BEFORE picking a chain for create_vm or any paid call —
+    operators flip chains on/off via Vault and the backend is the source
+    of truth. Returns the CAIP-2 identifier + EIP-712 domain shape per
+    chain so an agent's wallet adapter has everything it needs.
+    """
+    try:
+        async with _client() as hc:
+            data = await hc.payment_networks()
+        if not data.get("networks"):
+            return "No payment networks are currently enabled."
+        lines = ["Accepted payment chains:"]
+        for n in data["networks"]:
+            tag = " (testnet)" if n.get("testnet") else ""
+            lines.append(
+                f"- {n['display_name']}{tag}: {n['caip2']} · {n['asset']} · "
+                f"token={n['token_address']}"
+            )
+        lines.append(f"\nFacilitator: {data.get('facilitator_url')}")
+        return "\n".join(lines)
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def register_account(
+    password: str,
+    *,
+    with_api_key: bool = True,
+    api_key_name: str | None = None,
+) -> str:
+    """Bootstrap a new Hyrule Cloud account from MCP (Block D).
+
+    `with_api_key=True` (the default for agents) returns a cleartext
+    `hyr_sk_...` bearer alongside the recovery code. Save BOTH — the
+    recovery code is the only way to reset the password if it's lost, and
+    the API key is the only way to authenticate subsequent calls without
+    a browser. Set the returned key into HYRULE_API_KEY in this MCP
+    server's env to authenticate further tool calls.
+
+    The starter key carries the narrow DEFAULT_BOOTSTRAP_SCOPES
+    (vm:read, vm:create, intent:read, intent:create) — destructive
+    actions (vm:destroy, password change, account deletion) require
+    minting a wider key from the dashboard or a session.
+    """
+    try:
+        async with _client() as hc:
+            data = await hc.register(
+                password,
+                with_api_key=with_api_key,
+                api_key_name=api_key_name,
+            )
+        lines = [
+            "Account created — save the following SECRETS now (will not be re-shown):",
+            f"  account_id      = {data['account_id']}",
+            f"  recovery_code   = {data['recovery_code']}",
+        ]
+        if data.get("api_key"):
+            lines.append(f"  api_key         = {data['api_key']}")
+            lines.append(f"  api_key_id      = {data['api_key_id']}")
+            lines.append(f"  api_key_scopes  = {data['api_key_scopes']}")
+            lines.append(
+                "\nSet HYRULE_API_KEY={api_key} in this MCP server's env "
+                "to authenticate further calls.".format(api_key=data["api_key"])
+            )
+        return "\n".join(lines)
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def whoami() -> str:
+    """Return the currently-authenticated account ID (Block D).
+
+    Requires HYRULE_API_KEY or a cookie session. Use this to confirm
+    which account a key belongs to before running destructive tools.
+    """
+    try:
+        async with _client() as hc:
+            data = await hc._request("GET", "/v1/me")
+        return (
+            f"account_id  = {data['account_id']}\n"
+            f"vm_count    = {data.get('vm_count', '?')}\n"
+            f"created_at  = {data.get('created_at', '?')}"
+        )
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def list_api_keys() -> str:
+    """List active API keys for the authenticated account (Block D).
+
+    Requires an API key with `api_keys:read` OR a cookie session. The
+    cleartext bearer is never returned here — only summaries (key_id,
+    name, scopes, created_at, last_used_at).
+    """
+    try:
+        async with _client() as hc:
+            data = await hc.list_api_keys()
+        if not data.get("keys"):
+            return "No active API keys."
+        lines = []
+        for k in data["keys"]:
+            lines.append(
+                f"- {k['key_id']} · '{k['name']}' · scopes={k['scopes']} · "
+                f"created={k['created_at']}"
+            )
+        return "\n".join(lines)
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def create_api_key(
+    name: str,
+    scopes: list[str],
+    *,
+    expires_in_days: int | None = None,
+) -> str:
+    """Mint a fresh API key (Block D).
+
+    Requires `api_keys:write` for an API-key-authed caller. The cleartext
+    bearer is in the response — save it now, no second chance. When
+    minted via an API key (not a session), the requested scopes must be
+    a subset of the issuing key's scopes (no escalation).
+
+    Valid scopes: vm:read, vm:create, vm:reboot, vm:extend, vm:destroy,
+    intent:create, intent:read, domain:register, api_keys:read, api_keys:write.
+    """
+    try:
+        async with _client() as hc:
+            data = await hc.create_api_key(name, scopes, expires_in_days=expires_in_days)
+        return (
+            f"api_key     = {data['api_key']}  (SAVE NOW — not shown again)\n"
+            f"key_id      = {data['key']['key_id']}\n"
+            f"name        = {data['key']['name']}\n"
+            f"scopes      = {data['key']['scopes']}\n"
+            f"expires_at  = {data['key'].get('expires_at')}"
+        )
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def revoke_api_key(key_id: str) -> str:
+    """Revoke an API key by id (Block D). Idempotent — revoking an
+    already-revoked key returns success. A key cannot revoke itself."""
+    try:
+        async with _client() as hc:
+            await hc.revoke_api_key(key_id)
+        return f"Key {key_id} revoked."
     except HyruleError as e:
         return _err(e)
 
