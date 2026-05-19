@@ -221,6 +221,20 @@ async def register(
     if factory is None:
         raise HTTPException(503, "Database not available")
 
+    # Block D (Wave 3) lands the agent-bootstrap API-key path. Reject the
+    # opt-in up front — BEFORE generating account/recovery state — so a
+    # 400 doesn't leave behind a persisted account with no `account_id`
+    # returned to the caller (Sourcery review on cloud#6).
+    if body.with_api_key:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "with_api_key=true is not yet supported; Wave 3 (Block D) "
+                "adds the agent-bootstrap path. Register without the flag, "
+                "log in via session cookie, and use the dashboard for now."
+            ),
+        )
+
     ip_hash = derive_ip_prefix_hash(_client_ip(request))
     _check_rate(_RATE_REGISTER, ip_hash or "anon", limit=5)
 
@@ -257,22 +271,11 @@ async def register(
         )
 
         # Block D (Wave 3) will mint a starter API key here when
-        # body.with_api_key is True. Wave 2 leaves the cleartext fields
-        # None — clients that opt in still get a successful registration
-        # but no key (documented as 405-equivalent at runtime via the
-        # 400 below if they explicitly ask for one).
+        # body.with_api_key is True. The early-rejection above means we
+        # never reach this branch with the flag set in Wave 2.
         api_key_cleartext: str | None = None
         api_key_id: str | None = None
         api_key_scopes: list[str] | None = None
-        if body.with_api_key:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "with_api_key=true is not yet supported; Wave 3 (Block D) "
-                    "adds the agent-bootstrap path. Register without the flag, "
-                    "log in via session cookie, and use the dashboard for now."
-                ),
-            )
 
     response.set_cookie(value=token, **cookie_kwargs_for_set(secure=_should_secure(request)))
     log.info(

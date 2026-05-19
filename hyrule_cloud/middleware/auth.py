@@ -18,11 +18,11 @@ this dependency stays cheap.
 from __future__ import annotations
 
 import hashlib
-import os
 
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import AccountRow
 from hyrule_cloud.services.sessions import (
     SESSION_COOKIE_NAME,
@@ -31,15 +31,21 @@ from hyrule_cloud.services.sessions import (
 )
 from hyrule_cloud.state import AppState, get_app_state
 
+# Single source of truth: read once at import via pydantic-settings, which
+# resolves from env / .env. Keeps HyruleConfig.ip_prefix_pepper as THE field
+# rather than two parallel readers diverging.
+_FALLBACK_PEPPER = "hyrule-ip-pepper-wave2-rotate-via-vault"
+
 
 def _ip_pepper() -> str:
     """Pepper for IP prefix hashing.
 
-    Read from HYRULE_IP_PREFIX_PEPPER if set (production: Vault-rendered
-    into /opt/hyrule-cloud/.env). Falls back to a process-local random
-    constant — abuse-only metric, rotates on every restart.
+    Read from HyruleConfig.ip_prefix_pepper (sourced from
+    HYRULE_IP_PREFIX_PEPPER — production: Vault-rendered into
+    /opt/hyrule-cloud/.env). Falls back to a process-local constant when
+    unset — abuse-only metric, rotates on every restart.
     """
-    return os.environ.get("HYRULE_IP_PREFIX_PEPPER") or "hyrule-ip-pepper-wave2-rotate-via-vault"
+    return HyruleConfig().ip_prefix_pepper or _FALLBACK_PEPPER
 
 
 def derive_ip_prefix_hash(ip: str | None) -> str | None:

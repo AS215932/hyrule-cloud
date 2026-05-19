@@ -87,8 +87,7 @@ async def metrics_state():
     try:
         yield state, factory
     finally:
-        _RUNTIME_CACHE["value"] = None
-        _RUNTIME_CACHE["expires_at"] = 0.0
+        _RUNTIME_CACHE.clear()
         if prev is not None:
             app.state._typed_state = prev
         await engine.dispose()
@@ -252,3 +251,41 @@ async def test_runtime_ttl_cache_short_circuits(metrics_state, client):
     res1 = await client.get("/v1/stats/runtime")
     res2 = await client.get("/v1/stats/runtime")
     assert res1.json()["updated_at"] == res2.json()["updated_at"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_graceful_degrades_on_db_failure(metrics_state, client):
+    """Per Sourcery cloud#6 review: a DB outage must NOT 500 /v1/stats/runtime.
+    The handler swallows the exception, logs, and returns 200 with the
+    p50/sample count from the in-process recorder and zeroed counts. Locks
+    in the graceful-degradation contract so a future refactor can't silently
+    drop the try/except."""
+    from hyrule_cloud.api.routes import _RUNTIME_CACHE
+
+    _RUNTIME_CACHE.clear()  # don't serve a stale happy-path payload
+
+    state, _factory = metrics_state
+    orch = state.orchestrator
+
+    class _BadCM:
+        async def __aenter__(self) -> None:
+            raise RuntimeError("simulated DB outage")
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+    original_db = orch.db
+    orch.db = lambda: _BadCM()
+    try:
+        res = await client.get("/v1/stats/runtime")
+    finally:
+        orch.db = original_db
+        _RUNTIME_CACHE.clear()
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["live_vms"] == 0
+    assert body["build_queue"] == 0
+    assert body["avg_provision_seconds"] is None
+    # p50 source label still set so the frontend doesn't render a lying number.
+    assert body["api_p50_source"] == "api-process-local-rolling-window"

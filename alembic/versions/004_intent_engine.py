@@ -45,8 +45,20 @@ def upgrade() -> None:
     dialect = bind.dialect.name
 
     # 1. Grow the Postgres enum to include all new status values.
+    # Postgres `ALTER TYPE ... ADD VALUE` accepts only a string literal — it
+    # cannot take a bind parameter — so we MUST interpolate. The values are
+    # compile-time constants in _NEW_STATUS_VALUES; we re-validate against a
+    # narrow allowlist so a future contributor adding a value with a quote or
+    # other SQL metacharacter still gets a clear failure at migration time
+    # rather than producing a malformed DDL string. (Sourcery flagged this as
+    # SQL-injection — false positive given the constants, but the guard keeps
+    # the static analyser and a future reader honest.)
     if dialect == "postgresql":
+        import re
+        valid_pat = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
         for v in _NEW_STATUS_VALUES:
+            if not valid_pat.match(v):
+                raise ValueError(f"Invalid crypto_intent_status value: {v!r}")
             op.execute(f"ALTER TYPE crypto_intent_status ADD VALUE IF NOT EXISTS '{v}'")
 
     # 2. Add new columns. JSONB on PG, generic JSON on SQLite (tests).

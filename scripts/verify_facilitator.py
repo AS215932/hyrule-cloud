@@ -1,0 +1,125 @@
+"""CI gate: verify every chain advertised in PaymentConfig is actually
+supported by the configured x402 facilitator.
+
+Per feedback_verified_payment_chains.md: we don't ship a chain — in code or
+copy — until a real round-trip against the production facilitator confirms
+the chain is recognised. The CI workflow runs this on any PR that touches
+hyrule_cloud/config.py and gates merge on the exit code.
+
+Per chain in `PaymentConfig.networks`:
+  1. Probe the facilitator's `/supported` endpoint (the canonical Coinbase
+     CDP / x402.org discovery surface).
+  2. Confirm the chain identifier (CAIP-2 form for x402 v2; bare network
+     name for v1) is present in the supported list.
+  3. Print a one-line OK or FAIL per chain.
+
+Network failure (facilitator unreachable, DNS broken, etc) exits 2 so the
+CI step distinguishes "facilitator is down — retry later" from "facilitator
+doesn't support this chain — fix the config."
+
+In Wave 3 (Block C) this script gets extended to also smoke-test the EIP-712
+domain shape for each EVM chain and to register Solana support. For now it
+covers the Wave 2 minimum — the single Base entry — so the CI gate is real
+and not a no-op.
+"""
+
+from __future__ import annotations
+
+import sys
+from typing import Any
+
+import httpx
+
+from hyrule_cloud.config import PaymentConfig
+
+_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+
+
+def _normalise_supported_entries(payload: Any) -> set[str]:
+    """The /supported endpoint shape isn't standardised across facilitators
+    yet. Coinbase CDP returns `{"kinds": [{"network": "...", ...}, ...]}`;
+    x402.org returns `{"networks": [...]}`. Reduce both to a flat set of
+    network identifiers so the comparison below is shape-agnostic."""
+    if not isinstance(payload, dict):
+        return set()
+    out: set[str] = set()
+    for key in ("kinds", "networks", "supported"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, str):
+                out.add(item)
+            elif isinstance(item, dict):
+                for nk in ("network", "id", "caip2", "name"):
+                    val = item.get(nk)
+                    if isinstance(val, str):
+                        out.add(val)
+    return out
+
+
+def main() -> int:
+    cfg = PaymentConfig()
+    facilitator = cfg.facilitator_url.rstrip("/")
+    print(f"facilitator: {facilitator}")
+    print(f"configured chains: {len(cfg.networks)}")
+
+    try:
+        # follow_redirects=True: x402.org issues 308 to its canonical host.
+        resp = httpx.get(f"{facilitator}/supported", timeout=_TIMEOUT, follow_redirects=True)
+    except httpx.HTTPError as exc:
+        print(f"NETWORK ERROR — facilitator unreachable: {exc}", file=sys.stderr)
+        return 2
+
+    if resp.status_code != 200:
+        print(
+            f"NETWORK ERROR — /supported returned {resp.status_code}: {resp.text[:200]}",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        print(f"NETWORK ERROR — non-JSON from /supported: {exc}", file=sys.stderr)
+        return 2
+
+    supported = _normalise_supported_entries(payload)
+    if not supported:
+        print(
+            "NETWORK ERROR — /supported returned no recognisable network entries; "
+            f"raw payload: {payload!r:.300}",
+            file=sys.stderr,
+        )
+        return 2
+
+    failures: list[str] = []
+    for entry in cfg.networks:
+        network = entry.get("network", "")
+        if network in supported:
+            print(f"  OK   {network}")
+            continue
+        # CAIP-2 ↔ bare-name fallback: some facilitators key on `base-mainnet`
+        # rather than `eip155:8453`. We accept either direction as a match.
+        bare = network.split(":", 1)[-1] if ":" in network else network
+        if any(bare in s or s in bare for s in supported):
+            print(f"  OK   {network} (matched bare form)")
+            continue
+        print(f"  FAIL {network} — not in facilitator's supported list")
+        failures.append(network)
+
+    if failures:
+        print(
+            f"\nFAILED: {len(failures)} configured chain(s) not supported by "
+            f"the facilitator: {failures}",
+            file=sys.stderr,
+        )
+        print(f"Facilitator advertises: {sorted(supported)}", file=sys.stderr)
+        return 1
+
+    print(f"\nOK — all {len(cfg.networks)} configured chain(s) supported.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

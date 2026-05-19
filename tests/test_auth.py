@@ -604,6 +604,94 @@ async def test_register_rate_limit_kicks_in(auth_state, client):
     assert res.status_code == 429
 
 
+@pytest.mark.asyncio
+async def test_login_rate_limit_kicks_in(auth_state, client):
+    """Wave 2 (per Sourcery cloud#6 review): the login bucket is bounded at
+    10/hr per IP. The 11th must 429, even with valid credentials, so a
+    brute-forcer can't burn through the password space."""
+    from hyrule_cloud.api.auth import _RATE_LOGIN
+
+    _RATE_LOGIN.clear()
+
+    reg = await client.post("/v1/auth/register", json={"password": "lily long pw 1234567"})
+    account_id = reg.json()["account_id"]
+    await client.post("/v1/auth/logout")
+
+    for _ in range(10):
+        res = await client.post(
+            "/v1/auth/login",
+            json={"account_id": account_id, "password": "lily long pw 1234567"},
+        )
+        assert res.status_code == 200
+        await client.post("/v1/auth/logout")
+
+    res = await client.post(
+        "/v1/auth/login",
+        json={"account_id": account_id, "password": "lily long pw 1234567"},
+    )
+    assert res.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_recovery_rate_limit_kicks_in(auth_state, client):
+    """Wave 2 (per Sourcery cloud#6 review): the recover-code bucket is
+    bounded at 3/hr per IP. The 4th must 429 — recovery codes are
+    high-entropy but rate limiting protects against typo-storms and any
+    future weakness in the code shape."""
+    from hyrule_cloud.api.auth import _RATE_RECOVER
+
+    _RATE_RECOVER.clear()
+
+    reg = await client.post(
+        "/v1/auth/register", json={"password": "mike long pw 1234567"}
+    )
+    account_id = reg.json()["account_id"]
+    await client.post("/v1/auth/logout")
+
+    # 3 attempts allowed; 4th must 429. We use a wrong code so the request
+    # exercises the rate-limit path before the auth-check path, and the
+    # quota counts regardless of success.
+    for _ in range(3):
+        res = await client.post(
+            "/v1/auth/recover/code",
+            json={
+                "account_id": account_id,
+                "recovery_code": "hyr-rec-wrongwrongwrongwrongwrong",
+                "new_password": "next long pw 1234",
+            },
+        )
+        assert res.status_code in (401, 200)
+
+    res = await client.post(
+        "/v1/auth/recover/code",
+        json={
+            "account_id": account_id,
+            "recovery_code": "hyr-rec-wrongwrongwrongwrongwrong",
+            "new_password": "next long pw 1234",
+        },
+    )
+    assert res.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_register_with_api_key_flag_returns_400_for_now(auth_state, client):
+    """Wave 2 (per Sourcery cloud#6 review): with_api_key=true is the Block-D
+    agent-bootstrap path; it ships in Wave 3. Until then, the endpoint must
+    400 BEFORE creating any account/session state — locking that contract in
+    keeps a future contributor from accidentally enabling a half-implemented
+    path that would leak orphaned account rows.
+    """
+    res = await client.post(
+        "/v1/auth/register",
+        json={"password": "nora long pw 12345678", "with_api_key": True},
+    )
+    assert res.status_code == 400
+    assert "Wave 3" in res.json()["detail"]
+    # No cookie set — the rejection happens before /v1/auth/register would
+    # normally call response.set_cookie.
+    assert "hyr_sess" not in res.cookies
+
+
 # --- Test: /me/recovery-code rotation ---
 
 
