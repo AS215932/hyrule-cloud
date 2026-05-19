@@ -4,40 +4,36 @@ The frontend reads from this endpoint and renders the chain selector from
 it (never hardcodes — see [[feedback_verified_payment_chains]]). The tests
 below lock in the response shape so a future refactor can't quietly drop
 a field the JS adapter depends on.
+
+We use ASGITransport rather than TestClient so the lifespan hook (which
+opens a Postgres connection) doesn't fire — these tests verify the route
+in isolation. AppState is wired in manually via the `app.state._typed_state`
+slot, mirroring the pattern in tests/test_api.py.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-
 import pytest
-from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from hyrule_cloud.app import app
 from hyrule_cloud.config import HyruleConfig, PaymentConfig, PaymentNetwork
 from hyrule_cloud.state import AppState
 
 
-def _install_state(payment_cfg: PaymentConfig) -> AppState:
+@pytest.fixture
+def real_payment_state():
+    """Pin the real PaymentConfig (Base/Polygon/Arbitrum defaults) onto the
+    app for this test only. Restores any previously-installed state on
+    teardown so we don't bleed into other test modules."""
     cfg = HyruleConfig()
-    # Replace the payment sub-config with the test's tailored one — that's
-    # the only field /v1/payments/networks cares about.
-    cfg.payment = payment_cfg
+    cfg.payment = PaymentConfig()
     state = AppState(
         config=cfg,
         orchestrator=None,
         payment_gate=None,
         network_provider=None,
     )
-    return state
-
-
-@pytest.fixture
-def real_payment_state() -> Iterator[AppState]:
-    """Pin the real PaymentConfig (Base/Polygon/Arbitrum defaults) onto the
-    app for this test only. Restores any previously-installed state on
-    teardown so we don't bleed into other test modules."""
-    state = _install_state(PaymentConfig())
     prev = getattr(app.state, "_typed_state", None)
     app.state._typed_state = state
     try:
@@ -52,22 +48,22 @@ def real_payment_state() -> Iterator[AppState]:
                 pass
 
 
-def test_payments_networks_returns_base_by_default(
-    real_payment_state: AppState,
-) -> None:
+@pytest.mark.asyncio
+async def test_payments_networks_returns_base_by_default(real_payment_state) -> None:
     """Default config: only Base mainnet is enabled out of the box because
     that's what the default facilitator (public x402.org) verifies against.
     Polygon and Arbitrum are coded but disabled; operators flip them on in
     Vault once they're pointed at Coinbase CDP."""
-    with TestClient(app) as c:
-        res = c.get("/v1/payments/networks")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        res = await c.get("/v1/payments/networks")
     assert res.status_code == 200
     keys = [n["key"] for n in res.json()["networks"]]
     assert keys == ["base"]
 
 
-def test_payments_networks_omits_disabled_chains_by_default(
-    real_payment_state: AppState,
+@pytest.mark.asyncio
+async def test_payments_networks_omits_disabled_chains_by_default(
+    real_payment_state,
 ) -> None:
     """Polygon and Arbitrum are present in PaymentConfig but enabled=False —
     the endpoint MUST NOT advertise them. Per [[feedback_verified_payment_chains]],
@@ -75,21 +71,22 @@ def test_payments_networks_omits_disabled_chains_by_default(
     cfg = PaymentConfig()
     polygon = next(n for n in cfg.payment_networks if n.key == "polygon")
     assert polygon.enabled is False
-    with TestClient(app) as c:
-        body = c.get("/v1/payments/networks").json()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        body = (await c.get("/v1/payments/networks")).json()
     keys_on_wire = {n["key"] for n in body["networks"]}
     assert "polygon" not in keys_on_wire
     assert "arbitrum" not in keys_on_wire
 
 
-def test_payments_networks_shape_locks_in_required_fields(
-    real_payment_state: AppState,
+@pytest.mark.asyncio
+async def test_payments_networks_shape_locks_in_required_fields(
+    real_payment_state,
 ) -> None:
     """Every network entry MUST carry the fields the EVM JS adapter signs an
     EIP-712 payment with — name, version, chain_id, token_address, decimals,
     asset. Plus CAIP-2 for x402 v2."""
-    with TestClient(app) as c:
-        body = c.get("/v1/payments/networks").json()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        body = (await c.get("/v1/payments/networks")).json()
     for n in body["networks"]:
         assert n["family"] == "evm"
         assert n["caip2"].startswith("eip155:")
@@ -102,11 +99,12 @@ def test_payments_networks_shape_locks_in_required_fields(
         assert n["eip712_domain"]["version"]
 
 
-def test_payments_networks_top_level_carries_receiver_and_facilitator(
-    real_payment_state: AppState,
+@pytest.mark.asyncio
+async def test_payments_networks_top_level_carries_receiver_and_facilitator(
+    real_payment_state,
 ) -> None:
-    with TestClient(app) as c:
-        body = c.get("/v1/payments/networks").json()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        body = (await c.get("/v1/payments/networks")).json()
     assert "receiver_address" in body
     assert body["facilitator_url"] == "https://x402.org/facilitator"
 
