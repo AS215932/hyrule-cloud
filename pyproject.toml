@@ -30,6 +30,11 @@ dependencies = [
     "argon2-cffi>=23.1",
     # Block A1 (Wave 2): TTL cache for per-IP rate-limit buckets
     "cachetools>=5.5",
+    # Block E (Wave 4): pure-Python BIP32/BIP84 HD derivation for BTC receive
+    # addresses from a watch-only xpub (no keys held). coincurve is bip-utils'
+    # secp256k1 backend; pinned for the Debian 13 / Python 3.13 runner.
+    "bip-utils>=2.9,<2.10",
+    "coincurve>=20.0,<21.0",
 ]
 
 [project.optional-dependencies]

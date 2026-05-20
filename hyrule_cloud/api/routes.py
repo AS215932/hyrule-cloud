@@ -594,80 +594,132 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
         
     return resp
 
-import uuid
-from datetime import UTC, datetime, timedelta
-
-from sqlalchemy import select
+from sqlalchemy import update as _sql_update
 
 from hyrule_cloud.db import CryptoIntentRow
 from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
+from hyrule_cloud.services.intents import IntentExistsError, create_intent
+
+
+def _intent_to_response(row: CryptoIntentRow, request: Request | None = None) -> CryptoIntentResponse:
+    """Render a CryptoIntentRow as the public response. Builds management_url
+    from request.base_url when the one-shot cleartext is present."""
+    from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
+
+    qr_uri = None
+    try:
+        qr_uri = NativeCryptoProvider.build_uri(row.asset, row.address, row.amount_crypto)
+    except Exception:
+        pass
+
+    mgmt_url = None
+    if row.vm_id and row.anon_token_cleartext and request is not None:
+        base = str(request.base_url).rstrip("/")
+        mgmt_url = f"{base}/v1/vm/{row.vm_id}?token={row.anon_token_cleartext}"
+
+    return CryptoIntentResponse(
+        intent_id=row.intent_id,
+        asset=row.asset,
+        address=row.address,
+        amount_crypto=str(row.amount_crypto),
+        amount_usd=str(row.amount_usd) if row.amount_usd is not None else None,
+        rate_snapshot=str(row.rate_snapshot) if row.rate_snapshot is not None else None,
+        rate_valid_until=row.rate_valid_until,
+        status=CryptoIntentStatus(row.status),
+        confirmations=row.confirmations or 0,
+        amount_received_crypto=(
+            str(row.amount_received_crypto) if row.amount_received_crypto is not None else None
+        ),
+        qr_code_uri=qr_uri,
+        expires_at=row.expires_at,
+        vm_id=row.vm_id,
+        management_token=row.anon_token_cleartext,
+        management_url=mgmt_url,
+    )
 
 
 @router.post("/intent/create", response_model=CryptoIntentResponse)
-async def create_crypto_intent(body: CryptoIntentRequest, orch = Depends(get_orch), cfg = Depends(get_cfg)):
-    if body.asset.upper() not in ["BTC", "XMR", "ZEC"]:
-        raise HTTPException(400, "Unsupported asset. Use BTC, XMR, or ZEC.")
-    
-    amount_usd = Decimal(body.amount_usd)
-    from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
-    provider = NativeCryptoProvider(cfg)
-    rate = provider.get_exchange_rate(body.asset)
-    amount_crypto = amount_usd / rate
-    
-    intent_id = str(uuid.uuid4())
-    bip32_index = None
-    if body.asset.upper() == "BTC":
-        async with orch.db() as session:
-            # Simple simulation for MAX index logic
-            from sqlalchemy import func
-            res = await session.execute(select(func.max(CryptoIntentRow.bip32_index)).where(CryptoIntentRow.asset == "BTC"))
-            max_idx = res.scalar() or 0
-            bip32_index = max_idx + 1
-        address = provider.generate_btc_address(bip32_index)
-    elif body.asset.upper() == "XMR":
-        address, bip32_index = provider.generate_xmr_address()
-        
-    expires_at = datetime.now(UTC) + timedelta(minutes=60)
-    
-    row = CryptoIntentRow(
-        intent_id=intent_id,
-        asset=body.asset.upper(),
-        amount_usd=amount_usd,
-        amount_crypto=amount_crypto,
-        address=address,
-        bip32_index=bip32_index,
-        expires_at=expires_at,
-        status=CryptoIntentStatus.PENDING
-    )
-    
-    async with orch.db() as session:
-        session.add(row)
-        await session.commit()
-    
-    return CryptoIntentResponse(
-        intent_id=row.intent_id,
-        asset=row.asset,
-        amount_crypto=str(row.amount_crypto),
-        address=row.address,
-        status=CryptoIntentStatus.PENDING,
-        expires_at=row.expires_at
-    )
+async def create_crypto_intent(
+    body: CryptoIntentRequest,
+    request: Request,
+    orch=Depends(get_orch),
+    cfg=Depends(get_cfg),
+    account=Depends(current_account),
+) -> CryptoIntentResponse:
+    """Block E: open a payment intent for BTC or XMR.
+
+    Idempotent on `client_order_id`: repeated POSTs with the same key return
+    the existing intent unchanged (no second deposit address is allocated).
+    """
+    asset = body.asset.upper()
+    if asset not in ("BTC", "XMR"):
+        raise HTTPException(400, "Unsupported asset. Use BTC or XMR.")
+
+    if body.order_payload.domain_mode.value == "custom" and not body.order_payload.domain:
+        raise HTTPException(400, "domain required when domain_mode=custom")
+    for port in body.order_payload.open_ports:
+        if port in cfg.blocked_ports:
+            raise HTTPException(400, f"Port {port} is blocked by policy")
+
+    total, _ = orch.compute_price(body.order_payload)
+
+    app_state: AppState = get_app_state(request)
+    provider = getattr(app_state, "native_crypto", None)
+    rates = getattr(app_state, "rate_provider", None)
+    if provider is None or rates is None:
+        raise HTTPException(503, "Native crypto provider not configured")
+
+    try:
+        row = await create_intent(
+            session_factory=orch.db,
+            provider=provider,
+            rates=rates,
+            asset=asset,
+            order_payload=body.order_payload,
+            amount_usd=total,
+            client_order_id=body.client_order_id,
+            owner_account_id=(account.account_id if account is not None else None),
+        )
+    except IntentExistsError as exc:
+        # Idempotent replay: return the existing intent verbatim
+        return _intent_to_response(exc.existing, request)
+    except RuntimeError as exc:
+        log.error("intent_create_failed", error=str(exc))
+        raise HTTPException(503, "Could not create payment intent")
+
+    return _intent_to_response(row, request)
+
 
 @router.get("/intent/{intent_id}", response_model=CryptoIntentResponse)
-async def get_crypto_intent_status(intent_id: str, orch = Depends(get_orch)):
+async def get_crypto_intent_status(
+    intent_id: str,
+    request: Request,
+    orch=Depends(get_orch),
+    account=Depends(current_account),
+) -> CryptoIntentResponse:
+    """Returns current intent state. On the first GET after PROVISIONED, the
+    one-shot `anon_token_cleartext` column is included in the response AND
+    immediately nulled so subsequent GETs cannot re-reveal it."""
     async with orch.db() as session:
-        q = select(CryptoIntentRow).where(CryptoIntentRow.intent_id == intent_id)
-        res = await session.execute(q)
-        row = res.scalar_one_or_none()
-    
-    if not row:
-        raise HTTPException(404, "Intent not found")
-        
-    return CryptoIntentResponse(
-        intent_id=row.intent_id,
-        asset=row.asset,
-        amount_crypto=str(row.amount_crypto),
-        address=row.address,
-        status=CryptoIntentStatus(row.status),
-        expires_at=row.expires_at
-    )
+        row = await session.get(CryptoIntentRow, intent_id)
+        if row is None:
+            raise HTTPException(404, "Intent not found")
+        # Account-owned intents are only visible to the owner (or admin) —
+        # 404 (not 403) to avoid leaking existence.
+        if row.owner_account_id is not None:
+            if account is None or (
+                account.account_id != row.owner_account_id and not account.is_admin
+            ):
+                raise HTTPException(404, "Intent not found")
+        # One-shot reveal: snapshot cleartext, then NULL it.
+        revealed = row.anon_token_cleartext
+        if revealed is not None:
+            await session.execute(
+                _sql_update(CryptoIntentRow)
+                .where(CryptoIntentRow.intent_id == intent_id)
+                .values(anon_token_cleartext=None)
+            )
+            await session.commit()
+            row.anon_token_cleartext = revealed  # local copy for the response
+
+    return _intent_to_response(row, request)
