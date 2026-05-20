@@ -215,16 +215,44 @@ class NetworkResponse(BaseModel):
 
 
 class CryptoIntentRequest(BaseModel):
-    asset: str = Field(description="Asset symbol (BTC, XMR)")
-    amount_usd: str = Field(description="USD amount to be converted")
+    """Block E: payment-intent creation. `order_payload` carries the full VM
+    spec so the orchestrator can provision on settlement without re-asking
+    the client. `client_order_id` is the idempotency key."""
+
+    asset: str = Field(description="Asset symbol: BTC or XMR")
+    order_payload: VMCreateRequest = Field(
+        description="The VM spec to provision once the payment settles."
+    )
+    client_order_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Idempotency key. Repeated POSTs with the same key return the same intent.",
+    )
+
 
 class CryptoIntentResponse(BaseModel):
+    """Block E intent shape returned by both /v1/intent/create and /v1/intent/{id}.
+
+    Once status == PROVISIONED, `vm_id`, `management_token`, `management_url`
+    mirror the A0 anon-checkout response so the frontend can stash the token
+    identically.
+    """
+
     intent_id: str
     asset: str
-    amount_crypto: str
     address: str
+    amount_crypto: str
+    amount_usd: str | None = None
+    rate_snapshot: str | None = None
+    rate_valid_until: datetime | None = None
     status: CryptoIntentStatus
+    confirmations: int = 0
+    amount_received_crypto: str | None = None
+    qr_code_uri: str | None = None   # bitcoin:<addr>?amount=<x> or monero:<addr>?tx_amount=<x>
     expires_at: datetime
+    vm_id: str | None = None
+    management_token: str | None = None
+    management_url: str | None = None
 
 
 # --- Internal State (DB-backed) ---

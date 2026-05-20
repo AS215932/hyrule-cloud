@@ -6,6 +6,7 @@ Agentic VPS hosting on AS215932 with x402 payments.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -21,6 +22,9 @@ from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
 from hyrule_cloud.middleware.metrics import install_metrics
 from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
+from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
+from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.services.intents import scan_pending_intents
 
 # Newline-delimited JSON to stdout per AS215932's application logging
 # contract (hyrule-infra/docs/application-logging.md). systemd-journald
@@ -64,18 +68,46 @@ async def lifespan(app: FastAPI):
     orchestrator = Orchestrator(config, session_factory)
     await orchestrator.startup()
 
+    # Block E: native crypto (BTC/XMR) intent engine + rate provider
+    rate_provider = RateProvider()
+    await rate_provider.start()
+    native_crypto = NativeCryptoProvider(config.payment)
+    await native_crypto.start()
+
     # Wire up app state
     app.state._typed_state = AppState(
         config=config,
         orchestrator=orchestrator,
         payment_gate=payment_gate,
         network_provider=network_provider,
+        native_crypto=native_crypto,
+        rate_provider=rate_provider,
+        session_factory=session_factory,
     )
 
     # Expiry scheduler
     scheduler = AsyncIOScheduler()
     scheduler.add_job(orchestrator.check_expiries, "interval", minutes=5)
     scheduler.start()
+
+    # Block E: background intent poller. Single worker; coordinated via the
+    # exactly-once atomic SQL trigger in services/intents.py.
+    async def _intent_poller_loop() -> None:
+        while True:
+            try:
+                await scan_pending_intents(
+                    session_factory=session_factory,
+                    provider=native_crypto,
+                    rates=rate_provider,
+                    orch=orchestrator,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("intent_poller_iteration_failed")
+            await asyncio.sleep(15)
+
+    poller_task = asyncio.create_task(_intent_poller_loop())
 
     log.info(
         "hyrule_cloud_started",
@@ -86,8 +118,15 @@ async def lifespan(app: FastAPI):
     yield
 
     scheduler.shutdown()
+    poller_task.cancel()
+    try:
+        await poller_task
+    except asyncio.CancelledError:
+        pass
     await orchestrator.shutdown()
     await network_provider.close()
+    await native_crypto.close()
+    await rate_provider.close()
     await engine.dispose()
     log.info("hyrule_cloud_stopped")
 
