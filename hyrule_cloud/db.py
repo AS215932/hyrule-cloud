@@ -358,6 +358,23 @@ class RecoveryAttemptRow(Base):
     )
 
 
-# Block F (Wave 5) will add RecoveryChallengeRow here for wallet-signature
-# password recovery. Wave 2 ships only the code-based recovery path, which
-# does not need a server-side nonce store.
+class RecoveryChallengeRow(Base):
+    """Server-side nonce store for wallet-signature recovery (Block F).
+
+    DB-backed (not in-process) so the challenge survives across workers and a
+    single-use marker (`used_at`) makes replay impossible even if a signed
+    message leaks. The full challenge_text is what the user signs verbatim;
+    we hold it server-side so the verify endpoint never has to trust client
+    framing of nonce/timestamps.
+    """
+
+    __tablename__ = "recovery_challenges"
+
+    nonce: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(11), index=True)
+    challenge_text: Mapped[str] = mapped_column(Text)
+    issued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

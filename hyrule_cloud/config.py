@@ -208,6 +208,10 @@ class HyruleConfig(BaseSettings):
 
     deploy_domain: str = "deploy.hyrule.host"
 
+    # Block H (Wave 5): Prometheus on `mon` for /v1/stats/network fleet truth.
+    # Empty = static fallback (CI / local dev).
+    prometheus_url: str = ""
+
     # DNS (RFC 2136)
     dns_server: str = ""
     dns_tsig_key: str = ""
