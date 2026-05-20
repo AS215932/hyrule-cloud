@@ -50,13 +50,19 @@ class HyruleClient:
         *,
         payment_header: str | None = None,
         dev_bypass: str | None = None,
+        api_key: str | None = None,
         timeout: float = 60.0,
     ) -> None:
+        """If `api_key` is set (Wave 3 / Block D) the bearer is sent on every
+        request, taking the place of session-cookie auth. Keys are minted via
+        `register(with_api_key=True)` or `/v1/me/api-keys` on the dashboard."""
         headers: dict[str, str] = {}
         if payment_header:
             headers["X-PAYMENT"] = payment_header
         if dev_bypass:
             headers["X-DEV-BYPASS"] = dev_bypass
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
 
         self._http = httpx.AsyncClient(
             base_url=base_url,
@@ -233,3 +239,51 @@ class HyruleClient:
     async def health(self) -> dict[str, Any]:
         """Health check."""
         return await self._request("GET", "/health")
+
+    # -- Block A1 (Wave 2) + D (Wave 3): account-level operations --
+
+    async def payment_networks(self) -> dict[str, Any]:
+        """Block C: list the chains the backend currently accepts.
+
+        Frontends and agent SDKs SHOULD call this rather than hardcoding a
+        chain list — operators flip individual chains on/off in Vault and
+        the wire format is the single source of truth."""
+        return await self._request("GET", "/v1/payments/networks")
+
+    async def register(
+        self,
+        password: str,
+        *,
+        with_api_key: bool = False,
+        api_key_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Register a fresh account. Returns `{account_id, recovery_code, ...}`.
+
+        If `with_api_key=True` the response also carries a cleartext
+        `api_key` (Block D agent bootstrap) with the narrow
+        DEFAULT_BOOTSTRAP_SCOPES — save it; we never re-show it."""
+        payload: dict[str, Any] = {"password": password}
+        if with_api_key:
+            payload["with_api_key"] = True
+            if api_key_name:
+                payload["api_key_name"] = api_key_name
+        return await self._request("POST", "/v1/auth/register", json=payload)
+
+    async def list_api_keys(self) -> dict[str, Any]:
+        """Block D: list active (non-revoked) API keys for the current
+        account. Authenticate via `api_key=` on the client constructor."""
+        return await self._request("GET", "/v1/me/api-keys")
+
+    async def create_api_key(
+        self, name: str, scopes: list[str], *, expires_in_days: int | None = None,
+    ) -> dict[str, Any]:
+        """Block D: mint a new API key. Response carries the cleartext
+        bearer exactly once."""
+        payload: dict[str, Any] = {"name": name, "scopes": scopes}
+        if expires_in_days is not None:
+            payload["expires_in_days"] = expires_in_days
+        return await self._request("POST", "/v1/me/api-keys", json=payload)
+
+    async def revoke_api_key(self, key_id: str) -> dict[str, Any]:
+        """Block D: idempotent revocation."""
+        return await self._request("DELETE", f"/v1/me/api-keys/{key_id}")

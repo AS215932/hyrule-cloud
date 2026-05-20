@@ -1,18 +1,21 @@
 """`current_account` FastAPI dependency.
 
-Wave 2 (Block A1) ships the session-cookie resolution only. Scoped API
-keys (Block D) land in Wave 3 and add a Bearer-token resolution step
-upstream of the cookie path; this file will be REPLACED then. Until
-that wave ships, `request.state.is_api_key` is always False and
-`request.state.api_key_scopes` is always an empty set so route handlers
-that already check those fields (post-Wave-3) remain correct.
+Resolves the caller's identity from one of two paths:
 
-Returns `AccountRow | None`. `None` is the anon path — preserved
-everywhere routes treat anon-by-vm_id (or anon-by-management-token, per
-Block A0) as valid.
+  1. `Authorization: Bearer hyr_sk_...` — scoped API keys (Block D / Wave 3).
+     Stamps `request.state.is_api_key = True` plus `api_key_scopes` and
+     `api_key_id` so per-route deps can enforce scopes.
+  2. `hyr_sess` cookie — opaque session token (Block A1 / Wave 2). The cookie
+     path is used by the dashboard and by any browser-driven flow.
 
-Per-IP rate limiting for `/auth/*` lives in `api/auth.py`, not here, so
-this dependency stays cheap.
+The two paths are independent: if a Bearer is present and valid we never
+even read the cookie. There is intentionally no fallback chain from key to
+cookie — a leaked agent bearer must not silently gain destructive-session
+powers (see [[feedback_security_split]]).
+
+Anon (`None`) is still a valid return — the management-token middleware
+(Block A0) and the anon vm/create path depend on it. Per-IP rate limits
+for /auth/* live in api/auth.py, not here, so this dep stays cheap.
 """
 
 from __future__ import annotations
@@ -24,6 +27,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import AccountRow
+from hyrule_cloud.services.api_keys import (
+    API_KEY_PREFIX,
+    looks_like_api_key,
+    lookup_api_key,
+)
 from hyrule_cloud.services.sessions import (
     SESSION_COOKIE_NAME,
     lookup_session,
@@ -76,17 +84,36 @@ def _get_session_factory(app_state: AppState) -> async_sessionmaker | None:
     return db if callable(db) else None
 
 
+def _extract_bearer(request: Request, prefix: str) -> str | None:
+    """Pull `Authorization: Bearer <prefix>...` (RFC 7235 §2.1 — scheme is
+    case-insensitive, credential is preserved verbatim).
+
+    We accept *only* bearers that start with `prefix` so the Block-A0 anon
+    management-token middleware and the Block-D account-key middleware can
+    share the Authorization header without colliding."""
+    auth = (request.headers.get("authorization") or "").strip()
+    if not auth:
+        return None
+    scheme, _, credential = auth.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    candidate = credential.strip()
+    if not candidate.startswith(prefix):
+        return None
+    return candidate
+
+
 async def current_account(
     request: Request,
     app_state: AppState = Depends(get_app_state),
 ) -> AccountRow | None:
-    """Resolve the caller's account from the session cookie.
+    """Resolve the caller's account from a Bearer API key OR session cookie.
 
-    Wave 2 stamps `request.state` with placeholder values so future
-    scope-checking helpers added in Wave 3 keep working unchanged:
-      - `is_api_key` (bool) — always False until Wave 3
-      - `api_key_scopes` (set[str]) — always empty until Wave 3
-      - `api_key_id` (str | None) — always None until Wave 3
+    Stamps `request.state` so downstream deps and route handlers can
+    differentiate the two:
+      - `is_api_key` (bool)
+      - `api_key_scopes` (set[str])
+      - `api_key_id` (str | None)
     """
     request.state.is_api_key = False
     request.state.api_key_scopes = set()
@@ -96,10 +123,29 @@ async def current_account(
     if factory is None:
         return None
 
+    # Path 1: Bearer hyr_sk_... — scoped API key.
+    sk_token = _extract_bearer(request, API_KEY_PREFIX)
+    if sk_token and looks_like_api_key(sk_token):
+        async with factory() as db_session:
+            key_row = await lookup_api_key(db_session, sk_token)
+            if key_row is None:
+                # Invalid/revoked/expired key — DO NOT fall through to the
+                # cookie path. Treating a bad bearer as an anon caller is a
+                # footgun: a leaked-then-revoked agent key would silently
+                # pick up whatever cookie the browser happens to attach.
+                raise HTTPException(401, "Invalid or revoked API key")
+            account = await db_session.get(AccountRow, key_row.account_id)
+            if account is None:
+                raise HTTPException(401, "API key references missing account")
+            request.state.is_api_key = True
+            request.state.api_key_scopes = set(key_row.scopes or [])
+            request.state.api_key_id = key_row.key_id
+            return account
+
+    # Path 2: hyr_sess cookie — browser session.
     cookie_val = request.cookies.get(SESSION_COOKIE_NAME)
     if not cookie_val:
         return None
-
     async with factory() as db_session:
         row = await lookup_session(db_session, cookie_val)
         if row is None:
@@ -107,7 +153,6 @@ async def current_account(
         account = await db_session.get(AccountRow, row.account_id)
         if account is None:
             return None
-        # Best-effort touch (no-op unless >5min stale).
         try:
             await touch_session(db_session, row)
         except Exception:
@@ -134,13 +179,9 @@ async def require_browser_session(
     """Reject API-key-authed callers; require a real cookie session.
 
     Used for password change, recovery-code rotation, and account deletion —
-    the operations that, per the plan, MUST NOT be reachable via API key
-    even with `api_keys:write`. A leaked agent key should never destroy the
-    account it belongs to.
-
-    In Wave 2 this is effectively a no-op beyond `require_account` (because
-    `is_api_key` is always False until Wave 3), but the dep is wired now so
-    the route signatures and tests are stable across waves.
+    the operations that MUST NOT be reachable via API key even with
+    `api_keys:write`. A leaked agent key should never destroy the account
+    it belongs to. See [[feedback_security_split]].
     """
     if getattr(request.state, "is_api_key", False):
         raise HTTPException(
@@ -148,6 +189,36 @@ async def require_browser_session(
             detail="This action requires a browser session, not an API key",
         )
     return account
+
+
+def require_scope(*needed: str):
+    """Dependency factory: enforce that an API-key caller carries every
+    `needed` scope. Cookie sessions bypass — a session = full account access.
+
+    Usage:
+        @router.post("/v1/vm/create", dependencies=[Depends(require_scope("vm:create"))])
+        async def create_vm(...): ...
+
+    Returns 401 if no account is authenticated, 403 if the key is missing
+    any required scope. The exception detail names the missing scope so an
+    agent can fix its key shape without guesswork.
+    """
+    async def _dep(
+        request: Request,
+        account: AccountRow = Depends(require_account),
+    ) -> AccountRow:
+        if not getattr(request.state, "is_api_key", False):
+            return account  # cookie session = full access
+        held: set[str] = getattr(request.state, "api_key_scopes", set())
+        missing = [s for s in needed if s not in held]
+        if missing:
+            raise HTTPException(
+                status_code=403,
+                detail=f"API key missing required scope(s): {missing}",
+            )
+        return account
+
+    return _dep
 
 
 # Convenience type alias for routes that accept either signed-in or anon.

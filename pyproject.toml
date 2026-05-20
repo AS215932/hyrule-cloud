@@ -66,7 +66,12 @@ ignore = ["E402", "E501"]
 # fresh nested mock classes (MockOrchestrator, _OrchOK, etc.) and the
 # mutable-default pitfall (state bleeding across instances) doesn't
 # apply — they're per-test scaffolding. Suppressed only under tests/.
-"tests/*.py" = ["RUF012"]
+# F811: cross-file pytest fixtures (e.g. tests/test_api_keys.py imports
+# `auth_state` + `client` from tests/test_auth.py). The fixture-name-
+# as-argument idiom looks like a redefinition to ruff but is how pytest
+# discovers fixtures across modules. Moving them to conftest.py is the
+# long-term fix; until then, ignore the noise inside tests/.
+"tests/*.py" = ["RUF012", "F811"]
 
 [tool.mypy]
 python_version = "3.12"

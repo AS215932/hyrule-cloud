@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import hmac
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 
 import structlog
@@ -41,9 +41,23 @@ from hyrule_cloud.models import (
     VMStatus,
     generate_anon_management_token,
 )
+from hyrule_cloud.services.api_keys import (
+    DEFAULT_BOOTSTRAP_SCOPES,
+    ApiKeyScope,
+)
+from hyrule_cloud.services.api_keys import (
+    assert_key_scopes_subset as _assert_key_scopes_subset,
+)
+from hyrule_cloud.services.api_keys import (
+    create_api_key as svc_create_api_key,
+)
+from hyrule_cloud.services.api_keys import (
+    list_keys_for_account as svc_list_keys,
+)
+from hyrule_cloud.services.api_keys import (
+    revoke_api_key as svc_revoke_key,
+)
 
-# Block D (Wave 3) will add: ApiKeyRow, ApiKeyScope, services.api_keys helpers,
-#   require_scope, assert_key_scopes_subset, and the /me/api-keys CRUD routes.
 # Block F (Wave 5) will add: RecoveryChallengeRow, the wallet-recovery routes,
 #   and the EVM signature verification helpers.
 from hyrule_cloud.services.passwords import (
@@ -203,8 +217,34 @@ class AccountDeleteResponse(BaseModel):
     detached_vms: list[dict] = []  # only populated for vm_policy=detach
 
 
-# Block D (Wave 3) will add ApiKeyCreateRequest, ApiKeySummary,
-# ApiKeyCreateResponse, ApiKeyListResponse + their endpoints.
+# --- Block D (Wave 3): scoped API key payloads ---
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    scopes: list[str] = Field(min_length=1, max_length=20)
+    expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class ApiKeySummary(BaseModel):
+    """Shape used in list + create responses. Never carries the cleartext —
+    that's surfaced exactly once via ApiKeyCreateResponse.api_key."""
+
+    key_id: str
+    name: str
+    scopes: list[str]
+    created_at: datetime
+    last_used_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
+class ApiKeyCreateResponse(BaseModel):
+    api_key: str  # cleartext hyr_sk_... — show once, never re-fetch
+    key: ApiKeySummary
+
+
+class ApiKeyListResponse(BaseModel):
+    keys: list[ApiKeySummary]
 
 
 # --- Endpoints: auth ---
@@ -220,20 +260,6 @@ async def register(
     factory = _get_session_factory(app_state)
     if factory is None:
         raise HTTPException(503, "Database not available")
-
-    # Block D (Wave 3) lands the agent-bootstrap API-key path. Reject the
-    # opt-in up front — BEFORE generating account/recovery state — so a
-    # 400 doesn't leave behind a persisted account with no `account_id`
-    # returned to the caller (Sourcery review on cloud#6).
-    if body.with_api_key:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "with_api_key=true is not yet supported; Wave 3 (Block D) "
-                "adds the agent-bootstrap path. Register without the flag, "
-                "log in via session cookie, and use the dashboard for now."
-            ),
-        )
 
     ip_hash = derive_ip_prefix_hash(_client_ip(request))
     _check_rate(_RATE_REGISTER, ip_hash or "anon", limit=5)
@@ -270,12 +296,28 @@ async def register(
             ip_prefix_hash=ip_hash,
         )
 
-        # Block D (Wave 3) will mint a starter API key here when
-        # body.with_api_key is True. The early-rejection above means we
-        # never reach this branch with the flag set in Wave 2.
+        # Block D (Wave 3): mint a starter API key alongside the account
+        # when the caller asked for one. The starter scopes are intentionally
+        # narrow (vm:read/create, intent:read/create) so an agent's first
+        # key can't destroy a VM it never wrote — they have to mint a wider
+        # key from the dashboard to opt in. svc_create_api_key flushes but
+        # does not commit; we commit once below so the key INSERT lands
+        # atomically with whatever else this transaction queued (Sourcery
+        # cloud#7 review).
         api_key_cleartext: str | None = None
         api_key_id: str | None = None
         api_key_scopes: list[str] | None = None
+        if body.with_api_key:
+            cleartext, key_row = await svc_create_api_key(
+                db,
+                account_id=account_id,
+                name=(body.api_key_name or "agent-bootstrap")[:64],
+                scopes=[s.value for s in DEFAULT_BOOTSTRAP_SCOPES],
+            )
+            await db.commit()
+            api_key_cleartext = cleartext
+            api_key_id = key_row.key_id
+            api_key_scopes = list(key_row.scopes)
 
     response.set_cookie(value=token, **cookie_kwargs_for_set(secure=_should_secure(request)))
     log.info(
@@ -693,6 +735,126 @@ async def claim_vm(
 
     log.info("vm_claimed", vm_id=vm_id, account_id=account.account_id, proof=body.proof)
     return ClaimResponse(vm_id=vm_id, owner_account_id=account.account_id)
+
+
+# --- Block D (Wave 3): /v1/me/api-keys CRUD ---
+
+
+def _key_summary(row) -> ApiKeySummary:
+    return ApiKeySummary(
+        key_id=row.key_id,
+        name=row.name,
+        scopes=list(row.scopes or []),
+        created_at=row.created_at,
+        last_used_at=row.last_used_at,
+        expires_at=row.expires_at,
+    )
+
+
+@router.get("/me/api-keys", response_model=ApiKeyListResponse)
+async def list_api_keys(
+    request: Request,
+    account: AccountRow = Depends(require_account),
+    app_state: AppState = Depends(get_app_state),
+) -> ApiKeyListResponse:
+    """List active (non-revoked) API keys for the current account.
+
+    Reachable by API-key callers IF the key carries `api_keys:read`. Cookie
+    sessions bypass scope checking (a session = full account access).
+    """
+    if getattr(request.state, "is_api_key", False):
+        if ApiKeyScope.API_KEYS_READ.value not in getattr(
+            request.state, "api_key_scopes", set()
+        ):
+            raise HTTPException(403, "Missing scope: api_keys:read")
+
+    factory = _get_session_factory(app_state)
+    if factory is None:
+        raise HTTPException(503, "Database not available")
+    async with factory() as db:
+        rows = await svc_list_keys(db, account.account_id)
+    return ApiKeyListResponse(keys=[_key_summary(r) for r in rows])
+
+
+@router.post("/me/api-keys", response_model=ApiKeyCreateResponse)
+async def create_api_key_endpoint(
+    body: ApiKeyCreateRequest,
+    request: Request,
+    account: AccountRow = Depends(require_account),
+    app_state: AppState = Depends(get_app_state),
+) -> ApiKeyCreateResponse:
+    """Mint a new API key. The cleartext bearer is in the response — show
+    once and discard. Re-fetching the key from /v1/me/api-keys returns the
+    summary only; the cleartext is not stored server-side.
+
+    Scope rules:
+      - Cookie session: any scope is allowed (you have full account access).
+      - API key: needs `api_keys:write` AND every requested scope must be a
+        subset of the issuing key's scopes (no escalation — a vm:read-only
+        key cannot mint a vm:destroy key).
+    """
+    if getattr(request.state, "is_api_key", False):
+        held: set[str] = getattr(request.state, "api_key_scopes", set())
+        if ApiKeyScope.API_KEYS_WRITE.value not in held:
+            raise HTTPException(403, "Missing scope: api_keys:write")
+        try:
+            _assert_key_scopes_subset(list(held), body.scopes)
+        except ValueError as exc:
+            raise HTTPException(403, str(exc)) from exc
+
+    factory = _get_session_factory(app_state)
+    if factory is None:
+        raise HTTPException(503, "Database not available")
+
+    expires_at: datetime | None = None
+    if body.expires_in_days is not None:
+        expires_at = _now() + timedelta(days=body.expires_in_days)
+
+    async with factory() as db:
+        try:
+            cleartext, row = await svc_create_api_key(
+                db,
+                account_id=account.account_id,
+                name=body.name,
+                scopes=body.scopes,
+                expires_at=expires_at,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await db.commit()
+
+    return ApiKeyCreateResponse(api_key=cleartext, key=_key_summary(row))
+
+
+@router.delete("/me/api-keys/{key_id}")
+async def revoke_api_key_endpoint(
+    key_id: str,
+    request: Request,
+    account: AccountRow = Depends(require_account),
+    app_state: AppState = Depends(get_app_state),
+) -> dict:
+    """Revoke a key. Idempotent — re-revoking an already-revoked key is 200.
+
+    API-key callers need `api_keys:write`. A key cannot revoke itself
+    (would be a footgun for an agent) — we 403 on that specific case so
+    the agent gets a clear error rather than a silent self-lockout.
+    """
+    if getattr(request.state, "is_api_key", False):
+        held: set[str] = getattr(request.state, "api_key_scopes", set())
+        if ApiKeyScope.API_KEYS_WRITE.value not in held:
+            raise HTTPException(403, "Missing scope: api_keys:write")
+        if getattr(request.state, "api_key_id", None) == key_id:
+            raise HTTPException(403, "An API key cannot revoke itself")
+
+    factory = _get_session_factory(app_state)
+    if factory is None:
+        raise HTTPException(503, "Database not available")
+    async with factory() as db:
+        found = await svc_revoke_key(db, account_id=account.account_id, key_id=key_id)
+        await db.commit()
+    if not found:
+        raise HTTPException(404, "API key not found")
+    return {"key_id": key_id, "revoked": True}
 
 
 # --- helpers ---
