@@ -341,26 +341,101 @@ async def delete_dns_record(zone: str, name: str, record_type: str) -> str:
 
 @mcp.tool()
 async def list_payment_networks() -> str:
-    """List the payment chains the backend currently accepts (Block C).
+    """List the currently-enabled x402 payment networks (Block C/H).
 
-    Use this BEFORE picking a chain for create_vm or any paid call —
-    operators flip chains on/off via Vault and the backend is the source
-    of truth. Returns the CAIP-2 identifier + EIP-712 domain shape per
-    chain so an agent's wallet adapter has everything it needs.
+    Returns one line per network: key, display_name, family ("evm" or "svm"),
+    CAIP-2, USDC token address, and decimals. The dispatcher / agent uses
+    `family` to pick the right signing flow (EIP-3009 for EVM, signed SPL
+    transaction for SVM). Reads the live catalog — never hardcode the chain
+    list (feedback_verified_payment_chains.md).
     """
     try:
         async with _client() as hc:
             data = await hc.payment_networks()
-        if not data.get("networks"):
-            return "No payment networks are currently enabled."
-        lines = ["Accepted payment chains:"]
-        for n in data["networks"]:
-            tag = " (testnet)" if n.get("testnet") else ""
+        nets = data.get("networks", [])
+        if not nets:
+            return "No payment networks enabled."
+        lines = [f"Receiver: {data.get('receiver_address', '')}"]
+        lines.append(f"Facilitator: {data.get('facilitator_url', '')}")
+        for n in nets:
             lines.append(
-                f"- {n['display_name']}{tag}: {n['caip2']} · {n['asset']} · "
-                f"token={n['token_address']}"
+                f"  {n['key']:>12s} ({n.get('family', '?')}) {n['display_name']:<18s} "
+                f"caip2={n['caip2']} mint={n['token_address']} dec={n['token_decimals']}"
             )
-        lines.append(f"\nFacilitator: {data.get('facilitator_url')}")
+        return "\n".join(lines)
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def create_crypto_intent(
+    asset: str,
+    amount_usd: str,
+    order_payload: dict,
+    client_order_id: str | None = None,
+) -> str:
+    """
+    Open a BTC or XMR crypto intent for a VM order.
+
+    asset: "BTC" or "XMR".
+    amount_usd: USD price as a decimal string (e.g. "0.40").
+    order_payload: the full VM spec the intent will provision when paid (same
+        shape as create_vm: {"os", "size", "duration_days", "ssh_pubkey", ...}).
+    client_order_id: an opaque idempotency key — sending the same value twice
+        returns the existing intent without creating a second deposit address.
+
+    Returns the deposit address, exact crypto amount, rate snapshot expiry,
+    and a wallet-compatible URI for QR rendering. Poll with get_intent_status.
+    """
+    try:
+        async with _client() as hc:
+            result = await hc.create_crypto_intent(
+                asset=asset,
+                amount_usd=amount_usd,
+                order_payload=order_payload,
+                client_order_id=client_order_id,
+            )
+        lines = [
+            f"Intent: {result['intent_id']}",
+            f"Asset:  {result['asset']}",
+            f"Status: {result['status']}",
+            f"Pay:    {result['amount_crypto']} {result['asset']} "
+            f"(~${result.get('amount_usd', amount_usd)}) to {result['address']}",
+        ]
+        if result.get("rate_valid_until"):
+            lines.append(f"Rate valid until: {result['rate_valid_until']}")
+        if result.get("qr_code_uri"):
+            lines.append(f"Wallet URI: {result['qr_code_uri']}")
+        return "\n".join(lines)
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def get_intent_status(intent_id: str) -> str:
+    """
+    Poll a previously-created crypto intent.
+
+    Status transitions: CREATED → WAITING_PAYMENT → SETTLED → PROVISIONING →
+    PROVISIONED. Off-amount edge cases land in UNDERPAID / OVERPAID / LATE_PAID
+    / REFUND_MANUAL per the LENIENT policy (Block E). Once PROVISIONED the
+    response carries the resulting `vm_id` + management token.
+    """
+    try:
+        async with _client() as hc:
+            s = await hc.get_crypto_intent(intent_id)
+        lines = [
+            f"Intent: {s['intent_id']}",
+            f"Status: {s['status']}",
+        ]
+        if s.get("confirmations") is not None:
+            lines.append(f"Confirmations: {s['confirmations']}")
+        if s.get("amount_received_crypto"):
+            lines.append(f"Received: {s['amount_received_crypto']} {s.get('asset', '')}")
+        if s.get("vm_id"):
+            lines.append(f"VM: {s['vm_id']} (use vm_status to poll readiness)")
+        if s.get("management_token"):
+            lines.append(f"Management token: {s['management_token']} (save once!)")
         return "\n".join(lines)
     except HyruleError as e:
         return _err(e)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 
@@ -26,6 +27,7 @@ from sqlalchemy import select
 from hyrule_cloud.db import (
     AccountRow,
     RecoveryAttemptRow,
+    RecoveryChallengeRow,
     VMRow,
     generate_account_id,
 )
@@ -87,6 +89,12 @@ _RATE_REGISTER = TTLCache(maxsize=10_000, ttl=3600)
 _RATE_LOGIN = TTLCache(maxsize=10_000, ttl=3600)
 _RATE_RECOVER = TTLCache(maxsize=10_000, ttl=3600)
 
+# Block F (Wave 5): wallet-signature recovery. Origin binds the challenge so a
+# signature minted for another dApp can't be replayed here; TTL keeps the
+# server-side nonce short-lived.
+_RECOVERY_ORIGIN = "https://hyrule.host"
+_RECOVERY_CHALLENGE_TTL = timedelta(minutes=5)
+
 
 def _check_rate(bucket: TTLCache, key: str, limit: int) -> None:
     """Raise 429 if `key` has hit `limit` in the bucket's TTL window."""
@@ -144,9 +152,30 @@ class RecoveryCodeResponse(BaseModel):
     message: str = "Password reset. All previous sessions have been revoked."
 
 
-# Block F (Wave 5) will add the WalletChallenge*/WalletVerify* request/
-# response models + their endpoints. Wave 2 ships only the code-based
-# recovery path.
+class WalletChallengeRequest(BaseModel):
+    account_id: str = Field(min_length=11, max_length=11)
+
+
+class WalletChallengeResponse(BaseModel):
+    nonce: str
+    challenge_text: str
+    expires_at: datetime
+    message: str = (
+        "Sign challenge_text verbatim with the EVM wallet that paid for one of "
+        "this account's VMs (personal_sign / EIP-191). Submit the signature to "
+        "/v1/auth/recover/wallet/verify within 5 minutes."
+    )
+
+
+class WalletVerifyRequest(BaseModel):
+    nonce: str = Field(min_length=16, max_length=64)
+    signature: str = Field(min_length=10, max_length=200)
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+class WalletVerifyResponse(BaseModel):
+    account_id: str
+    message: str = "Password reset. All previous sessions have been revoked."
 
 
 class ChangePasswordRequest(BaseModel):
@@ -440,6 +469,222 @@ async def recover_with_code(
         account_id=acct.account_id,
         new_recovery_code=new_code,
     )
+
+
+# --- Endpoints: wallet-signature recovery (Block F) ---
+
+
+def _build_recovery_challenge_text(
+    account_id: str, nonce: str, issued: datetime, expires: datetime
+) -> str:
+    """Origin- and time-bound challenge.
+
+    Including the origin defeats cross-site replay (a signature minted for
+    some other dApp's "Sign in" prompt can't recover here). Including the
+    expiry in the visible text means the wallet UX shows the user how long
+    the proof is valid for.
+    """
+    return (
+        f"Recover Hyrule account {account_id}\n"
+        f"Origin: {_RECOVERY_ORIGIN}\n"
+        f"Nonce: {nonce}\n"
+        f"Issued: {issued.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+        f"Expires: {expires.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+    )
+
+
+@router.post(
+    "/auth/recover/wallet/challenge", response_model=WalletChallengeResponse
+)
+async def recover_wallet_challenge(
+    body: WalletChallengeRequest,
+    request: Request,
+    app_state: AppState = Depends(get_app_state),
+) -> WalletChallengeResponse:
+    """Issue a single-use, time-bound challenge for wallet-signature recovery.
+
+    We always insert + return a challenge — even for unknown account_ids —
+    so an attacker cannot enumerate which accounts exist. Verification will
+    fail at the signer-match step if no VM on this account was ever paid for
+    by the signing wallet.
+    """
+    factory = _get_session_factory(app_state)
+    if factory is None:
+        raise HTTPException(503, "Database not available")
+
+    ip_hash = derive_ip_prefix_hash(_client_ip(request))
+    _check_rate(_RATE_RECOVER, ip_hash or "anon", limit=3)
+
+    nonce = secrets.token_urlsafe(24)  # ~192 bits, URL-safe base64
+    now = _now()
+    expires = now + _RECOVERY_CHALLENGE_TTL
+    text = _build_recovery_challenge_text(body.account_id, nonce, now, expires)
+
+    async with factory() as db:
+        db.add(
+            RecoveryChallengeRow(
+                nonce=nonce,
+                account_id=body.account_id,
+                challenge_text=text,
+                expires_at=expires,
+            )
+        )
+        await db.commit()
+
+    log.info("recovery_wallet_challenge_issued", account_id=body.account_id)
+    return WalletChallengeResponse(
+        nonce=nonce, challenge_text=text, expires_at=expires
+    )
+
+
+@router.post("/auth/recover/wallet/verify", response_model=WalletVerifyResponse)
+async def recover_wallet_verify(
+    body: WalletVerifyRequest,
+    request: Request,
+    app_state: AppState = Depends(get_app_state),
+) -> WalletVerifyResponse:
+    """Verify an EIP-191 signature against a stored challenge + reset password.
+
+    Success requires ALL of:
+      - The challenge row exists, is not used, and is not expired.
+      - The signature recovers to an address that owns at least one VM under
+        the challenge's account_id (i.e. that wallet paid for one of its VMs).
+
+    On success: mark challenge used, set new password, revoke ALL sessions.
+    """
+    factory = _get_session_factory(app_state)
+    if factory is None:
+        raise HTTPException(503, "Database not available")
+
+    ip_hash = derive_ip_prefix_hash(_client_ip(request))
+    _check_rate(_RATE_RECOVER, ip_hash or "anon", limit=3)
+
+    # Generic error reused on every failure path. Distinct exceptions for
+    # "bad nonce" vs "bad signer" would let an attacker probe which step
+    # they failed at; one message keeps the failure-mode opaque.
+    invalid = HTTPException(401, "Invalid or expired recovery challenge")
+
+    async with factory() as db:
+        chal = await db.get(RecoveryChallengeRow, body.nonce)
+
+        # Use the same "always log an attempt" pattern as code recovery so
+        # the audit trail captures both real and probe traffic.
+        if chal is None:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=None,
+                    method="wallet",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise invalid
+
+        now = _now()
+        chal_expires = (
+            chal.expires_at.replace(tzinfo=UTC)
+            if chal.expires_at.tzinfo is None
+            else chal.expires_at
+        )
+        if chal.used_at is not None or chal_expires < now:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=chal.account_id,
+                    method="wallet",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise invalid
+
+        # Recover the signer. Any exception path (malformed signature,
+        # eth_account parse error) collapses to the generic 401.
+        try:
+            from eth_account import Account
+            from eth_account.messages import encode_defunct
+            msg = encode_defunct(text=chal.challenge_text)
+            recovered = Account.recover_message(msg, signature=body.signature)
+        except Exception:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=chal.account_id,
+                    method="wallet",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise invalid
+
+        # Does the recovered address own any VM on this account? (case-insens.)
+        from sqlalchemy import func as sa_func
+        res = await db.execute(
+            select(sa_func.count()).select_from(VMRow).where(
+                VMRow.owner_account_id == chal.account_id,
+                sa_func.lower(VMRow.owner_wallet) == recovered.lower(),
+            )
+        )
+        match_count = int(res.scalar() or 0)
+
+        if match_count == 0:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=chal.account_id,
+                    method="wallet",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise invalid
+
+        # Burn the challenge BEFORE doing anything else so a racing duplicate
+        # request can't double-spend the same signature.
+        chal.used_at = now
+        await db.commit()
+
+        acct = await db.get(AccountRow, chal.account_id)
+        if acct is None:
+            # The wallet+account pair matched a VM row but the account row
+            # itself is gone — treat as opaque failure.
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=chal.account_id,
+                    method="wallet",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise invalid
+
+        acct.password_hash = hash_password(body.new_password)
+        acct.password_changed_at = now
+        # Don't auto-rotate recovery_code on this path — the user can do that
+        # explicitly from the dashboard. The code endpoint rotates because the
+        # code is consumed in that flow; signatures aren't consumed analogously.
+        await db.commit()
+
+        revoked = await revoke_all_sessions_for(db, acct.account_id)
+
+        db.add(
+            RecoveryAttemptRow(
+                account_id=acct.account_id,
+                method="wallet",
+                success=True,
+                ip_prefix_hash=ip_hash,
+            )
+        )
+        await db.commit()
+
+    log.info(
+        "recovery_wallet_used",
+        account_id=acct.account_id,
+        sessions_revoked=revoked,
+    )
+    return WalletVerifyResponse(account_id=acct.account_id)
 
 
 # --- Endpoints: /me ---

@@ -8,6 +8,7 @@ either a 402 Response or the payer's wallet address.
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -154,6 +155,80 @@ async def get_runtime_stats(
     }
     _RUNTIME_CACHE["runtime"] = payload
     return payload
+
+
+# --- Block H (Wave 5): fleet-wide network stats from Prometheus on `mon` ---
+
+_NETWORK_CACHE: dict[str, object] = {"value": None, "expires_at": 0.0}
+_NETWORK_TTL_SECONDS = 30
+_NETWORK_STATIC_FALLBACK: dict[str, Any] = {
+    # Hard-coded fleet truth as of the last operator review. Drifts slowly;
+    # update this dict via PR if BGP topology or transit set changes.
+    "bgp_peers_established": None,
+    "ipv6_prefixes_announced": 3,
+    "nat64_sessions_active": None,
+    "transit_providers": ["AS34872", "AS210233"],
+}
+
+
+@router.get("/stats/network")
+async def get_network_stats(request: Request):
+    """Live fleet truth (BGP peers, IPv6 prefixes, NAT64 sessions) from
+    Prometheus on `mon`. Fail-soft: a missing/unreachable Prometheus returns
+    the static fallback shape with _source="fallback" — never a 500."""
+    import time as _time
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    now = _time.time()
+    cached = _NETWORK_CACHE.get("value")
+    if cached is not None and now < float(_NETWORK_CACHE["expires_at"]):
+        return cached
+
+    app_state: AppState = request.app.state._typed_state
+    cfg = app_state.config
+    prom_url = getattr(cfg, "prometheus_url", "") or ""
+
+    body: dict[str, Any] = {
+        "bgp_peers_established": _NETWORK_STATIC_FALLBACK["bgp_peers_established"],
+        "ipv6_prefixes_announced": _NETWORK_STATIC_FALLBACK["ipv6_prefixes_announced"],
+        "nat64_sessions_active": _NETWORK_STATIC_FALLBACK["nat64_sessions_active"],
+        "transit_providers": list(_NETWORK_STATIC_FALLBACK["transit_providers"]),
+        "_source": "fallback",
+        "updated_at": _dt.now(UTC).isoformat(),
+    }
+
+    if prom_url:
+        from hyrule_cloud.providers.prometheus import PrometheusClient
+
+        client = PrometheusClient(prom_url)
+        # PromQL queries — written so a missing exporter cleanly returns None
+        # rather than raising; the endpoint then keeps the static fallback for
+        # that one field while still labelling _source live for the rest.
+        bgp = await client.query_scalar('count(bgp_peer_state == 1)')
+        if bgp is None:
+            # FRR exporter alternative metric name
+            bgp = await client.query_scalar('count(frr_bgp_peer_state{state="Established"})')
+        prefixes = await client.query_scalar('count(count by (prefix) (bgp_prefix_received))')
+        nat64 = await client.query_scalar('sum(nat64_sessions_active)')
+
+        live_count = 0
+        if bgp is not None:
+            body["bgp_peers_established"] = int(bgp)
+            live_count += 1
+        if prefixes is not None:
+            body["ipv6_prefixes_announced"] = int(prefixes)
+            live_count += 1
+        if nat64 is not None:
+            body["nat64_sessions_active"] = int(nat64)
+            live_count += 1
+
+        if live_count > 0:
+            body["_source"] = f"prometheus-{prom_url}"
+
+    _NETWORK_CACHE["value"] = body
+    _NETWORK_CACHE["expires_at"] = now + _NETWORK_TTL_SECONDS
+    return body
 
 
 # --- Free endpoints ---

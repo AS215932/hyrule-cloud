@@ -250,6 +250,30 @@ class HyruleClient:
         the wire format is the single source of truth."""
         return await self._request("GET", "/v1/payments/networks")
 
+    async def create_crypto_intent(
+        self,
+        *,
+        asset: str,
+        amount_usd: str,
+        order_payload: dict[str, Any],
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Block E/H: open a BTC or XMR payment intent. Returns deposit address
+        + QR + rate snapshot. Use client_order_id for idempotent retries."""
+        body: dict[str, Any] = {
+            "asset": asset,
+            "amount_usd": amount_usd,
+            "order_payload": order_payload,
+        }
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+        return await self._request("POST", "/v1/intent/create", json=body)
+
+    async def get_crypto_intent(self, intent_id: str) -> dict[str, Any]:
+        """Block E/H: poll a crypto intent. Returns status, confirmations, and
+        once PROVISIONED the resulting vm_id + one-shot management token."""
+        return await self._request("GET", f"/v1/intent/{intent_id}")
+
     async def register(
         self,
         password: str,

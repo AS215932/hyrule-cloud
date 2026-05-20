@@ -35,6 +35,9 @@ dependencies = [
     # secp256k1 backend; pinned for the Debian 13 / Python 3.13 runner.
     "bip-utils>=2.9,<2.10",
     "coincurve>=20.0,<21.0",
+    # Block F (Wave 5): EIP-191 signature recovery for wallet-signature account
+    # recovery (recover the signer address from a personal_sign signature).
+    "eth-account>=0.13",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +47,8 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "aiosqlite>=0.20",
+    # Block H (Wave 5): mock httpx for the Prometheus /v1/stats/network tests.
+    "respx>=0.21",
 ]
 
 [project.scripts]
