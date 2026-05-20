@@ -186,6 +186,7 @@ async def get_payment_networks(cfg = Depends(get_cfg)) -> dict:
                 "token_address": n.token_address,
                 "token_decimals": n.token_decimals,
                 "eip712_domain": n.eip712_domain,
+                "native_currency": n.native_currency,
                 "rpc_url": n.rpc_url,
                 "block_explorer_url": n.block_explorer_url,
                 "testnet": n.testnet,

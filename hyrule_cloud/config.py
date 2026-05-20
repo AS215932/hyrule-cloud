@@ -38,6 +38,13 @@ class PaymentNetwork:
     token_address: str  # contract address (EVM) or mint (SVM)
     token_decimals: int
     eip712_domain: dict[str, str] = field(default_factory=dict)  # name + version
+    # Native gas token shape for wallet_addEthereumChain ({name, symbol,
+    # decimals}). Sourced from here rather than hardcoded ETH in the JS
+    # adapter — Polygon's native is POL, not ETH, so a baked-in default would
+    # mis-add the chain to the wallet (per [[feedback_verified_payment_chains]]).
+    native_currency: dict[str, str | int] = field(
+        default_factory=lambda: {"name": "Ether", "symbol": "ETH", "decimals": 18}
+    )
     rpc_url: str = ""
     block_explorer_url: str = ""
     testnet: bool = False
@@ -81,6 +88,7 @@ _DEFAULT_NETWORKS: list[PaymentNetwork] = [
         token_address="0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
         token_decimals=6,
         eip712_domain={"name": "USD Coin", "version": "2"},
+        native_currency={"name": "POL", "symbol": "POL", "decimals": 18},
         rpc_url="https://polygon-rpc.com",
         block_explorer_url="https://polygonscan.com",
         testnet=False,

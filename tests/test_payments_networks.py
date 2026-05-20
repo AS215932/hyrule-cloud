@@ -97,6 +97,11 @@ async def test_payments_networks_shape_locks_in_required_fields(
         # eip712_domain must have name + version — frontend needs both.
         assert n["eip712_domain"]["name"]
         assert n["eip712_domain"]["version"]
+        # native_currency feeds wallet_addEthereumChain when the wallet
+        # doesn't know the chain yet — must carry name/symbol/decimals.
+        assert n["native_currency"]["name"]
+        assert n["native_currency"]["symbol"]
+        assert isinstance(n["native_currency"]["decimals"], int)
 
 
 @pytest.mark.asyncio
@@ -133,3 +138,16 @@ def test_disabled_chain_drops_off_the_wire() -> None:
         ]
     )
     assert [n.key for n in cfg.enabled_networks()] == ["base"]
+
+
+def test_polygon_native_currency_is_pol_not_eth() -> None:
+    """Block C: Polygon's native gas token is POL, not ETH. The JS adapter
+    sources native_currency from the backend (never hardcodes ETH) so that
+    wallet_addEthereumChain advertises the correct token when an operator
+    enables Polygon via Vault. Guards the [[feedback_verified_payment_chains]]
+    rule that chain metadata flows from one source of truth."""
+    cfg = PaymentConfig()
+    polygon = next(n for n in cfg.payment_networks if n.key == "polygon")
+    assert polygon.native_currency["symbol"] == "POL"
+    base = next(n for n in cfg.payment_networks if n.key == "base")
+    assert base.native_currency["symbol"] == "ETH"
