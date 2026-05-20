@@ -1,11 +1,15 @@
 """native crypto intent engine: state machine + idempotency + ownership link
 
-Block E. Expands `CryptoIntentRow` from the toy PENDING/PAID/EXPIRED shape
-into the full LENIENT-policy state machine: CREATED → WAITING_PAYMENT →
-SETTLED → PROVISIONING → PROVISIONED, plus UNDERPAID/OVERPAID/LATE_PAID/
-EXPIRED/FAILED/REFUND_MANUAL branches. Adds idempotency key, order payload
-carry-through, rate snapshot, confirmations tracker, atomic provisioning
-trigger, XMR subaddress index, account link, and VM back-reference.
+Block E. Creates `crypto_intents` and the `crypto_intent_status` enum in their
+full LENIENT-policy shape: the toy pending/paid carry-overs plus the state
+machine CREATED → WAITING_PAYMENT → SETTLED → PROVISIONING → PROVISIONED, with
+UNDERPAID/OVERPAID/LATE_PAID/EXPIRED/FAILED/REFUND_MANUAL branches. Carries the
+idempotency key, order payload, rate snapshot, confirmations tracker, atomic
+provisioning trigger, XMR subaddress index, account link, and VM back-reference.
+
+Self-contained: it does NOT assume the hand-applied db_patch toy table/enum.
+Lands as dead schema in Wave 2; the engine code that reads it ships in Wave 4
+behind HYR_FEATURES_INTENT_ENGINE.
 
 Revision ID: 004
 Revises: 003
@@ -24,15 +28,19 @@ down_revision: str | None = "003"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
-# New status values to graft onto the existing crypto_intent_status enum.
-_NEW_STATUS_VALUES = (
+# Full crypto_intent_status value set: the legacy toy `pending`/`paid` plus the
+# Block E state machine. Order MATCHES hyrule_cloud.models.CryptoIntentStatus so
+# an alembic-migrated DB and a create_all() DB (tests) produce the same enum.
+_STATUS_VALUES = (
+    "pending",
+    "paid",
     "CREATED",
     "WAITING_PAYMENT",
     "UNDERPAID",
     "OVERPAID",
     "LATE_PAID",
     "SETTLED",
-    "EXPIRED",          # already in pre-Block-E enum but listed for completeness
+    "EXPIRED",
     "PROVISIONING",
     "PROVISIONED",
     "FAILED",
@@ -41,100 +49,81 @@ _NEW_STATUS_VALUES = (
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    dialect = bind.dialect.name
-
-    # 1. Grow the Postgres enum to include all new status values.
-    # Postgres `ALTER TYPE ... ADD VALUE` accepts only a string literal — it
-    # cannot take a bind parameter — so we MUST interpolate. The values are
-    # compile-time constants in _NEW_STATUS_VALUES; we re-validate against a
-    # narrow allowlist so a future contributor adding a value with a quote or
-    # other SQL metacharacter still gets a clear failure at migration time
-    # rather than producing a malformed DDL string. (Sourcery flagged this as
-    # SQL-injection — false positive given the constants, but the guard keeps
-    # the static analyser and a future reader honest.)
-    if dialect == "postgresql":
-        import re
-        valid_pat = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
-        for v in _NEW_STATUS_VALUES:
-            if not valid_pat.match(v):
-                raise ValueError(f"Invalid crypto_intent_status value: {v!r}")
-            op.execute(f"ALTER TYPE crypto_intent_status ADD VALUE IF NOT EXISTS '{v}'")
-
-    # 2. Add new columns. JSONB on PG, generic JSON on SQLite (tests).
+    # The crypto_intents table + crypto_intent_status enum are CREATED here,
+    # not extended. Earlier revisions of this migration assumed both already
+    # existed from the hand-applied db_patch toy scripts on `api`; that made the
+    # chain unappliable on a clean DB (disaster recovery, new env, alembic CI).
+    # We now create the full Block E shape from scratch so 001→006 applies on
+    # any empty database. This is dead schema until Wave 4 flips
+    # HYR_FEATURES_INTENT_ENGINE; no code reads it before then.
+    #
+    # JSONB on Postgres, generic JSON on SQLite (tests use create_all, not this
+    # migration, but keep the variant for parity).
     json_type = postgresql.JSONB().with_variant(sa.JSON(), "sqlite")
 
-    op.add_column("crypto_intents", sa.Column("client_order_id", sa.String(64), nullable=True))
-    op.create_index(
-        "ix_crypto_intents_client_order_id",
-        "crypto_intents",
-        ["client_order_id"],
-        unique=True,
-    )
+    # sa.Enum inside create_table emits CREATE TYPE before CREATE TABLE on
+    # Postgres and a CHECK constraint on SQLite — matching the model's
+    # Enum(..., name="crypto_intent_status"). Listing literal values (not user
+    # input) sidesteps the ALTER TYPE string-interpolation the old revision
+    # needed (and the Sourcery SQL-injection finding it carried).
+    status_enum = sa.Enum(*_STATUS_VALUES, name="crypto_intent_status")
 
-    op.add_column("crypto_intents", sa.Column("order_payload", json_type, nullable=True))
-    op.add_column("crypto_intents", sa.Column("rate_snapshot", sa.Numeric(20, 8), nullable=True))
-    op.add_column("crypto_intents", sa.Column("rate_valid_until", sa.DateTime(timezone=True), nullable=True))
-    op.add_column(
+    op.create_table(
         "crypto_intents",
+        sa.Column("intent_id", sa.String(36), primary_key=True),
+        sa.Column("asset", sa.String(8), nullable=False),
+        sa.Column("amount_crypto", sa.Numeric(24, 12), nullable=False),
+        sa.Column("amount_usd", sa.Numeric(12, 6), nullable=True),
+        sa.Column("address", sa.String(128), nullable=False),
+        sa.Column("status", status_enum, nullable=False),
+        sa.Column("bip32_index", sa.Integer, nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("paid_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("tx_hash", sa.String(128), nullable=True),
+        # --- Block E additions ---
+        sa.Column("client_order_id", sa.String(64), nullable=True),
+        sa.Column("order_payload", json_type, nullable=True),
+        sa.Column("rate_snapshot", sa.Numeric(20, 8), nullable=True),
+        sa.Column("rate_valid_until", sa.DateTime(timezone=True), nullable=True),
         sa.Column("confirmations", sa.Integer, nullable=False, server_default="0"),
-    )
-    op.add_column(
-        "crypto_intents",
         sa.Column("amount_received_crypto", sa.Numeric(24, 12), nullable=True),
-    )
-    op.add_column(
-        "crypto_intents",
         sa.Column("provisioning_triggered_at", sa.DateTime(timezone=True), nullable=True),
-    )
-    op.add_column("crypto_intents", sa.Column("xmr_subaddr_index", sa.Integer, nullable=True))
-    op.create_index(
-        "ix_crypto_intents_xmr_subaddr_index",
-        "crypto_intents",
-        ["xmr_subaddr_index"],
-        unique=True,
-    )
-    op.add_column("crypto_intents", sa.Column("last_scanned_at", sa.DateTime(timezone=True), nullable=True))
-    op.add_column(
-        "crypto_intents",
+        sa.Column("xmr_subaddr_index", sa.Integer, nullable=True),
+        sa.Column("last_scanned_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
             "owner_account_id",
             sa.String(11),
             sa.ForeignKey("accounts.account_id", ondelete="SET NULL"),
             nullable=True,
         ),
+        sa.Column("vm_id", sa.String(32), nullable=True),
+        # One-shot reveal column for the anon management token cleartext (see db.py).
+        sa.Column("anon_token_cleartext", sa.String(64), nullable=True),
+    )
+
+    op.create_index("ix_crypto_intents_status_expires", "crypto_intents", ["status", "expires_at"])
+    op.create_index("ix_crypto_intents_asset_bip32", "crypto_intents", ["asset", "bip32_index"])
+    op.create_index(
+        "ix_crypto_intents_client_order_id", "crypto_intents", ["client_order_id"], unique=True
+    )
+    # Model declares `unique=True` (no index=True) on xmr_subaddr_index, which
+    # create_all renders as a unique CONSTRAINT, not an index. Match that exact
+    # form/name so autogenerate stays quiet.
+    op.create_unique_constraint(
+        "crypto_intents_xmr_subaddr_index_key", "crypto_intents", ["xmr_subaddr_index"]
     )
     op.create_index("ix_crypto_intents_owner_account_id", "crypto_intents", ["owner_account_id"])
-    op.add_column("crypto_intents", sa.Column("vm_id", sa.String(32), nullable=True))
     op.create_index("ix_crypto_intents_vm_id", "crypto_intents", ["vm_id"])
-    # One-shot reveal column for the anon management token cleartext (see db.py).
-    op.add_column("crypto_intents", sa.Column("anon_token_cleartext", sa.String(64), nullable=True))
-
-    op.create_index(
-        "ix_crypto_intents_asset_bip32",
-        "crypto_intents",
-        ["asset", "bip32_index"],
-    )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_crypto_intents_asset_bip32", table_name="crypto_intents")
-    op.drop_column("crypto_intents", "anon_token_cleartext")
-    op.drop_index("ix_crypto_intents_vm_id", table_name="crypto_intents")
-    op.drop_column("crypto_intents", "vm_id")
-    op.drop_index("ix_crypto_intents_owner_account_id", table_name="crypto_intents")
-    op.drop_column("crypto_intents", "owner_account_id")
-    op.drop_column("crypto_intents", "last_scanned_at")
-    op.drop_index("ix_crypto_intents_xmr_subaddr_index", table_name="crypto_intents")
-    op.drop_column("crypto_intents", "xmr_subaddr_index")
-    op.drop_column("crypto_intents", "provisioning_triggered_at")
-    op.drop_column("crypto_intents", "amount_received_crypto")
-    op.drop_column("crypto_intents", "confirmations")
-    op.drop_column("crypto_intents", "rate_valid_until")
-    op.drop_column("crypto_intents", "rate_snapshot")
-    op.drop_column("crypto_intents", "order_payload")
-    op.drop_index("ix_crypto_intents_client_order_id", table_name="crypto_intents")
-    op.drop_column("crypto_intents", "client_order_id")
-    # Note: Postgres does not support removing values from an enum cleanly.
-    # Downgrade leaves the new status values present in the type definition
-    # but unused; this is conventional and harmless.
+    op.drop_table("crypto_intents")
+    # create_table auto-created the enum on Postgres; drop it explicitly so a
+    # downgrade leaves no orphan type behind. checkfirst keeps SQLite happy.
+    sa.Enum(name="crypto_intent_status").drop(op.get_bind(), checkfirst=True)
