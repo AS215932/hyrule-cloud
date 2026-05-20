@@ -20,6 +20,7 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine import Connection
 
 from alembic import op
 
@@ -48,7 +49,33 @@ _STATUS_VALUES = (
 )
 
 
+def _legacy_toy_schema_present(bind: Connection) -> bool:
+    """True if the hand-applied db_patch toy `crypto_intents` table or
+    `crypto_intent_status` enum is still in the DB. Those predate the alembic
+    chain; this migration creates both fresh, so they must be gone first."""
+    if "crypto_intents" in sa.inspect(bind).get_table_names():
+        return True
+    if bind.dialect.name == "postgresql":
+        row = bind.execute(
+            sa.text("SELECT 1 FROM pg_type WHERE typname = 'crypto_intent_status'")
+        ).first()
+        return row is not None
+    return False
+
+
 def upgrade() -> None:
+    # Fail fast with an actionable message if the legacy toy schema is still
+    # present, rather than a cryptic "relation/type already exists". The only
+    # environment that ever had it is `api`; playbooks/cloud_toy_cleanup.yml
+    # drops the empty toy accounts + crypto_intents + crypto_intent_status and
+    # is the documented pre-migration step.
+    if _legacy_toy_schema_present(op.get_bind()):
+        raise RuntimeError(
+            "Legacy db_patch toy crypto_intents/crypto_intent_status detected. "
+            "Run playbooks/cloud_toy_cleanup.yml (idempotent, refuses non-empty "
+            "tables) before applying migration 004."
+        )
+
     # The crypto_intents table + crypto_intent_status enum are CREATED here,
     # not extended. Earlier revisions of this migration assumed both already
     # existed from the hand-applied db_patch toy scripts on `api`; that made the
