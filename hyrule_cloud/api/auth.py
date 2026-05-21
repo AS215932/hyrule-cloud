@@ -89,10 +89,9 @@ _RATE_REGISTER = TTLCache(maxsize=10_000, ttl=3600)
 _RATE_LOGIN = TTLCache(maxsize=10_000, ttl=3600)
 _RATE_RECOVER = TTLCache(maxsize=10_000, ttl=3600)
 
-# Block F (Wave 5): wallet-signature recovery. Origin binds the challenge so a
-# signature minted for another dApp can't be replayed here; TTL keeps the
-# server-side nonce short-lived.
-_RECOVERY_ORIGIN = "https://hyrule.host"
+# Block F (Wave 5): wallet-signature recovery. The origin (bound into the
+# challenge so a signature minted for another dApp can't be replayed here) comes
+# from config.recovery_origin per-environment; TTL keeps the nonce short-lived.
 _RECOVERY_CHALLENGE_TTL = timedelta(minutes=5)
 
 
@@ -475,7 +474,7 @@ async def recover_with_code(
 
 
 def _build_recovery_challenge_text(
-    account_id: str, nonce: str, issued: datetime, expires: datetime
+    account_id: str, nonce: str, issued: datetime, expires: datetime, origin: str
 ) -> str:
     """Origin- and time-bound challenge.
 
@@ -486,7 +485,7 @@ def _build_recovery_challenge_text(
     """
     return (
         f"Recover Hyrule account {account_id}\n"
-        f"Origin: {_RECOVERY_ORIGIN}\n"
+        f"Origin: {origin}\n"
         f"Nonce: {nonce}\n"
         f"Issued: {issued.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
         f"Expires: {expires.strftime('%Y-%m-%dT%H:%M:%SZ')}"
@@ -518,7 +517,8 @@ async def recover_wallet_challenge(
     nonce = secrets.token_urlsafe(24)  # ~192 bits, URL-safe base64
     now = _now()
     expires = now + _RECOVERY_CHALLENGE_TTL
-    text = _build_recovery_challenge_text(body.account_id, nonce, now, expires)
+    origin = getattr(app_state.config, "recovery_origin", "https://hyrule.host")
+    text = _build_recovery_challenge_text(body.account_id, nonce, now, expires, origin)
 
     async with factory() as db:
         db.add(

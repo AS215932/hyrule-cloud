@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from hyrule_cloud.db import CryptoIntentRow
 from hyrule_cloud.models import (
@@ -131,7 +132,23 @@ async def create_intent(
             owner_account_id=owner_account_id,
         )
         db.add(row)
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError as exc:
+            # Lost a concurrent race on the unique client_order_id index — the
+            # pre-insert SELECT above is best-effort; the DB constraint is the
+            # real guard. Return the winner's intent instead of a duplicate.
+            await db.rollback()
+            if client_order_id:
+                existing = await db.execute(
+                    select(CryptoIntentRow).where(
+                        CryptoIntentRow.client_order_id == client_order_id
+                    )
+                )
+                won = existing.scalar_one_or_none()
+                if won is not None:
+                    raise IntentExistsError(won) from exc
+            raise
         await db.refresh(row)
         return row
 
@@ -354,9 +371,12 @@ async def scan_pending_intents(
             select(CryptoIntentRow.intent_id).where(
                 CryptoIntentRow.status.in_(
                     (
+                        # LATE_PAID is a reserved enum value but never a resting
+                        # state: the late-paid decision collapses inline to
+                        # SETTLED (re-quote within slippage) or REFUND_MANUAL in
+                        # _decide_status, so no row is ever stored as LATE_PAID.
                         CryptoIntentStatus.CREATED,
                         CryptoIntentStatus.WAITING_PAYMENT,
-                        CryptoIntentStatus.LATE_PAID,
                     )
                 )
             )

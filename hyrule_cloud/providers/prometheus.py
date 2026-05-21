@@ -18,11 +18,24 @@ log = structlog.get_logger()
 
 
 class PrometheusClient:
-    """Tiny GET /api/v1/query wrapper. Stateless, async, time-bounded."""
+    """Tiny GET /api/v1/query wrapper. Async, time-bounded, reuses one client."""
 
     def __init__(self, base_url: str, timeout_seconds: float = 5.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self._client: httpx.AsyncClient | None = None
+
+    def _http(self) -> httpx.AsyncClient:
+        # One reused connection pool across the several queries a single
+        # /stats/network request issues — cheaper than a client per query.
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.timeout_seconds)
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     async def query_scalar(self, promql: str) -> float | None:
         """Run a PromQL query expected to reduce to a single scalar.
@@ -31,11 +44,10 @@ class PrometheusClient:
         (network error, non-200, empty result, unparseable response).
         """
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                resp = await client.get(
-                    f"{self.base_url}/api/v1/query",
-                    params={"query": promql},
-                )
+            resp = await self._http().get(
+                f"{self.base_url}/api/v1/query",
+                params={"query": promql},
+            )
             if resp.status_code != 200:
                 log.warning("prometheus_non_200", status=resp.status_code, query=promql)
                 return None
@@ -67,11 +79,10 @@ class PrometheusClient:
         Useful when the caller wants the full vector (e.g. per-peer breakdown).
         """
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                resp = await client.get(
-                    f"{self.base_url}/api/v1/query",
-                    params={"query": promql},
-                )
+            resp = await self._http().get(
+                f"{self.base_url}/api/v1/query",
+                params={"query": promql},
+            )
             if resp.status_code != 200:
                 return None
             body = resp.json()

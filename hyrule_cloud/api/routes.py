@@ -205,12 +205,15 @@ async def get_network_stats(request: Request):
         # PromQL queries — written so a missing exporter cleanly returns None
         # rather than raising; the endpoint then keeps the static fallback for
         # that one field while still labelling _source live for the rest.
-        bgp = await client.query_scalar('count(bgp_peer_state == 1)')
-        if bgp is None:
-            # FRR exporter alternative metric name
-            bgp = await client.query_scalar('count(frr_bgp_peer_state{state="Established"})')
-        prefixes = await client.query_scalar('count(count by (prefix) (bgp_prefix_received))')
-        nat64 = await client.query_scalar('sum(nat64_sessions_active)')
+        try:
+            bgp = await client.query_scalar('count(bgp_peer_state == 1)')
+            if bgp is None:
+                # FRR exporter alternative metric name
+                bgp = await client.query_scalar('count(frr_bgp_peer_state{state="Established"})')
+            prefixes = await client.query_scalar('count(count by (prefix) (bgp_prefix_received))')
+            nat64 = await client.query_scalar('sum(nat64_sessions_active)')
+        finally:
+            await client.aclose()
 
         live_count = 0
         if bgp is not None:
@@ -786,15 +789,22 @@ async def get_crypto_intent_status(
                 account.account_id != row.owner_account_id and not account.is_admin
             ):
                 raise HTTPException(404, "Intent not found")
-        # One-shot reveal: snapshot cleartext, then NULL it.
+        # One-shot reveal: atomically clear the token under a NOT NULL guard so
+        # two concurrent GETs can't both reveal it. Only the caller whose UPDATE
+        # actually matches a row (rowcount == 1) returns the cleartext we read
+        # above; later callers match zero rows and respond without it. (Can't use
+        # UPDATE ... RETURNING here — that returns the post-update NULL value.)
         revealed = row.anon_token_cleartext
         if revealed is not None:
-            await session.execute(
+            result = await session.execute(
                 _sql_update(CryptoIntentRow)
-                .where(CryptoIntentRow.intent_id == intent_id)
+                .where(
+                    CryptoIntentRow.intent_id == intent_id,
+                    CryptoIntentRow.anon_token_cleartext.is_not(None),
+                )
                 .values(anon_token_cleartext=None)
             )
             await session.commit()
-            row.anon_token_cleartext = revealed  # local copy for the response
+            row.anon_token_cleartext = revealed if result.rowcount == 1 else None
 
     return _intent_to_response(row, request)
