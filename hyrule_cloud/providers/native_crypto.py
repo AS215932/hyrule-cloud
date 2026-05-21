@@ -105,7 +105,8 @@ class NativeCryptoProvider:
         We separately fetch `/address/<addr>/txs` for the most recent tx hash
         and block height (for confirmations).
         """
-        assert self._http is not None, "call start() before scanning"
+        if self._http is None:
+            raise RuntimeError("NativeCryptoProvider.start() must be called before scanning")
         for base in (_ESPLORA_PRIMARY, _ESPLORA_FALLBACK):
             try:
                 addr_resp = await self._http.get(f"{base}/address/{address}")
@@ -154,7 +155,8 @@ class NativeCryptoProvider:
 
     async def _xmr_rpc(self, method: str, params: dict | None = None) -> dict:
         """Single JSON-RPC call to monero-wallet-rpc on 127.0.0.1."""
-        assert self._http is not None, "call start() before scanning"
+        if self._http is None:
+            raise RuntimeError("NativeCryptoProvider.start() must be called before scanning")
         payload = {
             "jsonrpc": "2.0",
             "id": "0",

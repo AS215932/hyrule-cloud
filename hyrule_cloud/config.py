@@ -212,6 +212,10 @@ class HyruleConfig(BaseSettings):
     # Empty = static fallback (CI / local dev).
     prometheus_url: str = ""
 
+    # Block F (Wave 5): origin bound into wallet-recovery challenges. Per-env so
+    # staging / alternate domains emit a matching origin without a code change.
+    recovery_origin: str = "https://hyrule.host"
+
     # DNS (RFC 2136)
     dns_server: str = ""
     dns_tsig_key: str = ""
