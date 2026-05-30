@@ -27,7 +27,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 _INT_ARRAY = ARRAY(Integer).with_variant(JSON(), "sqlite")
 _JSONB = JSONB().with_variant(JSON(), "sqlite")
 
-from hyrule_cloud.models import CryptoIntentStatus, DomainMode, VMSize, VMStatus
+from hyrule_cloud.models import CryptoIntentStatus, DomainMode, QuoteStatus, VMSize, VMStatus
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -220,6 +220,48 @@ class CryptoIntentRow(Base):
         Index("ix_crypto_intents_status_expires", "status", "expires_at"),
         Index("ix_crypto_intents_asset_bip32", "asset", "bip32_index"),
     )
+
+
+class VMQuoteRow(Base):
+    """Durable order quote (issue #14).
+
+    The single order object the UI and agents pay against: priced once at
+    creation, it survives review-page reloads and mobile wallet handoffs via its
+    `quote_id`. Mirrors the CryptoIntentRow idempotency + order_payload pattern.
+
+    Lifecycle: created → consumed (a VM was provisioned) | expired (TTL).
+    """
+
+    __tablename__ = "vm_quotes"
+
+    quote_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # Full VM creation spec (a VMCreateRequest dump) carried through to create.
+    order_payload: Mapped[dict] = mapped_column(_JSONB)
+    # Price locked at quote creation; the 402 challenge uses this, not a recompute.
+    amount_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    status: Mapped[str] = mapped_column(
+        Enum(
+            QuoteStatus,
+            name="vm_quote_status",
+            create_constraint=True,
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        default=QuoteStatus.CREATED,
+    )
+    # Idempotency key from the client; same key + same spec returns the same quote.
+    client_order_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    # Account ownership (A1 parity) — set when created from a logged-in session.
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+    # Set when the quote is consumed (links to the provisioned VM).
+    vm_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("ix_vm_quotes_status_expires", "status", "expires_at"),)
 
 
 # --- Session factory ---
