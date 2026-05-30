@@ -136,12 +136,14 @@ async def get_quote(session_factory: async_sessionmaker, quote_id: str) -> VMQuo
         return await db.get(VMQuoteRow, quote_id)
 
 
-async def mark_consumed(session_factory: async_sessionmaker, quote_id: str, vm_id: str) -> bool:
-    """Flip CREATED → CONSUMED and link the provisioned VM.
+async def claim_quote(session_factory: async_sessionmaker, quote_id: str) -> bool:
+    """Atomically flip CREATED → CONSUMED. Returns True iff THIS call won the
+    claim (rowcount == 1).
 
-    Atomic and idempotent: only the caller whose UPDATE matches a still-CREATED
-    row (rowcount == 1) wins, so two concurrent paid creates can't both consume.
-    Returns True if this call performed the transition.
+    Must be called BEFORE provisioning: two concurrent paid creates for the same
+    quote both pass the CREATED check, but only one wins this atomic UPDATE, so
+    only the winner provisions a VM (the loser returns the winner's VM). The
+    vm_id is attached afterwards via link_quote_vm once the VM exists.
     """
     async with session_factory() as db:
         result = await db.execute(
@@ -150,7 +152,17 @@ async def mark_consumed(session_factory: async_sessionmaker, quote_id: str, vm_i
                 VMQuoteRow.quote_id == quote_id,
                 VMQuoteRow.status == QuoteStatus.CREATED,
             )
-            .values(status=QuoteStatus.CONSUMED, vm_id=vm_id)
+            .values(status=QuoteStatus.CONSUMED)
         )
         await db.commit()
         return result.rowcount == 1
+
+
+async def link_quote_vm(session_factory: async_sessionmaker, quote_id: str, vm_id: str) -> None:
+    """Attach the provisioned VM to its already-claimed quote (idempotent replay
+    of a consumed quote then returns this vm_id)."""
+    async with session_factory() as db:
+        await db.execute(
+            _sql_update(VMQuoteRow).where(VMQuoteRow.quote_id == quote_id).values(vm_id=vm_id)
+        )
+        await db.commit()

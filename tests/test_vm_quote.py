@@ -290,6 +290,27 @@ async def test_create_idempotent_replay_of_consumed_quote(quote_state, client):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_paid_creates_provision_at_most_one_vm(quote_state, client):
+    """Sourcery (#16): the quote is claimed atomically BEFORE provisioning, so two
+    concurrent paid creates for the same quote provision exactly one VM."""
+    import asyncio
+
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+
+    r1, r2 = await asyncio.gather(
+        client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"])),
+        client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"])),
+    )
+    # The invariant: at most one VM regardless of how the two interleave.
+    assert len(quote_state.orchestrator.created_vms) == 1
+    statuses = {r1.status_code, r2.status_code}
+    # Winner → 200 (vm_id); loser → 200 (idempotent existing VM) or 409 (mid-provision).
+    assert 200 in statuses
+    assert statuses.issubset({200, 409})
+
+
+@pytest.mark.asyncio
 async def test_create_unknown_quote_404(quote_state, client):
     quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
     res = await client.post("/v1/vm/create", json=_order(quote_id="q_nope"))

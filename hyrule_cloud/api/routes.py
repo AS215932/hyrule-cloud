@@ -55,10 +55,11 @@ from hyrule_cloud.models import (
 from hyrule_cloud.services.quotes import (
     QuoteConflictError,
     QuoteExistsError,
+    claim_quote,
     create_quote,
     get_quote,
     is_expired,
-    mark_consumed,
+    link_quote_vm,
 )
 from hyrule_cloud.state import AppState, get_app_state
 
@@ -530,7 +531,8 @@ async def create_vm(
                     existing_vm = await session.get(VMRow, quote_row.vm_id)
                 if existing_vm is not None:
                     return _vm_create_response(existing_vm, request, management_token=None)
-            raise HTTPException(409, "Quote already consumed")
+            # Claimed but not yet linked → the winner is mid-provision.
+            raise HTTPException(409, "Quote is being provisioned; poll the VM status")
         if is_expired(quote_row):
             raise HTTPException(409, "Quote expired; create a new one")
         if QuoteStatus(quote_row.status) != QuoteStatus.CREATED:
@@ -571,13 +573,28 @@ async def create_vm(
         return result
 
     wallet = result
+    # Issue #14 / Sourcery (#16): claim the quote atomically BEFORE provisioning
+    # so two concurrent paid creates for the same quote can't each provision a VM
+    # — only the winner of the CREATED → CONSUMED flip proceeds.
+    if quote_row is not None and not await claim_quote(orch.db, quote_row.quote_id):
+        # Lost the race: another paid create already claimed the quote. Return the
+        # VM it provisioned (idempotent); if it's still mid-provision, the caller
+        # polls the status URL.
+        latest = await get_quote(orch.db, quote_row.quote_id)
+        if latest is not None and latest.vm_id:
+            async with orch.db() as session:
+                existing_vm = await session.get(VMRow, latest.vm_id)
+            if existing_vm is not None:
+                return _vm_create_response(existing_vm, request, management_token=None)
+        raise HTTPException(409, "Quote is being provisioned; poll the VM status")
+
     row, management_token = await orch.create_vm(
         order, owner_wallet=wallet,
         owner_account_id=account.account_id if account else None,
     )
     row.payment_tx = getattr(request.state, "payment_tx", None)
     if quote_row is not None:
-        await mark_consumed(orch.db, quote_row.quote_id, row.vm_id)
+        await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
 
     # Block A0: status_url is the public sanitized view; management_url embeds
     # the one-time anon token. The UI must surface management_url prominently
