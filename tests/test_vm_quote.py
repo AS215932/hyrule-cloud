@@ -1,0 +1,363 @@
+"""Issue #14: durable VM order quotes.
+
+Covers the quote lifecycle (create / get / expiry), idempotency (same key + same
+spec → return; same key + different spec → 409), price-lock consistency, and the
+quote-bound POST /v1/vm/create path (paid, 402-no-payment, expired, body
+mismatch, idempotent replay of a consumed quote). Mirrors the in-memory SQLite +
+AppState fixture style of test_intent_engine.py.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from unittest.mock import AsyncMock
+
+import pytest
+import pytest_asyncio
+from fastapi import Response
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from hyrule_cloud.app import app
+from hyrule_cloud.db import Base, VMQuoteRow, VMRow
+from hyrule_cloud.models import CostBreakdown, QuoteStatus, VMSize, VMStatus
+from hyrule_cloud.services import quotes as quotes_service
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+# --- Stubs ---
+
+
+class _StubNetwork:
+    key = "base"
+    caip2 = "eip155:8453"
+    asset = "USDC"
+    chain_id = 8453
+
+
+class _StubPayment:
+    def enabled_networks(self):
+        return [_StubNetwork()]
+
+
+class _StubCfg:
+    payment = _StubPayment()
+    blocked_ports = [25]
+    deploy_domain = "deploy.hyrule.host"
+
+
+class _StubOrchestrator:
+    """Owns the session factory + the compute_price/create_vm contract routes use."""
+
+    def __init__(self, session_factory: async_sessionmaker) -> None:
+        self.db = session_factory
+        self.created_vms: list[str] = []
+
+    def compute_price(self, request):
+        total = Decimal("0.05") * request.duration_days
+        return total, CostBreakdown(vm_cost=f"${total}", domain_cost="$0.00", total=f"${total}")
+
+    async def create_vm(self, request, owner_wallet: str, owner_account_id: str | None = None):
+        from hyrule_cloud.middleware.anon_token import hash_anon_token
+        from hyrule_cloud.models import generate_anon_management_token, generate_vm_id
+
+        vm_id = generate_vm_id()
+        anon_token = generate_anon_management_token()
+        async with self.db() as session:
+            row = VMRow(
+                vm_id=vm_id,
+                owner_wallet=owner_wallet,
+                owner_account_id=owner_account_id,
+                anon_management_token_hash=hash_anon_token(anon_token),
+                status=VMStatus.PROVISIONING,
+                size=VMSize(request.size),
+                os=request.os,
+                ssh_pubkey=request.ssh_pubkey,
+                open_ports=[22, 80, 443],
+                expires_at=_now() + timedelta(days=request.duration_days),
+                cost_total=Decimal("0.05"),
+            )
+            session.add(row)
+            await session.commit()
+        self.created_vms.append(vm_id)
+        return row, anon_token
+
+
+@pytest_asyncio.fixture
+async def quote_state():
+    from hyrule_cloud.state import AppState
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    orch = _StubOrchestrator(factory)
+    gate = AsyncMock()
+
+    state = AppState(
+        config=_StubCfg(),
+        orchestrator=orch,
+        payment_gate=gate,
+        network_provider=None,
+        session_factory=factory,
+    )
+    prev = getattr(app.state, "_typed_state", None)
+    app.state._typed_state = state
+    try:
+        yield state
+    finally:
+        if prev is not None:
+            app.state._typed_state = prev
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def client():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost") as c:
+        yield c
+
+
+def _order(**overrides) -> dict:
+    base = {
+        "duration_days": 1,
+        "size": "xs",
+        "os": "debian-13",
+        "ssh_pubkey": "ssh-ed25519 AAAA test",
+    }
+    base.update(overrides)
+    return base
+
+
+# --- POST /v1/vm/quote ---
+
+
+@pytest.mark.asyncio
+async def test_create_quote_returns_quote(quote_state, client):
+    res = await client.post("/v1/vm/quote", json={"order_payload": _order()})
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["quote_id"].startswith("q_")
+    assert body["status"] == "created"
+    assert body["amount_usd"] == "0.050000"  # Numeric(12,6) round-trip
+    assert body["accepted_payment_methods"]["evm"][0]["caip2"] == "eip155:8453"
+    assert body["accepted_payment_methods"]["native"] == []  # no native rail wired
+    assert body["order_payload"]["size"] == "xs"
+    assert "expires_at" in body
+
+
+@pytest.mark.asyncio
+async def test_create_quote_price_matches_compute_price(quote_state, client):
+    res = await client.post("/v1/vm/quote", json={"order_payload": _order(duration_days=7)})
+    assert res.status_code == 201
+    # 0.05/day * 7 days
+    assert Decimal(res.json()["amount_usd"]) == Decimal("0.35")
+
+
+@pytest.mark.asyncio
+async def test_create_quote_custom_domain_requires_domain(quote_state, client):
+    res = await client.post(
+        "/v1/vm/quote", json={"order_payload": _order(domain_mode="custom")}
+    )
+    assert res.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_quote_blocked_port_rejected(quote_state, client):
+    res = await client.post(
+        "/v1/vm/quote", json={"order_payload": _order(open_ports=[25])}
+    )
+    assert res.status_code == 400
+
+
+# --- Idempotency ---
+
+
+@pytest.mark.asyncio
+async def test_quote_idempotent_same_key_same_spec_returns_existing(quote_state, client):
+    payload = {"order_payload": _order(), "client_order_id": "cli-1"}
+    first = await client.post("/v1/vm/quote", json=payload)
+    second = await client.post("/v1/vm/quote", json=payload)
+    assert first.status_code == 201
+    assert second.status_code == 200  # idempotent replay
+    assert first.json()["quote_id"] == second.json()["quote_id"]
+
+
+@pytest.mark.asyncio
+async def test_quote_idempotent_conflict_same_key_different_spec(quote_state, client):
+    await client.post(
+        "/v1/vm/quote", json={"order_payload": _order(), "client_order_id": "cli-2"}
+    )
+    conflict = await client.post(
+        "/v1/vm/quote",
+        json={"order_payload": _order(duration_days=30), "client_order_id": "cli-2"},
+    )
+    assert conflict.status_code == 409
+
+
+# --- GET /v1/vm/quote/{id} ---
+
+
+@pytest.mark.asyncio
+async def test_get_quote_round_trips(quote_state, client):
+    created = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+    got = await client.get(f"/v1/vm/quote/{created['quote_id']}")
+    assert got.status_code == 200
+    assert got.json()["quote_id"] == created["quote_id"]
+    assert got.json()["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_get_unknown_quote_404(quote_state, client):
+    assert (await client.get("/v1/vm/quote/q_does_not_exist")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_expired_quote_surfaces_expired_status(quote_state, client):
+    created = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+    await _expire(quote_state, created["quote_id"])
+    got = await client.get(f"/v1/vm/quote/{created['quote_id']}")
+    assert got.status_code == 200
+    assert got.json()["status"] == "expired"
+
+
+# --- POST /v1/vm/create with quote_id ---
+
+
+@pytest.mark.asyncio
+async def test_create_with_quote_paid_provisions_and_consumes(quote_state, client):
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+
+    res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+    assert res.status_code == 200, res.text
+    assert res.json()["vm_id"]
+    assert res.json()["management_token"] is not None
+    # Quote is now consumed and linked to the VM.
+    row = await quotes_service.get_quote(quote_state.orchestrator.db, quote["quote_id"])
+    assert QuoteStatus(row.status) == QuoteStatus.CONSUMED
+    assert row.vm_id == res.json()["vm_id"]
+
+
+@pytest.mark.asyncio
+async def test_create_with_quote_no_payment_402_leaves_quote_created(quote_state, client):
+    quote_state.payment_gate.check_payment = AsyncMock(return_value=Response(status_code=402))
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+
+    res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+    assert res.status_code == 402
+    row = await quotes_service.get_quote(quote_state.orchestrator.db, quote["quote_id"])
+    assert QuoteStatus(row.status) == QuoteStatus.CREATED  # unconsumed, retry-able
+
+
+@pytest.mark.asyncio
+async def test_create_with_expired_quote_409(quote_state, client):
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+    await _expire(quote_state, quote["quote_id"])
+    res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_create_with_mismatched_body_422(quote_state, client):
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+    # Body differs from the stored spec (duration 30 vs quoted 1).
+    res = await client.post(
+        "/v1/vm/create", json=_order(duration_days=30, quote_id=quote["quote_id"])
+    )
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_idempotent_replay_of_consumed_quote(quote_state, client):
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+    first = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+    second = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["vm_id"] == second.json()["vm_id"]
+    # The one-shot management token is only revealed on first provision.
+    assert second.json()["management_token"] is None
+    # Exactly one VM was provisioned despite two create posts.
+    assert len(quote_state.orchestrator.created_vms) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_paid_creates_provision_at_most_one_vm(quote_state, client):
+    """Sourcery (#16): the quote is claimed atomically BEFORE provisioning, so two
+    concurrent paid creates for the same quote provision exactly one VM."""
+    import asyncio
+
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+
+    r1, r2 = await asyncio.gather(
+        client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"])),
+        client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"])),
+    )
+    # The invariant: at most one VM regardless of how the two interleave.
+    assert len(quote_state.orchestrator.created_vms) == 1
+    statuses = {r1.status_code, r2.status_code}
+    # Winner → 200 (vm_id); loser → 200 (idempotent existing VM) or 409 (mid-provision).
+    assert 200 in statuses
+    assert statuses.issubset({200, 409})
+
+
+@pytest.mark.asyncio
+async def test_create_unknown_quote_404(quote_state, client):
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    res = await client.post("/v1/vm/create", json=_order(quote_id="q_nope"))
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_legacy_create_without_quote_id_still_works(quote_state, client):
+    """Backward-compat: the legacy compute-price-from-body path is unchanged."""
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    res = await client.post("/v1/vm/create", json=_order())
+    assert res.status_code == 200, res.text
+    assert res.json()["vm_id"]
+
+
+# --- Migration 008 linkage / schema validity ---
+
+
+def test_migration_008_chains_to_007():
+    import importlib.util
+    from pathlib import Path
+
+    # Alembic versions are loaded by file path (the module name starts with a
+    # digit and the dir isn't a package), so load it the same way here.
+    path = Path(__file__).resolve().parent.parent / "alembic" / "versions" / "008_vm_quotes.py"
+    spec = importlib.util.spec_from_file_location("migration_008", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.revision == "008"
+    assert mod.down_revision == "007"
+    assert callable(mod.upgrade) and callable(mod.downgrade)
+
+
+def test_vm_quotes_table_in_metadata():
+    assert "vm_quotes" in Base.metadata.tables
+    cols = Base.metadata.tables["vm_quotes"].columns
+    assert {"quote_id", "order_payload", "amount_usd", "status", "expires_at"} <= set(cols.keys())
+
+
+# --- helpers ---
+
+
+async def _expire(state, quote_id: str) -> None:
+    async with state.orchestrator.db() as db:
+        await db.execute(
+            update(VMQuoteRow)
+            .where(VMQuoteRow.quote_id == quote_id)
+            .values(expires_at=_now() - timedelta(minutes=1))
+        )
+        await db.commit()

@@ -12,7 +12,9 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 
+from hyrule_cloud.db import VMQuoteRow, VMRow
 from hyrule_cloud.middleware.anon_token import (
     anon_management_token,
     can_manage_vm,
@@ -20,6 +22,7 @@ from hyrule_cloud.middleware.anon_token import (
 from hyrule_cloud.middleware.auth import current_account
 from hyrule_cloud.models import (
     VM_SPECS,
+    AcceptedPaymentMethods,
     DNSRecord,
     DNSRecordType,
     DomainCheckResponse,
@@ -33,15 +36,30 @@ from hyrule_cloud.models import (
     OSTemplate,
     PricingResponse,
     ProxyMode,
+    QuoteEvmMethod,
+    QuoteStatus,
     VMCreateRequest,
     VMCreateResponse,
     VMExtendRequest,
     VMLogEvent,
     VMLogsResponse,
+    VMProduct,
+    VMProductsResponse,
     VMPublicStatusResponse,
+    VMQuoteRequest,
+    VMQuoteResponse,
     VMSize,
     VMStatus,
     VMStatusResponse,
+)
+from hyrule_cloud.services.quotes import (
+    QuoteConflictError,
+    QuoteExistsError,
+    claim_quote,
+    create_quote,
+    get_quote,
+    is_expired,
+    link_quote_vm,
 )
 from hyrule_cloud.state import AppState, get_app_state
 
@@ -61,6 +79,55 @@ def get_gate(app_state: AppState = Depends(get_app_state)):
 
 def get_network(app_state: AppState = Depends(get_app_state)):
     return app_state.network_provider
+
+
+# --- Quote helpers (issue #14) ---
+
+
+def _accepted_payment_methods(cfg, app_state: AppState) -> AcceptedPaymentMethods:
+    """Single source of truth for what a quote can be paid with: enabled EVM
+    chains from config + native (BTC/XMR) iff the intent rail is wired."""
+    evm = [
+        QuoteEvmMethod(key=n.key, caip2=n.caip2, asset=n.asset, chain_id=n.chain_id)
+        for n in cfg.payment.enabled_networks()
+    ]
+    native: list[str] = []
+    if getattr(app_state, "native_crypto", None) and getattr(app_state, "rate_provider", None):
+        native = ["BTC", "XMR"]
+    return AcceptedPaymentMethods(evm=evm, native=native)
+
+
+def _quote_to_response(row: VMQuoteRow, cfg, app_state: AppState) -> VMQuoteResponse:
+    status = QuoteStatus(row.status)
+    if status == QuoteStatus.CREATED and is_expired(row):
+        status = QuoteStatus.EXPIRED
+    return VMQuoteResponse(
+        quote_id=row.quote_id,
+        status=status,
+        order_payload=VMCreateRequest(**row.order_payload),
+        amount_usd=str(row.amount_usd),
+        accepted_payment_methods=_accepted_payment_methods(cfg, app_state),
+        created_at=row.created_at,
+        expires_at=row.expires_at,
+    )
+
+
+def _vm_create_response(
+    row: VMRow, request: Request, management_token: str | None
+) -> VMCreateResponse:
+    base_url = str(request.base_url).rstrip("/")
+    return VMCreateResponse(
+        vm_id=row.vm_id,
+        status=VMStatus(row.status),
+        status_url=f"{base_url}/v1/vm/{row.vm_id}/status",
+        estimated_ready_seconds=60,
+        management_token=management_token,
+        management_url=(
+            f"{base_url}/v1/vm/{row.vm_id}?token={management_token}"
+            if management_token
+            else None
+        ),
+    )
 
 
 # --- Block B (Wave 2): runtime metrics ---
@@ -295,6 +362,34 @@ async def get_pricing(cfg = Depends(get_cfg)) -> PricingResponse:
     )
 
 
+_VM_PRODUCT_NAMES = {
+    VMSize.XS: "Starter",
+    VMSize.SM: "Basic",
+    VMSize.MD: "Standard",
+    VMSize.LG: "Performance",
+}
+
+
+@router.get("/products/vms", response_model=VMProductsResponse)
+async def get_vm_products(request: Request, cfg=Depends(get_cfg)) -> VMProductsResponse:
+    """Issue #14: machine-readable VM catalog (specs + daily price per size) so
+    agents get the product list without scraping the /services HTML. Sourced from
+    VM_SPECS + the configured per-size prices (the same source as /v1/pricing)."""
+    products = [
+        VMProduct(
+            size=size,
+            name=_VM_PRODUCT_NAMES.get(size, size.value),
+            vcpu=VM_SPECS[size]["vcpu"],
+            ram_mb=VM_SPECS[size]["memory_mb"],
+            disk_gb=VM_SPECS[size]["disk_gb"],
+            price_usd_day=str(getattr(cfg.payment, f"price_vm_{size.value}")),
+        )
+        for size in VMSize
+    ]
+    base_url = str(request.base_url).rstrip("/")
+    return VMProductsResponse(products=products, os_templates_url=f"{base_url}/v1/os/list")
+
+
 @router.get("/os/list", response_model=OSListResponse)
 async def list_os_templates(cfg = Depends(get_cfg)) -> OSListResponse:
     templates = [
@@ -418,20 +513,53 @@ async def create_vm(
     # A0 management-token flow unchanged.
     account = Depends(current_account),
 ):
-    if body.domain_mode == DomainMode.CUSTOM and not body.domain:
+    # Issue #14: when a durable quote_id is supplied, the stored spec is
+    # authoritative and the price is locked to the quote. Otherwise this is the
+    # legacy compute-price-from-body flow, unchanged.
+    quote_row: VMQuoteRow | None = None
+    order = body
+    if body.quote_id:
+        quote_row = await get_quote(orch.db, body.quote_id)
+        if quote_row is None:
+            raise HTTPException(404, "Quote not found")
+        if QuoteStatus(quote_row.status) == QuoteStatus.CONSUMED:
+            # Idempotent replay: a VM was already provisioned from this quote —
+            # return it rather than charging/provisioning again. The one-shot
+            # management token was revealed at first creation and is not re-issued.
+            if quote_row.vm_id:
+                async with orch.db() as session:
+                    existing_vm = await session.get(VMRow, quote_row.vm_id)
+                if existing_vm is not None:
+                    return _vm_create_response(existing_vm, request, management_token=None)
+            # Claimed but not yet linked → the winner is mid-provision.
+            raise HTTPException(409, "Quote is being provisioned; poll the VM status")
+        if is_expired(quote_row):
+            raise HTTPException(409, "Quote expired; create a new one")
+        if QuoteStatus(quote_row.status) != QuoteStatus.CREATED:
+            raise HTTPException(409, "Quote is not payable")
+        # Tamper / price-lock guard: the body must match the stored spec exactly.
+        if body.model_dump(mode="json", exclude={"quote_id"}) != quote_row.order_payload:
+            raise HTTPException(422, "Order body does not match the quote")
+        order = VMCreateRequest(**quote_row.order_payload)
+
+    if order.domain_mode == DomainMode.CUSTOM and not order.domain:
         raise HTTPException(400, "domain required when domain_mode=custom")
 
-    for port in body.open_ports:
+    for port in order.open_ports:
         if port in cfg.blocked_ports:
             raise HTTPException(400, f"Port {port} is blocked by policy")
 
-    total, breakdown = orch.compute_price(body)
-    specs = VM_SPECS[body.size]
+    # Price-lock: a quote-bound create charges the amount quoted to the user,
+    # not a recomputation (which could drift). The breakdown is still recomputed
+    # for the 402 body's informational cost_breakdown.
+    computed, breakdown = orch.compute_price(order)
+    total = quote_row.amount_usd if quote_row is not None else computed
+    specs = VM_SPECS[order.size]
 
     result = await gate.check_payment(
         request,
         amount=total,
-        description=f"Hyrule Cloud VM ({body.size.value}) for {body.duration_days} days",
+        description=f"Hyrule Cloud VM ({order.size.value}) for {order.duration_days} days",
         extra_body={
             "cost_breakdown": breakdown.model_dump(),
             "specs": {**specs, "ipv6": True, "ipv4": False, "region": "eu-west"},
@@ -440,30 +568,110 @@ async def create_vm(
     )
 
     if isinstance(result, Response):
+        # No/invalid payment yet (402) — the quote stays CREATED so the EVM
+        # 402→sign→retry round-trip can post again with the same quote_id.
         return result
 
     wallet = result
+    # Issue #14 / Sourcery (#16): claim the quote atomically BEFORE provisioning
+    # so two concurrent paid creates for the same quote can't each provision a VM
+    # — only the winner of the CREATED → CONSUMED flip proceeds.
+    if quote_row is not None and not await claim_quote(orch.db, quote_row.quote_id):
+        # Lost the race: another paid create already claimed the quote. Return the
+        # VM it provisioned (idempotent); if it's still mid-provision, the caller
+        # polls the status URL.
+        latest = await get_quote(orch.db, quote_row.quote_id)
+        if latest is not None and latest.vm_id:
+            async with orch.db() as session:
+                existing_vm = await session.get(VMRow, latest.vm_id)
+            if existing_vm is not None:
+                return _vm_create_response(existing_vm, request, management_token=None)
+        raise HTTPException(409, "Quote is being provisioned; poll the VM status")
+
     row, management_token = await orch.create_vm(
-        body, owner_wallet=wallet,
+        order, owner_wallet=wallet,
         owner_account_id=account.account_id if account else None,
     )
     row.payment_tx = getattr(request.state, "payment_tx", None)
+    if quote_row is not None:
+        await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
 
-    base_url = str(request.base_url).rstrip("/")
-    # Block A0: status_url is the public sanitized view; management_url
-    # embeds the one-time anon token. UI must surface management_url
-    # prominently with a save-this-once warning — it cannot be retrieved
-    # again.
-    return VMCreateResponse(
-        vm_id=row.vm_id,
-        status=VMStatus(row.status),
-        status_url=f"{base_url}/v1/vm/{row.vm_id}/status",
-        estimated_ready_seconds=60,
-        management_token=management_token,
-        management_url=(
-            f"{base_url}/v1/vm/{row.vm_id}?token={management_token}"
-        ),
+    # Block A0: status_url is the public sanitized view; management_url embeds
+    # the one-time anon token. The UI must surface management_url prominently
+    # with a save-this-once warning — it cannot be retrieved again.
+    return _vm_create_response(row, request, management_token)
+
+
+@router.post("/vm/quote", response_model=VMQuoteResponse, status_code=201)
+async def create_vm_quote(
+    body: VMQuoteRequest,
+    request: Request,
+    orch=Depends(get_orch),
+    cfg=Depends(get_cfg),
+    account=Depends(current_account),
+) -> Response:
+    """Issue #14: price a VM order once and persist it as a durable quote.
+
+    Returns a `quote_id` the UI/agent pays against — it survives review-page
+    reloads and mobile wallet handoffs and locks the price for its TTL.
+    Idempotent on `client_order_id`: same key + same spec returns the existing
+    quote (200); same key + a different spec is a 409 conflict.
+    """
+    order = body.order_payload
+    if order.domain_mode == DomainMode.CUSTOM and not order.domain:
+        raise HTTPException(400, "domain required when domain_mode=custom")
+    for port in order.open_ports:
+        if port in cfg.blocked_ports:
+            raise HTTPException(400, f"Port {port} is blocked by policy")
+
+    total, _ = orch.compute_price(order)
+    app_state = get_app_state(request)
+    try:
+        row = await create_quote(
+            session_factory=orch.db,
+            order_payload=order,
+            amount_usd=total,
+            client_order_id=body.client_order_id,
+            owner_account_id=(account.account_id if account is not None else None),
+        )
+    except QuoteExistsError as exc:
+        # Idempotent replay — return the existing quote with 200, not 201.
+        return JSONResponse(
+            _quote_to_response(exc.existing, cfg, app_state).model_dump(mode="json"),
+            status_code=200,
+        )
+    except QuoteConflictError as exc:
+        raise HTTPException(
+            409,
+            f"client_order_id already used for a different order (quote {exc.existing.quote_id})",
+        )
+    return JSONResponse(
+        _quote_to_response(row, cfg, app_state).model_dump(mode="json"),
+        status_code=201,
     )
+
+
+@router.get("/vm/quote/{quote_id}", response_model=VMQuoteResponse)
+async def get_vm_quote(
+    quote_id: str,
+    request: Request,
+    orch=Depends(get_orch),
+    cfg=Depends(get_cfg),
+    account=Depends(current_account),
+) -> VMQuoteResponse:
+    """Restore a durable quote by id (reload-safe). Expired quotes still return
+    200 with status=expired so the UI can render a restart state."""
+    row = await get_quote(orch.db, quote_id)
+    if row is None:
+        raise HTTPException(404, "Quote not found")
+    # Account-owned quotes are only visible to the owner (or admin) — 404 (not
+    # 403) to avoid leaking existence, mirroring the intent GET guard.
+    if row.owner_account_id is not None and (
+        account is None
+        or (account.account_id != row.owner_account_id and not account.is_admin)
+    ):
+        raise HTTPException(404, "Quote not found")
+    return _quote_to_response(row, cfg, get_app_state(request))
 
 
 @router.post("/vm/{vm_id}/extend")

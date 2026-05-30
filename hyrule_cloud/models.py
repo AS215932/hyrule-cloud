@@ -31,6 +31,11 @@ def generate_anon_management_token() -> str:
     """
     return "hyr_vm_" + "".join(secrets.choice(_BASE62_ALPHABET) for _ in range(32))
 
+
+def generate_quote_id() -> str:
+    """Generate a fresh `q_<22 base62>` durable-order-quote id (~131 bits)."""
+    return "q_" + "".join(secrets.choice(_BASE62_ALPHABET) for _ in range(22))
+
 # --- Enums ---
 
 
@@ -88,6 +93,21 @@ class CryptoIntentStatus(enum.StrEnum):
     FAILED = "FAILED"
     REFUND_MANUAL = "REFUND_MANUAL"
 
+
+class QuoteStatus(enum.StrEnum):
+    """Durable order-quote lifecycle (issue #14).
+
+    created  → active, payable, not expired (the only payable state).
+    consumed → a VM was provisioned from it; terminal. Repeat creates with the
+               same quote_id are idempotent (return the original VM).
+    expired  → past expires_at; terminal for creation. GET still surfaces it so
+               the UI can render an "expired, start over" state.
+    """
+
+    CREATED = "created"
+    CONSUMED = "consumed"
+    EXPIRED = "expired"
+
 # --- VM Size Specifications ---
 
 
@@ -120,6 +140,16 @@ class VMCreateRequest(BaseModel):
         default=None,
         description="Optional shell script to execute after boot via cloud-init",
     )
+    quote_id: str | None = Field(
+        default=None,
+        max_length=36,
+        description=(
+            "Optional durable quote id from POST /v1/vm/quote. When set, the "
+            "server provisions the spec stored on the quote at the quote-locked "
+            "price; the rest of this body must match that stored spec. Omit for "
+            "the legacy compute-price-from-body flow."
+        ),
+    )
 
 
 class VMCreateResponse(BaseModel):
@@ -132,6 +162,45 @@ class VMCreateResponse(BaseModel):
     # is the convenience link that embeds the token as a query param.
     management_token: str | None = None
     management_url: str | None = None
+
+
+class VMQuoteRequest(BaseModel):
+    """Durable order quote (issue #14). `order_payload` is the full VM spec; the
+    server prices it once and stores it so the UI/agent can pay against a stable
+    `quote_id` that survives review-page reloads and mobile wallet handoffs."""
+
+    order_payload: VMCreateRequest = Field(description="The VM spec to price and store.")
+    client_order_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Idempotency key. Same key + same spec returns the same quote.",
+    )
+
+
+class QuoteEvmMethod(BaseModel):
+    key: str
+    caip2: str
+    asset: str
+    chain_id: int | None = None
+
+
+class AcceptedPaymentMethods(BaseModel):
+    """Single source of truth, derived from live backend config: enabled EVM
+    chains + whether the native (BTC/XMR) intent rail is wired."""
+
+    evm: list[QuoteEvmMethod] = Field(default_factory=list)
+    native: list[str] = Field(default_factory=list)
+
+
+class VMQuoteResponse(BaseModel):
+    quote_id: str
+    status: QuoteStatus
+    order_payload: VMCreateRequest
+    amount_usd: str
+    currency: str = "USD"
+    accepted_payment_methods: AcceptedPaymentMethods
+    created_at: datetime
+    expires_at: datetime
 
 
 class VMStatusResponse(BaseModel):
@@ -184,6 +253,27 @@ class PricingResponse(BaseModel):
     proxy_prices: dict[str, str] | None = None
     currency: str = "USDC"
     network: str = "Base (eip155:8453)"
+
+
+class VMProduct(BaseModel):
+    """One machine-readable VM tier (issue #14): specs + daily price."""
+
+    size: VMSize
+    name: str
+    vcpu: int
+    ram_mb: int
+    disk_gb: int
+    price_usd_day: str
+
+
+class VMProductsResponse(BaseModel):
+    """Agent-facing VM catalog so non-browser clients get specs + pricing
+    without scraping the /services HTML."""
+
+    currency: str = "USD"
+    billing: str = "prepaid-daily"
+    products: list[VMProduct]
+    os_templates_url: str
 
 
 class OSListResponse(BaseModel):

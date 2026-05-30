@@ -25,7 +25,41 @@ All paid endpoints use the **x402** protocol:
 2. Pay via the x402 facilitator (USDC on Base, chain `eip155:8453`)
 3. Resend the request with the `X-PAYMENT` header containing the payment proof
 
-The 402 response body includes `cost_breakdown`, `specs`, and the facilitator URL.
+The `402` carries an `X-PAYMENT-REQUIRED` header (base64-encoded JSON) plus a
+JSON body. Example for `POST /v1/vm/create` (xs, 7 days — values illustrative;
+always read the live header):
+
+```
+HTTP/1.1 402 Payment Required
+X-PAYMENT-REQUIRED: eyJ4NDAyVmVyc2lvbiI6Mn0...   # base64 of the body below
+```
+
+```json
+{
+  "x402Version": 2,
+  "accepts": [
+    {
+      "scheme": "exact",
+      "network": "eip155:8453",
+      "asset": "USDC",
+      "price": "$0.35",
+      "payTo": "0xReceiverAddress…"
+    }
+  ],
+  "amount": "0.35",
+  "cost_breakdown": {"vm_cost": "$0.35", "domain_cost": "$0.00", "total": "$0.35"},
+  "specs": {"vcpu": 1, "memory_mb": 512, "disk_gb": 10, "ipv6": true, "ipv4": false}
+}
+```
+
+Sign an EIP-3009 `TransferWithAuthorization` for the `accepts[].price`, base64-
+encode the x402 payment payload, and resend the same request with
+`X-PAYMENT: <base64>`.
+
+**Durable quotes (recommended):** call `POST /v1/vm/quote` first to lock a price
+and get a `quote_id`, then pass `quote_id` to `POST /v1/vm/create`. The server
+provisions the quoted spec at the locked price and is idempotent across the
+402 → sign → retry round-trip (a replayed paid create returns the same VM).
 
 ## Python Client
 
@@ -57,6 +91,39 @@ Returns current prices for all resources.
   "vpn_per_day": "$0.02/day",
   "currency": "USDC",
   "network": "Base (eip155:8453)"
+}
+```
+
+#### GET /v1/products/vms
+Machine-readable VM catalog — specs + daily price per size (no HTML scraping).
+
+```json
+{
+  "currency": "USD",
+  "billing": "prepaid-daily",
+  "products": [
+    {"size": "xs", "name": "Starter", "vcpu": 1, "ram_mb": 512, "disk_gb": 10, "price_usd_day": "0.05"},
+    {"size": "sm", "name": "Basic", "vcpu": 1, "ram_mb": 1024, "disk_gb": 20, "price_usd_day": "0.10"},
+    {"size": "md", "name": "Standard", "vcpu": 2, "ram_mb": 2048, "disk_gb": 40, "price_usd_day": "0.20"},
+    {"size": "lg", "name": "Performance", "vcpu": 4, "ram_mb": 4096, "disk_gb": 80, "price_usd_day": "0.40"}
+  ],
+  "os_templates_url": "https://cloud.hyrule.host/v1/os/list"
+}
+```
+
+#### POST /v1/vm/quote
+Lock a price and get a durable `quote_id` (free). Pass it to `POST /v1/vm/create`.
+Idempotent on `client_order_id` (same key + same spec → same quote; different
+spec → 409). Body: `{ "order_payload": { …VM spec… }, "client_order_id": "…" }`.
+
+```json
+{
+  "quote_id": "q_8sd1f9…",
+  "status": "created",
+  "amount_usd": "0.35",
+  "currency": "USD",
+  "accepted_payment_methods": {"evm": [{"key": "base", "caip2": "eip155:8453", "asset": "USDC"}], "native": ["BTC", "XMR"]},
+  "expires_at": "2026-05-31T13:00:00Z"
 }
 ```
 
