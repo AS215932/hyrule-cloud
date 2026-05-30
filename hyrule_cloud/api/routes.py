@@ -43,6 +43,8 @@ from hyrule_cloud.models import (
     VMExtendRequest,
     VMLogEvent,
     VMLogsResponse,
+    VMProduct,
+    VMProductsResponse,
     VMPublicStatusResponse,
     VMQuoteRequest,
     VMQuoteResponse,
@@ -357,6 +359,34 @@ async def get_pricing(cfg = Depends(get_cfg)) -> PricingResponse:
             "residential": f"${cfg.payment.price_proxy_residential}/request",
         } if hasattr(PricingResponse, '__annotations__') and 'proxy_prices' in PricingResponse.__annotations__ else {}
     )
+
+
+_VM_PRODUCT_NAMES = {
+    VMSize.XS: "Starter",
+    VMSize.SM: "Basic",
+    VMSize.MD: "Standard",
+    VMSize.LG: "Performance",
+}
+
+
+@router.get("/products/vms", response_model=VMProductsResponse)
+async def get_vm_products(request: Request, cfg=Depends(get_cfg)) -> VMProductsResponse:
+    """Issue #14: machine-readable VM catalog (specs + daily price per size) so
+    agents get the product list without scraping the /services HTML. Sourced from
+    VM_SPECS + the configured per-size prices (the same source as /v1/pricing)."""
+    products = [
+        VMProduct(
+            size=size,
+            name=_VM_PRODUCT_NAMES.get(size, size.value),
+            vcpu=VM_SPECS[size]["vcpu"],
+            ram_mb=VM_SPECS[size]["memory_mb"],
+            disk_gb=VM_SPECS[size]["disk_gb"],
+            price_usd_day=str(getattr(cfg.payment, f"price_vm_{size.value}")),
+        )
+        for size in VMSize
+    ]
+    base_url = str(request.base_url).rstrip("/")
+    return VMProductsResponse(products=products, os_templates_url=f"{base_url}/v1/os/list")
 
 
 @router.get("/os/list", response_model=OSListResponse)

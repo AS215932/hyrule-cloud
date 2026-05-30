@@ -255,6 +255,27 @@ class PricingResponse(BaseModel):
     network: str = "Base (eip155:8453)"
 
 
+class VMProduct(BaseModel):
+    """One machine-readable VM tier (issue #14): specs + daily price."""
+
+    size: VMSize
+    name: str
+    vcpu: int
+    ram_mb: int
+    disk_gb: int
+    price_usd_day: str
+
+
+class VMProductsResponse(BaseModel):
+    """Agent-facing VM catalog so non-browser clients get specs + pricing
+    without scraping the /services HTML."""
+
+    currency: str = "USD"
+    billing: str = "prepaid-daily"
+    products: list[VMProduct]
+    os_templates_url: str
+
+
 class OSListResponse(BaseModel):
     templates: list[OSTemplate]
 
