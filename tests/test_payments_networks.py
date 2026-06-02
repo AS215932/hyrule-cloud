@@ -114,6 +114,24 @@ async def test_payments_networks_top_level_carries_receiver_and_facilitator(
     assert body["facilitator_url"] == "https://x402.org/facilitator"
 
 
+@pytest.mark.asyncio
+async def test_payments_networks_native_empty_until_rail_wired(real_payment_state) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        body = (await c.get("/v1/payments/networks")).json()
+    assert body["native"] == []
+
+
+@pytest.mark.asyncio
+async def test_payments_networks_native_lists_btc_xmr_when_rail_wired(
+    real_payment_state,
+) -> None:
+    real_payment_state.native_crypto = object()
+    real_payment_state.rate_provider = object()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        body = (await c.get("/v1/payments/networks")).json()
+    assert body["native"] == ["BTC", "XMR"]
+
+
 def test_disabled_chain_drops_off_the_wire() -> None:
     """Wave 3: enabled_networks() filters; the wire format should mirror.
     Operators flip a chain off via Vault by re-rendering PAYMENT_PAYMENT_NETWORKS
