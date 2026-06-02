@@ -28,6 +28,7 @@ jobs:
   semgrep:
     name: semgrep
     runs-on: [self-hosted, linux, x64, hyrule-public-pr]
+    timeout-minutes: 20
     if: github.actor != 'dependabot[bot]'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2

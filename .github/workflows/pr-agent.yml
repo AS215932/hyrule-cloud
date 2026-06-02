@@ -41,3 +41,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENROUTER__KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # Pin our models via dynaconf env (SECTION__KEY, same path that
+          # delivers OPENROUTER__KEY). .pr_agent.toml is only honoured once it is
+          # on the default branch, so until this PR merges PR-Agent would
+          # otherwise fall back to its packaged gpt-5.5 default. deepseek-v4-flash
+          # / minimax-m2.7 are custom models → custom_model_max_tokens required.
+          CONFIG__MODEL: openrouter/deepseek/deepseek-v4-flash
+          CONFIG__FALLBACK_MODELS: '["openrouter/minimax/minimax-m2.7"]'
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"
