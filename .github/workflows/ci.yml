@@ -19,7 +19,7 @@ jobs:
     # Branch protection requires this exact check name. Don't rename without
     # updating the rule in repo settings.
     name: test
-    runs-on: [self-hosted, linux, x64, hyrule]
+    runs-on: [self-hosted, linux, x64, hyrule-public-pr]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
