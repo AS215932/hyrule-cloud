@@ -305,7 +305,10 @@ async def get_network_stats(request: Request):
 
 
 @router.get("/payments/networks")
-async def get_payment_networks(cfg = Depends(get_cfg)) -> dict:
+async def get_payment_networks(
+    cfg = Depends(get_cfg),
+    app_state: AppState = Depends(get_app_state),
+) -> dict:
     """Block C (Wave 3): the canonical list of supported payment chains.
 
     The frontend chain selector and any agent SDK that wants to know what
@@ -314,11 +317,14 @@ async def get_payment_networks(cfg = Depends(get_cfg)) -> dict:
     off via Vault (PAYMENT_PAYMENT_NETWORKS__N__enabled=false) and the
     frontend picks it up on the next poll without a redeploy.
 
-    Shape: `{ networks: [...], receiver_address, facilitator_url }`. Each
+    Shape: `{ networks: [...], native: [...], receiver_address, facilitator_url }`. Each
     network dict carries the CAIP-2 identifier (canonical for x402 v2), the
     EIP-712 domain shape (so the wallet adapter doesn't have to bake one
     in), and the explorer URL for the post-pay receipt link.
     """
+    native: list[str] = []
+    if getattr(app_state, "native_crypto", None) and getattr(app_state, "rate_provider", None):
+        native = ["BTC", "XMR"]
     return {
         "networks": [
             {
@@ -338,6 +344,7 @@ async def get_payment_networks(cfg = Depends(get_cfg)) -> dict:
             }
             for n in cfg.payment.enabled_networks()
         ],
+        "native": native,
         "receiver_address": cfg.payment.receiver_address,
         "facilitator_url": cfg.payment.facilitator_url,
     }
