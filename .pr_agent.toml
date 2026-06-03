@@ -1,0 +1,46 @@
+# PR-Agent (advisory) configuration for AS215932/hyrule-cloud.
+# Replaces hosted Sourcery. Runs only on the unprivileged hyrule-public-pr
+# runner with read/comment-only perms, on our OpenRouter key. See the
+# network-operations docs/ci/pr-agent.md for the full design.
+
+[config]
+git_provider = "github"
+# deepseek-v4-flash / minimax-m2.7 are not in PR-Agent's built-in model list,
+# so they are custom models — custom_model_max_tokens is required.
+model = "openrouter/deepseek/deepseek-v4-flash"
+fallback_models = ["openrouter/minimax/minimax-m2.7"]
+custom_model_max_tokens = 128000
+temperature = 0.2
+use_repo_settings_file = true
+publish_output = true
+
+[github_action_config]
+auto_review = true
+auto_describe = false
+auto_improve = true
+
+[pr_reviewer]
+require_security_review = true
+require_tests_review = true
+require_score_review = true
+require_estimate_effort_to_review = true
+extra_instructions = """
+This is hyrule-cloud: the x402-paid agentic VPS API (FastAPI + Pydantic v2 +
+SQLAlchemy async + asyncpg). HIGH RISK areas: the payment facilitator config
+(PaymentConfig / facilitator_url / networks / receiver_address in
+hyrule_cloud/config.py), x402 payment gating (middleware/x402.py), XCP-NG XAPI
+VM lifecycle, Openprovider registration, and RFC2136 DNS (TSIG key name is
+hardcoded `hyrule-dns`). Flag, with specifics:
+- changes to PaymentConfig or facilitator URL/network validation that bypass
+  scripts/verify_facilitator.py (the verified-payment-chains gate);
+- weakening the touched-file ruff/mypy gates, or relying on the TEMPORARY
+  `mypy ... || true` instead of fixing types;
+- missing tests around payment / order / provisioning state transitions and
+  idempotency;
+- secrets committed to files; SSRF / unsafe subprocess in providers/*;
+- trust-boundary issues on the (currently unauthenticated) management endpoints.
+Do not restate the diff; surface risk, missing tests, and operational footguns.
+"""
+
+[pr_description]
+publish_description_as_comment = true
