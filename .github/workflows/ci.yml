@@ -35,6 +35,14 @@ jobs:
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
+      - name: Cache uv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
       - name: Sync deps (system python)
         # `--extra dev` pulls in pytest/pytest-asyncio/ruff/mypy from
         # `[project.optional-dependencies].dev` in pyproject.toml.
@@ -42,52 +50,11 @@ jobs:
         # `[dependency-groups]`; the flag differs by where the group lives.
         run: ~/.local/bin/uv sync --frozen --extra dev
 
-      # Ruff is gated on touched files only — the 101 pre-existing errors
-      # in this repo are tracked under a separate cleanup PR. Full-tree
-      # ruff will become required once that lands. For pushes to main we
-      # diff against the previous commit on main; for PRs, against the
-      # merge-base.
-      - name: Ruff (touched files only)
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-          else
-            BASE="${{ github.event.before }}"
-          fi
-          CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE"...HEAD -- '*.py' || true)
-          if [ -n "$CHANGED" ]; then
-            echo "Linting:"
-            echo "$CHANGED"
-            ~/.local/bin/uv run ruff check $CHANGED
-          else
-            echo "No Python files changed; skipping ruff."
-          fi
+      - name: Ruff
+        run: ~/.local/bin/uv run ruff check .
 
-      # Mypy strict similarly gated on touched files. Cleanup PR will flip
-      # to full-tree.
-      #
-      # `|| true` is deliberate and TEMPORARY: the existing tree has
-      # pre-A0 type holes (~100 errors from baseline 0f0d765) that don't
-      # block A0's correctness. The mypy output is still surfaced in CI
-      # logs for signal. Removal criteria: once the dedicated mypy-cleanup
-      # PR lands (companion to the ruff cleanup PR, both scheduled
-      # immediately after the Wave 1 A0 hotfix), drop the `|| true` here
-      # and add this step as a required check in branch protection.
-      - name: Mypy (touched files only, strict)
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-          else
-            BASE="${{ github.event.before }}"
-          fi
-          CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE"...HEAD -- 'hyrule_cloud/**/*.py' || true)
-          if [ -n "$CHANGED" ]; then
-            # TODO(post-A0 cleanup): remove `|| true` after the type-cleanup
-            # PR lands so mypy failures gate merges.
-            ~/.local/bin/uv run mypy --strict $CHANGED || true
-          else
-            echo "No hyrule_cloud Python files changed; skipping mypy."
-          fi
+      - name: Mypy (strict)
+        run: ~/.local/bin/uv run mypy hyrule_cloud/
 
       - name: Pytest
         run: |
