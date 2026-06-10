@@ -1,0 +1,55 @@
+name: request-promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit SHA to promote; defaults to the current ref
+        required: false
+        type: string
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: request-promotion-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  request:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: [self-hosted, linux, x64, hyrule-public-pr]
+    timeout-minutes: 5
+    steps:
+      - name: Generate promotion app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.PROMOTION_APP_ID }}
+          private-key: ${{ secrets.PROMOTION_APP_PRIVATE_KEY }}
+          owner: AS215932
+          repositories: network-operations
+
+      - name: Request network-operations promotion PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          INPUT_SHA: ${{ inputs.sha }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          app="${REPOSITORY#AS215932/}"
+          SHA="${INPUT_SHA:-${WORKFLOW_RUN_SHA:-${GITHUB_SHA}}}"
+          gh api repos/AS215932/network-operations/dispatches \
+            -f event_type=app-promote \
+            -f client_payload[repository]="$REPOSITORY" \
+            -f client_payload[sha]="$SHA" \
+            -f client_payload[title]="Promote ${app} ${SHA:0:7}" \
+            -f client_payload[impact]="Automated promotion request from ${REPOSITORY}@${SHA}."
