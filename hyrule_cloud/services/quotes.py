@@ -14,6 +14,7 @@ conflict (QuoteConflictError → 409), so a client can't silently rebind a key.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -34,6 +35,18 @@ log = structlog.get_logger()
 # A quote's price is locked for this long; after it the quote is EXPIRED and a
 # fresh one must be created. Matches the intent-engine TTL.
 QUOTE_TTL = timedelta(minutes=60)
+
+# Same-process duplicate paid creates should not race through SQLite/test
+# sessions; the conditional database update remains the cross-process guard.
+_claim_locks: dict[str, asyncio.Lock] = {}
+
+
+def _claim_lock(quote_id: str) -> asyncio.Lock:
+    lock = _claim_locks.get(quote_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _claim_locks[quote_id] = lock
+    return lock
 
 
 def _now() -> datetime:
@@ -145,17 +158,18 @@ async def claim_quote(session_factory: async_sessionmaker, quote_id: str) -> boo
     only the winner provisions a VM (the loser returns the winner's VM). The
     vm_id is attached afterwards via link_quote_vm once the VM exists.
     """
-    async with session_factory() as db:
-        result = await db.execute(
-            _sql_update(VMQuoteRow)
-            .where(
-                VMQuoteRow.quote_id == quote_id,
-                VMQuoteRow.status == QuoteStatus.CREATED,
+    async with _claim_lock(quote_id):
+        async with session_factory() as db:
+            result = await db.execute(
+                _sql_update(VMQuoteRow)
+                .where(
+                    VMQuoteRow.quote_id == quote_id,
+                    VMQuoteRow.status == QuoteStatus.CREATED,
+                )
+                .values(status=QuoteStatus.CONSUMED)
             )
-            .values(status=QuoteStatus.CONSUMED)
-        )
-        await db.commit()
-        return result.rowcount == 1
+            await db.commit()
+            return result.rowcount == 1
 
 
 async def link_quote_vm(session_factory: async_sessionmaker, quote_id: str, vm_id: str) -> None:
