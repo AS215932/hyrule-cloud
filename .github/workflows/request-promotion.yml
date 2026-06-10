@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: request-promotion-${{ github.ref }}
-  cancel-in-progress: true
+  group: request-promotion-${{ github.event.workflow_run.head_sha || inputs.sha || github.sha }}
+  cancel-in-progress: false
 
 jobs:
   request:
@@ -39,7 +39,8 @@ jobs:
 
       - name: Request network-operations promotion PR
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          PROMOTION_TOKEN: ${{ steps.app-token.outputs.token }}
           REPOSITORY: ${{ github.repository }}
           INPUT_SHA: ${{ inputs.sha }}
           WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -47,9 +48,22 @@ jobs:
           set -euo pipefail
           app="${REPOSITORY#AS215932/}"
           SHA="${INPUT_SHA:-${WORKFLOW_RUN_SHA:-${GITHUB_SHA}}}"
-          gh api repos/AS215932/network-operations/dispatches \
+          SHA="${SHA,,}"
+
+          if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::promotion SHA must be a 40-character hex commit SHA"
+            exit 1
+          fi
+
+          canonical="$(gh api "repos/${REPOSITORY}/commits/${SHA}" --jq .sha)"
+          if [ "$canonical" != "$SHA" ]; then
+            echo "::error::commit ${SHA} was not found in ${REPOSITORY}"
+            exit 1
+          fi
+
+          GH_TOKEN="$PROMOTION_TOKEN" gh api --method POST repos/AS215932/network-operations/dispatches \
             -f event_type=app-promote \
-            -f client_payload[repository]="$REPOSITORY" \
-            -f client_payload[sha]="$SHA" \
-            -f client_payload[title]="Promote ${app} ${SHA:0:7}" \
-            -f client_payload[impact]="Automated promotion request from ${REPOSITORY}@${SHA}."
+            -f "client_payload[repository]=$REPOSITORY" \
+            -f "client_payload[sha]=$SHA" \
+            -f "client_payload[title]=Promote ${app} ${SHA:0:7}" \
+            -f "client_payload[impact]=Automated promotion request from ${REPOSITORY}@${SHA}."
