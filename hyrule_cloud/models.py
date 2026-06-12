@@ -32,6 +32,15 @@ def generate_anon_management_token() -> str:
     return "hyr_vm_" + "".join(secrets.choice(_BASE62_ALPHABET) for _ in range(32))
 
 
+def generate_domain_management_token() -> str:
+    """Generate a one-time domain management token.
+
+    Domain purchases can be ownerless like VM purchases, so they need the same
+    bearer-token management model with a distinct prefix.
+    """
+    return "hyr_dom_" + "".join(secrets.choice(_BASE62_ALPHABET) for _ in range(32))
+
+
 def generate_quote_id() -> str:
     """Generate a fresh `q_<22 base62>` durable-order-quote id (~131 bits)."""
     return "q_" + "".join(secrets.choice(_BASE62_ALPHABET) for _ in range(22))
@@ -64,6 +73,14 @@ class ProxyMode(enum.StrEnum):
     DIRECT = "direct"
     TOR = "tor"
     RESIDENTIAL = "residential"
+
+
+class DomainStatus(enum.StrEnum):
+    REGISTERING = "registering"
+    ACTIVE = "active"
+    FAILED = "failed"
+    EXPIRED = "expired"
+
 
 class CryptoIntentStatus(enum.StrEnum):
     """Block E: full payment-intent state machine for BTC/XMR.
@@ -287,10 +304,10 @@ class OSTemplate(BaseModel):
 
 
 class NetworkRequest(BaseModel):
-    url: str = Field(description="The full URL to fetch")
-    method: str = Field(default="GET", description="HTTP method (GET, POST, etc)")
+    url: str = Field(max_length=2048, description="The full URL to fetch")
+    method: str = Field(default="GET", description="HTTP method: GET, HEAD, or POST")
     headers: dict[str, str] | None = Field(default=None, description="Custom headers")
-    body: str | None = Field(default=None, description="Request body")
+    body: str | None = Field(default=None, max_length=65536, description="Request body")
     proxy_mode: ProxyMode = Field(default=ProxyMode.DIRECT, description="Routing mode")
     timeout_seconds: int = Field(default=15, ge=1, le=60, description="Request timeout")
 
@@ -382,10 +399,28 @@ class GenericActionResponse(BaseModel):
 class DomainCheckResponse(BaseModel):
     domain: str
     available: bool
+    registrar_price: str | None = None
+    markup: str | None = None
+    total: str | None = None
+    currency: str = "USD"
+    premium: bool = False
     price: str | None = None
 
 class DomainRegisterRequest(BaseModel):
+    domain: str | None = Field(default=None, min_length=3, max_length=253)
+    name: str | None = Field(default=None, max_length=128)
+    extension: str | None = Field(default=None, max_length=32)
     duration_years: int = Field(default=1, ge=1, le=10)
+    ipv6: str | None = Field(default=None, max_length=64)
+    client_order_id: str | None = Field(default=None, max_length=64)
+
+
+class DomainRegisterResponse(BaseModel):
+    domain: str
+    status: DomainStatus
+    management_token: str | None = None
+    management_url: str | None = None
+    message: str | None = None
 
 class DNSRecordType(enum.StrEnum):
     A = "A"

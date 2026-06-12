@@ -27,7 +27,14 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 _INT_ARRAY = ARRAY(Integer).with_variant(JSON(), "sqlite")
 _JSONB = JSONB().with_variant(JSON(), "sqlite")
 
-from hyrule_cloud.models import CryptoIntentStatus, DomainMode, QuoteStatus, VMSize, VMStatus
+from hyrule_cloud.models import (
+    CryptoIntentStatus,
+    DomainMode,
+    DomainStatus,
+    QuoteStatus,
+    VMSize,
+    VMStatus,
+)
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -131,13 +138,31 @@ class DomainRow(Base):
     fqdn: Mapped[str] = mapped_column(String(256), unique=True, index=True)
     vm_id: Mapped[str | None] = mapped_column(String(32), index=True)
     owner_wallet: Mapped[str] = mapped_column(String(64), index=True)
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+    anon_management_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(
+        Enum(DomainStatus, name="domain_status", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
+        default=DomainStatus.REGISTERING,
+    )
+    client_order_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
     openprovider_id: Mapped[int | None] = mapped_column()
+    registrar_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    markup: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    total_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    currency: Mapped[str] = mapped_column(String(8), default="USD", server_default="USD")
+    error: Mapped[str | None] = mapped_column(Text)
     registered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     payment_tx: Mapped[str | None] = mapped_column(String(128))
+
+    __table_args__ = (
+        Index("ix_domains_status", "status"),
+    )
 
 
 class VPNTunnelRow(Base):

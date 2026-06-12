@@ -118,7 +118,7 @@ class HyruleClient:
     async def check_domain(self, name: str, extension: str) -> dict[str, Any]:
         """Check domain availability and price."""
         return await self._request(
-            "GET", "/v1/domain/check", params={"name": name, "extension": extension}
+            "GET", "/v1/domain/check", params={"domain": f"{name}.{extension}"}
         )
 
     async def check_zone(self, name: str, extension: str) -> dict[str, Any]:
@@ -182,7 +182,7 @@ class HyruleClient:
         ipv6: str | None = None,
     ) -> dict[str, Any]:
         """Register a domain via Openprovider. Paid via x402."""
-        body: dict[str, Any] = {"name": name, "extension": extension}
+        body: dict[str, Any] = {"domain": f"{name}.{extension}"}
         if ipv6:
             body["ipv6"] = ipv6
         return await self._request("POST", "/v1/domain/register", json=body)

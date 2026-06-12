@@ -16,11 +16,12 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import VMRow
+from hyrule_cloud.db import DomainRow, VMRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
     DomainMode,
+    DomainStatus,
     VMCreateRequest,
     VMSize,
     VMStatus,
@@ -256,8 +257,49 @@ class Orchestrator:
         if len(parts) != 2:
             raise ValueError(f"Invalid domain: {row.domain}")
         name, extension = parts
-        await self.openprovider.register_domain(name, extension)
-        await self.dns.create_record(row.domain, "AAAA", row.ipv6)
+        op_result = await self.openprovider.register_domain(name, extension)
+        try:
+            await self.openprovider.create_zone(row.domain)
+        except Exception:
+            log.warning("zone_create_fallback", zone=row.domain)
+        await self.openprovider.create_zone_record(
+            zone_name=row.domain,
+            name="",
+            rtype="AAAA",
+            value=row.ipv6,
+            ttl=300,
+        )
+        raw_openprovider_id = (
+            op_result.get("id")
+            or op_result.get("domain", {}).get("id")
+            or op_result.get("data", {}).get("id")
+        )
+        try:
+            openprovider_id = int(raw_openprovider_id) if raw_openprovider_id is not None else None
+        except (TypeError, ValueError):
+            openprovider_id = None
+        async with self.db() as session:
+            existing = (
+                await session.execute(select(DomainRow).where(DomainRow.fqdn == row.domain))
+            ).scalar_one_or_none()
+            if existing is None:
+                session.add(
+                    DomainRow(
+                        name=name,
+                        extension=extension,
+                        fqdn=row.domain,
+                        vm_id=row.vm_id,
+                        owner_wallet=row.owner_wallet,
+                        owner_account_id=row.owner_account_id,
+                        status=DomainStatus.ACTIVE,
+                        openprovider_id=openprovider_id,
+                    )
+                )
+            else:
+                existing.vm_id = row.vm_id
+                existing.status = DomainStatus.ACTIVE
+                existing.openprovider_id = openprovider_id
+            await session.commit()
 
     # --- VM Management ---
 
@@ -372,8 +414,11 @@ class Orchestrator:
         for vm in expired_vms:
             if not vm["expires_at"]:
                 continue
+            expires_at = vm["expires_at"]
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
 
-            if now > vm["expires_at"] + grace:
+            if now > expires_at + grace:
                 log.info("vm_expiry_destroy", vm_id=vm["vm_id"])
                 await self.destroy_vm(vm["vm_id"])
             elif vm["status"] != VMStatus.SUSPENDED:

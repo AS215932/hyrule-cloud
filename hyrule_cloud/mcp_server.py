@@ -234,10 +234,10 @@ async def check_domain(name: str, extension: str) -> str:
     try:
         async with _client() as hc:
             result = await hc.check_domain(name, extension)
-            status = result.get("status", "unknown")
-            price = result.get("price", "N/A")
-            premium = " (premium)" if result.get("is_premium") else ""
-            return f"{name}.{extension}: {status}{premium}, price: ${price}"
+            status = "available" if result.get("available") else "unavailable"
+            price = result.get("total") or result.get("price") or "N/A"
+            premium = " (premium)" if result.get("premium") else ""
+            return f"{name}.{extension}: {status}{premium}, total: ${price}"
     except HyruleError as e:
         return _err(e)
 
@@ -256,11 +256,10 @@ async def register_domain(
     try:
         async with _client() as hc:
             result = await hc.register_domain(name, extension, ipv6)
-            ns = ", ".join(result.get("nameservers", []))
             return (
                 f"Domain {result.get('domain', f'{name}.{extension}')} registered!\n"
                 f"  Status: {result.get('status', 'registered')}\n"
-                f"  Nameservers: {ns}"
+                f"  Management URL: {result.get('management_url') or 'account-owned'}"
             )
     except HyruleError as e:
         return _err(e)
