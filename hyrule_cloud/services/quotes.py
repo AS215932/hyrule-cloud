@@ -164,9 +164,9 @@ async def claim_quote(session_factory: async_sessionmaker, quote_id: str) -> boo
                 _sql_update(VMQuoteRow)
                 .where(
                     VMQuoteRow.quote_id == quote_id,
-                    VMQuoteRow.status == QuoteStatus.CREATED,
+                    VMQuoteRow.status == QuoteStatus.CREATED.value,
                 )
-                .values(status=QuoteStatus.CONSUMED)
+                .values(status=QuoteStatus.CONSUMED.value)
             )
             await db.commit()
             return result.rowcount == 1

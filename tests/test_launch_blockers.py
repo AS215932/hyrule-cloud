@@ -56,6 +56,7 @@ class _Gate:
 class _Openprovider:
     def __init__(self) -> None:
         self.records: list[tuple[str, str, str, str]] = []
+        self.fail_register = False
 
     async def check_domain(self, name, extension):
         return {
@@ -66,6 +67,8 @@ class _Openprovider:
         }
 
     async def register_domain(self, name, extension, period=1):
+        if self.fail_register:
+            raise RuntimeError("registrar unavailable")
         return {"id": 42}
 
     async def create_zone(self, name):
@@ -91,7 +94,15 @@ class _Orch:
         from hyrule_cloud.models import CostBreakdown
 
         total = Decimal("0.05") * request.duration_days
-        return total, CostBreakdown(vm_cost=f"${total:.2f}", domain_cost="$0.00", total=f"${total:.2f}")
+        domain_cost = Decimal("0")
+        if request.domain_mode == "custom" and request.domain:
+            domain_cost = Decimal("1.00")
+        total += domain_cost
+        return total, CostBreakdown(
+            vm_cost=f"${total - domain_cost:.2f}",
+            domain_cost=f"${domain_cost:.2f}" if domain_cost else "$0.00",
+            total=f"${total:.2f}",
+        )
 
 
 @pytest_asyncio.fixture
@@ -161,13 +172,15 @@ async def test_domain_register_persists_ownerless_token_and_gates_records(launch
         assert body["status"] == "active"
         token = body["management_token"]
         assert token.startswith("hyr_dom_")
+        assert body["management_url"] == "/v1/zone/records?zone=example.test"
 
         denied = await client.get("/v1/zone/records", params={"zone": "example.test"})
         assert denied.status_code == 404
 
         allowed = await client.get(
             "/v1/zone/records",
-            params={"zone": "example.test", "token": token},
+            params={"zone": "example.test"},
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert allowed.status_code == 200
         assert allowed.json()["records"][0]["type"] == "AAAA"
@@ -177,6 +190,45 @@ async def test_domain_register_persists_ownerless_token_and_gates_records(launch
         assert row.fqdn == "example.test"
         assert row.status == DomainStatus.ACTIVE
         assert row.owner_wallet == "0xwallet"
+
+
+@pytest.mark.asyncio
+async def test_domain_register_failure_after_payment_persists_failed_row(launch_state):
+    launch_state.orchestrator.openprovider.fail_register = True
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        paid = await client.post(
+            "/v1/domain/register",
+            json={"domain": "broken.test", "client_order_id": "domain-fail-1"},
+            headers={"X-Mock-Paid": "1"},
+        )
+        assert paid.status_code == 502
+
+    async with launch_state.orchestrator.db() as session:
+        row = (await session.get(DomainRow, 1))
+        assert row.fqdn == "broken.test"
+        assert row.status == DomainStatus.FAILED
+        assert row.payment_tx == "0xpaid"
+        assert "registrar unavailable" in row.error
+
+
+@pytest.mark.asyncio
+async def test_vm_quote_custom_domain_includes_registrar_price_and_markup(launch_state):
+    payload = {
+        "order_payload": {
+            "duration_days": 1,
+            "size": "xs",
+            "os": "debian-13",
+            "ssh_pubkey": "ssh-ed25519 AAAA test",
+            "domain_mode": "custom",
+            "domain": "quoted.test",
+            "open_ports": [80, 443],
+        }
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post("/v1/vm/quote", json=payload)
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["amount_usd"] == "9.550000"
 
 
 @pytest.mark.asyncio

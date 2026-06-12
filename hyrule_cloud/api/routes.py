@@ -7,6 +7,8 @@ either a 402 Response or the payer's wallet address.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any
 
@@ -15,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy import update as _sql_update
+from sqlalchemy.exc import IntegrityError
 
 from hyrule_cloud.db import DomainRow, VMQuoteRow, VMRow
 from hyrule_cloud.middleware.anon_token import (
@@ -72,6 +75,31 @@ from hyrule_cloud.state import AppState, get_app_state
 log = structlog.get_logger()
 
 router = APIRouter(prefix="/v1")
+
+_domain_registration_locks: dict[str, asyncio.Lock] = {}
+
+
+def _domain_registration_lock(key: str) -> asyncio.Lock:
+    lock = _domain_registration_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _domain_registration_locks[key] = lock
+    return lock
+
+
+@asynccontextmanager
+async def _domain_registration_guard(fqdn: str, client_order_id: str | None):
+    keys = {f"domain:{fqdn}"}
+    if client_order_id:
+        keys.add(f"client:{client_order_id}")
+    locks = [_domain_registration_lock(key) for key in sorted(keys)]
+    for lock in locks:
+        await lock.acquire()
+    try:
+        yield
+    finally:
+        for lock in reversed(locks):
+            lock.release()
 
 
 def get_orch(app_state: AppState = Depends(get_app_state)):
@@ -138,9 +166,6 @@ def _domain_management_token(request: Request) -> str | None:
         scheme, _, credential = auth.partition(" ")
         if scheme.lower() == "bearer" and credential.strip().startswith("hyr_dom_"):
             return credential.strip()
-    token = request.query_params.get("token")
-    if token and token.startswith("hyr_dom_"):
-        return token
     return None
 
 
@@ -892,103 +917,125 @@ async def register_domain(
         extension=body.extension,
     )
 
-    async with orch.db() as session:
-        existing = (
-            await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
-        ).scalar_one_or_none()
-        if existing is not None:
-            if body.client_order_id and existing.client_order_id == body.client_order_id:
-                return DomainRegisterResponse(
-                    domain=fqdn,
-                    status=DomainStatus(existing.status),
-                    message="Domain registration already exists",
-                )
-            raise HTTPException(409, f"Domain {fqdn} is already managed")
-        if body.client_order_id:
-            existing_key = (
-                await session.execute(
-                    select(DomainRow).where(DomainRow.client_order_id == body.client_order_id)
-                )
+    async with _domain_registration_guard(fqdn, body.client_order_id):
+        async with orch.db() as session:
+            existing = (
+                await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
             ).scalar_one_or_none()
-            if existing_key is not None:
-                raise HTTPException(409, "client_order_id already used for a different domain")
+            if existing is not None:
+                if body.client_order_id and existing.client_order_id == body.client_order_id:
+                    return DomainRegisterResponse(
+                        domain=fqdn,
+                        status=DomainStatus(existing.status),
+                        management_url=f"/v1/zone/records?zone={fqdn}",
+                        message="Domain registration already exists",
+                    )
+                raise HTTPException(409, f"Domain {fqdn} is already managed")
+            if body.client_order_id:
+                existing_key = (
+                    await session.execute(
+                        select(DomainRow).where(DomainRow.client_order_id == body.client_order_id)
+                    )
+                ).scalar_one_or_none()
+                if existing_key is not None:
+                    raise HTTPException(409, "client_order_id already used for a different domain")
 
-    _, _, currency, registrar_price, markup, total, _ = await _domain_price(orch, cfg, fqdn)
+        _, _, currency, registrar_price, markup, total, _ = await _domain_price(orch, cfg, fqdn)
 
-    result = await gate.check_payment(
-        request,
-        amount=total,
-        description=f"Register domain {fqdn}",
-        extra_body={
-            "domain": fqdn,
-            "registrar_cost": str(registrar_price),
-            "markup": str(markup),
-            "duration_years": body.duration_years,
-        },
-    )
-
-    if isinstance(result, Response):
-        return result
-
-    wallet = result
-    token = generate_domain_management_token() if account is None else None
-    management_url = None
-    try:
-        op_result = await orch.openprovider.register_domain(name, extension, period=body.duration_years)
-    except Exception as e:
-        log.error("domain_registration_failed", error=str(e))
-        raise HTTPException(500, f"Domain registration failed: {e}")
-
-    try:
-        await orch.openprovider.create_zone(fqdn)
-    except Exception:
-        log.warning("zone_create_fallback", zone=fqdn)
-
-    if body.ipv6:
-        await orch.openprovider.create_zone_record(
-            zone_name=fqdn,
-            name="",
-            rtype="AAAA",
-            value=body.ipv6,
-            ttl=300,
+        result = await gate.check_payment(
+            request,
+            amount=total,
+            description=f"Register domain {fqdn}",
+            extra_body={
+                "domain": fqdn,
+                "registrar_cost": str(registrar_price),
+                "markup": str(markup),
+                "duration_years": body.duration_years,
+                "client_order_id": body.client_order_id,
+            },
         )
 
-    raw_openprovider_id = (
-        op_result.get("id")
-        or op_result.get("domain", {}).get("id")
-        or op_result.get("data", {}).get("id")
-    )
-    try:
-        openprovider_id = int(raw_openprovider_id) if raw_openprovider_id is not None else None
-    except (TypeError, ValueError):
-        openprovider_id = None
-    async with orch.db() as session:
-        row = DomainRow(
-            name=name,
-            extension=extension,
-            fqdn=fqdn,
-            owner_wallet=wallet,
-            owner_account_id=(account.account_id if account is not None else None),
-            anon_management_token_hash=(hash_anon_token(token) if token else None),
-            status=DomainStatus.ACTIVE,
-            client_order_id=body.client_order_id,
-            openprovider_id=openprovider_id,
-            registrar_price=registrar_price,
-            markup=markup,
-            total_price=total,
-            currency=currency,
-            payment_tx=getattr(request.state, "payment_tx", None),
-        )
-        session.add(row)
-        await session.commit()
+        if isinstance(result, Response):
+            return result
 
-    if token:
-        management_url = f"{str(request.base_url).rstrip('/')}/v1/zone/records?zone={fqdn}&token={token}"
+        wallet = result
+        token = generate_domain_management_token() if account is None else None
+        async with orch.db() as session:
+            row = DomainRow(
+                name=name,
+                extension=extension,
+                fqdn=fqdn,
+                owner_wallet=wallet,
+                owner_account_id=(account.account_id if account is not None else None),
+                anon_management_token_hash=(hash_anon_token(token) if token else None),
+                status=DomainStatus.REGISTERING,
+                client_order_id=body.client_order_id,
+                registrar_price=registrar_price,
+                markup=markup,
+                total_price=total,
+                currency=currency,
+                payment_tx=getattr(request.state, "payment_tx", None),
+            )
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                log.warning("domain_registration_reservation_conflict", domain=fqdn, error=str(exc))
+                raise HTTPException(409, f"Domain {fqdn} is already managed") from exc
+
+        try:
+            op_result = await orch.openprovider.register_domain(name, extension, period=body.duration_years)
+            try:
+                await orch.openprovider.create_zone(fqdn)
+            except Exception:
+                log.warning("zone_create_fallback", zone=fqdn)
+
+            if body.ipv6:
+                await orch.openprovider.create_zone_record(
+                    zone_name=fqdn,
+                    name="",
+                    rtype="AAAA",
+                    value=body.ipv6,
+                    ttl=300,
+                )
+        except Exception as e:
+            log.error("domain_registration_failed", domain=fqdn, error=str(e))
+            async with orch.db() as session:
+                await session.execute(
+                    _sql_update(DomainRow)
+                    .where(DomainRow.fqdn == fqdn)
+                    .values(status=DomainStatus.FAILED.value, error=str(e))
+                )
+                await session.commit()
+            raise HTTPException(502, f"Domain registration failed: {e}") from e
+
+        raw_openprovider_id = (
+            op_result.get("id")
+            or op_result.get("domain", {}).get("id")
+            or op_result.get("data", {}).get("id")
+        )
+        try:
+            openprovider_id = int(raw_openprovider_id) if raw_openprovider_id is not None else None
+        except (TypeError, ValueError):
+            openprovider_id = None
+        async with orch.db() as session:
+            await session.execute(
+                _sql_update(DomainRow)
+                .where(DomainRow.fqdn == fqdn)
+                .values(
+                    status=DomainStatus.ACTIVE.value,
+                    openprovider_id=openprovider_id,
+                    error=None,
+                )
+            )
+            await session.commit()
+
     return DomainRegisterResponse(
         domain=fqdn,
         status=DomainStatus.ACTIVE,
         management_token=token,
-        management_url=management_url,
+        management_url=f"/v1/zone/records?zone={fqdn}",
         message=f"Domain {fqdn} registered",
     )
 
