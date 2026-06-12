@@ -174,6 +174,7 @@ async def intent_state():
         network_provider=None,
         native_crypto=provider,
         rate_provider=rates,
+        native_payment_assets=["BTC", "XMR"],
     )
     prev = getattr(app.state, "_typed_state", None)
     app.state._typed_state = state

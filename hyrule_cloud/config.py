@@ -186,6 +186,8 @@ class PaymentConfig(BaseSettings):
 
     btc_xpub: str = ""
     xmr_viewkey: str = ""
+    xmr_rpc_url: str = "http://127.0.0.1:18088/json_rpc"
+    require_native: bool = False
 
     price_vm_xs: Decimal = Decimal("0.05")
     price_vm_sm: Decimal = Decimal("0.10")
@@ -223,6 +225,7 @@ class HyruleConfig(BaseSettings):
 
     # VM lifecycle
     vm_grace_period_hours: int = 48
+    max_paid_active_vms: int = 0
     max_duration_days: int = 365
     max_ports: int = 10
     blocked_ports: list[int] = Field(

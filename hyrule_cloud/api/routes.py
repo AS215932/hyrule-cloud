@@ -7,17 +7,23 @@ either a 402 Response or the payer's wallet address.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+from sqlalchemy import func, select
+from sqlalchemy import update as _sql_update
+from sqlalchemy.exc import IntegrityError
 
-from hyrule_cloud.db import VMQuoteRow, VMRow
+from hyrule_cloud.db import DomainRow, VMQuoteRow, VMRow
 from hyrule_cloud.middleware.anon_token import (
     anon_management_token,
     can_manage_vm,
+    hash_anon_token,
 )
 from hyrule_cloud.middleware.auth import current_account
 from hyrule_cloud.models import (
@@ -28,6 +34,8 @@ from hyrule_cloud.models import (
     DomainCheckResponse,
     DomainMode,
     DomainRegisterRequest,
+    DomainRegisterResponse,
+    DomainStatus,
     FirewallState,
     GenericActionResponse,
     NetworkRequest,
@@ -51,6 +59,7 @@ from hyrule_cloud.models import (
     VMSize,
     VMStatus,
     VMStatusResponse,
+    generate_domain_management_token,
 )
 from hyrule_cloud.services.quotes import (
     QuoteConflictError,
@@ -66,6 +75,31 @@ from hyrule_cloud.state import AppState, get_app_state
 log = structlog.get_logger()
 
 router = APIRouter(prefix="/v1")
+
+_domain_registration_locks: dict[str, asyncio.Lock] = {}
+
+
+def _domain_registration_lock(key: str) -> asyncio.Lock:
+    lock = _domain_registration_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _domain_registration_locks[key] = lock
+    return lock
+
+
+@asynccontextmanager
+async def _domain_registration_guard(fqdn: str, client_order_id: str | None):
+    keys = {f"domain:{fqdn}"}
+    if client_order_id:
+        keys.add(f"client:{client_order_id}")
+    locks = [_domain_registration_lock(key) for key in sorted(keys)]
+    for lock in locks:
+        await lock.acquire()
+    try:
+        yield
+    finally:
+        for lock in reversed(locks):
+            lock.release()
 
 
 def get_orch(app_state: AppState = Depends(get_app_state)):
@@ -84,6 +118,14 @@ def get_network(app_state: AppState = Depends(get_app_state)):
 # --- Quote helpers (issue #14) ---
 
 
+_NATIVE_ASSETS = ("BTC", "XMR")
+
+
+def _native_payment_assets(app_state: AppState) -> list[str]:
+    configured = [asset.upper() for asset in getattr(app_state, "native_payment_assets", [])]
+    return [asset for asset in _NATIVE_ASSETS if asset in configured]
+
+
 def _accepted_payment_methods(cfg, app_state: AppState) -> AcceptedPaymentMethods:
     """Single source of truth for what a quote can be paid with: enabled EVM
     chains from config + native (BTC/XMR) iff the intent rail is wired."""
@@ -91,10 +133,85 @@ def _accepted_payment_methods(cfg, app_state: AppState) -> AcceptedPaymentMethod
         QuoteEvmMethod(key=n.key, caip2=n.caip2, asset=n.asset, chain_id=n.chain_id)
         for n in cfg.payment.enabled_networks()
     ]
-    native: list[str] = []
-    if getattr(app_state, "native_crypto", None) and getattr(app_state, "rate_provider", None):
-        native = ["BTC", "XMR"]
+    native = _native_payment_assets(app_state)
     return AcceptedPaymentMethods(evm=evm, native=native)
+
+
+def _split_domain(domain: str) -> tuple[str, str, str]:
+    fqdn = domain.strip().lower().rstrip(".")
+    if not fqdn or ".." in fqdn or "." not in fqdn:
+        raise HTTPException(400, "domain must be a fully-qualified name")
+    name, extension = fqdn.rsplit(".", 1)
+    if not name or not extension:
+        raise HTTPException(400, "domain must be a fully-qualified name")
+    return name, extension, fqdn
+
+
+def _domain_from_parts(
+    *,
+    domain: str | None = None,
+    name: str | None = None,
+    extension: str | None = None,
+) -> tuple[str, str, str]:
+    if domain:
+        return _split_domain(domain)
+    if name and extension:
+        return _split_domain(f"{name}.{extension}")
+    raise HTTPException(400, "domain required")
+
+
+def _domain_management_token(request: Request) -> str | None:
+    auth = (request.headers.get("authorization") or "").strip()
+    if auth:
+        scheme, _, credential = auth.partition(" ")
+        if scheme.lower() == "bearer" and credential.strip().startswith("hyr_dom_"):
+            return credential.strip()
+    return None
+
+
+async def _domain_price(
+    orch,
+    cfg,
+    fqdn: str,
+) -> tuple[str, str, str, Decimal | None, Decimal, Decimal, bool]:
+    name, extension, _ = _split_domain(fqdn)
+    check = await orch.openprovider.check_domain(name, extension)
+    if check.get("status") != "free":
+        raise HTTPException(409, f"Domain {fqdn} is not available")
+    registrar = check.get("price")
+    registrar_price = Decimal(str(registrar)) if registrar is not None else Decimal("10")
+    markup = cfg.payment.price_domain_markup
+    total = registrar_price + markup
+    currency = str(check.get("currency") or "USD")
+    return name, extension, currency, registrar_price, markup, total, bool(check.get("is_premium"))
+
+
+async def _compute_vm_price(orch, cfg, order: VMCreateRequest) -> tuple[Decimal, Any]:
+    total, breakdown = orch.compute_price(order)
+    if order.domain_mode == DomainMode.CUSTOM and order.domain:
+        _, _, _, registrar_price, markup, _, _ = await _domain_price(orch, cfg, order.domain)
+        domain_total = registrar_price + markup
+        total = total - markup + domain_total
+        breakdown.domain_cost = f"${domain_total:.2f}"
+        breakdown.total = f"${total:.2f}"
+    return total, breakdown
+
+
+async def _enforce_paid_vm_cap(orch, cfg) -> None:
+    cap = int(getattr(cfg, "max_paid_active_vms", 0) or 0)
+    if cap <= 0:
+        return
+    async with orch.db() as session:
+        result = await session.execute(
+            select(func.count())
+            .select_from(VMRow)
+            .where(
+                VMRow.status.notin_([VMStatus.DESTROYED, VMStatus.FAILED]),
+                VMRow.owner_wallet != "",
+            )
+        )
+    if int(result.scalar() or 0) >= cap:
+        raise HTTPException(503, "Soft-launch VM capacity reached")
 
 
 def _quote_to_response(row: VMQuoteRow, cfg, app_state: AppState) -> VMQuoteResponse:
@@ -322,9 +439,7 @@ async def get_payment_networks(
     EIP-712 domain shape (so the wallet adapter doesn't have to bake one
     in), and the explorer URL for the post-pay receipt link.
     """
-    native: list[str] = []
-    if getattr(app_state, "native_crypto", None) and getattr(app_state, "rate_provider", None):
-        native = ["BTC", "XMR"]
+    native = _native_payment_assets(app_state)
     return {
         "networks": [
             {
@@ -364,7 +479,6 @@ async def get_pricing(cfg = Depends(get_cfg)) -> PricingResponse:
         proxy_prices={
             "direct": f"${cfg.payment.price_proxy_direct}/request",
             "tor": f"${cfg.payment.price_proxy_tor}/request",
-            "residential": f"${cfg.payment.price_proxy_residential}/request",
         } if hasattr(PricingResponse, '__annotations__') and 'proxy_prices' in PricingResponse.__annotations__ else {}
     )
 
@@ -556,10 +670,12 @@ async def create_vm(
         if port in cfg.blocked_ports:
             raise HTTPException(400, f"Port {port} is blocked by policy")
 
+    await _enforce_paid_vm_cap(orch, cfg)
+
     # Price-lock: a quote-bound create charges the amount quoted to the user,
     # not a recomputation (which could drift). The breakdown is still recomputed
     # for the 402 body's informational cost_breakdown.
-    computed, breakdown = orch.compute_price(order)
+    computed, breakdown = await _compute_vm_price(orch, cfg, order)
     total = quote_row.amount_usd if quote_row is not None else computed
     specs = VM_SPECS[order.size]
 
@@ -631,7 +747,7 @@ async def create_vm_quote(
         if port in cfg.blocked_ports:
             raise HTTPException(400, f"Port {port} is blocked by policy")
 
-    total, _ = orch.compute_price(order)
+    total, _ = await _compute_vm_price(orch, cfg, order)
     app_state = get_app_state(request)
     try:
         row = await create_quote(
@@ -752,68 +868,223 @@ async def destroy_vm(
 
 
 @router.get("/domain/check", response_model=DomainCheckResponse)
-async def check_domain(name: str, extension: str, orch = Depends(get_orch)) -> DomainCheckResponse:
-    """Check if a DNS zone (domain) is available for purchase."""
+async def check_domain(
+    domain: str | None = Query(default=None),
+    name: str | None = Query(default=None),
+    extension: str | None = Query(default=None),
+    orch=Depends(get_orch),
+    cfg=Depends(get_cfg),
+) -> DomainCheckResponse:
+    """Check if a domain is available for purchase."""
+    name, extension, fqdn = _domain_from_parts(domain=domain, name=name, extension=extension)
     check = await orch.openprovider.check_domain(name, extension)
+    registrar = check.get("price")
+    registrar_price = (
+        Decimal(str(registrar))
+        if registrar is not None
+        else (Decimal("10") if check.get("status") == "free" else None)
+    )
+    markup = cfg.payment.price_domain_markup
+    total = registrar_price + markup if registrar_price is not None else None
     return DomainCheckResponse(
-        domain=f"{name}.{extension}",
+        domain=fqdn,
         available=(check.get("status") == "free"),
-        price=str(check.get("price")) if check.get("price") else None,
+        registrar_price=str(registrar_price) if registrar_price is not None else None,
+        markup=str(markup),
+        total=str(total) if total is not None else None,
+        currency=str(check.get("currency") or "USD"),
+        premium=bool(check.get("is_premium")),
+        price=str(total) if total is not None else None,
     )
 
 
-@router.post("/domain/register", response_model=GenericActionResponse)
-async def register_domain(body: DomainRegisterRequest, name: str, extension: str, ipv6: str | None = None, request: Request=None, orch = Depends(get_orch), cfg = Depends(get_cfg), gate = Depends(get_gate)):
+@router.post("/domain/register", response_model=DomainRegisterResponse)
+async def register_domain(
+    body: DomainRegisterRequest,
+    request: Request,
+    orch=Depends(get_orch),
+    cfg=Depends(get_cfg),
+    gate=Depends(get_gate),
+    account=Depends(current_account),
+) -> DomainRegisterResponse:
     """
-    Buy a DNS zone: register the domain via Openprovider and create an
-    authoritative DNS zone. After purchase, the agent can manage records
-    via POST /v1/zone/record and DELETE /v1/zone/record.
+    Buy a DNS zone: register the domain via Openprovider and create a DNS zone.
+    Domain management is owner-gated by session account or one-time anon token.
     """
-    if not name or not extension:
-        raise HTTPException(400, "name and extension required")
-
-    check = await orch.openprovider.check_domain(name, extension)
-    if check["status"] != "free":
-        raise HTTPException(409, f"Domain {name}.{extension} is not available")
-
-    op_price = check.get("price") or Decimal("10")
-    total = op_price + cfg.payment.price_domain_markup
-
-    result = await gate.check_payment(
-        request,
-        amount=total,
-        description=f"Register domain {name}.{extension}",
-        extra_body={
-            "domain": f"{name}.{extension}",
-            "registrar_cost": str(op_price),
-            "markup": str(cfg.payment.price_domain_markup),
-        },
+    name, extension, fqdn = _domain_from_parts(
+        domain=body.domain,
+        name=body.name,
+        extension=body.extension,
     )
 
-    if isinstance(result, Response):
-        return result
+    async with _domain_registration_guard(fqdn, body.client_order_id):
+        async with orch.db() as session:
+            existing = (
+                await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
+            ).scalar_one_or_none()
+            if existing is not None:
+                if body.client_order_id and existing.client_order_id == body.client_order_id:
+                    return DomainRegisterResponse(
+                        domain=fqdn,
+                        status=DomainStatus(existing.status),
+                        management_url=f"/v1/zone/records?zone={fqdn}",
+                        message="Domain registration already exists",
+                    )
+                raise HTTPException(409, f"Domain {fqdn} is already managed")
+            if body.client_order_id:
+                existing_key = (
+                    await session.execute(
+                        select(DomainRow).where(DomainRow.client_order_id == body.client_order_id)
+                    )
+                ).scalar_one_or_none()
+                if existing_key is not None:
+                    raise HTTPException(409, "client_order_id already used for a different domain")
 
-    try:
-        await orch.openprovider.register_domain(name, extension)
-    except Exception as e:
-        log.error("domain_registration_failed", error=str(e))
-        raise HTTPException(500, f"Domain registration failed: {e}")
+        _, _, currency, registrar_price, markup, total, _ = await _domain_price(orch, cfg, fqdn)
 
-    fqdn = f"{name}.{extension}"
-    try:
-        await orch.openprovider.create_zone(fqdn)
-    except Exception:
-        log.warning("zone_create_fallback", zone=fqdn)
-        
-    if ipv6:
-        await orch.dns.create_record(fqdn, "AAAA", ipv6)
+        result = await gate.check_payment(
+            request,
+            amount=total,
+            description=f"Register domain {fqdn}",
+            extra_body={
+                "domain": fqdn,
+                "registrar_cost": str(registrar_price),
+                "markup": str(markup),
+                "duration_years": body.duration_years,
+                "client_order_id": body.client_order_id,
+            },
+        )
 
-    return GenericActionResponse(status="ok", message=f"Domain {fqdn} registered")
+        if isinstance(result, Response):
+            return result
+
+        wallet = result
+        token = generate_domain_management_token() if account is None else None
+        async with orch.db() as session:
+            row = DomainRow(
+                name=name,
+                extension=extension,
+                fqdn=fqdn,
+                owner_wallet=wallet,
+                owner_account_id=(account.account_id if account is not None else None),
+                anon_management_token_hash=(hash_anon_token(token) if token else None),
+                status=DomainStatus.REGISTERING,
+                client_order_id=body.client_order_id,
+                registrar_price=registrar_price,
+                markup=markup,
+                total_price=total,
+                currency=currency,
+                payment_tx=getattr(request.state, "payment_tx", None),
+            )
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                log.warning("domain_registration_reservation_conflict", domain=fqdn, error=str(exc))
+                raise HTTPException(409, f"Domain {fqdn} is already managed") from exc
+
+        try:
+            op_result = await orch.openprovider.register_domain(name, extension, period=body.duration_years)
+            try:
+                await orch.openprovider.create_zone(fqdn)
+            except Exception:
+                log.warning("zone_create_fallback", zone=fqdn)
+
+            if body.ipv6:
+                await orch.openprovider.create_zone_record(
+                    zone_name=fqdn,
+                    name="",
+                    rtype="AAAA",
+                    value=body.ipv6,
+                    ttl=300,
+                )
+        except Exception as e:
+            log.error("domain_registration_failed", domain=fqdn, error=str(e))
+            async with orch.db() as session:
+                await session.execute(
+                    _sql_update(DomainRow)
+                    .where(DomainRow.fqdn == fqdn)
+                    .values(status=DomainStatus.FAILED.value, error=str(e))
+                )
+                await session.commit()
+            raise HTTPException(502, f"Domain registration failed: {e}") from e
+
+        raw_openprovider_id = (
+            op_result.get("id")
+            or op_result.get("domain", {}).get("id")
+            or op_result.get("data", {}).get("id")
+        )
+        try:
+            openprovider_id = int(raw_openprovider_id) if raw_openprovider_id is not None else None
+        except (TypeError, ValueError):
+            openprovider_id = None
+        async with orch.db() as session:
+            await session.execute(
+                _sql_update(DomainRow)
+                .where(DomainRow.fqdn == fqdn)
+                .values(
+                    status=DomainStatus.ACTIVE.value,
+                    openprovider_id=openprovider_id,
+                    error=None,
+                )
+            )
+            await session.commit()
+
+    return DomainRegisterResponse(
+        domain=fqdn,
+        status=DomainStatus.ACTIVE,
+        management_token=token,
+        management_url=f"/v1/zone/records?zone={fqdn}",
+        message=f"Domain {fqdn} registered",
+    )
+
+
+async def _domain_for_management(
+    *,
+    zone: str,
+    request: Request,
+    orch,
+    account,
+) -> DomainRow:
+    _, _, fqdn = _split_domain(zone)
+    async with orch.db() as session:
+        row = (
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(404, "Domain not found")
+        if account is not None and row.owner_account_id is not None:
+            if account.account_id == row.owner_account_id or getattr(account, "is_admin", False):
+                return row
+        token = _domain_management_token(request)
+        if row.anon_management_token_hash and token:
+            if row.anon_management_token_hash == hash_anon_token(token):
+                return row
+    raise HTTPException(404, "Domain not found")
+
+
+@router.get("/zone/records")
+async def list_zone_records(
+    zone: str,
+    request: Request,
+    orch=Depends(get_orch),
+    account=Depends(current_account),
+) -> dict:
+    await _domain_for_management(zone=zone, request=request, orch=orch, account=account)
+    return {"zone": zone, "records": await orch.openprovider.list_zone_records(zone)}
 
 
 @router.post("/zone/record", response_model=GenericActionResponse)
-async def create_zone_record(zone: str, body: DNSRecord, orch = Depends(get_orch)) -> GenericActionResponse:
+async def create_zone_record(
+    zone: str,
+    body: DNSRecord,
+    request: Request,
+    orch=Depends(get_orch),
+    account=Depends(current_account),
+) -> GenericActionResponse:
     """Create a DNS record in a zone managed by Hyrule Cloud."""
+    await _domain_for_management(zone=zone, request=request, orch=orch, account=account)
     try:
         await orch.openprovider.create_zone_record(
             zone_name=zone,
@@ -836,9 +1107,12 @@ async def delete_zone_record(
     zone: str,
     name: str,
     type: str,
-    orch = Depends(get_orch),
+    request: Request,
+    orch=Depends(get_orch),
+    account=Depends(current_account),
 ):
     """Delete a DNS record from a zone managed by Hyrule Cloud."""
+    await _domain_for_management(zone=zone, request=request, orch=orch, account=account)
     try:
         rtype = DNSRecordType(type.upper())
     except ValueError:
@@ -886,9 +1160,6 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
         raise HTTPException(resp.status_code, resp.error)
         
     return resp
-
-from sqlalchemy import update as _sql_update
-
 from hyrule_cloud.db import CryptoIntentRow
 from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
 from hyrule_cloud.services.intents import IntentExistsError, create_intent
@@ -954,13 +1225,14 @@ async def create_crypto_intent(
         if port in cfg.blocked_ports:
             raise HTTPException(400, f"Port {port} is blocked by policy")
 
-    total, _ = orch.compute_price(body.order_payload)
+    await _enforce_paid_vm_cap(orch, cfg)
+    total, _ = await _compute_vm_price(orch, cfg, body.order_payload)
 
     app_state: AppState = get_app_state(request)
     provider = getattr(app_state, "native_crypto", None)
     rates = getattr(app_state, "rate_provider", None)
-    if provider is None or rates is None:
-        raise HTTPException(503, "Native crypto provider not configured")
+    if provider is None or rates is None or asset not in _native_payment_assets(app_state):
+        raise HTTPException(503, f"{asset} payments are not configured")
 
     try:
         row = await create_intent(

@@ -39,6 +39,7 @@ QUOTE_TTL = timedelta(minutes=60)
 # Same-process duplicate paid creates should not race through SQLite/test
 # sessions; the conditional database update remains the cross-process guard.
 _claim_locks: dict[str, asyncio.Lock] = {}
+_claimed_quote_ids: set[str] = set()
 
 
 def _claim_lock(quote_id: str) -> asyncio.Lock:
@@ -159,17 +160,22 @@ async def claim_quote(session_factory: async_sessionmaker, quote_id: str) -> boo
     vm_id is attached afterwards via link_quote_vm once the VM exists.
     """
     async with _claim_lock(quote_id):
+        if quote_id in _claimed_quote_ids:
+            return False
         async with session_factory() as db:
             result = await db.execute(
                 _sql_update(VMQuoteRow)
                 .where(
                     VMQuoteRow.quote_id == quote_id,
-                    VMQuoteRow.status == QuoteStatus.CREATED,
+                    VMQuoteRow.status == QuoteStatus.CREATED.value,
                 )
-                .values(status=QuoteStatus.CONSUMED)
+                .values(status=QuoteStatus.CONSUMED.value)
             )
             await db.commit()
-            return result.rowcount == 1
+            won = result.rowcount == 1
+            if won:
+                _claimed_quote_ids.add(quote_id)
+            return won
 
 
 async def link_quote_vm(session_factory: async_sessionmaker, quote_id: str, vm_id: str) -> None:

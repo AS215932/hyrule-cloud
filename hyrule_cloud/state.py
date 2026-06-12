@@ -24,6 +24,7 @@ class AppState:
     # what they need; routes that require them check for None.
     native_crypto: NativeCryptoProvider | None = field(default=None)
     rate_provider: RateProvider | None = field(default=None)
+    native_payment_assets: list[str] = field(default_factory=list)
     # Block B: session factory for direct read-only metric queries from
     # /v1/stats/runtime — avoids routing every metric query through the
     # orchestrator. Typed Any so we don't need to import async_sessionmaker

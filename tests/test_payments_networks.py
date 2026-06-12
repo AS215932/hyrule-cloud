@@ -127,6 +127,7 @@ async def test_payments_networks_native_lists_btc_xmr_when_rail_wired(
 ) -> None:
     real_payment_state.native_crypto = object()
     real_payment_state.rate_provider = object()
+    real_payment_state.native_payment_assets = ["BTC", "XMR"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         body = (await c.get("/v1/payments/networks")).json()
     assert body["native"] == ["BTC", "XMR"]

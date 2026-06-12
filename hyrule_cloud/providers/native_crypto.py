@@ -55,9 +55,9 @@ class NativeCryptoProvider:
     The spend key is NOT on this server; we can scan but not spend.
     """
 
-    def __init__(self, config: PaymentConfig, *, xmr_rpc_url: str = _XMR_RPC_DEFAULT) -> None:
+    def __init__(self, config: PaymentConfig, *, xmr_rpc_url: str | None = None) -> None:
         self.config = config
-        self.xmr_rpc_url = xmr_rpc_url
+        self.xmr_rpc_url = xmr_rpc_url or config.xmr_rpc_url or _XMR_RPC_DEFAULT
         # Lazy-init the BIP84 derivation context only if BTC is configured.
         self._btc_ctx = None
         self._http: httpx.AsyncClient | None = None
@@ -70,6 +70,15 @@ class NativeCryptoProvider:
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+
+    async def ready_assets(self) -> list[str]:
+        """Return native assets that are actually usable right now."""
+        assets: list[str] = []
+        if self.config.btc_xpub.strip():
+            assets.append("BTC")
+        if await self.xmr_ready():
+            assets.append("XMR")
+        return assets
 
     # ---------------- BTC ----------------
 
@@ -169,6 +178,15 @@ class NativeCryptoProvider:
         if "error" in body:
             raise RuntimeError(f"monero-wallet-rpc {method} failed: {body['error']}")
         return body.get("result", {})
+
+    async def xmr_ready(self) -> bool:
+        """True when the configured local wallet RPC is reachable."""
+        try:
+            await self._xmr_rpc("get_version")
+            return True
+        except Exception as exc:
+            log.warning("xmr_wallet_rpc_unready", error=str(exc))
+            return False
 
     async def create_xmr_subaddress(self, label: str | None = None) -> tuple[str, int]:
         """Create a fresh subaddress on account 0. Returns (address, address_index)."""

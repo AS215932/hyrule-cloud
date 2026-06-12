@@ -73,6 +73,12 @@ async def lifespan(app: FastAPI):
     await rate_provider.start()
     native_crypto = NativeCryptoProvider(config.payment)
     await native_crypto.start()
+    native_payment_assets = await native_crypto.ready_assets()
+    if config.payment.require_native and set(native_payment_assets) != {"BTC", "XMR"}:
+        raise RuntimeError(
+            "PAYMENT_REQUIRE_NATIVE=true but BTC/XMR are not both ready "
+            f"(ready={','.join(native_payment_assets) or 'none'})"
+        )
 
     # Wire up app state
     app.state._typed_state = AppState(
@@ -82,6 +88,7 @@ async def lifespan(app: FastAPI):
         network_provider=network_provider,
         native_crypto=native_crypto,
         rate_provider=rate_provider,
+        native_payment_assets=native_payment_assets,
         session_factory=session_factory,
     )
 
@@ -167,8 +174,10 @@ async def x402_manifest():
         "name": "Hyrule Cloud",
         "description": (
             "Bare VM hosting for AI agents. Deploy VMs with SSH access, "
-            "automatic HTTPS subdomains, and IPv6-native networking. "
-            "Pay with multi-chain USDC or native un-smart contracts."
+            "automatic HTTPS subdomains, IPv6-native networking, domain "
+            "registration, and paid direct/Tor network requests. x402 resources "
+            "settle with facilitator-verified USDC; VM checkout may also offer "
+            "BTC/XMR when the live payment catalog advertises native rails."
         ),
         "resources": [
             {
