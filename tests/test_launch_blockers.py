@@ -56,6 +56,7 @@ class _Gate:
 class _Openprovider:
     def __init__(self) -> None:
         self.records: list[tuple[str, str, str, str]] = []
+        self.registrations: list[tuple[str, str]] = []
         self.fail_register = False
 
     async def check_domain(self, name, extension):
@@ -69,6 +70,7 @@ class _Openprovider:
     async def register_domain(self, name, extension, period=1):
         if self.fail_register:
             raise RuntimeError("registrar unavailable")
+        self.registrations.append((name, extension))
         return {"id": 42}
 
     async def create_zone(self, name):
@@ -190,6 +192,46 @@ async def test_domain_register_persists_ownerless_token_and_gates_records(launch
         assert row.fqdn == "example.test"
         assert row.status == DomainStatus.ACTIVE
         assert row.owner_wallet == "0xwallet"
+
+
+@pytest.mark.asyncio
+async def test_domain_register_same_idempotency_key_returns_existing_domain(launch_state):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        first = await client.post(
+            "/v1/domain/register",
+            json={"domain": "example.test", "client_order_id": "domain-1"},
+            headers={"X-Mock-Paid": "1"},
+        )
+        replay = await client.post(
+            "/v1/domain/register",
+            json={"domain": "example.test", "client_order_id": "domain-1"},
+        )
+
+    assert first.status_code == 200, first.text
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["status"] == "active"
+    assert replay.json()["message"] == "Domain registration already exists"
+    assert launch_state.orchestrator.openprovider.registrations == [("example", "test")]
+
+
+@pytest.mark.asyncio
+async def test_domain_register_reused_idempotency_key_for_different_domain_conflicts(launch_state):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        first = await client.post(
+            "/v1/domain/register",
+            json={"domain": "example.test", "client_order_id": "domain-1"},
+            headers={"X-Mock-Paid": "1"},
+        )
+        conflict = await client.post(
+            "/v1/domain/register",
+            json={"domain": "other.test", "client_order_id": "domain-1"},
+            headers={"X-Mock-Paid": "1"},
+        )
+
+    assert first.status_code == 200, first.text
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == "client_order_id already used for a different domain"
+    assert launch_state.orchestrator.openprovider.registrations == [("example", "test")]
 
 
 @pytest.mark.asyncio
