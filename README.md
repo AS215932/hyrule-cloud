@@ -1,6 +1,6 @@
 # Hyrule Cloud
 
-Agentic VPS hosting on AS215932 with x402 payments.
+Agentic VPS hosting on Hyrule Networks (AS215932) with x402 payments.
 
 Agents discover this service via the x402 Bazaar or `/.well-known/x402.json`, pay with USDC on Base, and receive bare VMs with SSH access, automatic DNS, and IPv6-native networking.
 
@@ -167,3 +167,7 @@ alembic/
   versions/
     001_initial_schema.py
 ```
+
+---
+
+*Part of [Hyrule Networks (AS215932)](https://github.com/AS215932).*
