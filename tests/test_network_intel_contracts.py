@@ -25,6 +25,9 @@ def test_openapi_exposes_network_intelligence_contracts():
         "/v1/dns/resolve",
         "/v1/rdap/lookup",
         "/v1/whois/lookup",
+        "/v1/web/check",
+        "/v1/web/reports",
+        "/v1/web/tls/deep",
         "/v1/mx/check",
         "/v1/mx/jobs",
         "/v1/mail/accounts",
@@ -86,12 +89,14 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             dns = await client.post("/v1/dns/lookup", json={"name": "example.com", "type": "A"})
+            web = await client.post("/v1/web/check", json={"target": "https://example.com"})
             mx = await client.post("/v1/mx/check", json={"tool": "mx", "target": "example.com"})
             bgp = await client.post("/v1/bgp/lookup", json={"subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"}})
     finally:
         if old_state is not None:
             app.state._typed_state = old_state
     assert dns.status_code == 402
+    assert web.status_code == 402
     assert mx.status_code == 402
     assert bgp.status_code == 402
 
@@ -113,6 +118,8 @@ async def test_x402_manifest_lists_network_intel_resources():
     assert "/v1/dns/lookup" in paths
     assert "/v1/rdap/lookup" in paths
     assert "/v1/whois/lookup" in paths
+    assert "/v1/web/check" in paths
+    assert "/v1/web/tls/deep" in paths
     assert "/v1/mx/check" in paths
     assert "/v1/mail/accounts" in paths
 

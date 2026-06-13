@@ -24,6 +24,7 @@ from hyrule_cloud.api.mail import router as mail_router
 from hyrule_cloud.api.mx import router as mx_router
 from hyrule_cloud.api.registry import router as registry_router
 from hyrule_cloud.api.routes import router
+from hyrule_cloud.api.web import router as web_router
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
 from hyrule_cloud.middleware.metrics import install_metrics
@@ -169,6 +170,7 @@ app.include_router(bgp_router)
 app.include_router(ip_router)
 app.include_router(dns_router)
 app.include_router(registry_router)
+app.include_router(web_router)
 app.include_router(mx_router)
 app.include_router(mail_router)
 app.include_router(internal_bgp_router)
@@ -269,6 +271,27 @@ async def x402_manifest():
                 "method": "POST",
                 "description": "Paid legacy WHOIS lookup for domains, IPs, prefixes/network blocks, and ASNs",
                 "minPrice": str(getattr(config.payment, "price_whois_lookup", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/web/check",
+                "method": "POST",
+                "description": "Paid web reachability, HTTP/HTTPS, TLS certificate, security headers, and CDN/WAF diagnostic check",
+                "minPrice": str(getattr(config.payment, "price_web_check", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/web/reports",
+                "method": "POST",
+                "description": "Paid web reachability evidence pack from Hyrule/extmon vantage",
+                "minPrice": str(getattr(config.payment, "price_web_report", "0.03")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/web/tls/deep",
+                "method": "POST",
+                "description": "Paid Hyrule-native SSL Labs-style deep TLS scanner and grade",
+                "minPrice": str(getattr(config.payment, "price_web_tls_deep", "0.10")),
                 "networks": getattr(config.payment, "networks", []),
             },
             {

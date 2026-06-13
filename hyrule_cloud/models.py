@@ -619,6 +619,257 @@ class ProductCapabilityResponse(BaseModel):
     paid_endpoints: list[CapabilityEndpoint] = Field(default_factory=list)
 
 
+class WebCheck(enum.StrEnum):
+    DNS = "dns"
+    HTTP = "http"
+    HTTPS = "https"
+    TLS = "tls"
+    CERT = "cert"
+    HEADERS = "headers"
+    CDN_WAF = "cdn_waf"
+    DOWN = "down"
+
+
+class WebTLSDeepCheck(enum.StrEnum):
+    PROTOCOL_VERSIONS = "protocol_versions"
+    CIPHER_SUITES = "cipher_suites"
+    CERTIFICATE_CHAIN = "certificate_chain"
+    OCSP = "ocsp"
+    HSTS = "hsts"
+    CAA = "caa"
+    SECURITY_HEADERS = "security_headers"
+
+
+class WebCheckRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=2048)
+    checks: list[WebCheck] = Field(default_factory=lambda: [WebCheck.DNS, WebCheck.HTTP, WebCheck.TLS, WebCheck.CERT, WebCheck.HEADERS, WebCheck.CDN_WAF])
+    vantages: list[DiagnosticVantage] = Field(default_factory=lambda: [DiagnosticVantage.EXTMON])
+    timeout_ms: int = Field(default=10000, ge=500, le=60000)
+    include_raw: bool = False
+
+
+class WebReportRequest(WebCheckRequest):
+    profile: str = "web_reachability"
+
+
+class WebTLSDeepRequest(BaseModel):
+    host: str = Field(min_length=1, max_length=253)
+    port: int = Field(default=443, ge=1, le=65535)
+    scan_profile: str = "ssl_labs_style"
+    checks: list[WebTLSDeepCheck] = Field(default_factory=lambda: [check for check in WebTLSDeepCheck])
+    include_raw: bool = False
+
+
+class WebPricingResponse(BaseModel):
+    check_usd: str
+    report_usd: str
+    tls_deep_usd: str
+
+
+class PathProbeKind(enum.StrEnum):
+    PING = "ping"
+    TRACE = "trace"
+    MTR = "mtr"
+    ASYMMETRY = "asymmetry"
+
+
+class PathReportCheck(enum.StrEnum):
+    PING = "ping"
+    TRACEROUTE = "traceroute"
+    MTR = "mtr"
+    BGP = "bgp"
+    RPKI = "rpki"
+    ROUTER_TABLE = "router_table"
+
+
+class PathProbeRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=2048)
+    probe: PathProbeKind = PathProbeKind.PING
+    address_family: DiagnosticAddressFamily = DiagnosticAddressFamily.AUTO
+    vantages: list[DiagnosticVantage] = Field(default_factory=lambda: [DiagnosticVantage.EXTMON])
+    count: int = Field(default=4, ge=1, le=20)
+    timeout_ms: int = Field(default=10000, ge=500, le=60000)
+
+
+class PathReportRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=2048)
+    address_family: DiagnosticAddressFamily = DiagnosticAddressFamily.AUTO
+    vantages: list[DiagnosticVantage] = Field(default_factory=lambda: [DiagnosticVantage.EXTMON, DiagnosticVantage.AS215932, DiagnosticVantage.GLOBALPING])
+    checks: list[PathReportCheck] = Field(default_factory=lambda: [PathReportCheck.PING, PathReportCheck.TRACEROUTE, PathReportCheck.MTR, PathReportCheck.BGP, PathReportCheck.RPKI, PathReportCheck.ROUTER_TABLE])
+    max_duration_seconds: int = Field(default=60, ge=5, le=300)
+    include_raw: bool = False
+
+
+class PathPricingResponse(BaseModel):
+    probe_usd: str
+    report_usd: str
+
+
+class PathVantagesResponse(BaseModel):
+    vantages: list[dict[str, object]]
+
+
+class PortProtocol(enum.StrEnum):
+    TCP = "tcp"
+    UDP = "udp"
+
+
+class PortProfile(enum.StrEnum):
+    CUSTOM = "custom"
+    SSH = "ssh"
+    DNS = "dns"
+    HTTP = "http"
+    HTTPS = "https"
+    SMTP = "smtp"
+    SUBMISSION = "submission"
+    IMAP = "imap"
+    POP3 = "pop3"
+    SIP = "sip"
+    SIPS = "sips"
+
+
+class PortCheckRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=2048)
+    port: int = Field(ge=1, le=65535)
+    protocol: PortProtocol = PortProtocol.TCP
+    profile: PortProfile = PortProfile.CUSTOM
+    vantage: DiagnosticVantage = DiagnosticVantage.EXTMON
+    timeout_ms: int = Field(default=5000, ge=500, le=30000)
+    include_banner: bool = False
+
+
+class PortAllowedResponse(BaseModel):
+    tcp_ports: list[int]
+    udp_ports: list[int] = Field(default_factory=list)
+    note: str = "Single declared service checks only; broad port scanning is not supported."
+
+
+class PortPricingResponse(BaseModel):
+    check_usd: str
+
+
+class NATIPResponse(BaseModel):
+    ip: str
+    ip_version: int
+    asn: int | None = None
+    reverse_dns: list[str] = Field(default_factory=list)
+    headers_seen: dict[str, str | None] = Field(default_factory=dict)
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class NATLookupRequest(BaseModel):
+    observed_public_ip: str | None = None
+    customer_reported_wan_ip: str | None = None
+    customer_reported_lan_ip: str | None = None
+
+
+class NATLookupResponse(BaseModel):
+    cgnat_likely: bool
+    evidence: list[str] = Field(default_factory=list)
+    recommendation: str | None = None
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class NATPortForwardCheckRequest(PortCheckRequest):
+    pass
+
+
+class NATPricingResponse(BaseModel):
+    lookup_usd: str
+    port_forward_check_usd: str
+    what_is_my_ip_usd: str = "0"
+
+
+class ThreatSubjectType(enum.StrEnum):
+    DOMAIN = "domain"
+    IP = "ip"
+    CERT = "cert"
+    URL = "url"
+
+
+class ThreatView(enum.StrEnum):
+    RBL = "rbl"
+    CT = "ct"
+    RDAP = "rdap"
+    WHOIS = "whois"
+    DNS = "dns"
+    REPUTATION = "reputation"
+
+
+class ThreatSubject(BaseModel):
+    type: ThreatSubjectType
+    value: str
+
+
+class ThreatLookupRequest(BaseModel):
+    subject: ThreatSubject
+    views: list[ThreatView] = Field(default_factory=lambda: [ThreatView.RBL, ThreatView.CT, ThreatView.RDAP, ThreatView.WHOIS, ThreatView.DNS, ThreatView.REPUTATION])
+    include_raw: bool = False
+
+
+class ThreatSourcesResponse(BaseModel):
+    sources: dict[str, SourceHealth]
+    policy: str = "Open/public sources are used first; licensed and owner-verified sources are disabled until configured."
+
+
+class ThreatPricingResponse(BaseModel):
+    lookup_usd: str
+
+
+class VoIPCheck(enum.StrEnum):
+    SIP_DNS = "sip_dns"
+    SIP_OPTIONS = "sip_options"
+    SIP_TLS = "sip_tls"
+    STUN_TURN = "stun_turn"
+    NUMBER_INTEL = "number_intel"
+    CNAM = "cnam"
+    SPAM_REPUTATION = "spam_reputation"
+    E911 = "e911"
+
+
+class VoIPCheckRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=2048)
+    checks: list[VoIPCheck] = Field(default_factory=lambda: [VoIPCheck.SIP_DNS, VoIPCheck.SIP_TLS])
+    sip_port: int = Field(default=5061, ge=1, le=65535)
+    timeout_ms: int = Field(default=10000, ge=500, le=60000)
+    include_raw: bool = False
+
+
+class VoIPNumberLookupRequest(BaseModel):
+    number: str = Field(min_length=3, max_length=32)
+    country: str | None = Field(default=None, max_length=2)
+    checks: list[VoIPCheck] = Field(default_factory=lambda: [VoIPCheck.NUMBER_INTEL, VoIPCheck.CNAM, VoIPCheck.SPAM_REPUTATION, VoIPCheck.E911])
+    include_raw: bool = False
+
+
+class VoIPPricingResponse(BaseModel):
+    check_usd: str
+    number_lookup_usd: str
+    report_usd: str
+
+
+class VoIPSourcesResponse(BaseModel):
+    sources: dict[str, SourceHealth]
+
+
+class SpeedtestDirection(enum.StrEnum):
+    DOWNLOAD = "download"
+    UPLOAD = "upload"
+    BIDIRECTIONAL = "bidirectional"
+
+
+class SpeedtestRequest(BaseModel):
+    target: str = "hyrule"
+    direction: SpeedtestDirection = SpeedtestDirection.BIDIRECTIONAL
+    duration_seconds: int = Field(default=10, ge=3, le=60)
+    max_megabytes: int = Field(default=25, ge=1, le=250)
+    vantages: list[DiagnosticVantage] = Field(default_factory=lambda: [DiagnosticVantage.AS215932])
+
+
+class SpeedtestPricingResponse(BaseModel):
+    test_usd: str
+
+
 class BGPSubjectType(enum.StrEnum):
     PREFIX = "prefix"
     IP = "ip"
