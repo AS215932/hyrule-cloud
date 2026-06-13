@@ -22,6 +22,7 @@ from hyrule_cloud.api.internal_bgp import router as internal_bgp_router
 from hyrule_cloud.api.ip import router as ip_router
 from hyrule_cloud.api.mail import router as mail_router
 from hyrule_cloud.api.mx import router as mx_router
+from hyrule_cloud.api.path import router as path_router
 from hyrule_cloud.api.registry import router as registry_router
 from hyrule_cloud.api.routes import router
 from hyrule_cloud.api.web import router as web_router
@@ -172,6 +173,7 @@ app.include_router(dns_router)
 app.include_router(registry_router)
 app.include_router(web_router)
 app.include_router(mx_router)
+app.include_router(path_router)
 app.include_router(mail_router)
 app.include_router(internal_bgp_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
@@ -306,6 +308,20 @@ async def x402_manifest():
                 "method": "POST",
                 "description": "Paid full mail-delivery diagnostic report for agentic ISP support workflows",
                 "minPrice": str(getattr(config.payment, "price_mx_report", "0.03")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/path/report",
+                "method": "POST",
+                "description": "Paid routing/path evidence pack using extmon, AS215932, BGP/RPKI, and optional multi-vantage sources",
+                "minPrice": str(getattr(config.payment, "price_path_report", "0.05")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/path/ping",
+                "method": "POST",
+                "description": "Paid ping/path probe from approved Hyrule diagnostic vantages",
+                "minPrice": str(getattr(config.payment, "price_path_probe", "0.005")),
                 "networks": getattr(config.payment, "networks", []),
             },
             {
