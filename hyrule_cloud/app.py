@@ -27,6 +27,7 @@ from hyrule_cloud.api.path import router as path_router
 from hyrule_cloud.api.ports import router as ports_router
 from hyrule_cloud.api.registry import router as registry_router
 from hyrule_cloud.api.routes import router
+from hyrule_cloud.api.threat import router as threat_router
 from hyrule_cloud.api.web import router as web_router
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
@@ -178,6 +179,7 @@ app.include_router(mx_router)
 app.include_router(path_router)
 app.include_router(ports_router)
 app.include_router(nat_router)
+app.include_router(threat_router)
 app.include_router(mail_router)
 app.include_router(internal_bgp_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
@@ -347,6 +349,13 @@ async def x402_manifest():
                 "method": "POST",
                 "description": "Paid outside-in NAT port-forward reachability check for one declared service",
                 "minPrice": str(getattr(config.payment, "price_nat_port_forward_check", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/threat/lookup",
+                "method": "POST",
+                "description": "Paid open-source-first threat/reputation lookup with licensed provider adapters disabled until configured",
+                "minPrice": str(getattr(config.payment, "price_threat_lookup", "0.01")),
                 "networks": getattr(config.payment, "networks", []),
             },
             {

@@ -45,6 +45,9 @@ def test_openapi_exposes_network_intelligence_contracts():
         "/v1/nat/ip",
         "/v1/nat/lookup",
         "/v1/nat/port-forward/check",
+        "/v1/threat/lookup",
+        "/v1/threat/domain/{domain}",
+        "/v1/threat/rbl",
         "/v1/mail/accounts",
         "/v1/mail/messages/send",
     ]:
@@ -111,6 +114,7 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
             path = await client.post("/v1/path/report", json={"target": "example.com"})
             port = await client.post("/v1/ports/check", json={"target": "example.com", "port": 443})
             nat = await client.post("/v1/nat/lookup", json={"customer_reported_wan_ip": "100.64.1.1"})
+            threat = await client.post("/v1/threat/lookup", json={"subject": {"type": "domain", "value": "example.com"}})
             bgp = await client.post("/v1/bgp/lookup", json={"subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"}})
     finally:
         if old_state is not None:
@@ -123,6 +127,7 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
     assert path.status_code == 402
     assert port.status_code == 402
     assert nat.status_code == 402
+    assert threat.status_code == 402
     assert bgp.status_code == 402
 
 
@@ -149,6 +154,7 @@ async def test_x402_manifest_lists_network_intel_resources():
     assert "/v1/path/report" in paths
     assert "/v1/ports/check" in paths
     assert "/v1/nat/lookup" in paths
+    assert "/v1/threat/lookup" in paths
     assert "/v1/mail/accounts" in paths
 
 
