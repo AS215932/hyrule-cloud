@@ -7,12 +7,23 @@ from fastapi import APIRouter, Request, Response
 from hyrule_cloud.api._contract import payment_price, quote, require_payment
 from hyrule_cloud.models import (
     CapabilityEndpoint,
+    DNSAuthorityCompareRequest,
+    DNSDiagnosticResponse,
     DNSLookupRecordType,
     DNSLookupRequest,
     DNSLookupResponse,
     DNSPricingResponse,
+    DNSPropagationRequest,
+    DNSRecordRecommendationRequest,
     PaidEndpointQuote,
     ProductCapabilityResponse,
+)
+from hyrule_cloud.services.dns.diagnostics import (
+    authority_vs_recursive,
+    dnssec_report,
+    propagation,
+    recommend_records,
+    resolver_detect,
 )
 from hyrule_cloud.services.dns.lookup import lookup as dns_lookup_service
 from hyrule_cloud.services.dns.lookup import reverse as dns_reverse_service
@@ -40,6 +51,11 @@ async def get_dns_capabilities() -> ProductCapabilityResponse:
             CapabilityEndpoint(path="/v1/dns/dnssec", method="GET", paid=True, description="DNSSEC validation check"),
             CapabilityEndpoint(path="/v1/dns/servers", method="GET", paid=True, description="Authoritative DNS server discovery"),
             CapabilityEndpoint(path="/v1/dns/zone-check", method="GET", paid=True, description="Read-only zone health check"),
+            CapabilityEndpoint(path="/v1/dns/propagation", method="POST", paid=True, description="Compare answers across public recursive resolvers"),
+            CapabilityEndpoint(path="/v1/dns/recommend-records", method="POST", paid=True, description="Recommend records for web, mail, SIP, verification, or reverse DNS workflows"),
+            CapabilityEndpoint(path="/v1/dns/authority-vs-recursive", method="POST", paid=True, description="Compare authoritative/system answer with recursive resolvers"),
+            CapabilityEndpoint(path="/v1/dns/resolver-detect", method="POST", paid=True, description="Explain resolver-detection limits and observed request metadata"),
+            CapabilityEndpoint(path="/v1/dns/dnssec/report", method="POST", paid=True, description="DNSSEC-focused report"),
         ],
     )
 
@@ -112,3 +128,38 @@ async def dns_zone_check(request: Request, domain: str) -> DNSLookupResponse | R
     if payment := await _paid(request):
         return payment
     return await dns_lookup_service(DNSLookupRequest(name=domain, type=DNSLookupRecordType.SOA, dnssec=True))
+
+
+@router.post("/propagation", response_model=DNSDiagnosticResponse)
+async def dns_propagation(request: Request, body: DNSPropagationRequest) -> DNSDiagnosticResponse | Response:
+    if payment := await _paid(request):
+        return payment
+    return await propagation(body)
+
+
+@router.post("/recommend-records", response_model=DNSDiagnosticResponse)
+async def dns_recommend_records(request: Request, body: DNSRecordRecommendationRequest) -> DNSDiagnosticResponse | Response:
+    if payment := await _paid(request):
+        return payment
+    return recommend_records(body)
+
+
+@router.post("/authority-vs-recursive", response_model=DNSDiagnosticResponse)
+async def dns_authority_vs_recursive(request: Request, body: DNSAuthorityCompareRequest) -> DNSDiagnosticResponse | Response:
+    if payment := await _paid(request):
+        return payment
+    return await authority_vs_recursive(body)
+
+
+@router.post("/resolver-detect", response_model=DNSDiagnosticResponse)
+async def dns_resolver_detect(request: Request) -> DNSDiagnosticResponse | Response:
+    if payment := await _paid(request):
+        return payment
+    return resolver_detect(dict(request.headers))
+
+
+@router.post("/dnssec/report", response_model=DNSDiagnosticResponse)
+async def dns_dnssec_report(request: Request, name: str) -> DNSDiagnosticResponse | Response:
+    if payment := await _paid(request):
+        return payment
+    return await dnssec_report(name)

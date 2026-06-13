@@ -1163,6 +1163,47 @@ class DNSPricingResponse(BaseModel):
     lookup_usd: str
 
 
+class DNSPropagationRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=253)
+    type: DNSLookupRecordType = DNSLookupRecordType.A
+    expected: list[str] = Field(default_factory=list)
+    resolvers: list[str] = Field(default_factory=lambda: ["cloudflare", "google", "quad9", "system"])
+    authoritative: bool = True
+    timeout_ms: int = Field(default=3000, ge=500, le=30000)
+
+
+class DNSAuthorityCompareRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=253)
+    type: DNSLookupRecordType = DNSLookupRecordType.A
+    authoritative: bool = True
+    recursive_resolvers: list[str] = Field(default_factory=lambda: ["1.1.1.1", "8.8.8.8", "9.9.9.9"])
+    timeout_ms: int = Field(default=3000, ge=500, le=30000)
+
+
+class DNSRecordRecommendationUseCase(enum.StrEnum):
+    WEB = "web"
+    MAIL = "mail"
+    SIP = "sip"
+    VERIFY = "verify"
+    REVERSE_DNS = "reverse_dns"
+
+
+class DNSRecordRecommendationRequest(BaseModel):
+    domain: str = Field(min_length=1, max_length=253)
+    use_case: DNSRecordRecommendationUseCase = DNSRecordRecommendationUseCase.WEB
+    hostname: str | None = None
+    ipv4: str | None = None
+    ipv6: str | None = None
+    mail_provider: str | None = None
+    verification_name: str | None = None
+    verification_value: str | None = None
+    sip_target: str | None = None
+
+
+class DNSDiagnosticResponse(DiagnosticResponse):
+    pass
+
+
 class RegistrySubjectType(enum.StrEnum):
     DOMAIN = "domain"
     IP = "ip"

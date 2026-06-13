@@ -23,6 +23,11 @@ def test_openapi_exposes_network_intelligence_contracts():
         "/v1/ip/lookup",
         "/v1/dns/lookup",
         "/v1/dns/resolve",
+        "/v1/dns/propagation",
+        "/v1/dns/recommend-records",
+        "/v1/dns/authority-vs-recursive",
+        "/v1/dns/resolver-detect",
+        "/v1/dns/dnssec/report",
         "/v1/rdap/lookup",
         "/v1/whois/lookup",
         "/v1/web/check",
@@ -92,6 +97,7 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             dns = await client.post("/v1/dns/lookup", json={"name": "example.com", "type": "A"})
+            dns_prop = await client.post("/v1/dns/propagation", json={"name": "example.com", "type": "A"})
             web = await client.post("/v1/web/check", json={"target": "https://example.com"})
             mx = await client.post("/v1/mx/check", json={"tool": "mx", "target": "example.com"})
             bounce = await client.post("/v1/mx/bounce/parse", json={"message": "550 5.7.26 auth failed"})
@@ -100,6 +106,7 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
         if old_state is not None:
             app.state._typed_state = old_state
     assert dns.status_code == 402
+    assert dns_prop.status_code == 402
     assert web.status_code == 402
     assert mx.status_code == 402
     assert bounce.status_code == 402
