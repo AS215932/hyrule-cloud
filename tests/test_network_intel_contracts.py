@@ -29,6 +29,9 @@ def test_openapi_exposes_network_intelligence_contracts():
         "/v1/web/reports",
         "/v1/web/tls/deep",
         "/v1/mx/check",
+        "/v1/mx/bounce/parse",
+        "/v1/mx/recommend-records",
+        "/v1/mx/reports/mail-delivery",
         "/v1/mx/jobs",
         "/v1/mail/accounts",
         "/v1/mail/messages/send",
@@ -91,6 +94,7 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
             dns = await client.post("/v1/dns/lookup", json={"name": "example.com", "type": "A"})
             web = await client.post("/v1/web/check", json={"target": "https://example.com"})
             mx = await client.post("/v1/mx/check", json={"tool": "mx", "target": "example.com"})
+            bounce = await client.post("/v1/mx/bounce/parse", json={"message": "550 5.7.26 auth failed"})
             bgp = await client.post("/v1/bgp/lookup", json={"subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"}})
     finally:
         if old_state is not None:
@@ -98,6 +102,7 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
     assert dns.status_code == 402
     assert web.status_code == 402
     assert mx.status_code == 402
+    assert bounce.status_code == 402
     assert bgp.status_code == 402
 
 

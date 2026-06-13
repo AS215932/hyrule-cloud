@@ -15,12 +15,17 @@ from hyrule_cloud.api._contract import (
 )
 from hyrule_cloud.models import (
     CapabilityEndpoint,
+    MailBounceParseRequest,
+    MailBounceParseResponse,
+    MailRecordRecommendationRequest,
+    MailRecordRecommendationResponse,
     MXCheckRequest,
     MXCheckResponse,
     MXJobRequest,
     MXJobResponse,
     MXJobStatus,
     MXPricingResponse,
+    MXProfile,
     MXTool,
     MXToolDescription,
     MXToolsResponse,
@@ -28,6 +33,7 @@ from hyrule_cloud.models import (
     ProductCapabilityResponse,
 )
 from hyrule_cloud.services.mx.checks import run_check
+from hyrule_cloud.services.mx.deliverability import parse_bounce, recommend_records
 
 router = APIRouter(prefix="/v1/mx", tags=["MX diagnostics"])
 
@@ -84,6 +90,9 @@ async def get_mx_capabilities() -> ProductCapabilityResponse:
         paid_endpoints=[
             CapabilityEndpoint(path="/v1/mx/check", method="POST", paid=True, description="Run one MX diagnostic check"),
             CapabilityEndpoint(path="/v1/mx/{tool}/{target}", method="GET", paid=True, description="SuperTool-style single check"),
+            CapabilityEndpoint(path="/v1/mx/bounce/parse", method="POST", paid=True, description="Parse and classify a mail bounce/rejection message"),
+            CapabilityEndpoint(path="/v1/mx/recommend-records", method="POST", paid=True, description="Recommend SPF, DKIM, DMARC, MTA-STS, TLS-RPT, and BIMI DNS records"),
+            CapabilityEndpoint(path="/v1/mx/reports/mail-delivery", method="POST", paid=True, description="Create full mail-delivery diagnostic report"),
             CapabilityEndpoint(path="/v1/mx/jobs", method="POST", paid=True, description="Create async mail troubleshooting report"),
             CapabilityEndpoint(path="/v1/mx/jobs/{job_id}", method="GET", paid=True, description="Fetch report status/results"),
         ],
@@ -125,6 +134,26 @@ async def mx_check(request: Request, body: MXCheckRequest) -> MXCheckResponse | 
     if payment := await _paid_check(request):
         return payment
     return await run_check(body)
+
+
+@router.post("/bounce/parse", response_model=MailBounceParseResponse)
+async def parse_mx_bounce(request: Request, body: MailBounceParseRequest) -> MailBounceParseResponse | Response:
+    if payment := await _paid_check(request):
+        return payment
+    return parse_bounce(body)
+
+
+@router.post("/recommend-records", response_model=MailRecordRecommendationResponse)
+async def mx_recommend_records(request: Request, body: MailRecordRecommendationRequest) -> MailRecordRecommendationResponse | Response:
+    if payment := await _paid_check(request):
+        return payment
+    return recommend_records(body)
+
+
+@router.post("/reports/mail-delivery", response_model=MXJobResponse)
+async def create_mx_mail_delivery_report(request: Request, body: MXJobRequest) -> MXJobResponse | Response:
+    body.profile = MXProfile.MAIL_DELIVERY
+    return await create_mx_job(request, body)
 
 
 @router.post("/jobs", response_model=MXJobResponse)

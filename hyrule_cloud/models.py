@@ -1214,6 +1214,69 @@ class RegistryPricingResponse(BaseModel):
     whois_lookup_usd: str
 
 
+class MailBounceClassification(enum.StrEnum):
+    POLICY_REJECTION = "policy_rejection"
+    AUTH_FAILURE = "auth_failure"
+    MAILBOX_FULL = "mailbox_full"
+    RATE_LIMITED = "rate_limited"
+    DNS_FAILURE = "dns_failure"
+    TLS_FAILURE = "tls_failure"
+    UNKNOWN = "unknown"
+
+
+class MailBounceContext(BaseModel):
+    sender_domain: str | None = None
+    recipient_domain: str | None = None
+
+
+class MailBounceParseRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=262144)
+    context: MailBounceContext = Field(default_factory=MailBounceContext)
+
+
+class MailBounceParseResponse(BaseModel):
+    status: DiagnosticStatus
+    classification: MailBounceClassification
+    smtp_status: str | None = None
+    remote_mta: str | None = None
+    probable_causes: list[str] = Field(default_factory=list)
+    recommended_actions: list[str] = Field(default_factory=list)
+    evidence: dict[str, object] = Field(default_factory=dict)
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class MailRecordPolicy(BaseModel):
+    dmarc: str = "quarantine"
+    tls_reporting: bool = True
+    mta_sts: bool = True
+    bimi: bool = False
+
+
+class MailRecordRecommendationRequest(BaseModel):
+    domain: str = Field(min_length=3, max_length=253)
+    provider: str = "custom"
+    sending_hosts: list[str] = Field(default_factory=list)
+    sending_ips: list[str] = Field(default_factory=list)
+    policy: MailRecordPolicy = Field(default_factory=MailRecordPolicy)
+
+
+class MailRecordRecommendation(BaseModel):
+    type: DNSLookupRecordType
+    name: str
+    value: str
+    ttl: int = 3600
+    purpose: str
+    notes: str | None = None
+
+
+class MailRecordRecommendationResponse(BaseModel):
+    domain: str
+    provider: str
+    records: list[MailRecordRecommendation]
+    warnings: list[str] = Field(default_factory=list)
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class MXTool(enum.StrEnum):
     A = "a"
     AAAA = "aaaa"
