@@ -22,7 +22,9 @@ from hyrule_cloud.api.internal_bgp import router as internal_bgp_router
 from hyrule_cloud.api.ip import router as ip_router
 from hyrule_cloud.api.mail import router as mail_router
 from hyrule_cloud.api.mx import router as mx_router
+from hyrule_cloud.api.nat import router as nat_router
 from hyrule_cloud.api.path import router as path_router
+from hyrule_cloud.api.ports import router as ports_router
 from hyrule_cloud.api.registry import router as registry_router
 from hyrule_cloud.api.routes import router
 from hyrule_cloud.api.web import router as web_router
@@ -174,6 +176,8 @@ app.include_router(registry_router)
 app.include_router(web_router)
 app.include_router(mx_router)
 app.include_router(path_router)
+app.include_router(ports_router)
+app.include_router(nat_router)
 app.include_router(mail_router)
 app.include_router(internal_bgp_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
@@ -322,6 +326,27 @@ async def x402_manifest():
                 "method": "POST",
                 "description": "Paid ping/path probe from approved Hyrule diagnostic vantages",
                 "minPrice": str(getattr(config.payment, "price_path_probe", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/ports/check",
+                "method": "POST",
+                "description": "Paid outside-in single declared service reachability check with strict port allowlist",
+                "minPrice": str(getattr(config.payment, "price_port_check", "0.003")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/nat/lookup",
+                "method": "POST",
+                "description": "Paid server-only CGNAT/NAT hint report from caller and customer WAN/LAN evidence",
+                "minPrice": str(getattr(config.payment, "price_nat_lookup", "0.003")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/nat/port-forward/check",
+                "method": "POST",
+                "description": "Paid outside-in NAT port-forward reachability check for one declared service",
+                "minPrice": str(getattr(config.payment, "price_nat_port_forward_check", "0.005")),
                 "networks": getattr(config.payment, "networks", []),
             },
             {
