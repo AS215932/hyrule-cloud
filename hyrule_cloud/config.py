@@ -198,7 +198,8 @@ class PaymentConfig(BaseSettings):
     
     price_proxy_direct: Decimal = Decimal("0.01")
     price_proxy_tor: Decimal = Decimal("0.05")
-    price_proxy_residential: Decimal = Decimal("0.20")
+    price_proxy_i2p: Decimal = Decimal("0.05")
+    price_proxy_yggdrasil: Decimal = Decimal("0.03")
 
     # Dev bypass: set to a non-empty string to allow skipping payment
     # via X-DEV-BYPASS header. NEVER set in production.
@@ -213,6 +214,12 @@ class HyruleConfig(BaseSettings):
     # Block H (Wave 5): Prometheus on `mon` for /v1/stats/network fleet truth.
     # Empty = static fallback (CI / local dev).
     prometheus_url: str = ""
+
+    # Internal Go sidecar for x402-gated /v1/network/request execution.
+    # Hyrule Cloud verifies/settles x402; the sidecar performs egress.
+    network_proxy_url: str = "http://127.0.0.1:8450"
+    network_proxy_token: str = ""
+    network_proxy_health_ttl_seconds: int = 15
 
     # Block F (Wave 5): origin bound into wallet-recovery challenges. Per-env so
     # staging / alternate domains emit a matching origin without a code change.

@@ -479,6 +479,8 @@ async def get_pricing(cfg = Depends(get_cfg)) -> PricingResponse:
         proxy_prices={
             "direct": f"${cfg.payment.price_proxy_direct}/request",
             "tor": f"${cfg.payment.price_proxy_tor}/request",
+            "i2p": f"${cfg.payment.price_proxy_i2p}/request",
+            "yggdrasil": f"${cfg.payment.price_proxy_yggdrasil}/request",
         } if hasattr(PricingResponse, '__annotations__') and 'proxy_prices' in PricingResponse.__annotations__ else {}
     )
 
@@ -1136,9 +1138,15 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
     price_map = {
         ProxyMode.DIRECT: cfg.payment.price_proxy_direct,
         ProxyMode.TOR: cfg.payment.price_proxy_tor,
-        ProxyMode.RESIDENTIAL: cfg.payment.price_proxy_residential,
+        ProxyMode.I2P: cfg.payment.price_proxy_i2p,
+        ProxyMode.YGGDRASIL: cfg.payment.price_proxy_yggdrasil,
     }
     amount = price_map[body.proxy_mode]
+
+    mode_status = await provider.mode_status(body.proxy_mode)
+    if not mode_status.available:
+        reason = mode_status.reason or "network proxy mode unavailable"
+        raise HTTPException(503, f"Proxy mode {body.proxy_mode.value} unavailable: {reason}")
 
     result = await gate.check_payment(
         request,
@@ -1156,7 +1164,7 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
     # payment valid, proceed
     resp = await provider.execute_request(body)
     
-    if resp.error and resp.status_code in [400, 403, 501]:
+    if resp.error and resp.status_code in [400, 403]:
         raise HTTPException(resp.status_code, resp.error)
         
     return resp

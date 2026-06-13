@@ -27,6 +27,7 @@ Hyrule Cloud API (FastAPI + x402 SDK)
   |-- Openprovider       Domain registration (custom domain mode)
   |-- PostgreSQL         Persistent state (VMs, domains, tunnels)
   |-- x402 facilitator   Payment verification and settlement (official SDK)
+  |-- network proxy      Internal Go sidecar for paid Direct/Tor/I2P/Yggdrasil requests
 ```
 
 ## Endpoints
@@ -43,6 +44,7 @@ Hyrule Cloud API (FastAPI + x402 SDK)
 | `/v1/domain/register` | POST   | Yes  | Register via Openprovider    |
 | `/v1/pricing`         | GET    | No   | Current pricing              |
 | `/v1/os/list`         | GET    | No   | Available OS templates       |
+| `/v1/network/request` | POST   | Yes  | One paid network request     |
 
 ## Quick Start
 
@@ -129,8 +131,13 @@ only.
 x402 exact scheme, USDC on Base (eip155:8453). Uses the official Coinbase
 x402 Python SDK for verification and settlement.
 
-Pricing is per-day, paid upfront. Extend via `/v1/vm/{id}/extend`.
+VM/domain pricing is per-day or per-operation, paid upfront. Extend via `/v1/vm/{id}/extend`.
 VMs are suspended at expiry, destroyed after a 48h grace period.
+
+`POST /v1/network/request` is a per-request x402 resource. The API verifies
+payment, checks sidecar mode availability, and then delegates execution to the
+internal `hyrule-network-proxy` Go sidecar. Supported modes are `direct`, `tor`,
+`i2p`, and `yggdrasil`; residential proxying is intentionally not offered.
 
 ## Database
 
