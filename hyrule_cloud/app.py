@@ -60,9 +60,14 @@ async def lifespan(app: FastAPI):
     # Payment gate (official x402 SDK)
     payment_gate = PaymentGate(config.payment)
 
-    # Network client
+    # Network proxy sidecar client. x402 stays in Hyrule Cloud; the sidecar
+    # only executes already-authorized egress requests.
     from hyrule_cloud.providers.network_client import NetworkProvider
-    network_provider = NetworkProvider()
+    network_provider = NetworkProvider(
+        proxy_url=config.network_proxy_url,
+        token=config.network_proxy_token,
+        health_ttl_seconds=config.network_proxy_health_ttl_seconds,
+    )
 
     # Orchestrator
     orchestrator = Orchestrator(config, session_factory)
@@ -175,7 +180,7 @@ async def x402_manifest():
         "description": (
             "Bare VM hosting for AI agents. Deploy VMs with SSH access, "
             "automatic HTTPS subdomains, IPv6-native networking, domain "
-            "registration, and paid direct/Tor network requests. x402 resources "
+            "registration, and paid direct/Tor/I2P/Yggdrasil network requests. x402 resources "
             "settle with facilitator-verified USDC; VM checkout may also offer "
             "BTC/XMR when the live payment catalog advertises native rails."
         ),
@@ -197,7 +202,7 @@ async def x402_manifest():
             {
                 "path": "/v1/network/request",
                 "method": "POST",
-                "description": "Make a micro-proxy network request (Clearnet/Tor)",
+                "description": "Make a micro-proxy network request over Direct, Tor, I2P, or Yggdrasil",
                 "minPrice": str(config.payment.price_proxy_direct),
                 "networks": config.payment.networks,
             },

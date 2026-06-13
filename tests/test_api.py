@@ -7,7 +7,7 @@ from httpx import ASGITransport, AsyncClient
 
 from hyrule_cloud.app import app
 from hyrule_cloud.middleware.anon_token import hash_anon_token
-from hyrule_cloud.models import VMStatus
+from hyrule_cloud.models import NetworkResponse, VMStatus
 
 # Block A0: known token used by the mock VM. Tests that exercise the
 # management-gated routes pass this as Authorization: Bearer / ?token=.
@@ -23,7 +23,8 @@ class MockConfig:
         price_domain_markup = Decimal("1.00")
         price_proxy_direct = Decimal("0.01")
         price_proxy_tor = Decimal("0.05")
-        price_proxy_residential = Decimal("0.20")
+        price_proxy_i2p = Decimal("0.05")
+        price_proxy_yggdrasil = Decimal("0.03")
         asset = "USDC"
         network = "eip155:8453"
         dev_bypass_secret = ""
@@ -63,7 +64,27 @@ class MockGate:
         return Response(status_code=402)
 
 class MockNetworkProvider:
-    pass
+    def __init__(self):
+        self.available = True
+        self.reason = None
+        self.requests = []
+
+    async def mode_status(self, mode):
+        provider = self
+        class Status:
+            available = provider.available
+            reason = provider.reason
+        return Status()
+
+    async def execute_request(self, req):
+        self.requests.append(req)
+        return NetworkResponse(
+            status_code=200,
+            headers={"content-type": "text/plain"},
+            body="ok",
+            elapsed_seconds=0.01,
+            proxy_mode=req.proxy_mode,
+        )
 
 @pytest.fixture
 def override_state():
@@ -88,6 +109,12 @@ async def test_get_pricing(override_state):
         data = res.json()
         assert data["vm_prices"]["xs (1vCPU/512MB/10GB)"] == "$0.05/day"
         assert data["domain_auto"] == "$0.00 (subdomain under deploy.hyrule.host)"
+        assert data["proxy_prices"] == {
+            "direct": "$0.01/request",
+            "tor": "$0.05/request",
+            "i2p": "$0.05/request",
+            "yggdrasil": "$0.03/request",
+        }
 
 @pytest.mark.asyncio
 async def test_get_pricing_uses_configured_deploy_domain(override_state):
@@ -139,3 +166,30 @@ async def test_network_request_402(override_state):
             "proxy_mode": "direct"
         })
         assert res.status_code == 402
+
+
+@pytest.mark.asyncio
+async def test_network_request_paid_calls_sidecar_provider(override_state):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/network/request",
+            headers={"X-Mock-Wallet": "0xWallet"},
+            json={"url": "http://example.com", "proxy_mode": "i2p"},
+        )
+        assert res.status_code == 200
+        assert res.json()["body"] == "ok"
+        assert len(override_state.network_provider.requests) == 1
+        assert override_state.network_provider.requests[0].proxy_mode == "i2p"
+
+
+@pytest.mark.asyncio
+async def test_network_request_unavailable_mode_returns_503_before_payment(override_state):
+    override_state.network_provider.available = False
+    override_state.network_provider.reason = "tor SOCKS listener unavailable"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/network/request",
+            json={"url": "http://example.com", "proxy_mode": "tor"},
+        )
+        assert res.status_code == 503
+        assert "tor SOCKS listener unavailable" in res.text

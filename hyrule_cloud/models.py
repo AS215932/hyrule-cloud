@@ -72,7 +72,8 @@ class DomainMode(enum.StrEnum):
 class ProxyMode(enum.StrEnum):
     DIRECT = "direct"
     TOR = "tor"
-    RESIDENTIAL = "residential"
+    I2P = "i2p"
+    YGGDRASIL = "yggdrasil"
 
 
 class DomainStatus(enum.StrEnum):

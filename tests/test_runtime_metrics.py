@@ -37,7 +37,8 @@ class _MockPaymentConfig:
     price_domain_markup = Decimal("1.00")
     price_proxy_direct = Decimal("0.01")
     price_proxy_tor = Decimal("0.05")
-    price_proxy_residential = Decimal("0.20")
+    price_proxy_i2p = Decimal("0.05")
+    price_proxy_yggdrasil = Decimal("0.03")
     dev_bypass_secret = ""
 
 

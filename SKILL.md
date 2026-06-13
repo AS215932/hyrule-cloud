@@ -89,6 +89,12 @@ Returns current prices for all resources.
   },
   "domain_auto": "$0.00 (subdomain under deploy.hyrule.host)",
   "vpn_per_day": "$0.02/day",
+  "proxy_prices": {
+    "direct": "$0.01/request",
+    "tor": "$0.05/request",
+    "i2p": "$0.05/request",
+    "yggdrasil": "$0.03/request"
+  },
   "currency": "USDC",
   "network": "Base (eip155:8453)"
 }
@@ -221,6 +227,36 @@ Register a domain via Openprovider.
 {"name": "mysite", "extension": "dev", "ipv6": "2001:db8::1"}
 ```
 
+#### POST /v1/network/request
+Make one paid HTTP request through the internal Hyrule network proxy sidecar.
+Supported modes are `direct`, `tor`, `i2p`, and `yggdrasil`. Residential
+proxying is intentionally not offered. If a mode is unavailable, the API returns
+`503` before asking for x402 payment.
+
+```json
+{
+  "url": "https://example.com",
+  "method": "GET",
+  "headers": {"accept": "text/html"},
+  "body": null,
+  "proxy_mode": "tor",
+  "timeout_seconds": 15
+}
+```
+
+Response shape:
+
+```json
+{
+  "status_code": 200,
+  "headers": {"content-type": "text/html; charset=utf-8"},
+  "body": "<html>...</html>",
+  "elapsed_seconds": 0.42,
+  "proxy_mode": "tor",
+  "error": null
+}
+```
+
 #### POST /v1/zone/buy
 Buy a DNS zone — registers the domain and sets up Hyrule Cloud's authoritative DNS.
 
@@ -262,6 +298,7 @@ Get provisioning log for a VM.
 6. ssh root@<hostname>                      # deploy your app
 7. (optional) POST /v1/zone/buy             # buy a DNS zone
 8. (optional) POST /v1/zone/record          # point domain at VM
+9. (optional) POST /v1/network/request      # paid Direct/Tor/I2P/Yggdrasil request
 ```
 
 ## Infrastructure Details
@@ -270,4 +307,5 @@ Get provisioning log for a VM.
 - **DNS:** Auto subdomains under `deploy.hyrule.host`. Custom domains via Openprovider with Hyrule Cloud nameservers.
 - **Firewall:** Cloud-init sets UFW defaults (deny all inbound except 22/80/443, block outbound SMTP). Modify via SSH after boot.
 - **Expiry:** Prepaid model. VMs suspended at expiry, destroyed after 48h grace period. Extend with `/v1/vm/{id}/extend`.
+- **Network proxy:** `POST /v1/network/request` is x402-gated in Hyrule Cloud and executed by the internal `hyrule-network-proxy` Go sidecar.
 - **ASN:** AS215932 (RIPE)
