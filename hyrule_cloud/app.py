@@ -27,6 +27,7 @@ from hyrule_cloud.api.path import router as path_router
 from hyrule_cloud.api.ports import router as ports_router
 from hyrule_cloud.api.registry import router as registry_router
 from hyrule_cloud.api.routes import router
+from hyrule_cloud.api.speedtest import router as speedtest_router
 from hyrule_cloud.api.threat import router as threat_router
 from hyrule_cloud.api.voip import router as voip_router
 from hyrule_cloud.api.web import router as web_router
@@ -182,6 +183,7 @@ app.include_router(ports_router)
 app.include_router(nat_router)
 app.include_router(threat_router)
 app.include_router(voip_router)
+app.include_router(speedtest_router)
 app.include_router(mail_router)
 app.include_router(internal_bgp_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
@@ -372,6 +374,13 @@ async def x402_manifest():
                 "method": "POST",
                 "description": "Paid pluggable number carrier/CNAM/spam/E911 lookup",
                 "minPrice": str(getattr(config.payment, "price_voip_number_lookup", "0.05")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/speedtest",
+                "method": "POST",
+                "description": "Paid throughput/latency/jitter evidence to Hyrule/AS215932 endpoints",
+                "minPrice": str(getattr(config.payment, "price_speedtest", "0.10")),
                 "networks": getattr(config.payment, "networks", []),
             },
             {
