@@ -1110,6 +1110,7 @@ class DNSLookupRecordType(enum.StrEnum):
     DNSKEY = "DNSKEY"
     DS = "DS"
     MX = "MX"
+    NAPTR = "NAPTR"
     NS = "NS"
     PTR = "PTR"
     SOA = "SOA"
