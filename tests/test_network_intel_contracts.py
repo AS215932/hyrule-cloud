@@ -155,11 +155,15 @@ async def test_x402_manifest_lists_network_intel_resources():
     assert "/v1/bgp/lookup" in paths
     assert "/v1/ip/lookup" in paths
     assert "/v1/dns/lookup" in paths
+    assert "/v1/dns/propagation" in paths
+    assert "/v1/dns/recommend-records" in paths
     assert "/v1/rdap/lookup" in paths
     assert "/v1/whois/lookup" in paths
     assert "/v1/web/check" in paths
     assert "/v1/web/tls/deep" in paths
     assert "/v1/mx/check" in paths
+    assert "/v1/mx/bounce/parse" in paths
+    assert "/v1/mx/recommend-records" in paths
     assert "/v1/path/report" in paths
     assert "/v1/ports/check" in paths
     assert "/v1/nat/lookup" in paths

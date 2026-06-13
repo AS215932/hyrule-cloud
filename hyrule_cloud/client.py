@@ -263,6 +263,26 @@ class HyruleClient:
             json={"name": name, "type": record_type, "dnssec": dnssec, "trace": trace},
         )
 
+    async def dns_propagation(
+        self,
+        name: str,
+        record_type: str = "A",
+        *,
+        expected: list[str] | None = None,
+        resolvers: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Paid DNS propagation comparison across recursive resolvers."""
+        payload: dict[str, Any] = {"name": name, "type": record_type}
+        if expected is not None:
+            payload["expected"] = expected
+        if resolvers is not None:
+            payload["resolvers"] = resolvers
+        return await self._request("POST", "/v1/dns/propagation", json=payload)
+
+    async def dns_recommend_records(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Paid DNS record recommendation helper."""
+        return await self._request("POST", "/v1/dns/recommend-records", json=payload)
+
     async def rdap_lookup(self, subject_type: str, value: str | int, *, include_raw: bool = False) -> dict[str, Any]:
         """Paid RDAP lookup for domain/IP/prefix/ASN/entity."""
         return await self._request(
@@ -278,6 +298,17 @@ class HyruleClient:
             "/v1/whois/lookup",
             json={"subject": {"type": subject_type, "value": value}, "include_raw": include_raw},
         )
+
+    async def web_check(self, target: str, checks: list[str] | None = None) -> dict[str, Any]:
+        """Paid web reachability/TLS/header/CDN check."""
+        payload: dict[str, Any] = {"target": target}
+        if checks:
+            payload["checks"] = checks
+        return await self._request("POST", "/v1/web/check", json=payload)
+
+    async def web_tls_deep(self, host: str, port: int = 443) -> dict[str, Any]:
+        """Paid Hyrule-native SSL Labs-style TLS scan."""
+        return await self._request("POST", "/v1/web/tls/deep", json={"host": host, "port": port})
 
     async def mx_tools(self) -> dict[str, Any]:
         """Free list of MXToolbox-compatible diagnostic tools."""
@@ -307,6 +338,59 @@ class HyruleClient:
         if checks:
             payload["checks"] = checks
         return await self._request("POST", "/v1/mx/jobs", json=payload)
+
+    async def mx_parse_bounce(self, message: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Paid bounce/rejection parser."""
+        return await self._request("POST", "/v1/mx/bounce/parse", json={"message": message, "context": context or {}})
+
+    async def mx_recommend_records(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Paid mail DNS authentication record recommendations."""
+        return await self._request("POST", "/v1/mx/recommend-records", json=payload)
+
+    async def path_report(self, target: str, **kwargs: Any) -> dict[str, Any]:
+        """Paid routing/path evidence pack."""
+        return await self._request("POST", "/v1/path/report", json={"target": target, **kwargs})
+
+    async def port_check(self, target: str, port: int, protocol: str = "tcp", profile: str = "custom") -> dict[str, Any]:
+        """Paid outside-in single-service reachability check."""
+        return await self._request("POST", "/v1/ports/check", json={"target": target, "port": port, "protocol": protocol, "profile": profile})
+
+    async def nat_ip(self) -> dict[str, Any]:
+        """Free caller-observed IP."""
+        return await self._request("GET", "/v1/nat/ip")
+
+    async def nat_lookup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Paid server-only NAT/CGNAT hint report."""
+        return await self._request("POST", "/v1/nat/lookup", json=payload)
+
+    async def nat_port_forward_check(self, target: str, port: int, protocol: str = "tcp", profile: str = "custom") -> dict[str, Any]:
+        """Paid NAT port-forward outside-in check."""
+        return await self._request("POST", "/v1/nat/port-forward/check", json={"target": target, "port": port, "protocol": protocol, "profile": profile})
+
+    async def threat_lookup(self, subject_type: str, value: str, views: list[str] | None = None) -> dict[str, Any]:
+        """Paid threat/reputation lookup."""
+        payload: dict[str, Any] = {"subject": {"type": subject_type, "value": value}}
+        if views:
+            payload["views"] = views
+        return await self._request("POST", "/v1/threat/lookup", json=payload)
+
+    async def voip_check(self, target: str, checks: list[str] | None = None) -> dict[str, Any]:
+        """Paid SIP/VoIP diagnostic check."""
+        payload: dict[str, Any] = {"target": target}
+        if checks:
+            payload["checks"] = checks
+        return await self._request("POST", "/v1/voip/check", json=payload)
+
+    async def voip_number_lookup(self, number: str, country: str | None = None) -> dict[str, Any]:
+        """Paid VoIP number-provider lookup contract."""
+        payload: dict[str, Any] = {"number": number}
+        if country:
+            payload["country"] = country
+        return await self._request("POST", "/v1/voip/number/lookup", json=payload)
+
+    async def speedtest(self, **payload: Any) -> dict[str, Any]:
+        """Paid Hyrule/AS215932 speedtest evidence contract."""
+        return await self._request("POST", "/v1/speedtest", json=payload or {"target": "hyrule"})
 
     async def mail_products(self) -> dict[str, Any]:
         """Free Agent Mail product catalog."""

@@ -678,6 +678,136 @@ async def mx_mail_delivery_report(target: str) -> str:
 
 
 @mcp.tool()
+async def web_reachability_check(target: str) -> str:
+    """Paid web reachability, TLS, security-header, and CDN/WAF check."""
+    try:
+        async with _client() as hc:
+            return str(await hc.web_check(target))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def web_tls_deep_scan(host: str, port: int = 443) -> str:
+    """Paid Hyrule-native SSL Labs-style TLS deep scan and grade."""
+    try:
+        async with _client() as hc:
+            return str(await hc.web_tls_deep(host, port))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def dns_propagation_check(name: str, record_type: str = "A", expected: list[str] | None = None) -> str:
+    """Paid DNS propagation comparison across recursive resolvers."""
+    try:
+        async with _client() as hc:
+            return str(await hc.dns_propagation(name, record_type, expected=expected))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def dns_record_recommendations(payload: dict) -> str:
+    """Paid DNS record recommendations for web, mail, SIP, verification, or reverse DNS."""
+    try:
+        async with _client() as hc:
+            return str(await hc.dns_recommend_records(payload))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def mx_parse_bounce(message: str, sender_domain: str | None = None, recipient_domain: str | None = None) -> str:
+    """Paid mail bounce/rejection parser and likely-cause classifier."""
+    try:
+        async with _client() as hc:
+            return str(await hc.mx_parse_bounce(message, {"sender_domain": sender_domain, "recipient_domain": recipient_domain}))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def path_report(target: str) -> str:
+    """Paid routing/path evidence pack using extmon, AS215932, BGP/RPKI, and optional multi-vantage evidence."""
+    try:
+        async with _client() as hc:
+            return str(await hc.path_report(target))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def port_reachability_check(target: str, port: int, protocol: str = "tcp", profile: str = "custom") -> str:
+    """Paid outside-in single declared service reachability check."""
+    try:
+        async with _client() as hc:
+            return str(await hc.port_check(target, port, protocol, profile))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def nat_what_is_my_ip() -> str:
+    """Free caller-observed public IP as seen by Hyrule."""
+    try:
+        async with _client() as hc:
+            return str(await hc.nat_ip())
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def nat_cgnat_lookup(payload: dict) -> str:
+    """Paid server-only CGNAT/NAT hint report."""
+    try:
+        async with _client() as hc:
+            return str(await hc.nat_lookup(payload))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def threat_reputation_lookup(subject_type: str, value: str, views: list[str] | None = None) -> str:
+    """Paid open-source-first threat/reputation lookup."""
+    try:
+        async with _client() as hc:
+            return str(await hc.threat_lookup(subject_type, value, views))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def voip_sip_check(target: str, checks: list[str] | None = None) -> str:
+    """Paid SIP DNS/TLS/OPTIONS/STUN VoIP diagnostic check."""
+    try:
+        async with _client() as hc:
+            return str(await hc.voip_check(target, checks=checks))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def voip_number_lookup(number: str, country: str | None = None) -> str:
+    """Paid pluggable carrier/CNAM/spam/E911 number lookup contract."""
+    try:
+        async with _client() as hc:
+            return str(await hc.voip_number_lookup(number, country))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def hyrule_speedtest() -> str:
+    """Paid throughput/latency/jitter evidence contract to Hyrule/AS215932 endpoints."""
+    try:
+        async with _client() as hc:
+            return str(await hc.speedtest(target="hyrule"))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
 async def mail_products() -> str:
     """Free Agent Mail product catalog."""
     try:
