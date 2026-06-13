@@ -201,6 +201,37 @@ class PaymentConfig(BaseSettings):
     price_proxy_i2p: Decimal = Decimal("0.05")
     price_proxy_yggdrasil: Decimal = Decimal("0.03")
 
+    # Network intelligence / agentic support API prices. These are contract
+    # defaults; route implementations can compute dynamic prices around them.
+    price_bgp_lookup: Decimal = Decimal("0.005")
+    price_bgp_router_query: Decimal = Decimal("0.01")
+    price_bgpstream_hour: Decimal = Decimal("0.05")
+    price_bgpstream_rib: Decimal = Decimal("0.10")
+    price_bgp_router_table: Decimal = Decimal("0.10")
+    price_bgp_router_table_all: Decimal = Decimal("0.25")
+    price_ip_lookup: Decimal = Decimal("0.003")
+    price_dns_lookup: Decimal = Decimal("0.001")
+    price_rdap_lookup: Decimal = Decimal("0.003")
+    price_whois_lookup: Decimal = Decimal("0.005")
+    price_mx_check: Decimal = Decimal("0.005")
+    price_mx_report: Decimal = Decimal("0.03")
+    price_web_check: Decimal = Decimal("0.005")
+    price_web_report: Decimal = Decimal("0.03")
+    price_web_tls_deep: Decimal = Decimal("0.10")
+    price_path_probe: Decimal = Decimal("0.005")
+    price_path_report: Decimal = Decimal("0.05")
+    price_port_check: Decimal = Decimal("0.003")
+    price_nat_lookup: Decimal = Decimal("0.003")
+    price_nat_port_forward_check: Decimal = Decimal("0.005")
+    price_threat_lookup: Decimal = Decimal("0.01")
+    price_voip_check: Decimal = Decimal("0.01")
+    price_voip_number_lookup: Decimal = Decimal("0.05")
+    price_voip_report: Decimal = Decimal("0.08")
+    price_speedtest: Decimal = Decimal("0.10")
+    price_mail_agent_basic_day: Decimal = Decimal("0.05")
+    price_mail_storage_gb_day: Decimal = Decimal("0.01")
+    price_mail_outbound_message: Decimal = Decimal("0.001")
+
     # Dev bypass: set to a non-empty string to allow skipping payment
     # via X-DEV-BYPASS header. NEVER set in production.
     dev_bypass_secret: str = ""
@@ -241,6 +272,11 @@ class HyruleConfig(BaseSettings):
 
     # Cloud-init template directory
     templates_dir: Path = Path("templates")
+
+    # Network intelligence / BGP data storage
+    bgp_data_enabled: bool = True
+    bgp_data_dir: Path = Path("/var/lib/hyrule-cloud/bgp")
+    bgp_ingest_token: str = ""
 
     # Database (Postgres)
     database_url: str = "postgresql+asyncpg://hyrule:hyrule@localhost/hyrule"

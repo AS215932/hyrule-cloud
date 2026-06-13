@@ -584,6 +584,139 @@ async def revoke_api_key(key_id: str) -> str:
         return _err(e)
 
 
+# --- Tools: Network intelligence / Agentic support ---
+
+
+@mcp.tool()
+async def bgp_status() -> str:
+    """Free AS215932 BGP/routing status."""
+    try:
+        async with _client() as hc:
+            return str(await hc.bgp_status())
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def bgp_lookup(subject_type: str, value: str) -> str:
+    """Paid BGP lookup by prefix, IP, or ASN. Prefix/IP do not require ASN."""
+    try:
+        async with _client() as hc:
+            return str(await hc.bgp_lookup({"type": subject_type, "value": value}))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def ip_lookup(address: str, views: list[str] | None = None) -> str:
+    """Paid IP geolocation, ASN/ISP, reverse DNS, RDAP/WHOIS, reputation lookup."""
+    try:
+        async with _client() as hc:
+            return str(await hc.ip_lookup(address, views=views))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def dns_lookup(name: str, record_type: str = "A", dnssec: bool = False, trace: bool = False) -> str:
+    """Paid read-only DNS lookup. Does not register domains or mutate zones."""
+    try:
+        async with _client() as hc:
+            return str(await hc.dns_lookup(name, record_type, dnssec=dnssec, trace=trace))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def rdap_lookup(subject_type: str, value: str, include_raw: bool = False) -> str:
+    """Paid RDAP lookup for domain, IP, prefix, ASN, or entity."""
+    try:
+        async with _client() as hc:
+            return str(await hc.rdap_lookup(subject_type, value, include_raw=include_raw))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def whois_lookup(subject_type: str, value: str, include_raw: bool = False) -> str:
+    """Paid WHOIS lookup for domain, IP, prefix/network block, or ASN."""
+    try:
+        async with _client() as hc:
+            return str(await hc.whois_lookup(subject_type, value, include_raw=include_raw))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def mx_tools() -> str:
+    """Free list of MXToolbox-compatible Hyrule MX diagnostic tools."""
+    try:
+        async with _client() as hc:
+            return str(await hc.mx_tools())
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def mx_check(tool: str, target: str, dkim_selectors: list[str] | None = None) -> str:
+    """Paid MXToolbox-compatible check: a, aaaa, arin, asn, bimi, blacklist, cname, dkim, dmarc, dns, http, https, mta-sts, mx, ping, ptr, smtp, soa, spf, tcp, tlsrpt, trace, txt, whois."""
+    try:
+        async with _client() as hc:
+            return str(await hc.mx_check(tool, target, dkim_selectors=dkim_selectors))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def mx_mail_delivery_report(target: str) -> str:
+    """Paid full mail-delivery troubleshooting report for missing/rejected/spam-filtered email."""
+    try:
+        async with _client() as hc:
+            return str(await hc.mx_report(target))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def mail_products() -> str:
+    """Free Agent Mail product catalog."""
+    try:
+        async with _client() as hc:
+            return str(await hc.mail_products())
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def mail_account_quote(local_part: str, duration_days: int = 30, domain: str = "agentmail.hyrule.host") -> str:
+    """Free quote for a paid Agent Mail mailbox."""
+    try:
+        async with _client() as hc:
+            return str(await hc.mail_account_quote(local_part, duration_days, domain))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def mail_account_create(local_part: str, duration_days: int = 30, domain: str = "agentmail.hyrule.host") -> str:
+    """Paid Agent Mail mailbox creation. SMTP/IMAP and API access are exposed by the account response once the backend adapter is enabled."""
+    try:
+        async with _client() as hc:
+            return str(await hc.create_mail_account(local_part, duration_days, domain))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def mail_send(payload: dict) -> str:
+    """Paid API email send through an Agent Mail mailbox."""
+    try:
+        async with _client() as hc:
+            return str(await hc.mail_send(payload))
+    except HyruleError as e:
+        return _err(e)
+
+
 # --- Entrypoint ---
 
 

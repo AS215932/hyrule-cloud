@@ -16,6 +16,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
 from hyrule_cloud.api.auth import router as auth_router
+from hyrule_cloud.api.bgp import router as bgp_router
+from hyrule_cloud.api.dns import router as dns_router
+from hyrule_cloud.api.internal_bgp import router as internal_bgp_router
+from hyrule_cloud.api.ip import router as ip_router
+from hyrule_cloud.api.mail import router as mail_router
+from hyrule_cloud.api.mx import router as mx_router
+from hyrule_cloud.api.registry import router as registry_router
 from hyrule_cloud.api.routes import router
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
@@ -156,6 +163,15 @@ app = FastAPI(
 )
 
 app.include_router(router)
+# Contract-first network intelligence APIs. Implementations land behind these
+# stable OpenAPI surfaces in the next execution steps.
+app.include_router(bgp_router)
+app.include_router(ip_router)
+app.include_router(dns_router)
+app.include_router(registry_router)
+app.include_router(mx_router)
+app.include_router(mail_router)
+app.include_router(internal_bgp_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
 app.include_router(auth_router)
 
@@ -190,23 +206,100 @@ async def x402_manifest():
                 "method": "POST",
                 "description": "Provision a bare VM with SSH access",
                 "minPrice": str(config.payment.price_vm_xs),
-                "networks": config.payment.networks,
+                "networks": getattr(config.payment, "networks", []),
             },
             {
                 "path": "/v1/domain/register",
                 "method": "POST",
                 "description": "Register a domain via Openprovider",
                 "minPrice": str(config.payment.price_domain_markup + 5),
-                "networks": config.payment.networks,
+                "networks": getattr(config.payment, "networks", []),
             },
             {
                 "path": "/v1/network/request",
                 "method": "POST",
                 "description": "Make a micro-proxy network request over Direct, Tor, I2P, or Yggdrasil",
                 "minPrice": str(config.payment.price_proxy_direct),
-                "networks": config.payment.networks,
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/bgp/lookup",
+                "method": "POST",
+                "description": "Paid BGP/routing lookup by prefix, IP, ASN, or AS215932 router-table dataset",
+                "minPrice": str(getattr(config.payment, "price_bgp_lookup", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/bgp/jobs",
+                "method": "POST",
+                "description": "Paid historical BGPStream job over RouteViews and RIPE RIS collectors",
+                "minPrice": str(getattr(config.payment, "price_bgpstream_hour", "0.05")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/bgp/snapshots/router/{snapshot_id}/download",
+                "method": "GET",
+                "description": "Paid AS215932 active router table snapshot download",
+                "minPrice": str(getattr(config.payment, "price_bgp_router_table", "0.10")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/ip/lookup",
+                "method": "POST",
+                "description": "Paid IP geolocation, ASN/ISP, reverse DNS, RDAP/WHOIS, reputation, and BGP-context lookup",
+                "minPrice": str(getattr(config.payment, "price_ip_lookup", "0.003")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/dns/lookup",
+                "method": "POST",
+                "description": "Paid read-only DNS lookup, reverse lookup, DNSSEC, and trace diagnostics",
+                "minPrice": str(getattr(config.payment, "price_dns_lookup", "0.001")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/rdap/lookup",
+                "method": "POST",
+                "description": "Paid structured RDAP lookup for domains, IPs, prefixes, ASNs, and entities",
+                "minPrice": str(getattr(config.payment, "price_rdap_lookup", "0.003")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/whois/lookup",
+                "method": "POST",
+                "description": "Paid legacy WHOIS lookup for domains, IPs, prefixes/network blocks, and ASNs",
+                "minPrice": str(getattr(config.payment, "price_whois_lookup", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/mx/check",
+                "method": "POST",
+                "description": "Paid MXToolbox-compatible diagnostic check for mail, DNS, blacklist, SMTP, and domain troubleshooting",
+                "minPrice": str(getattr(config.payment, "price_mx_check", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/mx/jobs",
+                "method": "POST",
+                "description": "Paid full mail-delivery diagnostic report for agentic ISP support workflows",
+                "minPrice": str(getattr(config.payment, "price_mx_report", "0.03")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/mail/accounts",
+                "method": "POST",
+                "description": "Create a paid Agent Mail mailbox with SMTP/IMAP and API access",
+                "minPrice": str(getattr(config.payment, "price_mail_agent_basic_day", "0.05")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/mail/messages/send",
+                "method": "POST",
+                "description": "Send email through an Agent Mail mailbox via API",
+                "minPrice": str(getattr(config.payment, "price_mail_outbound_message", "0.001")),
+                "networks": getattr(config.payment, "networks", []),
             },
         ],
-        "facilitator": config.payment.facilitator_url,
+        "facilitator": getattr(config.payment, "facilitator_url", ""),
         "contact": "https://github.com/as215932",
     }

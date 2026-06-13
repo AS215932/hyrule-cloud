@@ -289,6 +289,266 @@ class VMQuoteRow(Base):
     __table_args__ = (Index("ix_vm_quotes_status_expires", "status", "expires_at"),)
 
 
+# --- Network intelligence / BGP / MX / Agent Mail tables ---
+
+
+class BGPSourceStatusRow(Base):
+    __tablename__ = "bgp_source_status"
+
+    source_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), default="unknown", server_default="unknown")
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[dict | None] = mapped_column(_JSONB)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class BGPLookupCacheRow(Base):
+    __tablename__ = "bgp_lookup_cache"
+
+    cache_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    subject_type: Mapped[str] = mapped_column(String(32), index=True)
+    subject_value: Mapped[str] = mapped_column(String(256), index=True)
+    request_hash: Mapped[str] = mapped_column(String(64), index=True)
+    response: Mapped[dict] = mapped_column(_JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class BGPSnapshotRow(Base):
+    __tablename__ = "bgp_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    source: Mapped[str] = mapped_column(String(32), index=True)
+    router: Mapped[str | None] = mapped_column(String(64), index=True)
+    asn: Mapped[int | None] = mapped_column(Integer, index=True)
+    prefix: Mapped[str | None] = mapped_column(String(128), index=True)
+    artifact_path: Mapped[str | None] = mapped_column(Text)
+    artifact_format: Mapped[str | None] = mapped_column(String(64))
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    compressed_size_bytes: Mapped[int | None] = mapped_column(Integer)
+    payload: Mapped[dict | None] = mapped_column(_JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class BGPJobRow(Base):
+    __tablename__ = "bgp_jobs"
+
+    job_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    owner_wallet: Mapped[str | None] = mapped_column(String(64), index=True)
+    payment_tx: Mapped[str | None] = mapped_column(String(128))
+    access_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    query: Mapped[dict] = mapped_column(_JSONB)
+    price_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    claimed_by: Mapped[str | None] = mapped_column(String(64))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    artifact_snapshot_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class NetworkLookupCacheRow(Base):
+    __tablename__ = "network_lookup_cache"
+
+    cache_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    service: Mapped[str] = mapped_column(String(32), index=True)
+    subject: Mapped[str] = mapped_column(String(512), index=True)
+    response: Mapped[dict] = mapped_column(_JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class DiagnosticJobRow(Base):
+    """Generic async job row for x402 diagnostic evidence packs.
+
+    Product namespaces (/v1/web, /v1/path, /v1/threat, /v1/voip,
+    /v1/speedtest, etc.) share this shape so job tokens, artifacts, expiry,
+    and source metadata behave consistently.
+    """
+
+    __tablename__ = "diagnostic_jobs"
+
+    job_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    service: Mapped[str] = mapped_column(String(32), index=True)
+    kind: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    target: Mapped[str | None] = mapped_column(String(512), index=True)
+    owner_wallet: Mapped[str | None] = mapped_column(String(64), index=True)
+    owner_account_id: Mapped[str | None] = mapped_column(String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True)
+    payment_tx: Mapped[str | None] = mapped_column(String(128))
+    access_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    request: Mapped[dict] = mapped_column(_JSONB)
+    result: Mapped[dict | None] = mapped_column(_JSONB)
+    sources: Mapped[dict | None] = mapped_column(_JSONB)
+    artifact_path: Mapped[str | None] = mapped_column(Text)
+    artifact_format: Mapped[str | None] = mapped_column(String(64))
+    artifact_sha256: Mapped[str | None] = mapped_column(String(64))
+    artifact_size_bytes: Mapped[int | None] = mapped_column(Integer)
+    price_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+    __table_args__ = (
+        Index("ix_diagnostic_jobs_service_status", "service", "status"),
+        Index("ix_diagnostic_jobs_kind_status", "kind", "status"),
+    )
+
+
+class MXJobRow(Base):
+    __tablename__ = "mx_jobs"
+
+    job_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    target: Mapped[str] = mapped_column(String(512), index=True)
+    profile: Mapped[str] = mapped_column(String(64))
+    owner_wallet: Mapped[str | None] = mapped_column(String(64), index=True)
+    payment_tx: Mapped[str | None] = mapped_column(String(128))
+    access_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    request: Mapped[dict] = mapped_column(_JSONB)
+    result: Mapped[dict | None] = mapped_column(_JSONB)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class MailAccountRow(Base):
+    __tablename__ = "mail_accounts"
+
+    mailbox_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    address: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    owner_wallet: Mapped[str | None] = mapped_column(String(64), index=True)
+    owner_account_id: Mapped[str | None] = mapped_column(String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True)
+    management_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    plan: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    display_name: Mapped[str | None] = mapped_column(String(128))
+    features: Mapped[dict | None] = mapped_column(_JSONB)
+    backend: Mapped[str | None] = mapped_column(String(64))
+    backend_id: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    payment_tx: Mapped[str | None] = mapped_column(String(128))
+
+
+class MailDomainRow(Base):
+    __tablename__ = "mail_domains"
+
+    domain_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    domain: Mapped[str] = mapped_column(String(253), unique=True, index=True)
+    owner_account_id: Mapped[str | None] = mapped_column(String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    required_dns: Mapped[list | None] = mapped_column(_JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MailAliasRow(Base):
+    __tablename__ = "mail_aliases"
+
+    alias_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
+    address: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    destination: Mapped[str] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MailIdentityRow(Base):
+    __tablename__ = "mail_identities"
+
+    identity_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
+    address: Mapped[str] = mapped_column(String(320), index=True)
+    display_name: Mapped[str | None] = mapped_column(String(128))
+    reply_to: Mapped[str | None] = mapped_column(String(320))
+    verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MailAPIKeyRow(Base):
+    __tablename__ = "mail_api_keys"
+
+    key_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    scopes: Mapped[list] = mapped_column(_JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MailWebhookRow(Base):
+    __tablename__ = "mail_webhooks"
+
+    webhook_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
+    url: Mapped[str] = mapped_column(Text)
+    events: Mapped[list] = mapped_column(_JSONB, default=list)
+    secret_hash: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MailEventRow(Base):
+    __tablename__ = "mail_events"
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
+    type: Mapped[str] = mapped_column(String(64), index=True)
+    message_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    payload: Mapped[dict | None] = mapped_column(_JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class MailDeliveryLogRow(Base):
+    __tablename__ = "mail_delivery_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
+    message_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    direction: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    remote: Mapped[str | None] = mapped_column(String(320))
+    detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class MailMessageIndexRow(Base):
+    __tablename__ = "mail_message_index"
+
+    message_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
+    folder: Mapped[str] = mapped_column(String(64), index=True)
+    sender: Mapped[str | None] = mapped_column(String(320))
+    recipients: Mapped[list | None] = mapped_column(_JSONB)
+    subject: Mapped[str | None] = mapped_column(Text)
+    flags: Mapped[list | None] = mapped_column(_JSONB)
+    has_attachments: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class MailQuarantineRow(Base):
+    __tablename__ = "mail_quarantine"
+
+    quarantine_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
+    message_id: Mapped[str] = mapped_column(String(128), index=True)
+    reason: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[dict | None] = mapped_column(_JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 # --- Session factory ---
 
 

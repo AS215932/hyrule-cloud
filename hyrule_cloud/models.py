@@ -7,7 +7,7 @@ from __future__ import annotations
 import enum
 import secrets
 import string
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field
@@ -44,6 +44,22 @@ def generate_domain_management_token() -> str:
 def generate_quote_id() -> str:
     """Generate a fresh `q_<22 base62>` durable-order-quote id (~131 bits)."""
     return "q_" + "".join(secrets.choice(_BASE62_ALPHABET) for _ in range(22))
+
+
+def generate_diagnostic_request_id() -> str:
+    """Generate a fresh diagnostic request id for synchronous network checks."""
+    return "diag_" + "".join(secrets.choice(_BASE62_ALPHABET) for _ in range(22))
+
+
+def generate_diagnostic_job_id() -> str:
+    """Generate a fresh generic async diagnostic job id."""
+    return "job_" + "".join(secrets.choice(_BASE62_ALPHABET) for _ in range(22))
+
+
+def generate_diagnostic_job_access_token() -> str:
+    """Generate a one-time cleartext token for ownerless diagnostic jobs."""
+    return "hyr_job_" + "".join(secrets.choice(_BASE62_ALPHABET) for _ in range(32))
+
 
 # --- Enums ---
 
@@ -448,5 +464,846 @@ class VMLogsResponse(BaseModel):
     status: str
     events: list[VMLogEvent]
     error: str | None = None
+
+
+# --- Network intelligence / BGP / MX / Agent Mail API contracts ---
+
+
+class SourceStatus(enum.StrEnum):
+    OK = "ok"
+    INFO = "info"
+    STALE = "stale"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+    ERROR = "error"
+    UNKNOWN = "unknown"
+    DISABLED = "disabled"
+    NOT_CONFIGURED = "not_configured"
+    SOURCE_NOT_CONFIGURED = "source_not_configured"
+    RATE_LIMITED = "rate_limited"
+
+
+class SourceHealth(BaseModel):
+    status: SourceStatus | str = Field(description="ok, stale, degraded, unavailable, error, or source_not_configured")
+    age_seconds: int | None = None
+    message: str | None = None
+    checked_at: datetime | None = None
+    source_url: str | None = None
+
+
+class DiagnosticStatus(enum.StrEnum):
+    OK = "ok"
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+    ERROR = "error"
+
+
+class DiagnosticTargetType(enum.StrEnum):
+    DOMAIN = "domain"
+    HOST = "host"
+    URL = "url"
+    IP = "ip"
+    PREFIX = "prefix"
+    ASN = "asn"
+    PHONE_NUMBER = "phone_number"
+    EMAIL = "email"
+    CERTIFICATE = "certificate"
+    UNKNOWN = "unknown"
+
+
+class DiagnosticVantage(enum.StrEnum):
+    EXTMON = "extmon"
+    AS215932 = "as215932"
+    GLOBALPING = "globalping"
+    RIPE_ATLAS = "ripe_atlas"
+    SYSTEM = "system"
+
+
+class DiagnosticAddressFamily(enum.StrEnum):
+    AUTO = "auto"
+    IPV4 = "ipv4"
+    IPV6 = "ipv6"
+
+
+class DiagnosticTarget(BaseModel):
+    input: str
+    normalized: str | None = None
+    type: DiagnosticTargetType = DiagnosticTargetType.UNKNOWN
+
+
+class DiagnosticFinding(BaseModel):
+    severity: DiagnosticStatus
+    code: str
+    message: str
+    evidence: dict[str, object] = Field(default_factory=dict)
+    recommendation: str | None = None
+
+
+class DiagnosticResponse(BaseModel):
+    request_id: str = Field(default_factory=generate_diagnostic_request_id)
+    status: DiagnosticStatus
+    summary: str
+    target: DiagnosticTarget
+    findings: list[DiagnosticFinding] = Field(default_factory=list)
+    sources: dict[str, SourceHealth] = Field(default_factory=dict)
+    partial: bool = False
+    raw: dict[str, object] | None = None
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class DiagnosticJobStatus(enum.StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
+class DiagnosticJobKind(enum.StrEnum):
+    WEB_REPORT = "web_report"
+    WEB_TLS_DEEP = "web_tls_deep"
+    PATH_REPORT = "path_report"
+    SPEEDTEST = "speedtest"
+    VOIP_REPORT = "voip_report"
+    THREAT_REPORT = "threat_report"
+    MX_MAIL_DELIVERY = "mx_mail_delivery"
+
+
+class DiagnosticJobResponse(BaseModel):
+    job_id: str = Field(default_factory=generate_diagnostic_job_id)
+    job_access_token: str | None = None
+    service: str
+    kind: DiagnosticJobKind | str
+    status: DiagnosticJobStatus
+    status_url: str | None = None
+    download_url: str | None = None
+    charged_amount_usd: str | None = None
+    error: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    expires_at: datetime | None = None
+
+
+class DiagnosticJobResultResponse(DiagnosticJobResponse):
+    result: DiagnosticResponse | dict[str, object] | None = None
+    artifact: dict[str, object] | None = None
+
+
+class QuoteLineItem(BaseModel):
+    name: str
+    quantity: int = 1
+    unit_price_usd: str
+
+
+class PaidEndpointQuote(BaseModel):
+    amount_usd: str
+    currency: str = "USD"
+    billable_units: list[QuoteLineItem]
+    paid_endpoint: str
+
+
+class CapabilityEndpoint(BaseModel):
+    path: str
+    method: str
+    paid: bool = False
+    description: str
+
+
+class ProductCapabilityResponse(BaseModel):
+    service: str
+    version: str = "2026-06-13"
+    purpose: str
+    separation_of_concerns: str | None = None
+    free_endpoints: list[CapabilityEndpoint] = Field(default_factory=list)
+    paid_endpoints: list[CapabilityEndpoint] = Field(default_factory=list)
+
+
+class BGPSubjectType(enum.StrEnum):
+    PREFIX = "prefix"
+    IP = "ip"
+    ASN = "asn"
+
+
+class BGPDataset(enum.StrEnum):
+    PUBLIC_ROUTING = "public_routing"
+    RPKI = "rpki"
+    PEERINGDB = "peeringdb"
+    AS215932_ROUTER_TABLES = "as215932_router_tables"
+
+
+class BGPView(enum.StrEnum):
+    ORIGINS = "origins"
+    VISIBILITY = "visibility"
+    RPKI = "rpki"
+    PATHS = "paths"
+    ANNOUNCED_PREFIXES = "announced_prefixes"
+    PEERINGDB = "peeringdb"
+    ROUTER_ROUTES = "router_routes"
+    RAW_SOURCE_PAYLOADS = "raw_source_payloads"
+
+
+class BGPTimeMode(enum.StrEnum):
+    LATEST = "latest"
+    AT = "at"
+    RANGE = "range"
+
+
+class BGPSubject(BaseModel):
+    type: BGPSubjectType
+    value: str | int = Field(description="CIDR prefix, IP address, or ASN/AS-prefixed ASN")
+
+
+class BGPTimeSelector(BaseModel):
+    mode: BGPTimeMode = BGPTimeMode.LATEST
+    at: datetime | None = None
+    from_time: datetime | None = None
+    until_time: datetime | None = None
+    max_age_seconds: int = Field(default=900, ge=0, le=86400)
+
+
+class BGPFilters(BaseModel):
+    match: str = Field(default="exact", description="exact, covering, covered, or best")
+    routers: list[str] = Field(default_factory=list)
+    include_raw: bool = False
+
+
+class BGPAssertions(BaseModel):
+    expected_origin_asns: list[int] = Field(default_factory=list)
+    expected_rpki: str | None = Field(default=None, description="valid, invalid, not_found, or unknown")
+
+
+class BGPLookupRequest(BaseModel):
+    subject: BGPSubject
+    datasets: list[BGPDataset] = Field(
+        default_factory=lambda: [BGPDataset.PUBLIC_ROUTING, BGPDataset.RPKI]
+    )
+    views: list[BGPView] = Field(default_factory=lambda: [BGPView.ORIGINS, BGPView.RPKI])
+    sources: list[str] = Field(default_factory=lambda: ["auto"])
+    time: BGPTimeSelector = Field(default_factory=BGPTimeSelector)
+    filters: BGPFilters = Field(default_factory=BGPFilters)
+    assertions: BGPAssertions = Field(default_factory=BGPAssertions)
+    limit: int = Field(default=500, ge=1, le=100000)
+
+
+class BGPOriginObservation(BaseModel):
+    asn: int
+    rpki: str | None = None
+    sources: list[str] = Field(default_factory=list)
+
+
+class BGPResolvedSubject(BaseModel):
+    routed: bool | None = None
+    best_prefix: str | None = None
+    observed_origin_asns: list[int] = Field(default_factory=list)
+    origins: list[BGPOriginObservation] = Field(default_factory=list)
+
+
+class BGPLookupResponse(BaseModel):
+    request_id: str
+    subject: dict[str, str | int]
+    resolved: BGPResolvedSubject = Field(default_factory=BGPResolvedSubject)
+    results: dict[str, object] = Field(default_factory=dict)
+    assertions: dict[str, object] = Field(default_factory=dict)
+    sources: dict[str, SourceHealth] = Field(default_factory=dict)
+    partial: bool = False
+    charged_amount_usd: str | None = None
+    generated_at: datetime
+
+
+class BGPStatusResponse(BaseModel):
+    status: str
+    scope: str = "as215932"
+    monitored: dict[str, object]
+    routing: dict[str, object]
+    sources: dict[str, str]
+    updated_at: datetime
+
+
+class BGPSourcesResponse(BaseModel):
+    sources: dict[str, SourceHealth]
+    updated_at: datetime
+
+
+class BGPPricingResponse(BaseModel):
+    public_latest_lookup_usd: str
+    router_table_lookup_usd: str
+    bgpstream_update_hour_usd: str
+    bgpstream_rib_usd: str
+    router_snapshot_download_usd: str
+    router_snapshot_bundle_usd: str
+
+
+class BGPSnapshotSummary(BaseModel):
+    snapshot_id: str
+    kind: str = "router_table"
+    router: str | None = None
+    created_at: datetime
+    expires_at: datetime | None = None
+    formats: list[str] = Field(default_factory=lambda: ["normalized_jsonl.gz"])
+    size_bytes: int | None = None
+    sha256: str | None = None
+
+
+class BGPSnapshotListResponse(BaseModel):
+    snapshots: list[BGPSnapshotSummary] = Field(default_factory=list)
+
+
+class BGPStreamRecordType(enum.StrEnum):
+    UPDATES = "updates"
+    RIBS = "ribs"
+
+
+class BGPStreamJobRequest(BaseModel):
+    subject: BGPSubject
+    projects: list[str] = Field(default_factory=lambda: ["routeviews", "ris"])
+    record_type: BGPStreamRecordType = BGPStreamRecordType.UPDATES
+    from_time: datetime | None = None
+    until_time: datetime | None = None
+    collectors: list[str] = Field(default_factory=list)
+    limit: int = Field(default=100000, ge=1, le=1000000)
+
+
+class BGPJobStatus(enum.StrEnum):
+    QUEUED = "queued"
+    CLAIMED = "claimed"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    EXPIRED = "expired"
+
+
+class BGPJobResponse(BaseModel):
+    job_id: str
+    job_access_token: str | None = None
+    status: BGPJobStatus
+    charged_amount_usd: str | None = None
+    status_url: str | None = None
+    download_url: str | None = None
+    error: str | None = None
+    created_at: datetime
+    expires_at: datetime | None = None
+
+
+class IPLookupView(enum.StrEnum):
+    GEO = "geo"
+    ASN = "asn"
+    RDNS = "rdns"
+    RDAP = "rdap"
+    WHOIS = "whois"
+    REPUTATION = "reputation"
+    BGP = "bgp"
+
+
+class IPLookupRequest(BaseModel):
+    address: str
+    views: list[IPLookupView] = Field(
+        default_factory=lambda: [IPLookupView.GEO, IPLookupView.ASN, IPLookupView.RDNS]
+    )
+    max_age_seconds: int = Field(default=3600, ge=0, le=604800)
+
+
+class IPGeoResult(BaseModel):
+    country: str | None = None
+    region: str | None = None
+    city: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    source: str | None = None
+
+
+class IPNetworkResult(BaseModel):
+    asn: int | None = None
+    asn_name: str | None = None
+    isp: str | None = None
+    prefix: str | None = None
+    registry: str | None = None
+
+
+class IPReputationListing(BaseModel):
+    provider: str
+    listed: bool
+    detail: str | None = None
+
+
+class IPReputationResult(BaseModel):
+    listed: bool = False
+    lists_checked: int = 0
+    listings: list[IPReputationListing] = Field(default_factory=list)
+
+
+class IPLookupResponse(BaseModel):
+    request_id: str
+    address: str
+    geo: IPGeoResult | None = None
+    network: IPNetworkResult | None = None
+    reverse_dns: list[str] = Field(default_factory=list)
+    rdap: dict[str, object] | None = None
+    whois: dict[str, object] | None = None
+    reputation: IPReputationResult | None = None
+    bgp: dict[str, object] | None = None
+    sources: dict[str, str] = Field(default_factory=dict)
+    partial: bool = False
+    generated_at: datetime
+
+
+class IPPricingResponse(BaseModel):
+    lookup_usd: str
+
+
+class DNSLookupRecordType(enum.StrEnum):
+    A = "A"
+    AAAA = "AAAA"
+    CAA = "CAA"
+    CNAME = "CNAME"
+    DNSKEY = "DNSKEY"
+    DS = "DS"
+    MX = "MX"
+    NS = "NS"
+    PTR = "PTR"
+    SOA = "SOA"
+    SRV = "SRV"
+    TXT = "TXT"
+    TLSA = "TLSA"
+    ANY = "ANY"
+
+
+class DNSLookupRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=253)
+    type: DNSLookupRecordType = DNSLookupRecordType.A
+    resolver: str = "system"
+    dnssec: bool = False
+    trace: bool = False
+    timeout_ms: int = Field(default=3000, ge=500, le=30000)
+
+
+class DNSQuestion(BaseModel):
+    name: str
+    type: str
+
+
+class DNSRecordAnswer(BaseModel):
+    name: str
+    type: str
+    ttl: int | None = None
+    value: str
+
+
+class DNSSECResult(BaseModel):
+    validated: bool | None = None
+    chain_status: str | None = None
+    detail: str | None = None
+
+
+class DNSLookupResponse(BaseModel):
+    request_id: str
+    question: DNSQuestion
+    answers: list[DNSRecordAnswer] = Field(default_factory=list)
+    authority: list[DNSRecordAnswer] = Field(default_factory=list)
+    additional: list[DNSRecordAnswer] = Field(default_factory=list)
+    rcode: str
+    dnssec: DNSSECResult | None = None
+    resolver: str
+    trace: list[dict[str, object]] = Field(default_factory=list)
+    generated_at: datetime
+
+
+class DNSPricingResponse(BaseModel):
+    lookup_usd: str
+
+
+class RegistrySubjectType(enum.StrEnum):
+    DOMAIN = "domain"
+    IP = "ip"
+    PREFIX = "prefix"
+    ASN = "asn"
+    ENTITY = "entity"
+
+
+class RegistrySubject(BaseModel):
+    type: RegistrySubjectType
+    value: str | int
+
+
+class RDAPLookupRequest(BaseModel):
+    subject: RegistrySubject
+    include_raw: bool = False
+    max_age_seconds: int = Field(default=86400, ge=0, le=2592000)
+
+
+class RDAPLookupResponse(BaseModel):
+    request_id: str
+    subject: RegistrySubject
+    registry: str | None = None
+    bootstrap_url: str | None = None
+    parsed: dict[str, object] = Field(default_factory=dict)
+    raw: dict[str, object] | None = None
+    generated_at: datetime
+
+
+class WhoisLookupRequest(BaseModel):
+    subject: RegistrySubject
+    include_raw: bool = False
+    max_age_seconds: int = Field(default=86400, ge=0, le=2592000)
+
+
+class WhoisLookupResponse(BaseModel):
+    request_id: str
+    subject: RegistrySubject
+    registry: str | None = None
+    server: str | None = None
+    parsed: dict[str, object] = Field(default_factory=dict)
+    raw: str | None = None
+    redacted: bool = True
+    generated_at: datetime
+
+
+class RegistryPricingResponse(BaseModel):
+    rdap_lookup_usd: str
+    whois_lookup_usd: str
+
+
+class MXTool(enum.StrEnum):
+    A = "a"
+    AAAA = "aaaa"
+    ARIN = "arin"
+    ASN = "asn"
+    BIMI = "bimi"
+    BLACKLIST = "blacklist"
+    CNAME = "cname"
+    DKIM = "dkim"
+    DMARC = "dmarc"
+    DNS = "dns"
+    HTTP = "http"
+    HTTPS = "https"
+    MTA_STS = "mta-sts"
+    MX = "mx"
+    PING = "ping"
+    PTR = "ptr"
+    SMTP = "smtp"
+    SOA = "soa"
+    SPF = "spf"
+    TCP = "tcp"
+    TLSRPT = "tlsrpt"
+    TRACE = "trace"
+    TXT = "txt"
+    WHOIS = "whois"
+
+
+class MXStatus(enum.StrEnum):
+    OK = "ok"
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+    ERROR = "error"
+
+
+class MXCheckOptions(BaseModel):
+    timeout_ms: int = Field(default=5000, ge=500, le=60000)
+    include_raw: bool = False
+    dkim_selectors: list[str] = Field(default_factory=list)
+    smtp_starttls: bool = True
+    include_recommendations: bool = True
+    port: int | None = Field(default=None, ge=1, le=65535)
+
+
+class MXCheckRequest(BaseModel):
+    tool: MXTool | None = None
+    target: str | None = Field(default=None, min_length=1, max_length=2048)
+    command: str | None = Field(
+        default=None,
+        description="SuperTool-compatible command, e.g. mx:example.com or blacklist:8.8.8.8",
+    )
+    options: MXCheckOptions = Field(default_factory=MXCheckOptions)
+
+
+class MXFinding(BaseModel):
+    severity: MXStatus
+    code: str
+    message: str
+    evidence: dict[str, object] = Field(default_factory=dict)
+    recommendation: str | None = None
+
+
+class MXCheckResponse(BaseModel):
+    request_id: str
+    tool: MXTool
+    target: str
+    status: MXStatus
+    summary: str
+    findings: list[MXFinding] = Field(default_factory=list)
+    raw: dict[str, object] | None = None
+    sources: dict[str, str] = Field(default_factory=dict)
+    generated_at: datetime
+
+
+class MXProfile(enum.StrEnum):
+    MAIL_DELIVERY = "mail_delivery"
+    DOMAIN_HEALTH = "domain_health"
+    REPUTATION = "reputation"
+    CONNECTIVITY = "connectivity"
+
+
+class MXJobRequest(BaseModel):
+    profile: MXProfile = MXProfile.MAIL_DELIVERY
+    target: str = Field(min_length=1, max_length=2048)
+    checks: list[MXTool] = Field(default_factory=list)
+    options: MXCheckOptions = Field(default_factory=MXCheckOptions)
+
+
+class MXJobStatus(enum.StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    EXPIRED = "expired"
+
+
+class MXJobResponse(BaseModel):
+    job_id: str
+    job_access_token: str | None = None
+    status: MXJobStatus
+    target: str
+    profile: MXProfile
+    status_url: str | None = None
+    download_url: str | None = None
+    results: list[MXCheckResponse] = Field(default_factory=list)
+    error: str | None = None
+    created_at: datetime
+    expires_at: datetime | None = None
+
+
+class MXToolDescription(BaseModel):
+    tool: MXTool
+    target: str
+    description: str
+    active_probe: bool = False
+
+
+class MXToolsResponse(BaseModel):
+    tools: list[MXToolDescription]
+    disclaimer: str = "Hyrule implements compatible diagnostics internally and is not affiliated with MXToolbox."
+
+
+class MXPricingResponse(BaseModel):
+    single_check_usd: str
+    mail_delivery_report_usd: str
+
+
+class MailPlan(enum.StrEnum):
+    AGENT_BASIC = "agent-basic"
+    AGENT_PRO = "agent-pro"
+
+
+class MailAccountStatus(enum.StrEnum):
+    PROVISIONING = "provisioning"
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    DELETED = "deleted"
+    FAILED = "failed"
+
+
+class MailSecurityMode(enum.StrEnum):
+    TLS = "tls"
+    STARTTLS = "starttls"
+
+
+class MailAccountFeatures(BaseModel):
+    smtp_imap: bool = True
+    api_access: bool = True
+    inbound_webhooks: bool = True
+
+
+class MailAccountCreateRequest(BaseModel):
+    plan: MailPlan = MailPlan.AGENT_BASIC
+    duration_days: int = Field(default=30, ge=1, le=365)
+    local_part: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9._+-]+$")
+    domain: str = Field(default="agentmail.hyrule.host", min_length=3, max_length=253)
+    display_name: str | None = Field(default=None, max_length=128)
+    features: MailAccountFeatures = Field(default_factory=MailAccountFeatures)
+    client_order_id: str | None = Field(default=None, max_length=64)
+
+
+class MailEndpointConfig(BaseModel):
+    host: str
+    port: int
+    security: MailSecurityMode
+    username: str
+
+
+class MailAPIAccessConfig(BaseModel):
+    base_url: str
+    auth: str
+
+
+class MailLimits(BaseModel):
+    storage_mb: int
+    outbound_messages_per_day: int
+    inbound_messages_per_day: int
+
+
+class MailAccountResponse(BaseModel):
+    mailbox_id: str
+    address: str
+    status: MailAccountStatus
+    management_token: str | None = None
+    management_url: str | None = None
+    smtp: MailEndpointConfig | None = None
+    imap: MailEndpointConfig | None = None
+    api: MailAPIAccessConfig | None = None
+    limits: MailLimits
+    expires_at: datetime | None = None
+
+
+class MailAccountUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=128)
+    features: MailAccountFeatures | None = None
+
+
+class MailAccountExtendRequest(BaseModel):
+    days: int = Field(ge=1, le=365)
+
+
+class MailDomainCreateRequest(BaseModel):
+    domain: str = Field(min_length=3, max_length=253)
+
+
+class MailDomainResponse(BaseModel):
+    domain_id: str
+    domain: str
+    status: str
+    required_dns: list[DNSRecordAnswer] = Field(default_factory=list)
+
+
+class MailAliasRequest(BaseModel):
+    address: str = Field(min_length=3, max_length=320)
+    destination: str | None = Field(default=None, max_length=320)
+
+
+class MailAliasResponse(BaseModel):
+    alias_id: str
+    address: str
+    destination: str
+
+
+class MailIdentityRequest(BaseModel):
+    address: str = Field(min_length=3, max_length=320)
+    display_name: str | None = Field(default=None, max_length=128)
+    reply_to: str | None = Field(default=None, max_length=320)
+
+
+class MailIdentityResponse(BaseModel):
+    identity_id: str
+    address: str
+    display_name: str | None = None
+    reply_to: str | None = None
+    verified: bool = False
+
+
+class MailAPIKeyCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    scopes: list[str] = Field(default_factory=lambda: ["mail:read", "mail:send"])
+
+
+class MailAPIKeyResponse(BaseModel):
+    key_id: str
+    name: str
+    token: str | None = None
+    scopes: list[str]
+    created_at: datetime
+
+
+class MailAttachment(BaseModel):
+    filename: str
+    content_type: str = "application/octet-stream"
+    content_base64: str | None = None
+    attachment_id: str | None = None
+    size_bytes: int | None = None
+
+
+class MailSendRequest(BaseModel):
+    mailbox_id: str
+    from_: str = Field(alias="from")
+    to: list[str]
+    cc: list[str] = Field(default_factory=list)
+    bcc: list[str] = Field(default_factory=list)
+    subject: str = Field(max_length=998)
+    text: str | None = None
+    html: str | None = None
+    attachments: list[MailAttachment] = Field(default_factory=list)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+
+class MailMessageSummary(BaseModel):
+    message_id: str
+    mailbox_id: str
+    folder: str = "INBOX"
+    from_: str = Field(alias="from")
+    to: list[str] = Field(default_factory=list)
+    subject: str | None = None
+    received_at: datetime | None = None
+    sent_at: datetime | None = None
+    flags: list[str] = Field(default_factory=list)
+    has_attachments: bool = False
+
+
+class MailMessageResponse(MailMessageSummary):
+    text: str | None = None
+    html: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+    attachments: list[MailAttachment] = Field(default_factory=list)
+
+
+class MailMessageListResponse(BaseModel):
+    messages: list[MailMessageSummary]
+    next_cursor: str | None = None
+
+
+class MailSearchRequest(BaseModel):
+    mailbox_id: str
+    query: str = Field(max_length=1024)
+    folder: str | None = None
+    limit: int = Field(default=50, ge=1, le=500)
+    cursor: str | None = None
+
+
+class MailMessageActionRequest(BaseModel):
+    text: str | None = None
+    html: str | None = None
+    attachments: list[MailAttachment] = Field(default_factory=list)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+
+class MailWebhookRequest(BaseModel):
+    url: str = Field(max_length=2048)
+    events: list[str]
+    secret: str | None = Field(default=None, max_length=128)
+
+
+class MailWebhookResponse(BaseModel):
+    webhook_id: str
+    url: str
+    events: list[str]
+    created_at: datetime
+
+
+class MailEventResponse(BaseModel):
+    event_id: str
+    type: str
+    message_id: str | None = None
+    payload: dict[str, object] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class MailProductsResponse(BaseModel):
+    currency: str = "USD"
+    products: list[dict[str, object]]
+
+
+class MailPricingResponse(BaseModel):
+    agent_basic_usd_day: str
+    storage_extra_usd_gb_day: str
+    outbound_overage_usd_message: str
+
 
 # Rebuild all refs if needed

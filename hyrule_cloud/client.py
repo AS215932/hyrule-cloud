@@ -230,6 +230,108 @@ class HyruleClient:
             params={"zone": zone, "name": name, "type": rtype},
         )
 
+    # -- Network intelligence / agentic support --
+
+    async def bgp_status(self) -> dict[str, Any]:
+        """Free AS215932 BGP/routing status."""
+        return await self._request("GET", "/v1/bgp/status")
+
+    async def bgp_lookup(self, subject: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        """Paid BGP lookup by prefix, IP, or ASN. Prefix/IP do not require ASN."""
+        payload: dict[str, Any] = {"subject": subject, **kwargs}
+        return await self._request("POST", "/v1/bgp/lookup", json=payload)
+
+    async def ip_lookup(self, address: str, views: list[str] | None = None) -> dict[str, Any]:
+        """Paid IP geolocation/ASN/rDNS/RDAP/WHOIS/reputation lookup."""
+        payload: dict[str, Any] = {"address": address}
+        if views:
+            payload["views"] = views
+        return await self._request("POST", "/v1/ip/lookup", json=payload)
+
+    async def dns_lookup(
+        self,
+        name: str,
+        record_type: str = "A",
+        *,
+        dnssec: bool = False,
+        trace: bool = False,
+    ) -> dict[str, Any]:
+        """Paid read-only DNS lookup."""
+        return await self._request(
+            "POST",
+            "/v1/dns/lookup",
+            json={"name": name, "type": record_type, "dnssec": dnssec, "trace": trace},
+        )
+
+    async def rdap_lookup(self, subject_type: str, value: str | int, *, include_raw: bool = False) -> dict[str, Any]:
+        """Paid RDAP lookup for domain/IP/prefix/ASN/entity."""
+        return await self._request(
+            "POST",
+            "/v1/rdap/lookup",
+            json={"subject": {"type": subject_type, "value": value}, "include_raw": include_raw},
+        )
+
+    async def whois_lookup(self, subject_type: str, value: str | int, *, include_raw: bool = False) -> dict[str, Any]:
+        """Paid WHOIS lookup for domain/IP/prefix/ASN."""
+        return await self._request(
+            "POST",
+            "/v1/whois/lookup",
+            json={"subject": {"type": subject_type, "value": value}, "include_raw": include_raw},
+        )
+
+    async def mx_tools(self) -> dict[str, Any]:
+        """Free list of MXToolbox-compatible diagnostic tools."""
+        return await self._request("GET", "/v1/mx/tools")
+
+    async def mx_check(
+        self,
+        tool: str,
+        target: str,
+        *,
+        dkim_selectors: list[str] | None = None,
+        include_raw: bool = False,
+    ) -> dict[str, Any]:
+        """Paid MXToolbox-compatible single diagnostic check."""
+        options: dict[str, Any] = {"include_raw": include_raw}
+        if dkim_selectors:
+            options["dkim_selectors"] = dkim_selectors
+        return await self._request(
+            "POST",
+            "/v1/mx/check",
+            json={"tool": tool, "target": target, "options": options},
+        )
+
+    async def mx_report(self, target: str, checks: list[str] | None = None) -> dict[str, Any]:
+        """Paid full mail-delivery diagnostic report."""
+        payload: dict[str, Any] = {"profile": "mail_delivery", "target": target}
+        if checks:
+            payload["checks"] = checks
+        return await self._request("POST", "/v1/mx/jobs", json=payload)
+
+    async def mail_products(self) -> dict[str, Any]:
+        """Free Agent Mail product catalog."""
+        return await self._request("GET", "/v1/mail/products")
+
+    async def mail_account_quote(self, local_part: str, duration_days: int = 30, domain: str = "agentmail.hyrule.host") -> dict[str, Any]:
+        """Free quote for creating an Agent Mail account."""
+        return await self._request(
+            "POST",
+            "/v1/mail/accounts/quote",
+            json={"plan": "agent-basic", "duration_days": duration_days, "local_part": local_part, "domain": domain},
+        )
+
+    async def create_mail_account(self, local_part: str, duration_days: int = 30, domain: str = "agentmail.hyrule.host") -> dict[str, Any]:
+        """Paid Agent Mail account creation."""
+        return await self._request(
+            "POST",
+            "/v1/mail/accounts",
+            json={"plan": "agent-basic", "duration_days": duration_days, "local_part": local_part, "domain": domain},
+        )
+
+    async def mail_send(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Paid API send through an Agent Mail mailbox."""
+        return await self._request("POST", "/v1/mail/messages/send", json=payload)
+
     # -- Discovery --
 
     async def x402_manifest(self) -> dict[str, Any]:
