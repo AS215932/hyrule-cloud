@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
@@ -26,7 +26,7 @@ def config_from_request(request: Request) -> HyruleConfig:
     state = getattr(request.app.state, "_typed_state", None)
     cfg = getattr(state, "config", None)
     if cfg is not None:
-        return cfg
+        return cast(HyruleConfig, cfg)
     return HyruleConfig()
 
 
@@ -131,7 +131,7 @@ async def require_payment(
                 "description": description,
             },
         )
-    return await gate.check_payment(request, amount, description, extra_body or {})
+    return cast(Response | str | None, await gate.check_payment(request, amount, description, extra_body or {}))
 
 
 def not_implemented(service: str, detail: str | None = None) -> JSONResponse:

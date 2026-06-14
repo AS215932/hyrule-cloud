@@ -37,7 +37,7 @@ class UnsafeTargetError(ValueError):
     pass
 
 
-def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return any(
         [
             ip.is_private,
@@ -107,7 +107,7 @@ def resolve_public_addresses(host: str, *, family: int = socket.AF_UNSPEC) -> li
         raise UnsafeTargetError(f"unable to resolve target: {exc}") from exc
     addresses: list[str] = []
     for info in infos:
-        addr = info[4][0]
+        addr = str(info[4][0])
         ip = ipaddress.ip_address(addr)
         if _is_blocked_ip(ip):
             raise UnsafeTargetError(f"blocked resolved non-public target: {ip}")

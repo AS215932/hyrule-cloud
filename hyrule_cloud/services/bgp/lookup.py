@@ -203,9 +203,11 @@ async def lookup_bgp(req: BGPLookupRequest) -> BGPLookupResponse:
 
 
 async def as215932_status() -> BGPStatusResponse:
-    req = BGPLookupRequest(
-        subject={"type": "prefix", "value": "2a0c:b641:b50::/44"},
-        assertions={"expected_origin_asns": [215932], "expected_rpki": "valid"},
+    req = BGPLookupRequest.model_validate(
+        {
+            "subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"},
+            "assertions": {"expected_origin_asns": [215932], "expected_rpki": "valid"},
+        }
     )
     result = await lookup_bgp(req)
     visibility: dict[str, object] = {}

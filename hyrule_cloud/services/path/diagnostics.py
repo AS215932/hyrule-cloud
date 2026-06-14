@@ -17,6 +17,7 @@ from hyrule_cloud.models import (
     PathProbeKind,
     PathProbeRequest,
     PathReportRequest,
+    SourceHealth,
 )
 from hyrule_cloud.services.diagnostics.sources import source_not_configured, source_ok
 from hyrule_cloud.services.safety import assert_safe_active_probe_target, normalize_host
@@ -34,8 +35,8 @@ def _family(value: DiagnosticAddressFamily) -> int:
     return socket.AF_UNSPEC
 
 
-def _sources(vantages: list[DiagnosticVantage]) -> dict[str, object]:
-    sources: dict[str, object] = {}
+def _sources(vantages: list[DiagnosticVantage]) -> dict[str, SourceHealth]:
+    sources: dict[str, SourceHealth] = {}
     for vantage in vantages:
         if vantage in {DiagnosticVantage.EXTMON, DiagnosticVantage.AS215932}:
             sources[vantage.value] = source_ok()

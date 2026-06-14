@@ -9,6 +9,7 @@ from hyrule_cloud.models import (
     CapabilityEndpoint,
     IPLookupRequest,
     IPLookupResponse,
+    IPLookupView,
     IPPricingResponse,
     PaidEndpointQuote,
     ProductCapabilityResponse,
@@ -67,28 +68,28 @@ async def ip_lookup(request: Request, body: IPLookupRequest) -> IPLookupResponse
 async def ip_geo(request: Request, address: str) -> IPLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await ip_lookup_service(IPLookupRequest(address=address, views=["geo"]))
+    return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.GEO]))
 
 
 @router.get("/{address}/asn", response_model=IPLookupResponse)
 async def ip_asn(request: Request, address: str) -> IPLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await ip_lookup_service(IPLookupRequest(address=address, views=["asn"]))
+    return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.ASN]))
 
 
 @router.get("/{address}/rdns", response_model=IPLookupResponse)
 async def ip_rdns(request: Request, address: str) -> IPLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await ip_lookup_service(IPLookupRequest(address=address, views=["rdns"]))
+    return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.RDNS]))
 
 
 @router.get("/{address}/reputation", response_model=IPLookupResponse)
 async def ip_reputation(request: Request, address: str) -> IPLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await ip_lookup_service(IPLookupRequest(address=address, views=["reputation"]))
+    return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.REPUTATION]))
 
 
 @router.get("/{address}", response_model=IPLookupResponse)

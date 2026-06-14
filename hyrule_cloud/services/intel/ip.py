@@ -108,26 +108,26 @@ async def lookup_ip(req: IPLookupRequest) -> IPLookupResponse:
             partial = True
 
     if IPLookupView.RDAP in req.views:
-        result = await rdap_lookup(
+        rdap_result = await rdap_lookup(
             RDAPLookupRequest(
                 subject=RegistrySubject(type=RegistrySubjectType.IP, value=ip),
                 include_raw=False,
             )
         )
-        rdap = result.parsed
-        sources["rdap"] = "ok" if "error" not in result.parsed else "degraded"
-        partial = partial or "error" in result.parsed
+        rdap = rdap_result.parsed
+        sources["rdap"] = "ok" if "error" not in rdap_result.parsed else "degraded"
+        partial = partial or "error" in rdap_result.parsed
 
     if IPLookupView.WHOIS in req.views:
-        result = await whois_lookup(
+        whois_result = await whois_lookup(
             WhoisLookupRequest(
                 subject=RegistrySubject(type=RegistrySubjectType.IP, value=ip),
                 include_raw=False,
             )
         )
-        whois = result.parsed
-        sources["whois"] = "ok" if "error" not in result.parsed else "degraded"
-        partial = partial or "error" in result.parsed
+        whois = whois_result.parsed
+        sources["whois"] = "ok" if "error" not in whois_result.parsed else "degraded"
+        partial = partial or "error" in whois_result.parsed
 
     if IPLookupView.REPUTATION in req.views:
         reputation = IPReputationResult()

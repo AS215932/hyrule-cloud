@@ -103,7 +103,7 @@ async def dnssec_report(name: str) -> DNSDiagnosticResponse:
 
 def resolver_detect(headers: dict[str, str | None] | None = None) -> DNSDiagnosticResponse:
     headers = headers or {}
-    evidence = {
+    evidence: dict[str, object] = {
         "x_forwarded_for": headers.get("x-forwarded-for"),
         "cf_connecting_ip": headers.get("cf-connecting-ip"),
         "note": "Server-side APIs cannot reliably detect the end user's recursive resolver without a client-side DNS token test.",

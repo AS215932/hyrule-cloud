@@ -44,7 +44,7 @@ class BGPJobHeartbeat(BaseModel):
     artifact_snapshot_id: str | None = None
 
 
-def _state(request: Request):
+def _state(request: Request) -> Any | None:
     return getattr(request.app.state, "_typed_state", None)
 
 
@@ -57,7 +57,7 @@ def _require_token(request: Request) -> None:
         raise HTTPException(status_code=403, detail="invalid BGP ingest token")
 
 
-async def _session(request: Request):
+async def _session(request: Request) -> Any | None:
     state = _state(request)
     factory = getattr(state, "session_factory", None)
     if factory is None:

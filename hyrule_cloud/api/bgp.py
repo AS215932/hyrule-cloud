@@ -6,6 +6,7 @@ import hashlib
 import secrets
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse
@@ -40,11 +41,11 @@ from hyrule_cloud.services.bgp.lookup import as215932_status, lookup_bgp
 router = APIRouter(prefix="/v1/bgp", tags=["BGP intelligence"])
 
 
-def _state(request: Request):
+def _state(request: Request) -> Any | None:
     return getattr(request.app.state, "_typed_state", None)
 
 
-def _session_factory(request: Request):
+def _session_factory(request: Request) -> Any | None:
     return getattr(_state(request), "session_factory", None)
 
 
@@ -178,7 +179,7 @@ async def bgp_lookup(request: Request, body: BGPLookupRequest) -> BGPLookupRespo
 async def bgp_prefix(request: Request, prefix: str) -> BGPLookupResponse | Response:
     if payment := await _paid_lookup(request):
         return payment
-    body = BGPLookupRequest(subject={"type": "prefix", "value": prefix})
+    body = BGPLookupRequest.model_validate({"subject": {"type": "prefix", "value": prefix}})
     result = await lookup_bgp(body)
     result.charged_amount_usd = str(payment_price(request, "price_bgp_lookup", "0.005"))
     return result
@@ -188,7 +189,7 @@ async def bgp_prefix(request: Request, prefix: str) -> BGPLookupResponse | Respo
 async def bgp_ip(request: Request, address: str) -> BGPLookupResponse | Response:
     if payment := await _paid_lookup(request):
         return payment
-    body = BGPLookupRequest(subject={"type": "ip", "value": address})
+    body = BGPLookupRequest.model_validate({"subject": {"type": "ip", "value": address}})
     result = await lookup_bgp(body)
     result.charged_amount_usd = str(payment_price(request, "price_bgp_lookup", "0.005"))
     return result
@@ -198,7 +199,7 @@ async def bgp_ip(request: Request, address: str) -> BGPLookupResponse | Response
 async def bgp_asn(request: Request, asn: str) -> BGPLookupResponse | Response:
     if payment := await _paid_lookup(request):
         return payment
-    body = BGPLookupRequest(subject={"type": "asn", "value": asn})
+    body = BGPLookupRequest.model_validate({"subject": {"type": "asn", "value": asn}})
     result = await lookup_bgp(body)
     result.charged_amount_usd = str(payment_price(request, "price_bgp_lookup", "0.005"))
     return result

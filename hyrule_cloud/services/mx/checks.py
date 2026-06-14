@@ -71,7 +71,7 @@ def _dns_summary(tool: MXTool, target: str, values: list[str]) -> str:
 
 
 async def _dns_record(tool: MXTool, target: str, rtype: DNSLookupRecordType) -> MXCheckResponse:
-    resp = await dns_lookup(DNSLookupRequest(name=target, type=rtype))  # type: ignore[name-defined]
+    resp = await dns_lookup(DNSLookupRequest(name=target, type=rtype))
     values = [answer.value for answer in resp.answers]
     findings = [
         _finding(MXStatus.OK, f"{tool.value}_present", f"Found {len(values)} {rtype.value} record(s).", records=values)

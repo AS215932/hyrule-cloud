@@ -192,7 +192,7 @@ def _tls_certificate(host: str, port: int) -> dict[str, object]:
     addresses = assert_safe_active_probe_target(host, port=port)
     with socket.create_connection((addresses[0], port), timeout=10) as sock:
         with context.wrap_socket(sock, server_hostname=host) as tls:
-            cert = tls.getpeercert()
+            cert: dict[str, object] = dict(tls.getpeercert() or {})
             return {
                 "subject": cert.get("subject", []),
                 "issuer": cert.get("issuer", []),
@@ -212,7 +212,12 @@ def _cert_findings(host: str, cert: dict[str, object]) -> list[DiagnosticFinding
         days = (expires - datetime.now(UTC)).days
         severity = DiagnosticStatus.CRITICAL if days < 0 else DiagnosticStatus.WARNING if days < 14 else DiagnosticStatus.OK
         findings.append(_finding(severity, "tls_cert_expiry", f"Certificate expires in {days} day(s).", "Renew the certificate." if days < 14 else None, expires_at=expires.isoformat(), days_remaining=days))
-    sans = [item[1] for item in cert.get("subject_alt_names", []) if isinstance(item, tuple) and len(item) == 2]
+    raw_sans = cert.get("subject_alt_names", [])
+    sans: list[str] = []
+    if isinstance(raw_sans, (list, tuple)):
+        for item in raw_sans:
+            if isinstance(item, tuple) and len(item) == 2:
+                sans.append(str(item[1]))
     if _host_matches_san(host, sans):
         findings.append(_finding(DiagnosticStatus.OK, "tls_name_matches", "Certificate subjectAltName matches host.", sans=sans[:20]))
     else:
