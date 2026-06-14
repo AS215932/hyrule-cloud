@@ -16,7 +16,21 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
 from hyrule_cloud.api.auth import router as auth_router
+from hyrule_cloud.api.bgp import router as bgp_router
+from hyrule_cloud.api.dns import router as dns_router
+from hyrule_cloud.api.internal_bgp import router as internal_bgp_router
+from hyrule_cloud.api.ip import router as ip_router
+from hyrule_cloud.api.mail import router as mail_router
+from hyrule_cloud.api.mx import router as mx_router
+from hyrule_cloud.api.nat import router as nat_router
+from hyrule_cloud.api.path import router as path_router
+from hyrule_cloud.api.ports import router as ports_router
+from hyrule_cloud.api.registry import router as registry_router
 from hyrule_cloud.api.routes import router
+from hyrule_cloud.api.speedtest import router as speedtest_router
+from hyrule_cloud.api.threat import router as threat_router
+from hyrule_cloud.api.voip import router as voip_router
+from hyrule_cloud.api.web import router as web_router
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
 from hyrule_cloud.middleware.metrics import install_metrics
@@ -156,6 +170,22 @@ app = FastAPI(
 )
 
 app.include_router(router)
+# Contract-first network intelligence APIs. Implementations land behind these
+# stable OpenAPI surfaces in the next execution steps.
+app.include_router(bgp_router)
+app.include_router(ip_router)
+app.include_router(dns_router)
+app.include_router(registry_router)
+app.include_router(web_router)
+app.include_router(mx_router)
+app.include_router(path_router)
+app.include_router(ports_router)
+app.include_router(nat_router)
+app.include_router(threat_router)
+app.include_router(voip_router)
+app.include_router(speedtest_router)
+app.include_router(mail_router)
+app.include_router(internal_bgp_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
 app.include_router(auth_router)
 
@@ -190,23 +220,212 @@ async def x402_manifest():
                 "method": "POST",
                 "description": "Provision a bare VM with SSH access",
                 "minPrice": str(config.payment.price_vm_xs),
-                "networks": config.payment.networks,
+                "networks": getattr(config.payment, "networks", []),
             },
             {
                 "path": "/v1/domain/register",
                 "method": "POST",
                 "description": "Register a domain via Openprovider",
                 "minPrice": str(config.payment.price_domain_markup + 5),
-                "networks": config.payment.networks,
+                "networks": getattr(config.payment, "networks", []),
             },
             {
                 "path": "/v1/network/request",
                 "method": "POST",
                 "description": "Make a micro-proxy network request over Direct, Tor, I2P, or Yggdrasil",
                 "minPrice": str(config.payment.price_proxy_direct),
-                "networks": config.payment.networks,
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/bgp/lookup",
+                "method": "POST",
+                "description": "Paid BGP/routing lookup by prefix, IP, ASN, or AS215932 router-table dataset",
+                "minPrice": str(getattr(config.payment, "price_bgp_lookup", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/bgp/jobs",
+                "method": "POST",
+                "description": "Paid historical BGPStream job over RouteViews and RIPE RIS collectors",
+                "minPrice": str(getattr(config.payment, "price_bgpstream_hour", "0.05")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/bgp/snapshots/router/{snapshot_id}/download",
+                "method": "GET",
+                "description": "Paid AS215932 active router table snapshot download",
+                "minPrice": str(getattr(config.payment, "price_bgp_router_table", "0.10")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/ip/lookup",
+                "method": "POST",
+                "description": "Paid IP geolocation, ASN/ISP, reverse DNS, RDAP/WHOIS, reputation, and BGP-context lookup",
+                "minPrice": str(getattr(config.payment, "price_ip_lookup", "0.003")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/dns/lookup",
+                "method": "POST",
+                "description": "Paid read-only DNS lookup, reverse lookup, DNSSEC, and trace diagnostics",
+                "minPrice": str(getattr(config.payment, "price_dns_lookup", "0.001")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/dns/propagation",
+                "method": "POST",
+                "description": "Paid DNS propagation comparison across public recursive resolvers",
+                "minPrice": str(getattr(config.payment, "price_dns_lookup", "0.001")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/dns/recommend-records",
+                "method": "POST",
+                "description": "Paid DNS record recommendations for web, mail, SIP, verification, and reverse DNS workflows",
+                "minPrice": str(getattr(config.payment, "price_dns_lookup", "0.001")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/rdap/lookup",
+                "method": "POST",
+                "description": "Paid structured RDAP lookup for domains, IPs, prefixes, ASNs, and entities",
+                "minPrice": str(getattr(config.payment, "price_rdap_lookup", "0.003")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/whois/lookup",
+                "method": "POST",
+                "description": "Paid legacy WHOIS lookup for domains, IPs, prefixes/network blocks, and ASNs",
+                "minPrice": str(getattr(config.payment, "price_whois_lookup", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/web/check",
+                "method": "POST",
+                "description": "Paid web reachability, HTTP/HTTPS, TLS certificate, security headers, and CDN/WAF diagnostic check",
+                "minPrice": str(getattr(config.payment, "price_web_check", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/web/reports",
+                "method": "POST",
+                "description": "Paid web reachability evidence pack from Hyrule/extmon vantage",
+                "minPrice": str(getattr(config.payment, "price_web_report", "0.03")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/web/tls/deep",
+                "method": "POST",
+                "description": "Paid Hyrule-native SSL Labs-style deep TLS scanner and grade",
+                "minPrice": str(getattr(config.payment, "price_web_tls_deep", "0.10")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/mx/check",
+                "method": "POST",
+                "description": "Paid MXToolbox-compatible diagnostic check for mail, DNS, blacklist, SMTP, and domain troubleshooting",
+                "minPrice": str(getattr(config.payment, "price_mx_check", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/mx/bounce/parse",
+                "method": "POST",
+                "description": "Paid mail bounce/rejection parser and likely-cause classifier",
+                "minPrice": str(getattr(config.payment, "price_mx_check", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/mx/recommend-records",
+                "method": "POST",
+                "description": "Paid SPF, DKIM, DMARC, MTA-STS, TLS-RPT, and BIMI recommendation engine",
+                "minPrice": str(getattr(config.payment, "price_mx_check", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/mx/jobs",
+                "method": "POST",
+                "description": "Paid full mail-delivery diagnostic report for agentic ISP support workflows",
+                "minPrice": str(getattr(config.payment, "price_mx_report", "0.03")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/path/report",
+                "method": "POST",
+                "description": "Paid routing/path evidence pack using extmon, AS215932, BGP/RPKI, and optional multi-vantage sources",
+                "minPrice": str(getattr(config.payment, "price_path_report", "0.05")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/path/ping",
+                "method": "POST",
+                "description": "Paid ping/path probe from approved Hyrule diagnostic vantages",
+                "minPrice": str(getattr(config.payment, "price_path_probe", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/ports/check",
+                "method": "POST",
+                "description": "Paid outside-in single declared service reachability check with strict port allowlist",
+                "minPrice": str(getattr(config.payment, "price_port_check", "0.003")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/nat/lookup",
+                "method": "POST",
+                "description": "Paid server-only CGNAT/NAT hint report from caller and customer WAN/LAN evidence",
+                "minPrice": str(getattr(config.payment, "price_nat_lookup", "0.003")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/nat/port-forward/check",
+                "method": "POST",
+                "description": "Paid outside-in NAT port-forward reachability check for one declared service",
+                "minPrice": str(getattr(config.payment, "price_nat_port_forward_check", "0.005")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/threat/lookup",
+                "method": "POST",
+                "description": "Paid open-source-first threat/reputation lookup with licensed provider adapters disabled until configured",
+                "minPrice": str(getattr(config.payment, "price_threat_lookup", "0.01")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/voip/check",
+                "method": "POST",
+                "description": "Paid SIP DNS, SIP TLS, OPTIONS, STUN/TURN diagnostic check",
+                "minPrice": str(getattr(config.payment, "price_voip_check", "0.01")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/voip/number/lookup",
+                "method": "POST",
+                "description": "Paid pluggable number carrier/CNAM/spam/E911 lookup",
+                "minPrice": str(getattr(config.payment, "price_voip_number_lookup", "0.05")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/speedtest",
+                "method": "POST",
+                "description": "Paid throughput/latency/jitter evidence to Hyrule/AS215932 endpoints",
+                "minPrice": str(getattr(config.payment, "price_speedtest", "0.10")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/mail/accounts",
+                "method": "POST",
+                "description": "Create a paid Agent Mail mailbox with SMTP/IMAP and API access",
+                "minPrice": str(getattr(config.payment, "price_mail_agent_basic_day", "0.05")),
+                "networks": getattr(config.payment, "networks", []),
+            },
+            {
+                "path": "/v1/mail/messages/send",
+                "method": "POST",
+                "description": "Send email through an Agent Mail mailbox via API",
+                "minPrice": str(getattr(config.payment, "price_mail_outbound_message", "0.001")),
+                "networks": getattr(config.payment, "networks", []),
             },
         ],
-        "facilitator": config.payment.facilitator_url,
+        "facilitator": getattr(config.payment, "facilitator_url", ""),
         "contact": "https://github.com/as215932",
     }

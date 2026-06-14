@@ -1,0 +1,68 @@
+# Hyrule Agentic ISP Support Skill
+
+Hyrule Agentic ISP Support is the umbrella Skill for x402-paid network facts
+that LLMs cannot infer: live reachability, DNS, BGP, mail deliverability,
+routing/path evidence, TLS, reputation, VoIP, NAT hints, speedtests, and
+AS215932-backed external vantage data.
+
+## Focused subskills
+
+- `SKILL-web-reachability.md` → `/v1/web`
+- `SKILL-mail-deliverability.md` → `/v1/mx`
+- `SKILL-dns-registry.md` → `/v1/dns`, `/v1/rdap`, `/v1/whois`
+- `SKILL-routing-path.md` → `/v1/path`, `/v1/bgp`
+- `SKILL-port-reachability.md` → `/v1/ports`
+- `SKILL-nat-cgnat.md` → `/v1/nat`
+- `SKILL-threat-reputation.md` → `/v1/threat`
+- `SKILL-voip-sip.md` → `/v1/voip`
+- `SKILL-speedtest.md` → `/v1/speedtest`
+- `SKILL-mail.md` → `/v1/mail`
+
+## Typical ISP support flow
+
+1. Identify caller domain, IP, URL, mailbox, phone number, or service port.
+2. For website outages, run `/v1/web/check`; use `/v1/web/tls/deep` for deep TLS.
+3. For mail delivery, run `/v1/mx/reports/mail-delivery`; parse bounces with
+   `/v1/mx/bounce/parse`.
+4. For DNS/registry, use `/v1/dns/propagation`, `/v1/dns/recommend-records`,
+   `/v1/rdap/lookup`, and `/v1/whois/lookup`.
+5. For routing/path claims, use `/v1/path/report` and `/v1/bgp/lookup`.
+6. For outside-in reachability, use `/v1/ports/check` or
+   `/v1/nat/port-forward/check`.
+7. For NAT/CGNAT, start with free `/v1/nat/ip`, then paid `/v1/nat/lookup`.
+8. For reputation, use `/v1/threat/lookup`; for VoIP, use `/v1/voip/check`.
+9. For throughput to Hyrule/AS215932, use `/v1/speedtest`.
+10. Use `/v1/mail` only for Hyrule-hosted Agent Mail mailbox operations.
+
+## Discovery
+
+- `/.well-known/x402.json` lists paid resources and prices.
+- `/v1/*/capabilities` describes each product boundary.
+- `/v1/mx/tools` lists SuperTool-compatible mail diagnostics.
+- `/v1/path/vantages`, `/v1/threat/sources`, and `/v1/voip/sources` expose
+  external/provider source status.
+
+## Product boundaries
+
+- Domain sales: `/v1/domain`
+- Authoritative DNS mutation: `/v1/zone`
+- Recursive/read-only DNS diagnostics: `/v1/dns`
+- Mail deliverability diagnostics: `/v1/mx`
+- Paid mailboxes: `/v1/mail`
+- BGP/routing intelligence: `/v1/bgp`
+- Path/packet-loss evidence: `/v1/path`
+- Web/TLS/header/CDN diagnostics: `/v1/web`
+- Single-service reachability: `/v1/ports`
+- NAT/CGNAT hints: `/v1/nat`
+- Threat/reputation context: `/v1/threat`
+- VoIP/SIP diagnostics: `/v1/voip`
+- Speedtest to Hyrule/AS215932: `/v1/speedtest`
+- IP/registry intelligence: `/v1/ip`, `/v1/rdap`, `/v1/whois`
+
+## Abuse and source policy
+
+Active probes block private, reserved, loopback, link-local, and multicast
+targets by default. Port reachability is single-service only, not broad
+scanning. Licensed threat/VoIP/mail reputation providers are represented as
+pluggable sources and return `source_not_configured` until credentials and terms
+are in place.
