@@ -20,42 +20,54 @@ _STATUS_VALUES = ("registering", "active", "failed", "expired")
 
 
 def upgrade() -> None:
-    status_enum = sa.Enum(*_STATUS_VALUES, name="domain_status")
-    status_enum.create(op.get_bind(), checkfirst=True)
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    existing_columns = {column["name"] for column in inspector.get_columns("domains")}
+    existing_indexes = {index["name"] for index in inspector.get_indexes("domains")}
+    existing_fks = {fk["name"] for fk in inspector.get_foreign_keys("domains")}
 
-    op.add_column("domains", sa.Column("owner_account_id", sa.String(11), nullable=True))
-    op.add_column("domains", sa.Column("anon_management_token_hash", sa.String(64), nullable=True))
-    op.add_column(
-        "domains",
+    status_enum = sa.Enum(*_STATUS_VALUES, name="domain_status")
+    status_enum.create(bind, checkfirst=True)
+
+    def add_column_if_missing(column: sa.Column) -> None:
+        if column.name not in existing_columns:
+            op.add_column("domains", column)
+            existing_columns.add(column.name)
+
+    add_column_if_missing(sa.Column("owner_account_id", sa.String(11), nullable=True))
+    add_column_if_missing(sa.Column("anon_management_token_hash", sa.String(64), nullable=True))
+    add_column_if_missing(
         sa.Column(
             "status",
             status_enum,
             nullable=False,
             server_default="active",
-        ),
+        )
     )
-    op.add_column("domains", sa.Column("client_order_id", sa.String(64), nullable=True))
-    op.add_column("domains", sa.Column("registrar_price", sa.Numeric(12, 6), nullable=True))
-    op.add_column("domains", sa.Column("markup", sa.Numeric(12, 6), nullable=True))
-    op.add_column("domains", sa.Column("total_price", sa.Numeric(12, 6), nullable=True))
-    op.add_column(
-        "domains",
-        sa.Column("currency", sa.String(8), nullable=False, server_default="USD"),
-    )
-    op.add_column("domains", sa.Column("error", sa.Text(), nullable=True))
+    add_column_if_missing(sa.Column("client_order_id", sa.String(64), nullable=True))
+    add_column_if_missing(sa.Column("registrar_price", sa.Numeric(12, 6), nullable=True))
+    add_column_if_missing(sa.Column("markup", sa.Numeric(12, 6), nullable=True))
+    add_column_if_missing(sa.Column("total_price", sa.Numeric(12, 6), nullable=True))
+    add_column_if_missing(sa.Column("currency", sa.String(8), nullable=False, server_default="USD"))
+    add_column_if_missing(sa.Column("error", sa.Text(), nullable=True))
 
-    op.create_foreign_key(
-        "domains_owner_account_id_fkey",
-        "domains",
-        "accounts",
-        ["owner_account_id"],
-        ["account_id"],
-        ondelete="SET NULL",
-    )
-    op.create_index("ix_domains_owner_account_id", "domains", ["owner_account_id"])
-    op.create_index("ix_domains_anon_management_token_hash", "domains", ["anon_management_token_hash"])
-    op.create_index("ix_domains_status", "domains", ["status"])
-    op.create_index("ix_domains_client_order_id", "domains", ["client_order_id"], unique=True)
+    if "domains_owner_account_id_fkey" not in existing_fks:
+        op.create_foreign_key(
+            "domains_owner_account_id_fkey",
+            "domains",
+            "accounts",
+            ["owner_account_id"],
+            ["account_id"],
+            ondelete="SET NULL",
+        )
+    if "ix_domains_owner_account_id" not in existing_indexes:
+        op.create_index("ix_domains_owner_account_id", "domains", ["owner_account_id"])
+    if "ix_domains_anon_management_token_hash" not in existing_indexes:
+        op.create_index("ix_domains_anon_management_token_hash", "domains", ["anon_management_token_hash"])
+    if "ix_domains_status" not in existing_indexes:
+        op.create_index("ix_domains_status", "domains", ["status"])
+    if "ix_domains_client_order_id" not in existing_indexes:
+        op.create_index("ix_domains_client_order_id", "domains", ["client_order_id"], unique=True)
 
 
 def downgrade() -> None:
