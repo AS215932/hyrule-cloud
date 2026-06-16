@@ -57,7 +57,7 @@ def build_launch_proof(
         payment_status = PaymentStatus.PAID
 
     # --- Launch-proof state ---
-    vm_status_str = _safe_getattr(vm_row, "status", "")
+    vm_status_str = str(_safe_getattr(vm_row, "status", "") or "")
     try:
         vm_status = VMStatus(vm_status_str)
     except ValueError:
@@ -113,7 +113,8 @@ def build_launch_proof(
 
     if vm_status == VMStatus.FAILED:
         if not operator_message:
-            operator_message = _safe_getattr(vm_row, "error", None)
+            err = _safe_getattr(vm_row, "error", None)
+            operator_message = str(err) if err else None
         if not customer_message:
             customer_message = (
                 "Provisioning could not be completed. "
