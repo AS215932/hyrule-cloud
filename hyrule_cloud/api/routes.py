@@ -61,6 +61,7 @@ from hyrule_cloud.models import (
     VMStatusResponse,
     generate_domain_management_token,
 )
+from hyrule_cloud.services.launch_proof import build_launch_proof
 from hyrule_cloud.services.quotes import (
     QuoteConflictError,
     QuoteExistsError,
@@ -572,12 +573,23 @@ async def get_vm_public_status(
     row = await orch.get_vm(vm_id)
     if not row:
         raise HTTPException(404, "VM not found")
+    quote = None
+    if hasattr(orch, "get_quote_for_vm"):
+        quote = await orch.get_quote_for_vm(vm_id)
+    lp = build_launch_proof(row, quote_row=quote)
     return VMPublicStatusResponse(
         vm_id=row.vm_id,
         status=VMStatus(row.status),
         ipv6=row.ipv6,
         hostname=row.hostname,
         expires_at=row.expires_at,
+        launch_proof_status=lp["launch_proof_status"],
+        payment_status=lp["payment_status"],
+        dns_aaaa_verified=lp["dns_aaaa_verified"],
+        ssh_smoke_status=lp["ssh_smoke_status"],
+        rollback_available=lp["rollback_available"],
+        operator_message=lp["operator_message"],
+        customer_message=lp["customer_message"],
     )
 
 

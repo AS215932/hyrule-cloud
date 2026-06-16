@@ -16,7 +16,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import DomainRow, VMRow
+from hyrule_cloud.db import DomainRow, VMQuoteRow, VMRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
@@ -161,7 +161,17 @@ class Orchestrator:
         return row, anon_token
 
     async def _provision_vm(self, vm_id: str) -> None:
-        """Background provisioning: create VM, wait for IPv6, configure DNS."""
+        """Background provisioning: create VM, wait for IPv6, configure DNS.
+
+        Issue #28: controlled simulation by default. Real XCP-NG / DNS only
+        when HCP_LAUNCH_PROOF_REAL_XCPNG=1.
+        """
+        from hyrule_cloud.services.launch_proof import use_real_provisioning
+
+        if not use_real_provisioning():
+            await self._simulate_provisioning(vm_id)
+            return
+
         try:
             log.info("provision_start", vm_id=vm_id)
 
@@ -239,6 +249,39 @@ class Orchestrator:
                 )
                 await session.commit()
 
+    async def _simulate_provisioning(self, vm_id: str) -> None:
+        """Controlled simulation of provisioning (issue #28).
+
+        Skips XCP-NG, DNS, and Openprovider. Sets a fake IPv6 and flips
+        the VM to READY after a short delay so the launch-proof contract
+        can be exercised end-to-end without touching real infra.
+        """
+        import random
+
+        log.info("provision_simulate_start", vm_id=vm_id)
+
+        # Simulate brief provisioning work
+        await asyncio.sleep(0.1)
+
+        fake_ipv6 = f"2001:db8::{random.randint(0x1000, 0x9999):04x}"
+
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if not row:
+                return
+            row.ipv6 = fake_ipv6
+            row.status = VMStatus.READY
+            row.provisioned_at = _now()
+            meta = row.metadata_ or {}
+            lp = meta.get("launch_proof", {})
+            lp["dns_aaaa_verified"] = True
+            lp["ssh_smoke_status"] = "passed"
+            meta["launch_proof"] = lp
+            row.metadata_ = meta
+            await session.commit()
+
+        log.info("provision_simulate_complete", vm_id=vm_id, ipv6=fake_ipv6)
+
     async def _wait_for_ipv6(self, xcpng_uuid: str, timeout: int = 120) -> str | None:
         elapsed = 0
         interval = 5
@@ -311,6 +354,13 @@ class Orchestrator:
         async with self.db() as session:
             result = await session.execute(
                 select(VMRow).where(VMRow.vm_id == vm_id, VMRow.owner_wallet == wallet)
+            )
+            return result.scalar_one_or_none()
+
+    async def get_quote_for_vm(self, vm_id: str) -> VMQuoteRow | None:
+        async with self.db() as session:
+            result = await session.execute(
+                select(VMQuoteRow).where(VMQuoteRow.vm_id == vm_id)
             )
             return result.scalar_one_or_none()
 

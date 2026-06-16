@@ -49,10 +49,16 @@ class MockOrchestrator:
                 error = None
                 open_ports = [22, 80]
                 created_at = datetime.utcnow()
+                metadata_ = None
+                payment_tx = None
+                cost_total = Decimal("0.05")
                 # Block A0: matches _TEST_TOKEN, so the management routes
                 # accept the bearer header / ?token= param in tests.
                 anon_management_token_hash = hash_anon_token(_TEST_TOKEN)
             return MockRow()
+        return None
+
+    async def get_quote_for_vm(self, vm_id):
         return None
 
 class MockGate:
