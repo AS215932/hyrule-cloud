@@ -80,6 +80,33 @@ class VMStatus(enum.StrEnum):
     DESTROYED = "destroyed"
 
 
+class LaunchProofStatus(enum.StrEnum):
+    """Issue #28: customer-visible launch-proof contract states."""
+
+    ACCEPTED = "accepted"
+    PAYMENT_REQUIRED = "payment_required"
+    PROVISIONING = "provisioning"
+    PROVISIONED = "provisioned"
+    FAILED = "failed"
+    ROLLED_BACK = "rolled_back"
+
+
+class PaymentStatus(enum.StrEnum):
+    """Issue #28: payment status for the launch-proof contract."""
+
+    PAID = "paid"
+    PAYMENT_REQUIRED = "payment_required"
+    NOT_REQUIRED = "not_required"
+
+
+class SSHSmokeStatus(enum.StrEnum):
+    """Issue #28: SSH smoke-test result for the launch-proof contract."""
+
+    NOT_RUN = "not_run"
+    PASSED = "passed"
+    FAILED = "failed"
+
+
 class DomainMode(enum.StrEnum):
     AUTO = "auto"      # subdomain under the configured deploy domain
     CUSTOM = "custom"  # register via Openprovider
@@ -255,6 +282,9 @@ class VMPublicStatusResponse(BaseModel):
     Block A0: any caller (no token, no account) can fetch this for any
     vm_id. Reveals only the fields needed for an order-status page —
     NO ssh string, NO firewall config, NO provisioning error detail.
+
+    Issue #28: enriched with launch-proof contract fields so a customer
+    can follow a VM from quote acceptance through provisioned/failed.
     """
 
     vm_id: str
@@ -262,6 +292,14 @@ class VMPublicStatusResponse(BaseModel):
     ipv6: str | None = None
     hostname: str | None = None
     expires_at: datetime | None = None
+    # Launch-proof contract fields (issue #28)
+    launch_proof_status: LaunchProofStatus | None = None
+    payment_status: PaymentStatus | None = None
+    dns_aaaa_verified: bool = False
+    ssh_smoke_status: SSHSmokeStatus = SSHSmokeStatus.NOT_RUN
+    rollback_available: bool = False
+    operator_message: str | None = None
+    customer_message: str | None = None
 
 
 class FirewallState(BaseModel):
