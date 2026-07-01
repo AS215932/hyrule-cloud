@@ -156,7 +156,7 @@ class PaymentConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PAYMENT_", env_file=".env", extra="ignore")
 
     receiver_address: str = ""
-    facilitator_url: str = "https://x402.org/facilitator"
+    facilitator_url: str = "https://pay.openfacilitator.io"
 
     # Block C (Wave 3): the rich PaymentNetwork list. Keyed list rather than a
     # dict so iteration order matches the order operators set in Vault. This

@@ -7,28 +7,123 @@ the SDK's lower-level primitives:
 
 - x402ResourceServer + ExactEvmServerScheme for verify/settle
 - HTTPFacilitatorClient for facilitator communication
-- PaymentOption / RouteConfig types for response formatting
+- PaymentRequirements / PaymentRequired models for response formatting
 
-Route handlers call `require_payment()` with a computed amount and get
+Route handlers call `check_payment()` with a computed amount and get
 back either a 402 Response or the verified payment details.
 """
 
 from __future__ import annotations
 
-import base64
+import asyncio
+import inspect
 import json
+import os
+import secrets
+import time
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlparse
 
 import structlog
 from fastapi import Request, Response
-from x402.http import FacilitatorConfig, HTTPFacilitatorClient
+from x402.http import (
+    PAYMENT_REQUIRED_HEADER,
+    PAYMENT_RESPONSE_HEADER,
+    PAYMENT_SIGNATURE_HEADER,
+    X_PAYMENT_HEADER,
+    X_PAYMENT_RESPONSE_HEADER,
+    AuthHeaders,
+    FacilitatorConfig,
+    HTTPFacilitatorClient,
+    decode_payment_signature_header,
+    encode_payment_required_header,
+    encode_payment_response_header,
+)
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
+from x402.schemas import PaymentPayload, PaymentRequirements, ResourceConfig, ResourceInfo
 from x402.server import x402ResourceServer
 
 from hyrule_cloud.config import PaymentConfig
 
 log = structlog.get_logger()
+
+LEGACY_PAYMENT_REQUIRED_HEADER = "X-PAYMENT-REQUIRED"
+_OPENFACILITATOR_HOST = "pay.openfacilitator.io"
+_CDP_FACILITATOR_HOST = "api.cdp.coinbase.com"
+_ALLOWED_FACILITATOR_HOSTS = {_OPENFACILITATOR_HOST, _CDP_FACILITATOR_HOST}
+
+
+class CdpFacilitatorAuthProvider:
+    """Generate short-lived CDP REST JWT auth headers for x402 facilitator calls."""
+
+    def __init__(self, api_key_id: str, api_key_secret: str, facilitator_url: str) -> None:
+        self.api_key_id = api_key_id
+        self.api_key_secret = api_key_secret.replace("\\n", "\n")
+        parsed = urlparse(facilitator_url)
+        self.host = parsed.netloc or _CDP_FACILITATOR_HOST
+        self.base_path = parsed.path.rstrip("/")
+
+    def _jwt_for(self, method: str, suffix: str) -> str:
+        import jwt
+
+        now = int(time.time())
+        path = f"{self.base_path}/{suffix.lstrip('/')}"
+        uri = f"{method.upper()} {self.host}{path}"
+        payload = {
+            "iss": self.api_key_id,
+            "sub": self.api_key_id,
+            "nbf": now,
+            "exp": now + 120,
+            "uri": uri,
+        }
+        headers = {"kid": self.api_key_id, "nonce": secrets.token_hex(16)}
+        return jwt.encode(payload, self.api_key_secret, algorithm="ES256", headers=headers)
+
+    def _bearer(self, method: str, suffix: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._jwt_for(method, suffix)}"}
+
+    def get_auth_headers(self) -> AuthHeaders:
+        return AuthHeaders(
+            verify=self._bearer("POST", "verify"),
+            settle=self._bearer("POST", "settle"),
+            supported=self._bearer("GET", "supported"),
+        )
+
+
+def _dotenv_value(key: str) -> str:
+    try:
+        for raw_line in open(".env", encoding="utf-8"):
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name.strip() == key:
+                return value.strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def _env_or_dotenv(key: str) -> str:
+    return os.environ.get(key, "") or _dotenv_value(key)
+
+
+def _facilitator_config(config: PaymentConfig) -> FacilitatorConfig:
+    auth_provider = None
+    facilitator_host = urlparse(config.facilitator_url).hostname or ""
+    if facilitator_host not in _ALLOWED_FACILITATOR_HOSTS:
+        raise ValueError(f"Unsupported x402 facilitator host: {facilitator_host}")
+    if facilitator_host == _CDP_FACILITATOR_HOST:
+        api_key_id = _env_or_dotenv("CDP_API_KEY_ID")
+        api_key_secret = _env_or_dotenv("CDP_API_KEY_SECRET")
+        if api_key_id and api_key_secret:
+            auth_provider = CdpFacilitatorAuthProvider(
+                api_key_id,
+                api_key_secret,
+                config.facilitator_url,
+            )
+    return FacilitatorConfig(url=config.facilitator_url, auth_provider=auth_provider)
 
 
 class PaymentGate:
@@ -42,59 +137,145 @@ class PaymentGate:
 
     def __init__(self, config: PaymentConfig) -> None:
         self.config = config
-        self.facilitator = HTTPFacilitatorClient(
-            FacilitatorConfig(url=config.facilitator_url)
-        )
+        self.facilitator = HTTPFacilitatorClient(_facilitator_config(config))
         self.server = x402ResourceServer(self.facilitator)
         for net_cfg in self.config.networks:
             # We assume ExactEvmServerScheme works out of the box for these during Phase 1
             # (In production, Solana would use an ExactSolanaServerScheme)
             self.server.register(net_cfg["network"], ExactEvmServerScheme())
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
 
-    def build_402_response(
+    async def _ensure_initialized(self) -> bool:
+        """Lazily fetch facilitator support once for SDK requirement building."""
+        if self._initialized:
+            return True
+        async with self._init_lock:
+            if self._initialized:
+                return True
+            try:
+                await asyncio.to_thread(self.server.initialize)
+            except Exception:
+                log.error("payment_facilitator_initialization_failed", exc_info=True)
+                return False
+            self._initialized = True
+            return True
+
+    @staticmethod
+    def _json_response(status_code: int, body: dict[str, Any], headers: dict[str, str] | None = None) -> Response:
+        response_headers = {"Content-Type": "application/json"}
+        if headers:
+            response_headers.update(headers)
+        return Response(
+            status_code=status_code,
+            content=json.dumps(body),
+            headers=response_headers,
+        )
+
+    def _resource_configs(self, amount: Decimal) -> list[ResourceConfig]:
+        return [
+            ResourceConfig(
+                scheme=net_cfg["scheme"],
+                network=net_cfg["network"],
+                pay_to=self.config.receiver_address,
+                price=f"${amount}",
+            )
+            for net_cfg in self.config.networks
+        ]
+
+    def _build_requirements(self, amount: Decimal) -> list[PaymentRequirements]:
+        requirements: list[PaymentRequirements] = []
+        for resource_cfg in self._resource_configs(amount):
+            requirements.extend(self.server.build_payment_requirements(resource_cfg))
+        return requirements
+
+    async def _payment_required_response(
+        self,
+        requirements: list[PaymentRequirements],
+        amount: Decimal,
+        description: str,
+        extra_body: dict[str, Any] | None,
+        request_url: str | None = None,
+        error: str | None = None,
+    ) -> Response:
+        resource = ResourceInfo(url=request_url or "", description=description or None)
+        payment_required = self.server.create_payment_required_response(
+            requirements,
+            resource=resource,
+            error=error,
+        )
+        if inspect.isawaitable(payment_required):
+            payment_required = await payment_required
+        encoded = encode_payment_required_header(payment_required)
+
+        body: dict[str, Any] = dict(extra_body or {})
+        body.update(
+            {
+                "x402Version": 2,
+                "accepts": [
+                    req.model_dump(by_alias=True, exclude_none=True) for req in requirements
+                ],
+                "payment_required": True,
+                "amount": str(amount),
+                "description": description,
+                "networks": self.config.networks,
+            }
+        )
+        if error:
+            body["error"] = error
+
+        return self._json_response(
+            402,
+            body,
+            headers={
+                PAYMENT_REQUIRED_HEADER: encoded,
+                LEGACY_PAYMENT_REQUIRED_HEADER: encoded,
+            },
+        )
+
+    async def build_402_response(
         self,
         amount: Decimal,
         description: str = "",
         extra_body: dict[str, Any] | None = None,
+        request_url: str | None = None,
+        error: str | None = None,
     ) -> Response:
         """
-        Build a 402 Payment Required response using x402 SDK types.
+        Build a Payment Required response using x402 SDK types.
 
-        The response includes both the standard x402 header and a
-        JSON body with application-specific metadata (cost breakdown, etc).
+        The response includes the standard x402 v2 header (`PAYMENT-REQUIRED`)
+        plus Hyrule's legacy compatibility header (`X-PAYMENT-REQUIRED`).
         """
-        accepts = []
-        for net_cfg in self.config.networks:
-            accepts.append({
-                "scheme": net_cfg["scheme"],
-                "network": net_cfg["network"],
-                "price": f"${amount}",
-                "pay_to": self.config.receiver_address,
-            })
+        if not self.config.networks or not self.config.receiver_address:
+            log.error(
+                "payment_config_unavailable",
+                has_receiver=bool(self.config.receiver_address),
+                networks=len(self.config.networks),
+            )
+            return self._json_response(503, {"error": "Payment facilitator unavailable"})
 
-        payment_required = {
-            "x402Version": 2,
-            "accepts": accepts,
-            "description": description,
-        }
+        if not await self._ensure_initialized():
+            return self._json_response(503, {"error": "Payment facilitator unavailable"})
 
-        encoded = base64.b64encode(
-            json.dumps(payment_required).encode()
-        ).decode()
+        try:
+            requirements = self._build_requirements(amount)
+        except Exception:
+            log.error("payment_requirement_build_failed", exc_info=True)
+            return self._json_response(503, {"error": "Payment facilitator unavailable"})
 
-        body = extra_body or {}
-        body["payment_required"] = True
-        body["amount"] = str(amount)
-        body["networks"] = self.config.networks
-
-        return Response(
-            status_code=402,
-            content=json.dumps(body),
-            headers={
-                "X-PAYMENT-REQUIRED": encoded,
-                "Content-Type": "application/json",
-            },
+        return await self._payment_required_response(
+            requirements,
+            amount,
+            description,
+            extra_body,
+            request_url=request_url,
+            error=error,
         )
+
+    @staticmethod
+    def _payment_header(request: Request) -> str | None:
+        return request.headers.get(PAYMENT_SIGNATURE_HEADER) or request.headers.get(X_PAYMENT_HEADER)
 
     async def check_payment(
         self,
@@ -124,67 +305,88 @@ class PaymentGate:
                 request.state.payment_tx = "dev_bypass_0x0"
                 return "0xDEV_TEST_WALLET"
 
-        payment_header = (
-            request.headers.get("X-PAYMENT")
-            or request.headers.get("x-payment")
-            or request.headers.get("PAYMENT-SIGNATURE")
-            or request.headers.get("payment-signature")
-        )
-
+        payment_header = self._payment_header(request)
         if not payment_header:
-            return self.build_402_response(amount, description, extra_body)
+            return await self.build_402_response(
+                amount,
+                description,
+                extra_body,
+                request_url=str(request.url),
+            )
+
+        if not await self._ensure_initialized():
+            return self._json_response(503, {"error": "Payment facilitator unavailable"})
 
         try:
-            decoded_header = json.loads(base64.b64decode(payment_header).decode())
-            req_network = (
-                decoded_header.get("payload", {}).get("authorization", {}).get("asset", {}).get("network")
-                or decoded_header.get("network")
-                or self.config.networks[0]["network"]
-            )
-        except (ValueError, TypeError, json.JSONDecodeError):
-            req_network = self.config.networks[0]["network"]
-
-        # Use SDK server to verify the payment
-        try:
-            verification = await self.server.verify(
-                payment_header,
-                {
-                    "scheme": "exact",
-                    "network": req_network,
-                    "maxAmountRequired": str(int(amount * 10**6)),  # USDC 6 decimals
-                    "resource": self.config.receiver_address,
-                },
-            )
-
-            if not verification or not verification.get("isValid"):
-                log.warning("payment_verification_failed", verification=verification)
-                return Response(
-                    status_code=402,
-                    content=json.dumps({"error": "Payment verification failed"}),
-                    headers={"Content-Type": "application/json"},
+            requirements = self._build_requirements(amount)
+            payment_payload = decode_payment_signature_header(payment_header)
+            if not isinstance(payment_payload, PaymentPayload):
+                return await self._payment_required_response(
+                    requirements,
+                    amount,
+                    description,
+                    extra_body,
+                    request_url=str(request.url),
+                    error="Unsupported payment payload version",
                 )
 
-            # Settle the payment
-            settlement = await self.server.settle(
-                payment_header,
-                {
-                    "scheme": "exact",
-                    "network": req_network,
-                    "maxAmountRequired": str(int(amount * 10**6)),
-                    "resource": self.config.receiver_address,
-                },
+            matching_requirements = self.server.find_matching_requirements(
+                requirements,
+                payment_payload,
             )
-
-            if not settlement:
-                log.error("payment_settlement_failed")
-                return Response(
-                    status_code=502,
-                    content=json.dumps({"error": "Payment settlement failed"}),
-                    headers={"Content-Type": "application/json"},
+            if matching_requirements is None:
+                return await self._payment_required_response(
+                    requirements,
+                    amount,
+                    description,
+                    extra_body,
+                    request_url=str(request.url),
+                    error="No matching payment requirements",
                 )
 
-            wallet = self._extract_wallet(payment_header)
-            tx_hash = settlement.get("txHash", "")
+            verification = await self.server.verify_payment(
+                payment_payload,
+                matching_requirements,
+            )
+            if not verification.is_valid:
+                log.warning(
+                    "payment_verification_failed",
+                    invalid_reason=verification.invalid_reason,
+                    invalid_message=verification.invalid_message,
+                )
+                return await self._payment_required_response(
+                    requirements,
+                    amount,
+                    description,
+                    extra_body,
+                    request_url=str(request.url),
+                    error=verification.invalid_reason or "Payment verification failed",
+                )
+
+            settlement = await self.server.settle_payment(
+                payment_payload,
+                matching_requirements,
+            )
+            settlement_header = encode_payment_response_header(settlement)
+            settlement_headers = {
+                PAYMENT_RESPONSE_HEADER: settlement_header,
+                X_PAYMENT_RESPONSE_HEADER: settlement_header,
+            }
+
+            if not settlement.success:
+                log.warning(
+                    "payment_settlement_failed",
+                    error_reason=settlement.error_reason,
+                    error_message=settlement.error_message,
+                )
+                return self._json_response(
+                    402,
+                    {"error": settlement.error_reason or "Payment settlement failed"},
+                    headers=settlement_headers,
+                )
+
+            wallet = settlement.payer or verification.payer or self._extract_wallet(payment_header)
+            tx_hash = settlement.transaction or ""
 
             log.info(
                 "payment_settled",
@@ -193,28 +395,22 @@ class PaymentGate:
                 tx_hash=tx_hash,
             )
 
-            # Store tx_hash on request state for the route handler
             request.state.payment_tx = tx_hash
+            request.state.payment_response_headers = settlement_headers
             return wallet or "unknown"
 
         except Exception:
             log.error("payment_processing_error", exc_info=True)
-            return Response(
-                status_code=502,
-                content=json.dumps({"error": "Payment processing error"}),
-                headers={"Content-Type": "application/json"},
-            )
+            return self._json_response(502, {"error": "Payment processing error"})
 
     @staticmethod
     def _extract_wallet(payment_header: str) -> str | None:
-        """Extract payer wallet address from the payment header."""
+        """Extract payer wallet address from the payment header using the SDK."""
         try:
-            decoded = base64.b64decode(payment_header)
-            payload = json.loads(decoded)
-            # x402 exact scheme: the 'from' field in the authorization
-            return (
-                payload.get("payload", {}).get("authorization", {}).get("from")
-                or payload.get("from")
-            )
+            payload = decode_payment_signature_header(payment_header)
+            if isinstance(payload, PaymentPayload):
+                auth = payload.payload.get("authorization", {})
+                return auth.get("from") or payload.payload.get("from")
+            return None
         except Exception:
             return None
