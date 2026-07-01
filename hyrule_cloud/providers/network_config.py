@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 from ipaddress import IPv6Address, IPv6Network
+from typing import Any, cast
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 CUSTOMER_VM_INTERFACE = "enX0"
 CUSTOMER_VM_ADDRESS_HOST_ID = 2
@@ -61,7 +62,7 @@ def render_debian_network_config(
 ) -> str:
     network = IPv6Network(prefix, strict=True)
     address_with_prefix = f"{IPv6Address(address)}/{network.prefixlen}"
-    config = {
+    config: dict[str, Any] = {
         "version": 2,
         "ethernets": {
             interface: {
@@ -77,4 +78,4 @@ def render_debian_network_config(
             }
         },
     }
-    return yaml.dump(config, default_flow_style=False, sort_keys=False, width=120)
+    return cast(str, yaml.dump(config, default_flow_style=False, sort_keys=False, width=120))
