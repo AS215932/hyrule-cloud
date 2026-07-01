@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -16,11 +18,15 @@ from x402.http import (
 )
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
 from x402.schemas import (
+    AssetAmount,
     PaymentPayload,
     PaymentRequired,
     PaymentRequirements,
+    ResourceConfig,
     ResourceInfo,
     SettleResponse,
+    SupportedKind,
+    SupportedResponse,
     VerifyResponse,
 )
 
@@ -31,6 +37,7 @@ from hyrule_cloud.middleware.x402 import (
     PaymentGate,
     _facilitator_config,
 )
+from hyrule_cloud.payments.zcash import ZCASH_ASSET, ZCASH_TESTNET
 
 RECEIVER = "0xFf4555af30A1066A889324a3Fe88c76796159f15"
 PAYER = "0xFBD95291e4b9C901E084a8856eA184d3F7A232ed"
@@ -146,6 +153,82 @@ class _FailingInitServer(_FakeServer):
         raise RuntimeError("facilitator down")
 
 
+class _FakeZcashPayment:
+    enabled = True
+    network = ZCASH_TESTNET
+
+    def __init__(self) -> None:
+        self.invoice = SimpleNamespace(
+            invoice_id="inv_test",
+            network=ZCASH_TESTNET,
+            amount_zat="50000",
+            pay_to="utest1merchantinvoice",
+            max_timeout_seconds=180,
+            pool="orchard",
+            memo_hex="783430322d7a63617368",
+            min_confirmations=1,
+            resource_hash="sha256:" + "11" * 32,
+        )
+
+    def supported_response(self) -> SupportedResponse:
+        return SupportedResponse(
+            kinds=[
+                SupportedKind(
+                    x402_version=2,
+                    scheme="exact",
+                    network=ZCASH_TESTNET,
+                    extra={"assetName": "ZEC", "unit": "zatoshi", "decimals": 8},
+                )
+            ],
+            extensions=[],
+            signers={},
+        )
+
+    def payment_required_extensions(self) -> dict[str, Any]:
+        return {
+            "zcash": {
+                "version": 1,
+                "supportsShielded": True,
+                "supportsTransparent": False,
+                "requiresMemo": True,
+            }
+        }
+
+    async def create_invoice(self, *, resource_url: str, amount_usd: Decimal):
+        self.invoice.resource_url = resource_url
+        self.invoice.amount_usd = amount_usd
+        return self.invoice
+
+    def requirement_for_invoice(self, invoice) -> PaymentRequirements:
+        return PaymentRequirements(
+            scheme="exact",
+            network=invoice.network,
+            asset=ZCASH_ASSET,
+            amount=invoice.amount_zat,
+            pay_to=invoice.pay_to,
+            max_timeout_seconds=invoice.max_timeout_seconds,
+            extra={
+                "invoiceId": invoice.invoice_id,
+                "memoHex": invoice.memo_hex,
+                "broadcastMode": "client",
+            },
+        )
+
+    def resource_config_for_invoice(self, invoice) -> ResourceConfig:
+        requirement = self.requirement_for_invoice(invoice)
+        return ResourceConfig(
+            scheme="exact",
+            network=invoice.network,
+            pay_to=invoice.pay_to,
+            price=AssetAmount(
+                amount=invoice.amount_zat,
+                asset=ZCASH_ASSET,
+                extra=requirement.extra,
+            ),
+            max_timeout_seconds=invoice.max_timeout_seconds,
+        )
+
+
 def _gate(server: _FakeServer) -> PaymentGate:
     gate = PaymentGate(
         PaymentConfig(
@@ -245,6 +328,28 @@ async def test_no_payment_returns_standard_and_legacy_payment_required_headers()
     assert LEGACY_PAYMENT_REQUIRED_HEADER in result.headers
     assert result.headers[PAYMENT_REQUIRED_HEADER] == result.headers[LEGACY_PAYMENT_REQUIRED_HEADER]
     assert server.initialized is True
+
+
+@pytest.mark.asyncio
+async def test_zcash_only_gate_can_issue_payment_required_without_evm_receiver() -> None:
+    gate = PaymentGate(
+        PaymentConfig(
+            payment_networks=[],
+            receiver_address="",
+            facilitator_url="https://pay.openfacilitator.io",
+            zcash_enabled=True,
+        ),
+        zcash=_FakeZcashPayment(),  # type: ignore[arg-type]
+    )
+
+    result = await gate.check_payment(_request(), Decimal("0.05"), "ZEC report")
+
+    assert isinstance(result, Response)
+    assert result.status_code == 402
+    assert PAYMENT_REQUIRED_HEADER in result.headers
+    body = json.loads(result.body)
+    assert body["accepts"][0]["network"] == ZCASH_TESTNET
+    assert body["accepts"][0]["asset"] == ZCASH_ASSET
 
 
 @pytest.mark.asyncio

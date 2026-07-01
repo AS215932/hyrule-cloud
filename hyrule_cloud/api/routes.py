@@ -61,6 +61,7 @@ from hyrule_cloud.models import (
     VMStatusResponse,
     generate_domain_management_token,
 )
+from hyrule_cloud.payments.zcash import ZCASH_ASSET, ZCASH_TESTNET, normalize_zcash_network
 from hyrule_cloud.services.launch_proof import build_launch_proof
 from hyrule_cloud.services.quotes import (
     QuoteConflictError,
@@ -125,6 +126,43 @@ _NATIVE_ASSETS = ("BTC", "XMR")
 def _native_payment_assets(app_state: AppState) -> list[str]:
     configured = [asset.upper() for asset in getattr(app_state, "native_payment_assets", [])]
     return [asset for asset in _NATIVE_ASSETS if asset in configured]
+
+
+def _zcash_payment_networks(app_state: AppState) -> list[dict[str, Any]]:
+    cfg = app_state.config.payment
+    service = getattr(app_state, "zcash_payment", None)
+    if not cfg.zcash_enabled and not (service is not None and service.enabled):
+        return []
+
+    network = service.network if service is not None else normalize_zcash_network(cfg.zcash_network)
+    pool = service.pool if service is not None else "orchard"
+    testnet = network == ZCASH_TESTNET
+    return [
+        {
+            "key": "zcash-testnet" if testnet else "zcash-mainnet",
+            "display_name": "Zcash Testnet" if testnet else "Zcash",
+            "caip2": network,
+            "family": "zcash",
+            "chain_id": None,
+            "asset": "ZEC",
+            "asset_id": ZCASH_ASSET,
+            "token_address": ZCASH_ASSET,
+            "token_decimals": 8,
+            "eip712_domain": {},
+            "native_currency": {"name": "Zcash", "symbol": "ZEC", "decimals": 8},
+            "rpc_url": "",
+            "block_explorer_url": "",
+            "testnet": testnet,
+            "x402": {
+                "scheme": "exact",
+                "network": network,
+                "asset": ZCASH_ASSET,
+                "unit": "zatoshi",
+                "modes": ["client-broadcast"],
+                "pools": [pool],
+            },
+        }
+    ]
 
 
 def _accepted_payment_methods(cfg, app_state: AppState) -> AcceptedPaymentMethods:
@@ -459,7 +497,8 @@ async def get_payment_networks(
                 "testnet": n.testnet,
             }
             for n in cfg.payment.enabled_networks()
-        ],
+        ]
+        + _zcash_payment_networks(app_state),
         "native": native,
         "receiver_address": cfg.payment.receiver_address,
         "facilitator_url": cfg.payment.facilitator_url,

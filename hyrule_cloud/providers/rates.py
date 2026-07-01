@@ -22,12 +22,12 @@ from cachetools import TTLCache
 
 log = structlog.get_logger()
 
-Asset = Literal["BTC", "XMR"]
+Asset = Literal["BTC", "XMR", "ZEC"]
 
 _COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
-_COINGECKO_IDS = {"BTC": "bitcoin", "XMR": "monero"}
+_COINGECKO_IDS = {"BTC": "bitcoin", "XMR": "monero", "ZEC": "zcash"}
 _KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
-_KRAKEN_PAIRS = {"BTC": "XBTUSD", "XMR": "XMRUSD"}
+_KRAKEN_PAIRS = {"BTC": "XBTUSD", "XMR": "XMRUSD", "ZEC": "ZECUSD"}
 
 
 class RateProvider:

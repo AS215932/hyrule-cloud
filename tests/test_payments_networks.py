@@ -133,6 +133,22 @@ async def test_payments_networks_native_lists_btc_xmr_when_rail_wired(
     assert body["native"] == ["BTC", "XMR"]
 
 
+@pytest.mark.asyncio
+async def test_payments_networks_lists_zcash_when_enabled(real_payment_state) -> None:
+    real_payment_state.config.payment.zcash_enabled = True
+    real_payment_state.config.payment.zcash_network = "testnet"
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        body = (await c.get("/v1/payments/networks")).json()
+
+    zcash = next(n for n in body["networks"] if n["family"] == "zcash")
+    assert zcash["key"] == "zcash-testnet"
+    assert zcash["caip2"] == "bip122:05a60a92d99d85997cce3b87616c089f"
+    assert zcash["asset"] == "ZEC"
+    assert zcash["asset_id"] == "slip44:133"
+    assert zcash["x402"]["modes"] == ["client-broadcast"]
+
+
 def test_disabled_chain_drops_off_the_wire() -> None:
     """Wave 3: enabled_networks() filters; the wire format should mirror.
     Operators flip a chain off via Vault by re-rendering PAYMENT_PAYMENT_NETWORKS
