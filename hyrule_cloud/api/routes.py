@@ -61,6 +61,7 @@ from hyrule_cloud.models import (
     VMStatusResponse,
     generate_domain_management_token,
 )
+from hyrule_cloud.providers.network_config import supports_static_network_config
 from hyrule_cloud.services.launch_proof import build_launch_proof
 from hyrule_cloud.services.quotes import (
     QuoteConflictError,
@@ -246,6 +247,27 @@ def _vm_create_response(
             else None
         ),
     )
+
+
+def _real_provisioning_enabled() -> bool:
+    from hyrule_cloud.services.launch_proof import use_real_provisioning
+
+    return use_real_provisioning()
+
+
+def _validate_vm_order(order: VMCreateRequest, cfg) -> None:
+    if order.domain_mode == DomainMode.CUSTOM and not order.domain:
+        raise HTTPException(400, "domain required when domain_mode=custom")
+
+    for port in order.open_ports:
+        if port in cfg.blocked_ports:
+            raise HTTPException(400, f"Port {port} is blocked by policy")
+
+    if _real_provisioning_enabled() and not supports_static_network_config(order.os):
+        raise HTTPException(
+            400,
+            f"OS template {order.os} is not supported for real VM provisioning yet",
+        )
 
 
 # --- Block B (Wave 2): runtime metrics ---
@@ -516,16 +538,24 @@ async def get_vm_products(request: Request, cfg=Depends(get_cfg)) -> VMProductsR
 
 @router.get("/os/list", response_model=OSListResponse)
 async def list_os_templates(cfg = Depends(get_cfg)) -> OSListResponse:
+    names = list(cfg.xcpng.templates)
+    if not names:
+        names = ["debian-13", "alpine-3.21", "freebsd-14"]
+    if _real_provisioning_enabled():
+        names = [name for name in names if supports_static_network_config(name)]
+    descriptions = {
+        "debian-13": "Debian 13 (Trixie)",
+        "alpine-3.21": "Alpine Linux 3.21",
+        "freebsd-14": "FreeBSD 14.2",
+    }
     templates = [
-        OSTemplate(name=name, description=f"OS template: {name}", default=(name == "debian-13"))
-        for name in cfg.xcpng.templates
+        OSTemplate(
+            name=name,
+            description=descriptions.get(name, f"OS template: {name}"),
+            default=(name == "debian-13"),
+        )
+        for name in names
     ]
-    if not templates:
-        templates = [
-            OSTemplate(name="debian-13", description="Debian 13 (Trixie)", default=True),
-            OSTemplate(name="alpine-3.21", description="Alpine Linux 3.21"),
-            OSTemplate(name="freebsd-14", description="FreeBSD 14.2"),
-        ]
     return OSListResponse(templates=templates)
 
 
@@ -581,6 +611,7 @@ async def get_vm_public_status(
         vm_id=row.vm_id,
         status=VMStatus(row.status),
         ipv6=row.ipv6,
+        ipv6_prefix=getattr(row, "ipv6_prefix", None),
         hostname=row.hostname,
         expires_at=row.expires_at,
         launch_proof_status=lp["launch_proof_status"],
@@ -610,6 +641,7 @@ async def get_vm_status(
         vm_id=row.vm_id,
         status=VMStatus(row.status),
         ipv6=row.ipv6,
+        ipv6_prefix=getattr(row, "ipv6_prefix", None),
         hostname=row.hostname,
         ssh=f"ssh root@{row.hostname}" if is_ready else None,
         expires_at=row.expires_at,
@@ -677,12 +709,7 @@ async def create_vm(
             raise HTTPException(422, "Order body does not match the quote")
         order = VMCreateRequest(**quote_row.order_payload)
 
-    if order.domain_mode == DomainMode.CUSTOM and not order.domain:
-        raise HTTPException(400, "domain required when domain_mode=custom")
-
-    for port in order.open_ports:
-        if port in cfg.blocked_ports:
-            raise HTTPException(400, f"Port {port} is blocked by policy")
+    _validate_vm_order(order, cfg)
 
     await _enforce_paid_vm_cap(orch, cfg)
 
@@ -755,11 +782,7 @@ async def create_vm_quote(
     quote (200); same key + a different spec is a 409 conflict.
     """
     order = body.order_payload
-    if order.domain_mode == DomainMode.CUSTOM and not order.domain:
-        raise HTTPException(400, "domain required when domain_mode=custom")
-    for port in order.open_ports:
-        if port in cfg.blocked_ports:
-            raise HTTPException(400, f"Port {port} is blocked by policy")
+    _validate_vm_order(order, cfg)
 
     total, _ = await _compute_vm_price(orch, cfg, order)
     app_state = get_app_state(request)

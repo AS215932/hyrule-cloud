@@ -10,10 +10,12 @@ class CreateProvider(XCPNGProvider):
     def __init__(self) -> None:
         super().__init__(XCPNGConfig())
         self.events: list[str] = []
+        self.vm_create_params: dict | None = None
 
     async def _xo_call(self, method: str, **params):
         self.events.append(method)
         if method == "vm.create":
+            self.vm_create_params = params
             return "vm-new"
         return None
 
@@ -129,6 +131,23 @@ async def test_debian_create_skips_openbsd_prep():
     )
 
     assert provider.events == ["vm.create", "resize", "vm.start"]
+    assert "networkConfig" not in provider.vm_create_params
+
+
+@pytest.mark.asyncio
+async def test_debian_create_passes_network_config_to_xo():
+    provider = CreateProvider()
+
+    await provider.create_vm(
+        template_uuid="template",
+        name_label="test-debian",
+        os_name="debian-13",
+        size=VMSize.XS,
+        cloud_init_config="#cloud-config\n{}",
+        network_config="version: 2\n",
+    )
+
+    assert provider.vm_create_params["networkConfig"] == "version: 2\n"
 
 
 @pytest.mark.asyncio

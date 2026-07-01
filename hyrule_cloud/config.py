@@ -273,6 +273,13 @@ class HyruleConfig(BaseSettings):
     # Cloud-init template directory
     templates_dir: Path = Path("templates")
 
+    # Customer VM IPv6 allocation. The current customer L2 is one shared
+    # XCP-NG network, so Hyrule injects static guest network-config instead of
+    # relying on RA/DHCPv6.
+    customer_ipv6_supernet: str = "2a0c:b641:b51::/48"
+    customer_ipv6_gateway: str = "2a0c:b641:b51::1"
+    customer_ipv6_dns: str = "2a0c:b641:b51::1"
+
     # Network intelligence / BGP data storage
     bgp_data_enabled: bool = True
     bgp_data_dir: Path = Path("/var/lib/hyrule-cloud/bgp")

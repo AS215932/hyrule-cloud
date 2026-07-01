@@ -139,6 +139,17 @@ async def test_get_os_list(override_state):
         data = res.json()
         assert len(data["templates"]) > 0
 
+
+@pytest.mark.asyncio
+async def test_real_mode_os_list_only_advertises_supported_templates(override_state, monkeypatch):
+    from hyrule_cloud.services import launch_proof
+
+    monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", True)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.get("/v1/os/list")
+        assert res.status_code == 200
+        assert [template["name"] for template in res.json()["templates"]] == ["debian-13"]
+
 @pytest.mark.asyncio
 async def test_get_vm_status(override_state):
     """Block A0: the old `/v1/vm/{id}` URL is now management-gated. With

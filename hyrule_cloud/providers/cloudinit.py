@@ -57,17 +57,9 @@ def _render_debian_cloud_init(
             ufw_commands.append(f"ufw allow {port}/tcp")
     ufw_commands.append("ufw --force enable")
 
-    ipv6_commands = [
-        "sysctl -w net.ipv6.conf.all.accept_ra=1",
-        "sysctl -w net.ipv6.conf.eth0.accept_ra=1",
-        "echo 'net.ipv6.conf.all.accept_ra=1' >> /etc/sysctl.d/99-ipv6.conf",
-        "echo 'net.ipv6.conf.eth0.accept_ra=1' >> /etc/sysctl.d/99-ipv6.conf",
-    ]
-
     runcmd = [
         "apt-get update -q",
         "apt-get install -y -q ufw curl git",
-        *ipv6_commands,
         *ufw_commands,
     ]
 
