@@ -189,6 +189,20 @@ class PaymentConfig(BaseSettings):
     xmr_rpc_url: str = "http://127.0.0.1:18088/json_rpc"
     require_native: bool = False
 
+    # Zcash x402 v2 MVP. Disabled by default; when enabled, Hyrule advertises
+    # a custom exact/ZEC binding and verifies client-broadcast payments through
+    # the merchant zcashd wallet view.
+    zcash_enabled: bool = False
+    zcash_network: str = "testnet"
+    zcash_rpc_url: str = "http://127.0.0.1:18232/"
+    zcash_rpc_user: str = ""
+    zcash_rpc_password: str = ""
+    zcash_account: int = 0
+    zcash_receiver_types: list[str] = Field(default_factory=lambda: ["orchard"])
+    zcash_min_confirmations: int = 1
+    zcash_invoice_ttl_seconds: int = 180
+    zcash_merchant: str = "hyrule.host"
+
     price_vm_xs: Decimal = Decimal("0.05")
     price_vm_sm: Decimal = Decimal("0.10")
     price_vm_md: Decimal = Decimal("0.20")

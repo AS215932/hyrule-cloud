@@ -247,6 +247,62 @@ class CryptoIntentRow(Base):
     )
 
 
+class ZcashInvoiceRow(Base):
+    """One-time x402/Zcash invoice for client-broadcast ZEC payments."""
+
+    __tablename__ = "zcash_invoices"
+
+    invoice_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    resource_url: Mapped[str] = mapped_column(Text)
+    resource_hash: Mapped[str] = mapped_column(String(80))
+    network: Mapped[str] = mapped_column(String(48))
+    amount_zat: Mapped[str] = mapped_column(String(32))
+    amount_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    rate_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
+    pay_to: Mapped[str] = mapped_column(String(256))
+    memo_hex: Mapped[str] = mapped_column(Text)
+    merchant: Mapped[str | None] = mapped_column(String(128))
+    pool: Mapped[str] = mapped_column(String(32), default="orchard", server_default="orchard")
+    account: Mapped[int | None] = mapped_column(Integer)
+    diversifier_index: Mapped[str | None] = mapped_column(String(64))
+    min_confirmations: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    max_timeout_seconds: Mapped[int] = mapped_column(Integer, default=180, server_default="180")
+    status: Mapped[str] = mapped_column(String(32), default="created", server_default="created")
+    txid: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("ix_zcash_invoices_status_expires", "status", "expires_at"),
+        Index("ix_zcash_invoices_txid", "txid"),
+    )
+
+
+class ZcashPaymentRow(Base):
+    """Verified Zcash payment receipt tied to a single invoice and txid."""
+
+    __tablename__ = "zcash_payments"
+
+    payment_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    invoice_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("zcash_invoices.invoice_id", ondelete="CASCADE")
+    )
+    txid: Mapped[str] = mapped_column(String(128))
+    network: Mapped[str] = mapped_column(String(48))
+    amount_zat: Mapped[str] = mapped_column(String(32))
+    confirmations: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    pool: Mapped[str | None] = mapped_column(String(32))
+    memo_hex: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_zcash_payments_invoice_id_uq", "invoice_id", unique=True),
+        Index("ix_zcash_payments_txid_uq", "txid", unique=True),
+    )
+
+
 class VMQuoteRow(Base):
     """Durable order quote (issue #14).
 

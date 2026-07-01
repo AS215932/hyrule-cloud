@@ -45,6 +45,12 @@ from x402.schemas import PaymentPayload, PaymentRequirements, ResourceConfig, Re
 from x402.server import x402ResourceServer
 
 from hyrule_cloud.config import PaymentConfig
+from hyrule_cloud.payments.zcash import (
+    ZCASH_ASSET,
+    ZcashExactServerScheme,
+    ZcashFacilitatorClient,
+    ZcashPaymentService,
+)
 
 log = structlog.get_logger()
 
@@ -135,14 +141,22 @@ class PaymentGate:
     a 402 Response (no/bad payment) or the payer's wallet address.
     """
 
-    def __init__(self, config: PaymentConfig) -> None:
+    def __init__(self, config: PaymentConfig, zcash: ZcashPaymentService | None = None) -> None:
         self.config = config
+        self.zcash = zcash
         self.facilitator = HTTPFacilitatorClient(_facilitator_config(config))
-        self.server = x402ResourceServer(self.facilitator)
+        facilitator_clients: list[Any] = []
+        if self.config.networks and self.config.receiver_address:
+            facilitator_clients.append(self.facilitator)
+        if self.zcash is not None and self.zcash.enabled:
+            facilitator_clients.append(ZcashFacilitatorClient(self.zcash))
+        self.server = x402ResourceServer(facilitator_clients)
         for net_cfg in self.config.networks:
             # We assume ExactEvmServerScheme works out of the box for these during Phase 1
             # (In production, Solana would use an ExactSolanaServerScheme)
             self.server.register(net_cfg["network"], ExactEvmServerScheme())
+        if self.zcash is not None and self.zcash.enabled:
+            self.server.register(self.zcash.network, ZcashExactServerScheme())
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
@@ -173,6 +187,8 @@ class PaymentGate:
         )
 
     def _resource_configs(self, amount: Decimal) -> list[ResourceConfig]:
+        if not self.config.receiver_address:
+            return []
         return [
             ResourceConfig(
                 scheme=net_cfg["scheme"],
@@ -189,6 +205,29 @@ class PaymentGate:
             requirements.extend(self.server.build_payment_requirements(resource_cfg))
         return requirements
 
+    async def _build_requirements_for_request(
+        self,
+        amount: Decimal,
+        request_url: str | None,
+    ) -> list[PaymentRequirements]:
+        requirements = self._build_requirements(amount)
+        if self.zcash is not None and self.zcash.enabled:
+            try:
+                invoice = await self.zcash.create_invoice(
+                    resource_url=request_url or "",
+                    amount_usd=amount,
+                )
+                requirements.extend(
+                    self.server.build_payment_requirements(
+                        self.zcash.resource_config_for_invoice(invoice)
+                    )
+                )
+            except Exception:
+                log.error("zcash_invoice_build_failed", exc_info=True)
+                if not requirements:
+                    raise
+        return requirements
+
     async def _payment_required_response(
         self,
         requirements: list[PaymentRequirements],
@@ -197,13 +236,22 @@ class PaymentGate:
         extra_body: dict[str, Any] | None,
         request_url: str | None = None,
         error: str | None = None,
+        extensions: dict[str, Any] | None = None,
     ) -> Response:
         resource = ResourceInfo(url=request_url or "", description=description or None)
-        payment_required = self.server.create_payment_required_response(
-            requirements,
-            resource=resource,
-            error=error,
-        )
+        try:
+            payment_required = self.server.create_payment_required_response(
+                requirements,
+                resource=resource,
+                error=error,
+                extensions=extensions,
+            )
+        except TypeError:
+            payment_required = self.server.create_payment_required_response(
+                requirements,
+                resource=resource,
+                error=error,
+            )
         if inspect.isawaitable(payment_required):
             payment_required = await payment_required
         encoded = encode_payment_required_header(payment_required)
@@ -247,7 +295,10 @@ class PaymentGate:
         The response includes the standard x402 v2 header (`PAYMENT-REQUIRED`)
         plus Hyrule's legacy compatibility header (`X-PAYMENT-REQUIRED`).
         """
-        if not self.config.networks or not self.config.receiver_address:
+        if (
+            (not self.config.networks or not self.config.receiver_address)
+            and not (self.zcash is not None and self.zcash.enabled)
+        ):
             log.error(
                 "payment_config_unavailable",
                 has_receiver=bool(self.config.receiver_address),
@@ -259,9 +310,12 @@ class PaymentGate:
             return self._json_response(503, {"error": "Payment facilitator unavailable"})
 
         try:
-            requirements = self._build_requirements(amount)
+            requirements = await self._build_requirements_for_request(amount, request_url)
         except Exception:
             log.error("payment_requirement_build_failed", exc_info=True)
+            return self._json_response(503, {"error": "Payment facilitator unavailable"})
+
+        if not requirements:
             return self._json_response(503, {"error": "Payment facilitator unavailable"})
 
         return await self._payment_required_response(
@@ -271,6 +325,7 @@ class PaymentGate:
             extra_body,
             request_url=request_url,
             error=error,
+            extensions=self._payment_required_extensions(),
         )
 
     @staticmethod
@@ -328,6 +383,15 @@ class PaymentGate:
                     extra_body,
                     request_url=str(request.url),
                     error="Unsupported payment payload version",
+                )
+
+            if self._is_zcash_payment(payment_payload):
+                return await self._check_zcash_payment(
+                    request=request,
+                    payment_payload=payment_payload,
+                    amount=amount,
+                    description=description,
+                    extra_body=extra_body,
                 )
 
             matching_requirements = self.server.find_matching_requirements(
@@ -402,6 +466,89 @@ class PaymentGate:
         except Exception:
             log.error("payment_processing_error", exc_info=True)
             return self._json_response(502, {"error": "Payment processing error"})
+
+    def _payment_required_extensions(self) -> dict[str, Any] | None:
+        if self.zcash is not None and self.zcash.enabled:
+            return self.zcash.payment_required_extensions()
+        return None
+
+    @staticmethod
+    def _is_zcash_payment(payment_payload: PaymentPayload) -> bool:
+        return (
+            payment_payload.accepted.network.startswith("bip122:")
+            and payment_payload.accepted.asset == ZCASH_ASSET
+            and payment_payload.accepted.scheme == "exact"
+        )
+
+    async def _check_zcash_payment(
+        self,
+        *,
+        request: Request,
+        payment_payload: PaymentPayload,
+        amount: Decimal,
+        description: str,
+        extra_body: dict[str, Any] | None,
+    ) -> Response | str:
+        if self.zcash is None or not self.zcash.enabled:
+            return await self._payment_required_response(
+                [payment_payload.accepted],
+                amount,
+                description,
+                extra_body,
+                request_url=str(request.url),
+                error="zcash_disabled",
+            )
+
+        invoice_id = payment_payload.payload.get("invoiceId") or payment_payload.accepted.extra.get("invoiceId")
+        invoice = await self.zcash.get_invoice(invoice_id) if isinstance(invoice_id, str) else None
+        requirements = [self.zcash.requirement_for_invoice(invoice)] if invoice is not None else [payment_payload.accepted]
+
+        verification = await self.zcash.verify(payment_payload, requirements[0])
+        if not verification.is_valid:
+            log.warning(
+                "zcash_payment_verification_failed",
+                invalid_reason=verification.invalid_reason,
+            )
+            return await self._payment_required_response(
+                requirements,
+                amount,
+                description,
+                extra_body,
+                request_url=str(request.url),
+                error=verification.invalid_reason or "Payment verification failed",
+                extensions=self._payment_required_extensions(),
+            )
+
+        settlement = await self.zcash.settle(payment_payload, requirements[0])
+        settlement_header = encode_payment_response_header(settlement)
+        settlement_headers = {
+            PAYMENT_RESPONSE_HEADER: settlement_header,
+            X_PAYMENT_RESPONSE_HEADER: settlement_header,
+        }
+
+        if not settlement.success:
+            log.warning(
+                "zcash_payment_settlement_failed",
+                error_reason=settlement.error_reason,
+                error_message=settlement.error_message,
+            )
+            return self._json_response(
+                402,
+                {"error": settlement.error_reason or "Payment settlement failed"},
+                headers=settlement_headers,
+            )
+
+        request.state.payment_tx = settlement.transaction
+        request.state.payment_response_headers = settlement_headers
+        owner = f"zec:{invoice_id}" if isinstance(invoice_id, str) else "zec:unknown"
+
+        log.info(
+            "zcash_payment_settled",
+            owner=owner,
+            amount=str(amount),
+            tx_hash=settlement.transaction,
+        )
+        return owner
 
     @staticmethod
     def _extract_wallet(payment_header: str) -> str | None:
