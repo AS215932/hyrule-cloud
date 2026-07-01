@@ -39,6 +39,10 @@ class DNSProvider(Provider):
         })
         self.tsig_algo = config.dns_tsig_algo
 
+    @staticmethod
+    def _absolute_name(name: str) -> str:
+        return f"{name.rstrip('.')}."
+
     def _make_update(self, commands: list[tuple[str, ...]]) -> dns.update.Update:
         """Build a dns.update.Update message from a list of command tuples."""
         update = dns.update.Update(
@@ -97,17 +101,19 @@ class DNSProvider(Provider):
     async def create_aaaa(self, subdomain: str, ipv6_address: str, ttl: int = 300) -> None:
         """Create an AAAA record under the deploy zone."""
         fqdn = f"{subdomain}.{self.zone}"
+        record_name = self._absolute_name(fqdn)
         await self._send([
-            ("delete", fqdn, dns.rdatatype.AAAA),
-            ("add", fqdn, ttl, dns.rdatatype.AAAA, ipv6_address),
+            ("delete", record_name, dns.rdatatype.AAAA),
+            ("add", record_name, ttl, dns.rdatatype.AAAA, ipv6_address),
         ])
         log.info("dns_aaaa_created", fqdn=fqdn, ipv6=ipv6_address)
 
     async def delete_aaaa(self, subdomain: str) -> None:
         """Remove AAAA record for a subdomain."""
         fqdn = f"{subdomain}.{self.zone}"
+        record_name = self._absolute_name(fqdn)
         await self._send([
-            ("delete", fqdn, dns.rdatatype.AAAA),
+            ("delete", record_name, dns.rdatatype.AAAA),
         ])
         log.info("dns_aaaa_deleted", fqdn=fqdn)
 
@@ -120,14 +126,16 @@ class DNSProvider(Provider):
     ) -> None:
         """Create an arbitrary DNS record."""
         rdtype = dns.rdatatype.from_text(rtype)
+        record_name = self._absolute_name(fqdn)
         await self._send([
-            ("delete", fqdn, rdtype),
-            ("add", fqdn, ttl, rdtype, value),
+            ("delete", record_name, rdtype),
+            ("add", record_name, ttl, rdtype, value),
         ])
 
     async def delete_record(self, fqdn: str, rtype: str) -> None:
         """Delete a DNS record."""
         rdtype = dns.rdatatype.from_text(rtype)
+        record_name = self._absolute_name(fqdn)
         await self._send([
-            ("delete", fqdn, rdtype),
+            ("delete", record_name, rdtype),
         ])

@@ -268,6 +268,7 @@ class VMStatusResponse(BaseModel):
     vm_id: str
     status: VMStatus
     ipv6: str | None = None
+    ipv6_prefix: str | None = None
     hostname: str | None = None
     ssh: str | None = None
     expires_at: datetime | None = None
@@ -290,6 +291,7 @@ class VMPublicStatusResponse(BaseModel):
     vm_id: str
     status: VMStatus
     ipv6: str | None = None
+    ipv6_prefix: str | None = None
     hostname: str | None = None
     expires_at: datetime | None = None
     # Launch-proof contract fields (issue #28)

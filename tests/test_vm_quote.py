@@ -174,6 +174,19 @@ async def test_create_quote_blocked_port_rejected(quote_state, client):
     assert res.status_code == 400
 
 
+@pytest.mark.asyncio
+async def test_real_mode_quote_rejects_unsupported_os(quote_state, client, monkeypatch):
+    from hyrule_cloud.services import launch_proof
+
+    monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", True)
+
+    res = await client.post(
+        "/v1/vm/quote", json={"order_payload": _order(os="openbsd-7.8")}
+    )
+    assert res.status_code == 400
+    assert "not supported" in res.text
+
+
 # --- Idempotency ---
 
 
@@ -326,6 +339,20 @@ async def test_legacy_create_without_quote_id_still_works(quote_state, client):
     assert res.json()["vm_id"]
 
 
+@pytest.mark.asyncio
+async def test_real_mode_create_rejects_unsupported_os_before_payment(
+    quote_state, client, monkeypatch
+):
+    from hyrule_cloud.services import launch_proof
+
+    monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", True)
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+
+    res = await client.post("/v1/vm/create", json=_order(os="openbsd-7.8"))
+    assert res.status_code == 400
+    quote_state.payment_gate.check_payment.assert_not_awaited()
+
+
 # --- Migration 008 linkage / schema validity ---
 
 
@@ -348,6 +375,29 @@ def test_vm_quotes_table_in_metadata():
     assert "vm_quotes" in Base.metadata.tables
     cols = Base.metadata.tables["vm_quotes"].columns
     assert {"quote_id", "order_payload", "amount_usd", "status", "expires_at"} <= set(cols.keys())
+
+
+def test_migration_012_chains_to_011():
+    import importlib.util
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "alembic"
+        / "versions"
+        / "012_vm_customer_ipv6_prefixes.py"
+    )
+    spec = importlib.util.spec_from_file_location("migration_012", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.revision == "012"
+    assert mod.down_revision == "011"
+    assert callable(mod.upgrade) and callable(mod.downgrade)
+
+
+def test_vms_table_has_customer_ipv6_prefix_columns():
+    cols = Base.metadata.tables["vms"].columns
+    assert {"ipv6_prefix_index", "ipv6_prefix"} <= set(cols.keys())
 
 
 # --- helpers ---

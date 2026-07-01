@@ -125,6 +125,7 @@ class XCPNGProvider(Provider):
         os_name: str = "debian-13",
         size: VMSize,
         cloud_init_config: str,
+        network_config: str | None = None,
     ) -> str:
         """
         Create a VM via XO's JSON-RPC API.
@@ -137,15 +138,18 @@ class XCPNGProvider(Provider):
         specs = VM_SPECS[size]
         log.info("vm_create_start", template=template_uuid, name=name_label, size=size.value)
 
-        vm_uuid = await self._xo_call(
-            "vm.create",
-            template=template_uuid,
-            name_label=name_label,
-            cloudConfig=cloud_init_config,
-            VIFs=[{"network": self.config.default_network_uuid}],
-            bootAfterCreate=False,
-            clone=True,
-        )
+        create_params = {
+            "template": template_uuid,
+            "name_label": name_label,
+            "cloudConfig": cloud_init_config,
+            "VIFs": [{"network": self.config.default_network_uuid}],
+            "bootAfterCreate": False,
+            "clone": True,
+        }
+        if network_config is not None:
+            create_params["networkConfig"] = network_config
+
+        vm_uuid = await self._xo_call("vm.create", **create_params)
         log.info("vm_cloned", uuid=vm_uuid)
 
         try:

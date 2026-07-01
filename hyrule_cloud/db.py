@@ -79,6 +79,8 @@ class VMRow(Base):
     )
     os: Mapped[str] = mapped_column(String(64), default="debian-13")
     ipv6: Mapped[str | None] = mapped_column(String(64))
+    ipv6_prefix_index: Mapped[int | None] = mapped_column(Integer)
+    ipv6_prefix: Mapped[str | None] = mapped_column(String(64))
     hostname: Mapped[str | None] = mapped_column(String(256))
     ssh_pubkey: Mapped[str] = mapped_column(Text, default="")
 
@@ -124,6 +126,8 @@ class VMRow(Base):
     __table_args__ = (
         Index("ix_vms_status_expires", "status", "expires_at"),
         Index("ix_vms_owner_status", "owner_wallet", "status"),
+        Index("ix_vms_ipv6_prefix_index", "ipv6_prefix_index", unique=True),
+        Index("ix_vms_ipv6_prefix", "ipv6_prefix", unique=True),
     )
 
 

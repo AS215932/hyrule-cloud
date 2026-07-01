@@ -10,9 +10,11 @@ import asyncio
 import hashlib
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from ipaddress import IPv6Address, IPv6Network
 
 import structlog
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
@@ -30,6 +32,16 @@ from hyrule_cloud.models import (
 )
 from hyrule_cloud.providers.cloudinit import render_cloud_init
 from hyrule_cloud.providers.dns import DNSProvider
+from hyrule_cloud.providers.network_config import (
+    RESERVED_PREFIX_INDEXES,
+    customer_prefix_count,
+    parse_dns_servers,
+    prefix_for_index,
+    prefix_index_candidate,
+    render_debian_network_config,
+    supports_static_network_config,
+    vm_address_for_prefix,
+)
 from hyrule_cloud.providers.openprovider import OpenproviderClient
 from hyrule_cloud.providers.xcpng import XCPNGProvider
 
@@ -103,6 +115,31 @@ class Orchestrator:
     def _generate_hostname(vm_id: str) -> str:
         return hashlib.sha256(vm_id.encode()).hexdigest()[:8]
 
+    def _customer_supernet(self) -> IPv6Network:
+        return IPv6Network(self.config.customer_ipv6_supernet, strict=True)
+
+    async def _allocate_customer_prefix(
+        self,
+        session: AsyncSession,
+        vm_id: str,
+    ) -> tuple[int, IPv6Network]:
+        supernet = self._customer_supernet()
+        result = await session.execute(
+            select(VMRow.ipv6_prefix_index).where(VMRow.ipv6_prefix_index.isnot(None))
+        )
+        used = {int(index) for index in result.scalars().all()}
+        used.update(RESERVED_PREFIX_INDEXES)
+
+        total = customer_prefix_count(supernet)
+        start = prefix_index_candidate(vm_id, supernet)
+        for offset in range(total - len(RESERVED_PREFIX_INDEXES)):
+            index = ((start - 1 + offset) % (total - 1)) + 1
+            if index in used:
+                continue
+            return index, prefix_for_index(supernet, index)
+
+        raise RuntimeError(f"No customer /64 prefixes available in {supernet}")
+
     async def create_vm(
         self,
         request: VMCreateRequest,
@@ -122,37 +159,49 @@ class Orchestrator:
         token + the account both authorize management, redundancy is
         intentional so the operator can claim/transfer later.
         """
-        vm_id = generate_vm_id()
-        hostname_prefix = self._generate_hostname(vm_id)
-        hostname = f"{hostname_prefix}.{self.config.deploy_domain}"
         expires_at = _now() + timedelta(days=request.duration_days)
         total, _ = self.compute_price(request)
         anon_token = generate_anon_management_token()
 
-        row = VMRow(
-            vm_id=vm_id,
-            owner_wallet=owner_wallet,
-            owner_account_id=owner_account_id,
-            status=VMStatus.PROVISIONING,
-            anon_management_token_hash=hash_anon_token(anon_token),
-            size=request.size,
-            os=request.os,
-            ipv6=None,
-            hostname=hostname,
-            ssh_pubkey=request.ssh_pubkey,
-            open_ports=[22] + [p for p in request.open_ports if p != 22],
-            setup_script=request.setup_script,
-            domain_mode=request.domain_mode,
-            domain=request.domain,
-            expires_at=expires_at,
-            cost_total=total,
-        )
+        for _ in range(5):
+            vm_id = generate_vm_id()
+            hostname_prefix = self._generate_hostname(vm_id)
+            hostname = f"{hostname_prefix}.{self.config.deploy_domain}"
 
-        async with self.db() as session:
-            session.add(row)
-            await session.commit()
-            # Refresh to get server defaults
-            await session.refresh(row)
+            async with self.db() as session:
+                prefix_index, prefix = await self._allocate_customer_prefix(session, vm_id)
+                row = VMRow(
+                    vm_id=vm_id,
+                    owner_wallet=owner_wallet,
+                    owner_account_id=owner_account_id,
+                    status=VMStatus.PROVISIONING,
+                    anon_management_token_hash=hash_anon_token(anon_token),
+                    size=request.size,
+                    os=request.os,
+                    ipv6=None,
+                    ipv6_prefix_index=prefix_index,
+                    ipv6_prefix=str(prefix),
+                    hostname=hostname,
+                    ssh_pubkey=request.ssh_pubkey,
+                    open_ports=[22] + [p for p in request.open_ports if p != 22],
+                    setup_script=request.setup_script,
+                    domain_mode=request.domain_mode,
+                    domain=request.domain,
+                    expires_at=expires_at,
+                    cost_total=total,
+                )
+                session.add(row)
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    await session.rollback()
+                    log.warning("customer_ipv6_prefix_collision", vm_id=vm_id, prefix=str(prefix))
+                    continue
+                # Refresh to get server defaults
+                await session.refresh(row)
+                break
+        else:
+            raise RuntimeError("Could not allocate a unique customer IPv6 prefix")
 
         task = asyncio.create_task(self._provision_vm(vm_id))
         self._tasks.add(task)
@@ -184,10 +233,24 @@ class Orchestrator:
                 ssh_pubkey = row.ssh_pubkey
                 open_ports = list(row.open_ports)
                 setup_script = row.setup_script
+                ipv6_prefix = row.ipv6_prefix
 
             template_uuid = self.config.xcpng.templates.get(os_name)
             if not template_uuid:
                 raise ValueError(f"Unknown OS template: {os_name}")
+            if not supports_static_network_config(os_name):
+                raise ValueError(f"Static network config is not supported for OS template: {os_name}")
+            if not ipv6_prefix:
+                raise ValueError(f"VM {vm_id} has no allocated IPv6 prefix")
+
+            expected_ipv6 = str(vm_address_for_prefix(IPv6Network(ipv6_prefix, strict=True)))
+            network_config = render_debian_network_config(
+                address=expected_ipv6,
+                prefix=ipv6_prefix,
+                gateway=self.config.customer_ipv6_gateway,
+                dns_servers=parse_dns_servers(self.config.customer_ipv6_dns),
+                customer_supernet=self._customer_supernet(),
+            )
 
             cloud_config = render_cloud_init(
                 os_name=os_name,
@@ -203,6 +266,7 @@ class Orchestrator:
                 os_name=os_name,
                 size=VMSize(size),
                 cloud_init_config=cloud_config,
+                network_config=network_config,
             )
             
             async with self.db() as session:
@@ -212,9 +276,13 @@ class Orchestrator:
                     await session.commit()
 
             # Wait for IPv6 (outside DB session to avoid long-held connections)
-            ipv6 = await self._wait_for_ipv6(xcpng_uuid, timeout=120)
+            ipv6 = await self._wait_for_ipv6(
+                xcpng_uuid,
+                timeout=120,
+                expected_ipv6=expected_ipv6,
+            )
             if not ipv6:
-                raise TimeoutError("VM did not acquire IPv6 within 120s")
+                raise TimeoutError(f"VM did not report expected IPv6 {expected_ipv6} within 120s")
 
             # Create DNS
             subdomain = self._generate_hostname(vm_id)
@@ -282,13 +350,25 @@ class Orchestrator:
 
         log.info("provision_simulate_complete", vm_id=vm_id, ipv6=fake_ipv6)
 
-    async def _wait_for_ipv6(self, xcpng_uuid: str, timeout: int = 120) -> str | None:
+    async def _wait_for_ipv6(
+        self,
+        xcpng_uuid: str,
+        timeout: int = 120,
+        expected_ipv6: str | None = None,
+    ) -> str | None:
         elapsed = 0
         interval = 5
+        expected = IPv6Address(expected_ipv6) if expected_ipv6 else None
         while elapsed < timeout:
             ipv6 = await self.xcpng.get_vm_ipv6(xcpng_uuid)
-            if ipv6:
+            if ipv6 and expected is None:
                 return ipv6
+            if ipv6 and expected is not None:
+                try:
+                    if IPv6Address(ipv6.split("/", 1)[0]) == expected:
+                        return str(expected)
+                except ValueError:
+                    log.warning("vm_reported_invalid_ipv6", vm_uuid=xcpng_uuid, ipv6=ipv6)
             await asyncio.sleep(interval)
             elapsed += interval
         return None
