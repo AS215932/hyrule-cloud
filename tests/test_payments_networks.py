@@ -27,7 +27,7 @@ def real_payment_state():
     app for this test only. Restores any previously-installed state on
     teardown so we don't bleed into other test modules."""
     cfg = HyruleConfig()
-    cfg.payment = PaymentConfig(facilitator_url="https://pay.openfacilitator.io")
+    cfg.payment = PaymentConfig(facilitator_url="https://facilitator.payai.network")
     state = AppState(
         config=cfg,
         orchestrator=None,
@@ -51,7 +51,7 @@ def real_payment_state():
 @pytest.mark.asyncio
 async def test_payments_networks_returns_base_by_default(real_payment_state) -> None:
     """Default config: only Base mainnet is enabled out of the box because
-    that's what the default facilitator (public x402.org) verifies against.
+    that's what the default public facilitator verifies against.
     Polygon and Arbitrum are coded but disabled; operators flip them on in
     Vault once they're pointed at Coinbase CDP."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
@@ -111,7 +111,7 @@ async def test_payments_networks_top_level_carries_receiver_and_facilitator(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         body = (await c.get("/v1/payments/networks")).json()
     assert "receiver_address" in body
-    assert body["facilitator_url"] == "https://pay.openfacilitator.io"
+    assert body["facilitator_url"] == "https://facilitator.payai.network"
 
 
 @pytest.mark.asyncio
