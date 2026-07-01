@@ -59,19 +59,39 @@ def render_debian_network_config(
     gateway: str,
     dns_servers: list[str],
     interface: str = CUSTOMER_VM_INTERFACE,
+    customer_supernet: IPv6Network | None = None,
 ) -> str:
     network = IPv6Network(prefix, strict=True)
-    address_with_prefix = f"{IPv6Address(address)}/{network.prefixlen}"
+    if network.prefixlen != 64:
+        raise ValueError("customer VM prefix must be a /64")
+    address_ip = IPv6Address(address)
+    if address_ip not in network:
+        raise ValueError(f"VM address {address_ip} is not inside {network}")
+
+    gateway_ip = IPv6Address(gateway)
+    dns_ips = [IPv6Address(server) for server in dns_servers]
+    if not dns_ips:
+        raise ValueError("at least one DNS server is required")
+    if customer_supernet is not None:
+        if not network.subnet_of(customer_supernet):
+            raise ValueError(f"VM prefix {network} is not inside {customer_supernet}")
+        if gateway_ip not in customer_supernet:
+            raise ValueError(f"gateway {gateway_ip} is not inside {customer_supernet}")
+        for dns_ip in dns_ips:
+            if dns_ip not in customer_supernet:
+                raise ValueError(f"DNS server {dns_ip} is not inside {customer_supernet}")
+
+    address_with_prefix = f"{address_ip}/{network.prefixlen}"
     config: dict[str, Any] = {
         "version": 2,
         "ethernets": {
             interface: {
                 "addresses": [address_with_prefix],
-                "nameservers": {"addresses": dns_servers},
+                "nameservers": {"addresses": [str(dns_ip) for dns_ip in dns_ips]},
                 "routes": [
                     {
                         "to": "::/0",
-                        "via": str(IPv6Address(gateway)),
+                        "via": str(gateway_ip),
                         "on-link": True,
                     }
                 ],

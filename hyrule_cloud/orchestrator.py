@@ -249,6 +249,7 @@ class Orchestrator:
                 prefix=ipv6_prefix,
                 gateway=self.config.customer_ipv6_gateway,
                 dns_servers=parse_dns_servers(self.config.customer_ipv6_dns),
+                customer_supernet=self._customer_supernet(),
             )
 
             cloud_config = render_cloud_init(

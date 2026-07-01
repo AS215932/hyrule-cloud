@@ -46,6 +46,7 @@ def test_debian_network_config_uses_on_link_gateway():
         prefix="2a0c:b641:b51:1::/64",
         gateway="2a0c:b641:b51::1",
         dns_servers=["2a0c:b641:b51::1"],
+        customer_supernet=IPv6Network("2a0c:b641:b51::/48"),
     )
 
     body = yaml.safe_load(rendered)
@@ -55,6 +56,37 @@ def test_debian_network_config_uses_on_link_gateway():
     assert iface["routes"] == [
         {"to": "::/0", "via": "2a0c:b641:b51::1", "on-link": True}
     ]
+
+
+def test_debian_network_config_rejects_non_64_prefix():
+    with pytest.raises(ValueError, match="/64"):
+        render_debian_network_config(
+            address="2a0c:b641:b51:1::2",
+            prefix="2a0c:b641:b51::/48",
+            gateway="2a0c:b641:b51::1",
+            dns_servers=["2a0c:b641:b51::1"],
+        )
+
+
+def test_debian_network_config_rejects_address_outside_prefix():
+    with pytest.raises(ValueError, match="not inside"):
+        render_debian_network_config(
+            address="2a0c:b641:b51:2::2",
+            prefix="2a0c:b641:b51:1::/64",
+            gateway="2a0c:b641:b51::1",
+            dns_servers=["2a0c:b641:b51::1"],
+        )
+
+
+def test_debian_network_config_rejects_gateway_outside_customer_supernet():
+    with pytest.raises(ValueError, match="gateway"):
+        render_debian_network_config(
+            address="2a0c:b641:b51:1::2",
+            prefix="2a0c:b641:b51:1::/64",
+            gateway="2001:db8::1",
+            dns_servers=["2a0c:b641:b51::1"],
+            customer_supernet=IPv6Network("2a0c:b641:b51::/48"),
+        )
 
 
 def test_static_network_config_support_is_debian_first():
