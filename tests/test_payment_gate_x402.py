@@ -150,7 +150,7 @@ def _gate(server: _FakeServer) -> PaymentGate:
     gate = PaymentGate(
         PaymentConfig(
             receiver_address=RECEIVER,
-            facilitator_url="https://pay.openfacilitator.io",
+            facilitator_url="https://facilitator.payai.network",
         )
     )
     gate.server = server  # type: ignore[assignment]
@@ -194,14 +194,21 @@ def test_unknown_facilitator_host_is_rejected() -> None:
         )
 
 
-def test_non_cdp_facilitator_does_not_attach_cdp_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "facilitator_url",
+    [
+        "https://facilitator.payai.network",
+        "https://pay.openfacilitator.io",
+    ],
+)
+def test_non_cdp_facilitator_does_not_attach_cdp_auth(monkeypatch: pytest.MonkeyPatch, facilitator_url: str) -> None:
     monkeypatch.setenv("CDP_API_KEY_ID", "organizations/test/apiKeys/key-id")
-    monkeypatch.setenv("CDP_API_KEY_SECRET", "not-used-for-open-facilitator")
+    monkeypatch.setenv("CDP_API_KEY_SECRET", "not-used-for-public-facilitator")
 
     config = _facilitator_config(
         PaymentConfig(
             receiver_address=RECEIVER,
-            facilitator_url="https://pay.openfacilitator.io",
+            facilitator_url=facilitator_url,
         )
     )
 
