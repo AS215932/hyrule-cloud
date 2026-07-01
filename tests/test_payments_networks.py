@@ -27,7 +27,7 @@ def real_payment_state():
     app for this test only. Restores any previously-installed state on
     teardown so we don't bleed into other test modules."""
     cfg = HyruleConfig()
-    cfg.payment = PaymentConfig()
+    cfg.payment = PaymentConfig(facilitator_url="https://pay.openfacilitator.io")
     state = AppState(
         config=cfg,
         orchestrator=None,
@@ -111,7 +111,7 @@ async def test_payments_networks_top_level_carries_receiver_and_facilitator(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         body = (await c.get("/v1/payments/networks")).json()
     assert "receiver_address" in body
-    assert body["facilitator_url"] == "https://x402.org/facilitator"
+    assert body["facilitator_url"] == "https://pay.openfacilitator.io"
 
 
 @pytest.mark.asyncio

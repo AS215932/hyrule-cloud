@@ -13,7 +13,8 @@ from contextlib import asynccontextmanager
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
+from x402.http import PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER
 
 from hyrule_cloud.api.auth import router as auth_router
 from hyrule_cloud.api.bgp import router as bgp_router
@@ -168,6 +169,28 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def attach_payment_response_headers(request: Request, call_next) -> Response:
+    """Attach x402 settlement headers saved by PaymentGate to successful responses."""
+    response = await call_next(request)
+    headers = getattr(request.state, "payment_response_headers", None)
+    if not headers:
+        return response
+
+    for key, value in headers.items():
+        response.headers[key] = value
+
+    exposed = {
+        h.strip()
+        for h in response.headers.get("Access-Control-Expose-Headers", "").split(",")
+        if h.strip()
+    }
+    exposed.update({PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER})
+    response.headers["Access-Control-Expose-Headers"] = ", ".join(sorted(exposed))
+    return response
+
 
 app.include_router(router)
 # Contract-first network intelligence APIs. Implementations land behind these

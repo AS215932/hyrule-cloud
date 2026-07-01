@@ -38,6 +38,10 @@ dependencies = [
     # Block F (Wave 5): EIP-191 signature recovery for wallet-signature account
     # recovery (recover the signer address from a personal_sign signature).
     "eth-account>=0.13",
+    # CDP x402 facilitator auth signs short-lived ES256 JWTs when operators
+    # select the Coinbase CDP production facilitator.
+    "pyjwt>=2.10",
+    "cryptography>=46.0",
 ]
 
 [project.optional-dependencies]
