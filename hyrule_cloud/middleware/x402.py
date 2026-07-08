@@ -140,8 +140,9 @@ class PaymentGate:
     a 402 Response (no/bad payment) or the payer's wallet address.
     """
 
-    def __init__(self, config: PaymentConfig) -> None:
+    def __init__(self, config: PaymentConfig, public_base_url: str = "") -> None:
         self.config = config
+        self.public_base_url = public_base_url.rstrip("/")
         self.facilitator = HTTPFacilitatorClient(_facilitator_config(config))
         self.server = x402ResourceServer(self.facilitator)
         for net_cfg in self.config.networks:
@@ -282,6 +283,15 @@ class PaymentGate:
     def _payment_header(request: Request) -> str | None:
         return request.headers.get(PAYMENT_SIGNATURE_HEADER) or request.headers.get(X_PAYMENT_HEADER)
 
+    def _canonical_url(self, request: Request) -> str:
+        """Resource URL for 402 responses. Behind the TLS proxy the raw request
+        URL is http://<backend-host>; discovery indexers key on the canonical
+        public URL, so prefer the configured public origin."""
+        if not self.public_base_url:
+            return str(request.url)
+        query = f"?{request.url.query}" if request.url.query else ""
+        return f"{self.public_base_url}{request.url.path}{query}"
+
     async def check_payment(
         self,
         request: Request,
@@ -316,7 +326,7 @@ class PaymentGate:
                 amount,
                 description,
                 extra_body,
-                request_url=str(request.url),
+                request_url=self._canonical_url(request),
             )
 
         if not await self._ensure_initialized():
@@ -331,7 +341,7 @@ class PaymentGate:
                     amount,
                     description,
                     extra_body,
-                    request_url=str(request.url),
+                    request_url=self._canonical_url(request),
                     error="Unsupported payment payload version",
                 )
 
@@ -345,7 +355,7 @@ class PaymentGate:
                     amount,
                     description,
                     extra_body,
-                    request_url=str(request.url),
+                    request_url=self._canonical_url(request),
                     error="No matching payment requirements",
                 )
 
@@ -364,7 +374,7 @@ class PaymentGate:
                     amount,
                     description,
                     extra_body,
-                    request_url=str(request.url),
+                    request_url=self._canonical_url(request),
                     error=verification.invalid_reason or "Payment verification failed",
                 )
 

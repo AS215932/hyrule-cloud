@@ -67,13 +67,18 @@ from hyrule_cloud.state import AppState
 async def lifespan(app: FastAPI):
     config = HyruleConfig()
 
+    # Production guard: refuse to boot in simulation/dev-bypass mode when the
+    # deployment declares it must provision real VMs.
+    from hyrule_cloud.services.launch_proof import enforce_real_provisioning_guard
+    enforce_real_provisioning_guard(config)
+
     # Database
     engine = create_db_engine(config.database_url)
     await init_db(engine)
     session_factory = create_session_factory(engine)
 
     # Payment gate (official x402 SDK)
-    payment_gate = PaymentGate(config.payment)
+    payment_gate = PaymentGate(config.payment, public_base_url=config.public_base_url)
 
     # Network proxy sidecar client. x402 stays in Hyrule Cloud; the sidecar
     # only executes already-authorized egress requests.

@@ -62,6 +62,7 @@ class _FakeServer:
         self.initialized = False
         self.verify_payment_calls = 0
         self.settle_payment_calls = 0
+        self.last_resource: ResourceInfo | None = None
         self.requirements = [
             PaymentRequirements(
                 scheme="exact",
@@ -86,6 +87,7 @@ class _FakeServer:
         resource: ResourceInfo | None = None,
         error: str | None = None,
     ) -> PaymentRequired:
+        self.last_resource = resource
         return PaymentRequired(
             x402_version=2,
             error=error,
@@ -146,12 +148,13 @@ class _FailingInitServer(_FakeServer):
         raise RuntimeError("facilitator down")
 
 
-def _gate(server: _FakeServer) -> PaymentGate:
+def _gate(server: _FakeServer, public_base_url: str = "") -> PaymentGate:
     gate = PaymentGate(
         PaymentConfig(
             receiver_address=RECEIVER,
             facilitator_url="https://facilitator.payai.network",
-        )
+        ),
+        public_base_url=public_base_url,
     )
     gate.server = server  # type: ignore[assignment]
     return gate
@@ -252,6 +255,34 @@ async def test_no_payment_returns_standard_and_legacy_payment_required_headers()
     assert LEGACY_PAYMENT_REQUIRED_HEADER in result.headers
     assert result.headers[PAYMENT_REQUIRED_HEADER] == result.headers[LEGACY_PAYMENT_REQUIRED_HEADER]
     assert server.initialized is True
+
+
+@pytest.mark.asyncio
+async def test_402_resource_url_prefers_public_base_url() -> None:
+    """Behind the TLS proxy the raw request URL is http://<backend>; the 402
+    resource URL must be the canonical public origin so Bazaar/x402scan index
+    the right identity."""
+    server = _FakeServer()
+    gate = _gate(server, public_base_url="https://cloud.hyrule.host")
+
+    result = await gate.check_payment(_request(), Decimal("0.05"), "VM creation")
+
+    assert isinstance(result, Response)
+    assert result.status_code == 402
+    assert server.last_resource is not None
+    assert server.last_resource.url == "https://cloud.hyrule.host/v1/vm/create"
+
+
+@pytest.mark.asyncio
+async def test_402_resource_url_falls_back_to_request_url() -> None:
+    server = _FakeServer()
+    gate = _gate(server)
+
+    result = await gate.check_payment(_request(), Decimal("0.05"), "VM creation")
+
+    assert isinstance(result, Response)
+    assert server.last_resource is not None
+    assert server.last_resource.url == "http://testserver/v1/vm/create"
 
 
 @pytest.mark.asyncio
