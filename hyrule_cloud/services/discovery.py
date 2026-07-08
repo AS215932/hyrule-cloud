@@ -14,13 +14,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import BaseModel
 from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 
 from hyrule_cloud import models
 
 
 def _json_body(
-    model_cls: type,
+    model_cls: type[BaseModel],
     example: dict[str, Any],
     output_example: dict[str, Any],
 ) -> dict[str, Any]:
