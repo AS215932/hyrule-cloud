@@ -18,6 +18,7 @@ from hyrule_cloud.models import (
     PathProbeRequest,
     PathReportRequest,
     SourceHealth,
+    SourceStatus,
 )
 from hyrule_cloud.services.diagnostics.sources import source_not_configured, source_ok
 from hyrule_cloud.services.safety import assert_safe_active_probe_target, normalize_host
@@ -47,6 +48,20 @@ def _sources(vantages: list[DiagnosticVantage]) -> dict[str, SourceHealth]:
         else:
             sources[vantage.value] = source_ok()
     return sources
+
+
+def path_active_probe_enabled() -> bool:
+    """Whether an external active-probe vantage is configured.
+
+    The built-in vantages (extmon/AS215932) don't actually execute probes, so
+    real reachability data requires Globalping or RIPE Atlas. Until one is
+    configured, path_probe/path_report only return a "probe accepted"
+    acknowledgement, so the routes return 501 before charging.
+    """
+    sources = _sources([DiagnosticVantage.GLOBALPING, DiagnosticVantage.RIPE_ATLAS])
+    return any(
+        source.status != SourceStatus.SOURCE_NOT_CONFIGURED for source in sources.values()
+    )
 
 
 async def path_probe(body: PathProbeRequest) -> DiagnosticResponse:

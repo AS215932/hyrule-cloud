@@ -29,21 +29,23 @@ cross-references resolve:
 4. `hyrule-dns-registry`
 5. `hyrule-mx`
 6. `hyrule-web-reachability`
-7. `hyrule-routing-path`
-8. `hyrule-port-reachability`
-9. `hyrule-nat-cgnat`
-10. `hyrule-voip-sip`
-11. `hyrule-agentic-support`
-12. `hyrule-mail-deliverability`
-13. `hyrule-threat-reputation` — only after its output quality passes the
-    Phase 3a canary (the lookup service currently makes no external calls)
+7. `hyrule-port-reachability`
+8. `hyrule-nat-cgnat`
+9. `hyrule-voip-sip` — SIP/`/v1/voip/check` only; strip `/v1/voip/number/lookup`
+   (501 until a number-intel provider is configured)
+10. `hyrule-agentic-support`
+11. `hyrule-mail-deliverability`
 
 ## Withheld — do NOT publish
 
 - `hyrule-mail` — every paid `/v1/mail` endpoint returns 501; contract preview only
 - `hyrule-speedtest` — measurement backend (payload/upload endpoints) not routed
+- `hyrule-routing-path` — `/v1/path/*` returns 501 until an active-probe vantage
+  (Globalping/RIPE Atlas) is configured; only a "probe accepted" contract today
+- `hyrule-threat-reputation` — `/v1/threat/lookup` returns 501 until a licensed
+  reputation source is configured; the lookup service makes no external calls today
 
-Both carry a NOT YET LAUNCHED banner. Publish only once the backends ship and
+These carry a NOT YET LAUNCHED banner. Publish only once the backends ship and
 the endpoints are re-advertised in `/.well-known/x402.json`.
 
 ## Keeping skills honest

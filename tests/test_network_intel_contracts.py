@@ -116,10 +116,8 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
             web = await client.post("/v1/web/check", json={"target": "https://example.com"})
             mx = await client.post("/v1/mx/check", json={"tool": "mx", "target": "example.com"})
             bounce = await client.post("/v1/mx/bounce/parse", json={"message": "550 5.7.26 auth failed"})
-            path = await client.post("/v1/path/report", json={"target": "example.com"})
             port = await client.post("/v1/ports/check", json={"target": "example.com", "port": 443})
             nat = await client.post("/v1/nat/lookup", json={"customer_reported_wan_ip": "100.64.1.1"})
-            threat = await client.post("/v1/threat/lookup", json={"subject": {"type": "domain", "value": "example.com"}})
             voip = await client.post("/v1/voip/check", json={"target": "example.com"})
             bgp = await client.post("/v1/bgp/lookup", json={"subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"}})
     finally:
@@ -130,10 +128,8 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
     assert web.status_code == 402
     assert mx.status_code == 402
     assert bounce.status_code == 402
-    assert path.status_code == 402
     assert port.status_code == 402
     assert nat.status_code == 402
-    assert threat.status_code == 402
     assert voip.status_code == 402
     assert bgp.status_code == 402
 
@@ -168,6 +164,16 @@ async def test_unbuilt_paid_endpoints_return_501_before_charging():
                 "/v1/speedtest/jobs": await client.post("/v1/speedtest/jobs", json={"target": "hyrule"}),
                 "/v1/voip/report": await client.post("/v1/voip/report", json={"target": "example.com"}),
                 "/v1/voip/jobs": await client.post("/v1/voip/jobs", json={"target": "example.com"}),
+                # Diagnostics whose real data source isn't configured must also
+                # refuse before charging (contract-only responses otherwise).
+                "/v1/threat/lookup": await client.post(
+                    "/v1/threat/lookup", json={"subject": {"type": "domain", "value": "example.com"}}
+                ),
+                "/v1/voip/number/lookup": await client.post(
+                    "/v1/voip/number/lookup", json={"number": "+31201234567"}
+                ),
+                "/v1/path/ping": await client.post("/v1/path/ping", json={"target": "example.com"}),
+                "/v1/path/report": await client.post("/v1/path/report", json={"target": "example.com"}),
             }
     finally:
         if old_state is not None:
@@ -201,16 +207,20 @@ async def test_x402_manifest_lists_network_intel_resources():
     assert "/v1/mx/check" in paths
     assert "/v1/mx/bounce/parse" in paths
     assert "/v1/mx/recommend-records" in paths
-    assert "/v1/path/report" in paths
     assert "/v1/ports/check" in paths
     assert "/v1/nat/lookup" in paths
-    assert "/v1/threat/lookup" in paths
     assert "/v1/voip/check" in paths
     # Unbuilt services must never be advertised in the discovery manifest:
     # they 501 before charging, so listing them would advertise dead ends.
     assert "/v1/speedtest" not in paths
     assert "/v1/speedtest/jobs" not in paths
     assert "/v1/mail/accounts" not in paths
+    # Diagnostics with no configured data source 501 before charging, so they
+    # are filtered out of discovery until a source is wired up.
+    assert "/v1/threat/lookup" not in paths
+    assert "/v1/voip/number/lookup" not in paths
+    assert "/v1/path/ping" not in paths
+    assert "/v1/path/report" not in paths
     assert "/v1/mail/messages/send" not in paths
     assert "/v1/web/reports" not in paths
     assert "/v1/path/jobs" not in paths
@@ -240,3 +250,50 @@ async def test_quotes_for_unbuilt_endpoints_return_501():
     for res in (mail_quote, speedtest_quote, web_report_quote):
         assert res.status_code == 501
         assert res.json()["error"] == "not_implemented"
+
+
+def test_diagnostic_enablement_predicates_default_off():
+    """With no external data source configured, the pluggable diagnostics report
+    disabled — this is what makes their routes 501 before charging."""
+    from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
+    from hyrule_cloud.services.threat.lookup import threat_intel_enabled
+    from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
+
+    assert threat_intel_enabled() is False
+    assert number_intel_enabled() is False
+    assert path_active_probe_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_threat_lookup_readvertises_and_charges_once_source_configured(monkeypatch):
+    """Configuring a real source must flip the route from 501-before-charge to a
+    normal paid endpoint, and bring it back into the discovery manifest — the
+    gate is data-driven, not a permanent removal."""
+    import hyrule_cloud.services.threat.lookup as threat_service
+    from hyrule_cloud.services.diagnostics.sources import source_ok
+
+    # Configure one licensed source. threat_intel_enabled() reads threat_sources()
+    # through the module global, so this reaches both the route and the manifest.
+    configured = threat_service.threat_sources()
+    configured["spamhaus_commercial"] = source_ok()
+    monkeypatch.setattr(threat_service, "threat_sources", lambda: configured)
+    old_state = getattr(app.state, "_typed_state", None)
+    if hasattr(app.state, "_typed_state"):
+        delattr(app.state, "_typed_state")
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            lookup = await client.post(
+                "/v1/threat/lookup", json={"subject": {"type": "domain", "value": "example.com"}}
+            )
+        app.state._typed_state = SimpleNamespace(config=HyruleConfig())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            manifest = await client.get("/.well-known/x402.json")
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+        elif hasattr(app.state, "_typed_state"):
+            delattr(app.state, "_typed_state")
+    # No payment header + a configured source => 402 (chargeable), not 501.
+    assert lookup.status_code == 402
+    paths = {resource["path"] for resource in manifest.json()["resources"]}
+    assert "/v1/threat/lookup" in paths

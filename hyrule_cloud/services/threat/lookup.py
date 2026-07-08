@@ -12,6 +12,7 @@ from hyrule_cloud.models import (
     DiagnosticTarget,
     DiagnosticTargetType,
     SourceHealth,
+    SourceStatus,
     ThreatLookupRequest,
     ThreatSubjectType,
     ThreatView,
@@ -39,6 +40,19 @@ def threat_sources() -> dict[str, SourceHealth]:
     }
     sources.update({name: source_not_configured("licensed or owner-verified provider is not configured") for name in _LICENSED_SOURCES})
     return sources
+
+
+def threat_intel_enabled() -> bool:
+    """Whether a real reputation source is configured.
+
+    Until a licensed/owner-verified provider is wired up, threat_lookup only
+    emits contract metadata (no external calls), so the route returns 501
+    before charging rather than billing for a non-answer.
+    """
+    sources = threat_sources()
+    return any(
+        sources[name].status != SourceStatus.SOURCE_NOT_CONFIGURED for name in _LICENSED_SOURCES
+    )
 
 
 async def threat_lookup(body: ThreatLookupRequest) -> DiagnosticResponse:

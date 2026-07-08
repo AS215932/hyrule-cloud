@@ -449,6 +449,33 @@ async def x402_manifest():
         manifest["resources"] = [
             r for r in manifest["resources"] if r.get("path") != "/v1/vm/create"
         ]
+    # Don't advertise diagnostic routes whose real data source isn't configured
+    # yet — they return 501 before charging, so pointing agents at them would
+    # only produce failed payments. They re-appear automatically once a source
+    # is wired up (same predicate the routes use).
+    from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
+    from hyrule_cloud.services.threat.lookup import threat_intel_enabled
+    from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
+
+    unconfigured: set[str] = set()
+    if not threat_intel_enabled():
+        unconfigured.add("/v1/threat/lookup")
+    if not number_intel_enabled():
+        unconfigured.add("/v1/voip/number/lookup")
+    if not path_active_probe_enabled():
+        unconfigured.update(
+            {
+                "/v1/path/ping",
+                "/v1/path/trace",
+                "/v1/path/mtr",
+                "/v1/path/asymmetry",
+                "/v1/path/report",
+            }
+        )
+    if unconfigured:
+        manifest["resources"] = [
+            r for r in manifest["resources"] if r.get("path") not in unconfigured
+        ]
     # Bazaar/x402scan: flag resources whose 402 responses carry a discovery
     # extension declaration (services/discovery.py).
     for resource in manifest["resources"]:

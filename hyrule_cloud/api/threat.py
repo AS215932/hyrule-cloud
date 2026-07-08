@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request, Response
 
-from hyrule_cloud.api._contract import diagnostic_quote, payment_price, require_paid_diagnostic
+from hyrule_cloud.api._contract import (
+    diagnostic_quote,
+    not_implemented,
+    payment_price,
+    require_paid_diagnostic,
+)
 from hyrule_cloud.models import (
     CapabilityEndpoint,
     DiagnosticResponse,
@@ -17,7 +22,11 @@ from hyrule_cloud.models import (
     ThreatSubjectType,
     ThreatView,
 )
-from hyrule_cloud.services.threat.lookup import threat_lookup, threat_sources
+from hyrule_cloud.services.threat.lookup import (
+    threat_intel_enabled,
+    threat_lookup,
+    threat_sources,
+)
 
 router = APIRouter(prefix="/v1/threat", tags=["Threat and reputation"])
 
@@ -62,6 +71,10 @@ async def quote_threat_lookup(request: Request, body: ThreatLookupRequest) -> Pa
 
 @router.post("/lookup", response_model=DiagnosticResponse)
 async def run_threat_lookup(request: Request, body: ThreatLookupRequest) -> DiagnosticResponse | Response:
+    # No licensed reputation source is configured, so a paid lookup would only
+    # return contract metadata. Refuse before charging until one is wired up.
+    if not threat_intel_enabled():
+        return not_implemented("threat.lookup")
     if payment := await require_paid_diagnostic(request, price_attr="price_threat_lookup", default="0.01", description="Hyrule threat/reputation lookup"):
         return payment
     return await threat_lookup(body)

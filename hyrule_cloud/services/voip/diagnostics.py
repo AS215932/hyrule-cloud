@@ -16,6 +16,7 @@ from hyrule_cloud.models import (
     DNSLookupRecordType,
     DNSLookupRequest,
     SourceHealth,
+    SourceStatus,
     VoIPCheck,
     VoIPCheckRequest,
     VoIPNumberLookupRequest,
@@ -35,6 +36,21 @@ def voip_sources() -> dict[str, SourceHealth]:
     }
     sources.update({provider: source_not_configured("number intelligence provider API key is not configured") for provider in _NUMBER_PROVIDERS})
     return sources
+
+
+def number_intel_enabled() -> bool:
+    """Whether a real number-intelligence provider is configured.
+
+    voip_number_lookup returns only a contract stub until a carrier/CNAM/spam
+    provider is wired up, so the route returns 501 before charging rather than
+    billing for a disabled-adapter notice. (voip_check does real SIP DNS/TLS
+    work and is unaffected.)
+    """
+    sources = voip_sources()
+    return any(
+        sources[provider].status != SourceStatus.SOURCE_NOT_CONFIGURED
+        for provider in _NUMBER_PROVIDERS
+    )
 
 
 async def voip_check(body: VoIPCheckRequest) -> DiagnosticResponse:

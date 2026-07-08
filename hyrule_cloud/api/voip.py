@@ -21,7 +21,12 @@ from hyrule_cloud.models import (
     VoIPPricingResponse,
     VoIPSourcesResponse,
 )
-from hyrule_cloud.services.voip.diagnostics import voip_check, voip_number_lookup, voip_sources
+from hyrule_cloud.services.voip.diagnostics import (
+    number_intel_enabled,
+    voip_check,
+    voip_number_lookup,
+    voip_sources,
+)
 
 router = APIRouter(prefix="/v1/voip", tags=["VoIP/SIP diagnostics"])
 
@@ -79,6 +84,10 @@ async def run_voip_check(request: Request, body: VoIPCheckRequest) -> Diagnostic
 
 @router.post("/number/lookup", response_model=DiagnosticResponse)
 async def run_voip_number_lookup(request: Request, body: VoIPNumberLookupRequest) -> DiagnosticResponse | Response:
+    # No carrier/CNAM/spam provider is configured, so a paid lookup would only
+    # return a disabled-adapter notice. Refuse before charging until one is set.
+    if not number_intel_enabled():
+        return not_implemented("voip.number.lookup")
     if payment := await require_paid_diagnostic(request, price_attr="price_voip_number_lookup", default="0.05", description="Hyrule VoIP number intelligence lookup"):
         return payment
     return await voip_number_lookup(body)

@@ -23,7 +23,11 @@ from hyrule_cloud.models import (
     PathVantagesResponse,
     ProductCapabilityResponse,
 )
-from hyrule_cloud.services.path.diagnostics import path_probe, path_report
+from hyrule_cloud.services.path.diagnostics import (
+    path_active_probe_enabled,
+    path_probe,
+    path_report,
+)
 
 router = APIRouter(prefix="/v1/path", tags=["Path diagnostics"])
 
@@ -76,6 +80,11 @@ async def quote_path_report(request: Request, body: PathReportRequest) -> PaidEn
 
 
 async def _paid_probe(request: Request) -> Response | None:
+    # No active-probe vantage is configured, so a probe would only return a
+    # "probe accepted" acknowledgement with no reachability data. Refuse before
+    # charging until Globalping/RIPE Atlas is wired up.
+    if not path_active_probe_enabled():
+        return not_implemented("path.probe")
     return await require_paid_diagnostic(request, price_attr="price_path_probe", default="0.005", description="Hyrule path diagnostic probe")
 
 
@@ -113,6 +122,10 @@ async def path_asymmetry(request: Request, body: PathProbeRequest) -> Diagnostic
 
 @router.post("/report", response_model=DiagnosticResponse)
 async def create_path_report(request: Request, body: PathReportRequest) -> DiagnosticResponse | Response:
+    # The evidence pack is inconclusive without active-probe vantages; refuse
+    # before charging until one is configured (see _paid_probe).
+    if not path_active_probe_enabled():
+        return not_implemented("path.report")
     if payment := await require_paid_diagnostic(request, price_attr="price_path_report", default="0.05", description="Hyrule routing/path evidence pack"):
         return payment
     return await path_report(body)
