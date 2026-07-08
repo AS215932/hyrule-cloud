@@ -71,15 +71,50 @@ class PaymentLedger:
         error: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
+        """Record a payment-gate outcome derived from an HTTP request."""
+        await self.record_event(
+            event_type=event_type,
+            resource_path=request.url.path,
+            method=request.method,
+            amount=amount,
+            network=network,
+            asset=asset,
+            payer=payer,
+            tx_hash=tx_hash,
+            facilitator_host=facilitator_host,
+            error=error,
+            extra=extra,
+        )
+
+    async def record_event(
+        self,
+        *,
+        event_type: str,
+        resource_path: str,
+        method: str = "",
+        amount: Decimal | None = None,
+        network: str | None = None,
+        asset: str | None = None,
+        payer: str | None = None,
+        tx_hash: str | None = None,
+        facilitator_host: str | None = None,
+        error: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Record an event from explicit fields (no HTTP request required).
+
+        Used by background flows — e.g. a refund obligation raised when a paid
+        VM fails to provision, long after the request that charged for it.
+        """
         try:
-            path = request.url.path
+            path = resource_path or ""
             async with self._session_factory() as session:
                 session.add(
                     PaymentEventRow(
                         event_id=str(uuid.uuid4()),
                         event_type=event_type,
                         resource_path=path[:256],
-                        method=request.method[:8],
+                        method=(method or "")[:8],
                         service_group=service_group_for_path(path),
                         amount_usd=amount,
                         network=network,

@@ -47,6 +47,8 @@ from hyrule_cloud.providers.network_config import (
 )
 from hyrule_cloud.providers.openprovider import OpenproviderClient
 from hyrule_cloud.providers.xcpng import XCPNGProvider
+from hyrule_cloud.services.payments_ledger import PaymentLedger
+from hyrule_cloud.services.refunds import RefundService
 
 log = structlog.get_logger()
 
@@ -66,6 +68,10 @@ class Orchestrator:
         self.xcpng = XCPNGProvider(config.xcpng)
         self.dns = DNSProvider(config)
         self.openprovider = OpenproviderClient(config.openprovider)
+        # Refund obligations for paid VMs that fail to provision. The ledger is
+        # a thin writer over the session factory, so a dedicated instance here
+        # is fine and keeps the constructor signature stable for callers/tests.
+        self.refunds = RefundService(PaymentLedger(session_factory))
 
         self._tasks: set[asyncio.Task] = set()
 
@@ -408,13 +414,26 @@ class Orchestrator:
 
         except Exception as e:
             log.error("provision_failed", vm_id=vm_id, error=str(e), exc_info=True)
+            owner_wallet, amount, payment_tx = "", None, None
             async with self.db() as session:
-                await session.execute(
-                    update(VMRow)
-                    .where(VMRow.vm_id == vm_id)
-                    .values(status=VMStatus.FAILED, error=str(e))
-                )
+                row = await session.get(VMRow, vm_id)
+                if row is not None:
+                    row.status = VMStatus.FAILED
+                    row.error = str(e)
+                    owner_wallet = row.owner_wallet
+                    amount = row.cost_total
+                    payment_tx = row.payment_tx
                 await session.commit()
+            # The customer paid (x402 settled at create) for a VM we could not
+            # deliver: record the refund we now owe them (no-op for free VMs).
+            await self.refunds.record_owed(
+                resource_path="/v1/vm/create",
+                payer=owner_wallet or None,
+                amount=amount,
+                original_tx=payment_tx,
+                reason=str(e),
+                vm_id=vm_id,
+            )
 
     async def _simulate_provisioning(self, vm_id: str) -> None:
         """Controlled simulation of provisioning (issue #28).
