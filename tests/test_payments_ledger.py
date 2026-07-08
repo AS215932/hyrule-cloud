@@ -394,3 +394,27 @@ async def test_verify_only_invalid_returns_response(session_factory) -> None:
     assert isinstance(result, Response)
     events = await _events(session_factory)
     assert [e.event_type for e in events] == ["verify_failed"]
+
+
+@pytest.mark.asyncio
+async def test_settle_verified_swallows_facilitator_exception(session_factory) -> None:
+    """A facilitator error during deferred settle must return False (so the
+    route withholds the paid result), not raise into an unhandled 500."""
+    from hyrule_cloud.middleware.x402 import VerifiedPayment
+
+    server = _FakeServer()
+    gate = _gate(server)
+    gate.ledger = PaymentLedger(session_factory)
+    req = _request({PAYMENT_SIGNATURE_HEADER: _payment_header(server.requirements[0])})
+
+    verified = await gate.verify_only(req, Decimal("0.05"), "Network proxy request")
+    assert isinstance(verified, VerifiedPayment)
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("facilitator down")
+
+    gate.server.settle_payment = boom
+    ok = await gate.settle_verified(req, verified)
+    assert ok is False
+    events = await _events(session_factory)
+    assert [e.event_type for e in events] == ["settle_failed"]

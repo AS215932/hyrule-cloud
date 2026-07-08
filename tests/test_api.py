@@ -292,3 +292,58 @@ async def test_network_request_delivered_response_settles(override_state):
     assert res.status_code == 200
     assert res.json()["body"] == "ok"
     assert override_state.payment_gate.settled == 1
+
+
+@pytest.mark.asyncio
+async def test_network_request_settlement_failure_withholds_response(override_state, monkeypatch):
+    """If settlement is declined after the fetch (e.g. a reused authorization),
+    the caller must get a payment error, NOT the fetched body for free."""
+    async def fail_settle(request, verified):
+        return False
+
+    monkeypatch.setattr(override_state.payment_gate, "settle_verified", fail_settle)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/network/request",
+            headers={"X-Mock-Wallet": "0xWallet"},
+            json={"url": "http://example.com", "proxy_mode": "direct"},
+        )
+    assert res.status_code == 402
+    assert res.json().get("body") != "ok"  # the paid content was withheld
+
+
+@pytest.mark.asyncio
+async def test_network_request_rejects_concurrent_authorization_reuse(override_state):
+    """Two concurrent requests reusing the same x402 authorization must not both
+    reach the sidecar — the second is rejected while the first is in flight."""
+    import asyncio
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    orig_execute = override_state.network_provider.execute_request
+
+    async def blocking_execute(req):
+        entered.set()
+        await release.wait()
+        return await orig_execute(req)
+
+    override_state.network_provider.execute_request = blocking_execute
+    headers = {"X-Mock-Wallet": "0xWallet", "X-PAYMENT": "sig-abc"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        async def call():
+            return await client.post(
+                "/v1/network/request",
+                headers=headers,
+                json={"url": "http://example.com", "proxy_mode": "direct"},
+            )
+
+        first = asyncio.create_task(call())
+        await entered.wait()  # first is now blocked in the fetch, holding the guard
+        second = await call()  # same authorization, still in flight
+        release.set()
+        first_res = await first
+
+    assert second.status_code == 409
+    assert first_res.status_code == 200
+    # Only one fetch actually ran for the shared authorization.
+    assert len(override_state.network_provider.requests) == 1

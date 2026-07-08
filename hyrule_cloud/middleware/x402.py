@@ -723,10 +723,25 @@ class PaymentGate:
             )
             return True
 
-        settlement = await self.server.settle_payment(
-            verified.payment_payload,
-            verified.matching_requirements,
-        )
+        try:
+            settlement = await self.server.settle_payment(
+                verified.payment_payload,
+                verified.matching_requirements,
+            )
+        except Exception:
+            # A facilitator error must not become an unhandled 500 in the route;
+            # report failed settlement so the caller withholds the paid result.
+            log.error("payment_settlement_error", exc_info=True)
+            await self._record(
+                "settle_failed",
+                request,
+                verified.amount,
+                network=verified.matching_requirements.network,
+                asset=verified.matching_requirements.asset,
+                payer=verified.payer,
+                error="Payment settlement error",
+            )
+            return False
         settlement_header = encode_payment_response_header(settlement)
         request.state.payment_response_headers = {
             PAYMENT_RESPONSE_HEADER: settlement_header,
