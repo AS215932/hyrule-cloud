@@ -1,6 +1,6 @@
 ---
 name: hyrule-nat-cgnat
-description: Use Hyrule Cloud when an AI agent needs server-side NAT or CGNAT hints for a customer. This MVP does not require browser/WebRTC/STUN participation.
+description: "Use Hyrule Cloud when an AI agent needs server-side NAT or CGNAT hints for a customer. This MVP does not require browser/WebRTC/STUN participation."
 ---
 
 # Hyrule NAT/CGNAT Skill

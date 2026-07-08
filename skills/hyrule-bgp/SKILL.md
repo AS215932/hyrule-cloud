@@ -1,6 +1,6 @@
 ---
 name: hyrule-bgp
-description: Hyrule BGP Data provides free AS215932 status plus paid public/global BGP intelligence for agents.
+description: "Hyrule BGP Data provides free AS215932 status plus paid public/global BGP intelligence for agents."
 ---
 
 # Hyrule BGP Data Skill

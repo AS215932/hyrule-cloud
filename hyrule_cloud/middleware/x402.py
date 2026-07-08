@@ -420,7 +420,24 @@ class PaymentGate:
 
         try:
             requirements = self._build_requirements(amount)
-            payment_payload = decode_payment_signature_header(payment_header)
+            try:
+                payment_payload = decode_payment_signature_header(payment_header)
+            except Exception:
+                # Malformed header (bad base64/JSON — scanners, broken wallets):
+                # a verification failure, not a server error. Record it so
+                # /metrics doesn't undercount, and answer with a fresh 402.
+                await self._record(
+                    "verify_failed", request, amount, error="Malformed payment header"
+                )
+                return await self._payment_required_response(
+                    requirements,
+                    amount,
+                    description,
+                    extra_body,
+                    request_url=self._canonical_url(request),
+                    error="Malformed payment header",
+                    extensions=extensions,
+                )
             if not isinstance(payment_payload, PaymentPayload):
                 await self._record(
                     "verify_failed", request, amount, error="Unsupported payment payload version"

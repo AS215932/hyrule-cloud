@@ -20,6 +20,38 @@ from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 from hyrule_cloud import models
 
 
+def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
+    """Resolve internal ``#/$defs/...`` references by substitution.
+
+    ``model_json_schema()`` emits ``$defs`` at the schema root, but the SDK
+    nests our schema under the extension's ``body`` property while the
+    ``$ref`` pointers keep targeting the (now wrong) document root — Bazaar
+    validation then rejects the extension as unresolvable. Our request models
+    are non-recursive (enums + small nested models), so full inlining is safe.
+    """
+    defs: dict[str, Any] = schema.get("$defs", {})
+
+    def resolve(node: Any, seen: frozenset[str]) -> Any:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                name = ref.removeprefix("#/$defs/")
+                if name in seen:  # cycle guard: leave the ref rather than loop
+                    return node
+                target = resolve(defs.get(name, {}), seen | {name})
+                # Sibling keys next to $ref (e.g. default) merge over the target.
+                return {**target, **{k: v for k, v in node.items() if k != "$ref"}}
+            return {k: resolve(v, seen) for k, v in node.items() if k != "$defs"}
+        if isinstance(node, list):
+            return [resolve(item, seen) for item in node]
+        return node
+
+    resolved: dict[str, Any] = resolve(
+        {k: v for k, v in schema.items() if k != "$defs"}, frozenset()
+    )
+    return resolved
+
+
 def _json_body(
     model_cls: type[BaseModel],
     example: dict[str, Any],
@@ -27,7 +59,7 @@ def _json_body(
 ) -> dict[str, Any]:
     return declare_discovery_extension(
         input=example,
-        input_schema=model_cls.model_json_schema(),
+        input_schema=_inline_defs(model_cls.model_json_schema()),
         body_type="json",
         output=OutputConfig(example=output_example),
     )

@@ -1,6 +1,6 @@
 ---
 name: hyrule-agentic-support
-description: Hyrule Agentic ISP Support is the umbrella Skill for x402-paid network facts that LLMs cannot infer: live reachability, DNS, BGP, mail deliverability, routing/path evidence, TLS, reputation, VoIP, NAT hints, speedtests, and AS215932-backed …
+description: "Hyrule Agentic ISP Support is the umbrella Skill for x402-paid network facts that LLMs cannot infer: live reachability, DNS, BGP, mail deliverability, routing/path evidence, TLS, reputation, VoIP, NAT hints, speedtests, and AS215932-backed \u2026"
 ---
 
 # Hyrule Agentic ISP Support Skill

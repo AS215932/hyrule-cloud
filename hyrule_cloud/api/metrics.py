@@ -22,6 +22,7 @@ from fastapi import APIRouter, Request, Response
 from sqlalchemy import func, select
 
 from hyrule_cloud.db import DomainRow, PaymentEventRow, VMRow
+from hyrule_cloud.models import VMStatus
 
 router = APIRouter(tags=["Observability"])
 
@@ -124,9 +125,19 @@ async def _render(session_factory: Any) -> str:
         ).scalar_one()
         lines.append(f"hyrule_payment_unique_payers_24h {unique_24h}")
 
-        _metric(lines, "hyrule_vms_active", "VMs by lifecycle status.", "gauge")
+        _metric(
+            lines,
+            "hyrule_vms_active",
+            "Live VMs by lifecycle status (destroyed/failed rows are retained "
+            "in the DB but excluded here so the gauge tracks the actual fleet).",
+            "gauge",
+        )
         rows = (
-            await session.execute(select(VMRow.status, func.count()).group_by(VMRow.status))
+            await session.execute(
+                select(VMRow.status, func.count())
+                .where(VMRow.status.notin_([VMStatus.DESTROYED, VMStatus.FAILED]))
+                .group_by(VMRow.status)
+            )
         ).all()
         for status, count in rows:
             value = getattr(status, "value", status)

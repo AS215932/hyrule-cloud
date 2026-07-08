@@ -1,6 +1,6 @@
 ---
 name: hyrule-mail-deliverability
-description: Use Hyrule Cloud when an AI agent needs to diagnose missing, rejected, delayed, or spam-filtered email for any public domain. This Skill is a marketing/support wrapper over the canonical /v1/mx API.
+description: "Use Hyrule Cloud when an AI agent needs to diagnose missing, rejected, delayed, or spam-filtered email for any public domain. This Skill is a marketing/support wrapper over the canonical /v1/mx API."
 ---
 
 # Hyrule Mail Deliverability Skill

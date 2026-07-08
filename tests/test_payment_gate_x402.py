@@ -447,3 +447,31 @@ def test_discovery_registry_only_declares_real_endpoints() -> None:
     declared_paths = {path for _, path in DISCOVERY}
     for dead in ("/v1/mail/accounts", "/v1/mail/messages/send", "/v1/speedtest", "/v1/web/reports", "/v1/voip/report", "/v1/path/jobs"):
         assert dead not in declared_paths
+
+
+def test_discovery_schemas_contain_no_unresolved_refs() -> None:
+    """Bazaar nests our schema under the extension body, so root-relative
+    $refs would dangle — every declared schema must be fully inlined."""
+    import json
+
+    from hyrule_cloud.services.discovery import DISCOVERY
+
+    as_json = {f"{m} {p}": ext for (m, p), ext in DISCOVERY.items()}
+    blob = json.dumps(as_json)
+    assert "$ref" not in blob
+    assert "$defs" not in blob
+    # Inlining must preserve real structure, e.g. the VM size enum.
+    vm = as_json["POST /v1/vm/create"]["bazaar"]
+    assert "xs" in json.dumps(vm)
+
+
+@pytest.mark.asyncio
+async def test_malformed_payment_header_returns_402_not_502() -> None:
+    server = _FakeServer()
+    gate = _gate(server)
+    req = _request({PAYMENT_SIGNATURE_HEADER: "!!!not-base64-json!!!"})
+
+    result = await gate.check_payment(req, Decimal("0.05"), "VM creation")
+
+    assert isinstance(result, Response)
+    assert result.status_code == 402

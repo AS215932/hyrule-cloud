@@ -1,6 +1,6 @@
 ---
 name: hyrule-mx
-description: Hyrule MX Diagnostics is a paid, MXToolbox-compatible troubleshooting API for AI agents and ISP support automation. Hyrule implements the checks internally; it is not affiliated with MXToolbox and does not scrape MXToolbox.
+description: "Hyrule MX Diagnostics is a paid, MXToolbox-compatible troubleshooting API for AI agents and ISP support automation. Hyrule implements the checks internally; it is not affiliated with MXToolbox and does not scrape MXToolbox."
 ---
 
 # Hyrule MX Diagnostics Skill

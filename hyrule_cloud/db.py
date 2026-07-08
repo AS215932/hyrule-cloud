@@ -272,7 +272,8 @@ class PaymentEventRow(Base):
     # vm | domain | network_proxy | network_intel | mail | other (from path)
     service_group: Mapped[str] = mapped_column(String(24), index=True)
     amount_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
-    network: Mapped[str | None] = mapped_column(String(32))  # CAIP-2
+    # CAIP-2; solana:<genesis-hash> exceeds 32 chars, so size for the family
+    network: Mapped[str | None] = mapped_column(String(64))
     asset: Mapped[str | None] = mapped_column(String(66))  # token address or symbol
     payer_wallet: Mapped[str | None] = mapped_column(String(64), index=True)
     tx_hash: Mapped[str | None] = mapped_column(String(128))

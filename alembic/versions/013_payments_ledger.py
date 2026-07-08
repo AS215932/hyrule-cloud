@@ -42,7 +42,7 @@ def upgrade() -> None:
         sa.Column("method", sa.String(8), nullable=False),
         sa.Column("service_group", sa.String(24), nullable=False),
         sa.Column("amount_usd", sa.Numeric(12, 6), nullable=True),
-        sa.Column("network", sa.String(32), nullable=True),
+        sa.Column("network", sa.String(64), nullable=True),
         sa.Column("asset", sa.String(66), nullable=True),
         sa.Column("payer_wallet", sa.String(64), nullable=True),
         sa.Column("tx_hash", sa.String(128), nullable=True),

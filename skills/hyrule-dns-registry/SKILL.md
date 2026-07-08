@@ -1,6 +1,6 @@
 ---
 name: hyrule-dns-registry
-description: Use Hyrule Cloud when an AI agent needs read-only DNS, DNSSEC, propagation, RDAP, WHOIS, registrar/delegation, or record-publication guidance.
+description: "Use Hyrule Cloud when an AI agent needs read-only DNS, DNSSEC, propagation, RDAP, WHOIS, registrar/delegation, or record-publication guidance."
 ---
 
 # Hyrule DNS and Registry Skill

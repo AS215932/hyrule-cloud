@@ -293,3 +293,49 @@ async def test_hung_ledger_cannot_block_a_settled_response(monkeypatch) -> None:
     )
 
     assert result == PAYER
+
+
+@pytest.mark.asyncio
+async def test_malformed_header_writes_verify_failed(session_factory) -> None:
+    gate = _gate(_FakeServer())
+    gate.ledger = PaymentLedger(session_factory)
+    req = _request({PAYMENT_SIGNATURE_HEADER: "!!!garbage!!!"})
+
+    result = await gate.check_payment(req, Decimal("0.05"), "VM creation")
+
+    assert isinstance(result, Response)
+    assert result.status_code == 402
+    events = await _events(session_factory)
+    assert [e.event_type for e in events] == ["verify_failed"]
+    assert events[0].error_reason == "Malformed payment header"
+
+
+@pytest.mark.asyncio
+async def test_vms_active_excludes_dead_rows(metrics_app_state) -> None:
+    session_factory = metrics_app_state
+    async with session_factory() as session:
+        for vm_id, status in (
+            ("vm_live", VMStatus.RUNNING),
+            ("vm_dead", VMStatus.DESTROYED),
+            ("vm_broken", VMStatus.FAILED),
+        ):
+            session.add(
+                VMRow(
+                    vm_id=vm_id,
+                    owner_wallet=PAYER,
+                    status=status,
+                    size=VMSize.XS,
+                    os="debian-13",
+                    hostname=f"{vm_id}.deploy.hyrule.host",
+                    cost_total=Decimal("0.05"),
+                )
+            )
+        await session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.get("/metrics", headers={"Authorization": "Bearer scrape-token"})
+
+    body = res.text
+    assert 'hyrule_vms_active{status="running"} 1' in body
+    assert 'status="destroyed"' not in body
+    assert 'hyrule_vms_active{status="failed"}' not in body

@@ -1,6 +1,6 @@
 ---
 name: hyrule-web-reachability
-description: Use Hyrule Cloud when an AI agent needs live, paid evidence for public website reachability, TLS/certificate failures, HTTP behavior, security headers, and CDN/WAF hints.
+description: "Use Hyrule Cloud when an AI agent needs live, paid evidence for public website reachability, TLS/certificate failures, HTTP behavior, security headers, and CDN/WAF hints."
 ---
 
 # Hyrule Web Reachability Skill
