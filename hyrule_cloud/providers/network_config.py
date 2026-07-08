@@ -60,6 +60,14 @@ def validate_customer_network_settings(*, supernet: str, gateway: str, dns: str)
     Raises ValueError on any problem.
     """
     net = IPv6Network(supernet, strict=True)
+    # Prefix indexes persist in a 32-bit Integer column (VMRow.ipv6_prefix_index);
+    # a supernet shorter than /33 can produce indexes past 2^31-1 and fail the
+    # INSERT after payment.
+    if net.prefixlen < 33:
+        raise ValueError(
+            f"customer supernet {net} is too large: prefix indexes must fit a "
+            f"32-bit integer, so the supernet must be /33 or longer"
+        )
     usable = customer_prefix_count(net) - len(RESERVED_PREFIX_INDEXES)
     if usable <= 0:
         raise ValueError(
