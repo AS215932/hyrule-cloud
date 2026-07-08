@@ -41,6 +41,7 @@ from hyrule_cloud.providers.network_config import (
     prefix_index_candidate,
     render_debian_network_config,
     supports_static_network_config,
+    validate_customer_network_settings,
     vm_address_for_prefix,
 )
 from hyrule_cloud.providers.openprovider import OpenproviderClient
@@ -68,6 +69,13 @@ class Orchestrator:
         self._tasks: set[asyncio.Task] = set()
 
     async def startup(self) -> None:
+        # Fail fast on malformed customer-network settings: an operator typo
+        # must surface at boot, not as a failed paid VM after the charge.
+        validate_customer_network_settings(
+            supernet=self.config.customer_ipv6_supernet,
+            gateway=self.config.customer_ipv6_gateway,
+            dns=self.config.customer_ipv6_dns,
+        )
         try:
             await self.xcpng.login()
         except Exception as exc:
@@ -160,6 +168,20 @@ class Orchestrator:
         token + the account both authorize management, redundancy is
         intentional so the operator can claim/transfer later.
         """
+        # Defense in depth: routes and intent creation validate this before
+        # charging, but create_vm is also reachable from settled intents
+        # created before those checks existed. Refuse before persisting a row
+        # so a paid order can never be accepted for an unprovisionable OS.
+        from hyrule_cloud.services.launch_proof import use_real_provisioning
+
+        if use_real_provisioning():
+            if not self.config.xcpng.templates.get(request.os):
+                raise ValueError(f"Unknown OS template: {request.os}")
+            if not supports_static_network_config(request.os):
+                raise ValueError(
+                    f"OS template {request.os} is not supported for real VM provisioning yet"
+                )
+
         expires_at = _now() + timedelta(days=request.duration_days)
         total, _ = self.compute_price(request)
         anon_token = generate_anon_management_token()
@@ -558,6 +580,14 @@ class Orchestrator:
             if row:
                 row.status = VMStatus.DESTROYED
                 row.destroyed_at = _now()
+                # Release the customer /64 for reuse: the unique index on
+                # ipv6_prefix_index would otherwise pin it to this dead row
+                # forever and eventually exhaust the pool. Only safe here —
+                # the guest and its DNS record are gone. FAILED rows keep the
+                # prefix until destroyed, since a partially-provisioned guest
+                # may still hold the address.
+                row.ipv6_prefix_index = None
+                row.ipv6_prefix = None
                 await session.commit()
 
         log.info("vm_destroyed", vm_id=vm_id)

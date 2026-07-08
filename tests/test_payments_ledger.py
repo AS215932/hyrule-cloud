@@ -253,3 +253,19 @@ async def test_metrics_renders_ledger_and_fleet_counters(metrics_app_state) -> N
     assert 'hyrule_vms_active{status="ready"} 1' in body
     assert 'hyrule_vm_provision_total{result="ready"} 0' in body
     assert 'hyrule_vm_provision_total{result="failed"} 0' in body
+
+
+@pytest.mark.asyncio
+async def test_facilitator_outage_records_no_required_402(session_factory) -> None:
+    """A 503 (facilitator down) is not a challenge issued — recording it as
+    required_402 would corrupt the conversion funnel."""
+    from tests.test_payment_gate_x402 import _FailingInitServer
+
+    gate = _gate(_FailingInitServer())
+    gate.ledger = PaymentLedger(session_factory)
+
+    result = await gate.check_payment(_request(), Decimal("0.05"), "VM creation")
+
+    assert isinstance(result, Response)
+    assert result.status_code == 503
+    assert await _events(session_factory) == []

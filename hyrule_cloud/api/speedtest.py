@@ -5,7 +5,6 @@ from __future__ import annotations
 from fastapi import APIRouter, Request, Response
 
 from hyrule_cloud.api._contract import (
-    diagnostic_quote,
     not_implemented,
     payment_price,
 )
@@ -42,8 +41,10 @@ async def get_speedtest_pricing(request: Request) -> SpeedtestPricingResponse:
 
 
 @router.post("/quote", response_model=PaidEndpointQuote)
-async def quote_speedtest(request: Request, body: SpeedtestRequest) -> PaidEndpointQuote:
-    return diagnostic_quote(request, price_attr="price_speedtest", default="0.10", name="speedtest", paid_endpoint="/v1/speedtest")
+async def quote_speedtest(request: Request, body: SpeedtestRequest) -> Response:
+    # The paid endpoint this quotes is 501 while the measurement backend is
+    # unbuilt; a payable-looking quote for it would send agents into a dead end.
+    return not_implemented("speedtest.quote")
 
 
 @router.post("", response_model=DiagnosticResponse)

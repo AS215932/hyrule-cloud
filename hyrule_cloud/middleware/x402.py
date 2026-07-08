@@ -378,14 +378,19 @@ class PaymentGate:
 
         payment_header = self._payment_header(request)
         if not payment_header:
-            await self._record("required_402", request, amount)
-            return await self.build_402_response(
+            response = await self.build_402_response(
                 amount,
                 description,
                 extra_body,
                 request_url=self._canonical_url(request),
                 extensions=extensions,
             )
+            # Only a real 402 counts as a challenge issued: a facilitator
+            # outage yields a 503 here, and recording it as required_402
+            # would corrupt the conversion funnel.
+            if response.status_code == 402:
+                await self._record("required_402", request, amount)
+            return response
 
         if not await self._ensure_initialized():
             return self._json_response(503, {"error": "Payment facilitator unavailable"})
