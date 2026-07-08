@@ -343,10 +343,14 @@ async def _trigger_provisioning(
     # Provision the VM. The wallet address is the deposit address (informational).
     try:
         order = VMCreateRequest.model_validate(row.order_payload)
+        # Create the VM row but DON'T start provisioning yet: link the intent to
+        # the vm_id first, so a fast provisioning failure (immediate XO/API
+        # error) can always find the paying intent and record its refund.
         vm_row, anon_token = await orch.create_vm(
             order,
             owner_wallet=row.address,
             owner_account_id=row.owner_account_id,
+            start_provisioning=False,
         )
         async with session_factory() as db:
             r = await db.get(CryptoIntentRow, intent_id)
@@ -358,6 +362,8 @@ async def _trigger_provisioning(
             # this cleartext and immediately nulls the column. Sha256 is on VMRow.
             r.anon_token_cleartext = anon_token
             await db.commit()
+        # The intent↔vm link is committed; now it is safe to provision.
+        orch.start_provisioning(vm_row.vm_id)
         log.info("intent_provisioned", intent_id=intent_id, vm_id=vm_row.vm_id)
     except Exception:
         log.exception("intent_provisioning_failed", intent_id=intent_id)

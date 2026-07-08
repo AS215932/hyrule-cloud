@@ -51,15 +51,18 @@ class RefundService:
         network: str | None = None,
         asset: str | None = None,
         vm_id: str | None = None,
+        extra: dict[str, object] | None = None,
     ) -> bool:
         """Record that a refund is owed to ``payer``.
 
         ``network``/``asset`` carry the chain the original payment settled on so
         the operator refunds from the right receiver wallet (multi-chain
-        deployments). Returns True if an obligation was recorded, False when
-        there is nothing to refund (an unpaid/simulated VM with no settled
-        charge). Best-effort: a ledger write failure is logged but never raised
-        into the caller's failure-handling path.
+        deployments). ``extra`` merges into the ledger event payload — used to
+        stash identifiers that don't fit the fixed columns (e.g. a long native
+        deposit address that overflows ``payer_wallet``). Returns True if an
+        obligation was recorded, False when there is nothing to refund (an
+        unpaid/simulated VM with no settled charge). Best-effort: a ledger write
+        failure is logged but never raised into the caller's failure path.
         """
         if not payer or amount is None or amount <= 0:
             # No settled payment (free subdomain VM, dev bypass, sim) — nothing
@@ -80,6 +83,9 @@ class RefundService:
         )
 
         if self._ledger is not None:
+            event_extra: dict[str, object] = {"vm_id": vm_id, "original_tx": original_tx}
+            if extra:
+                event_extra.update(extra)
             await self._ledger.record_event(
                 event_type=REFUND_OWED_EVENT,
                 resource_path=resource_path,
@@ -89,6 +95,6 @@ class RefundService:
                 payer=payer,
                 tx_hash=original_tx or None,
                 error=reason,
-                extra={"vm_id": vm_id, "original_tx": original_tx},
+                extra=event_extra,
             )
         return True

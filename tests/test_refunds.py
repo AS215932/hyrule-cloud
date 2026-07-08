@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import Base, CryptoIntentRow, PaymentEventRow, VMRow
-from hyrule_cloud.models import CryptoIntentStatus, VMSize, VMStatus
+from hyrule_cloud.models import CryptoIntentStatus, VMCreateRequest, VMSize, VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
@@ -218,7 +218,45 @@ async def test_failed_native_intent_vm_records_manual_refund(session_factory, mo
     assert owed[0].network == "native"
     assert owed[0].asset == "BTC"
     assert owed[0].amount_usd == Decimal("0.05")
-    assert owed[0].payer_wallet == NATIVE_DEPOSIT_ADDR
+    # payer is the bounded intent_id (deposit addresses — esp. XMR — can exceed
+    # payer_wallet's width); the deposit address rides in extra.
+    assert owed[0].payer_wallet == "int_native1"
+    assert owed[0].extra["native_deposit_address"] == NATIVE_DEPOSIT_ADDR
+    assert owed[0].extra["intent_id"] == "int_native1"
+
+
+@pytest.mark.asyncio
+async def test_long_xmr_deposit_address_records_refund(session_factory, monkeypatch) -> None:
+    """A 95-char XMR deposit address must not overflow payer_wallet and silently
+    drop the refund row — it goes in extra, with the bounded intent_id as payer."""
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    xmr_addr = "4" + "A" * 94  # 95 chars, longer than payer_wallet String(64)
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    async with session_factory() as session:
+        session.add(_paid_provisioning_vm("vm_xmr", wallet=xmr_addr, tx="xmr-txid", cost="0.05"))
+        session.add(
+            CryptoIntentRow(
+                intent_id="int_xmr1",
+                asset="XMR",
+                amount_crypto=Decimal("0.0003"),
+                amount_usd=Decimal("0.05"),
+                address=xmr_addr,
+                status=CryptoIntentStatus.PROVISIONED,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                vm_id="vm_xmr",
+                tx_hash="xmr-txid",
+            )
+        )
+        await session.commit()
+
+    await orch._provision_vm("vm_xmr")
+
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1
+    assert owed[0].payer_wallet == "int_xmr1"  # bounded, not the 95-char address
+    assert owed[0].extra["native_deposit_address"] == xmr_addr
 
 
 @pytest.mark.asyncio
@@ -260,3 +298,23 @@ async def test_failed_free_vm_records_no_refund(session_factory, monkeypatch) ->
         row = await session.get(VMRow, "vm_free")
         assert row.status == VMStatus.FAILED
     assert [e for e in await _events(session_factory) if e.event_type == "refund_owed"] == []
+
+
+@pytest.mark.asyncio
+async def test_create_vm_can_defer_provisioning(session_factory, monkeypatch) -> None:
+    """create_vm(start_provisioning=False) inserts the row WITHOUT spawning the
+    background task, so a native intent can link its vm_id before provisioning
+    can fail; start_provisioning(vm_id) then kicks it off explicitly."""
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: False
+    )
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    spawned: list[str] = []
+    monkeypatch.setattr(orch, "_spawn_provisioning", lambda vm_id: spawned.append(vm_id))
+    order = VMCreateRequest(duration_days=1, size=VMSize.XS, os="debian-13", ssh_pubkey="ssh-ed25519 AAAA test")
+
+    row, _ = await orch.create_vm(order, owner_wallet=EVM_WALLET, start_provisioning=False)
+    assert spawned == []  # deferred — nothing provisioning yet
+
+    orch.start_provisioning(row.vm_id)
+    assert spawned == [row.vm_id]  # explicit start works

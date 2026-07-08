@@ -98,12 +98,22 @@ class _StubOrchestrator:
     def __init__(self, session_factory: async_sessionmaker) -> None:
         self.db = session_factory
         self.created_vms: list[tuple[str, str | None]] = []
+        self.provisioning_started: list[str] = []
 
     def compute_price(self, request):
         # 0.05/day * 1 day = 0.05 for xs
         return Decimal("0.05") * request.duration_days, None
 
-    async def create_vm(self, request, owner_wallet: str, owner_account_id: str | None = None):
+    def start_provisioning(self, vm_id: str) -> None:
+        self.provisioning_started.append(vm_id)
+
+    async def create_vm(
+        self,
+        request,
+        owner_wallet: str,
+        owner_account_id: str | None = None,
+        start_provisioning: bool = True,
+    ):
         from hyrule_cloud.middleware.anon_token import hash_anon_token
         from hyrule_cloud.models import (
             generate_anon_management_token,

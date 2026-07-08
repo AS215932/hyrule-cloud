@@ -247,11 +247,21 @@ class Orchestrator:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    def start_provisioning(self, vm_id: str) -> None:
+        """Kick off background provisioning for an already-created VM row.
+
+        Used by callers that need to establish a link to the row (e.g. a native
+        crypto intent setting its vm_id) BEFORE provisioning can fail, so the
+        failure path can always find the paying record.
+        """
+        self._spawn_provisioning(vm_id)
+
     async def create_vm(
         self,
         request: VMCreateRequest,
         owner_wallet: str,
         owner_account_id: str | None = None,
+        start_provisioning: bool = True,
     ) -> tuple[VMRow, str]:
         """Create a VM record in DB and start background provisioning.
 
@@ -265,9 +275,14 @@ class Orchestrator:
         a session cookie. The VM still gets a management token — the
         token + the account both authorize management, redundancy is
         intentional so the operator can claim/transfer later.
+
+        ``start_provisioning=False`` returns the row WITHOUT spawning the
+        background task so the caller can first link the row to its paying
+        record, then call ``start_provisioning(vm_id)``.
         """
         row, anon_token = await self._insert_vm_row(request, owner_wallet, owner_account_id)
-        self._spawn_provisioning(row.vm_id)
+        if start_provisioning:
+            self._spawn_provisioning(row.vm_id)
         return row, anon_token
 
     async def reserve_vm(
@@ -522,23 +537,26 @@ class Orchestrator:
             if intent is None:
                 return False
             intent.status = CryptoIntentStatus.REFUND_MANUAL
+            intent_id = intent.intent_id
             asset = intent.asset
             amount = intent.amount_usd
             deposit_address = intent.address
             intent_tx = intent.tx_hash
             await session.commit()
-        log.warning("native_intent_refund_manual", vm_id=vm_id, asset=asset, reason=reason)
-        # payer is the deposit address — an identifier for the operator's manual
-        # native refund, not an auto-send destination (network="native").
+        log.warning("native_intent_refund_manual", vm_id=vm_id, intent_id=intent_id, asset=asset, reason=reason)
+        # payer is the intent_id (a bounded reference the operator resolves to
+        # the REFUND_MANUAL intent) — NOT the deposit address, which for XMR can
+        # exceed payer_wallet's column width; the address rides in extra.
         await self.refunds.record_owed(
             resource_path="/v1/vm/create",
-            payer=deposit_address,
+            payer=intent_id,
             amount=amount,
             network="native",
             asset=asset,
             original_tx=intent_tx,
             reason=reason,
             vm_id=vm_id,
+            extra={"intent_id": intent_id, "native_deposit_address": deposit_address},
         )
         return True
 
