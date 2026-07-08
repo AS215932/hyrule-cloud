@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from decimal import Decimal
+from ipaddress import IPv6Network
 from typing import Any
 
 import structlog
@@ -61,7 +62,11 @@ from hyrule_cloud.models import (
     VMStatusResponse,
     generate_domain_management_token,
 )
-from hyrule_cloud.providers.network_config import supports_static_network_config
+from hyrule_cloud.providers.network_config import (
+    RESERVED_PREFIX_INDEXES,
+    customer_prefix_count,
+    supports_static_network_config,
+)
 from hyrule_cloud.services.launch_proof import build_launch_proof
 from hyrule_cloud.services.quotes import (
     QuoteConflictError,
@@ -263,11 +268,42 @@ def _validate_vm_order(order: VMCreateRequest, cfg) -> None:
         if port in cfg.blocked_ports:
             raise HTTPException(400, f"Port {port} is blocked by policy")
 
-    if _real_provisioning_enabled() and not supports_static_network_config(order.os):
-        raise HTTPException(
-            400,
-            f"OS template {order.os} is not supported for real VM provisioning yet",
+    if _real_provisioning_enabled():
+        if not supports_static_network_config(order.os):
+            raise HTTPException(
+                400,
+                f"OS template {order.os} is not supported for real VM provisioning yet",
+            )
+        # An OS name without a configured template UUID would only fail inside
+        # Orchestrator.create_vm — after payment. Refuse it here.
+        templates = getattr(getattr(cfg, "xcpng", None), "templates", None) or {}
+        if not templates.get(order.os):
+            raise HTTPException(
+                400,
+                f"OS template {order.os} is not available on this deployment",
+            )
+
+
+async def _enforce_prefix_capacity(orch, cfg) -> None:
+    """Refuse new paid VM orders when the customer /64 pool is exhausted.
+
+    Runs BEFORE the payment gate: prefix allocation happens in create_vm after
+    the charge, so without this check the next order on a full pool would be
+    charged and then fail.
+    """
+    try:
+        supernet = IPv6Network(cfg.customer_ipv6_supernet, strict=True)
+    except (AttributeError, ValueError):
+        return  # startup validation owns config errors; don't mask them here
+    usable = customer_prefix_count(supernet) - len(RESERVED_PREFIX_INDEXES)
+    async with orch.db() as session:
+        result = await session.execute(
+            select(func.count())
+            .select_from(VMRow)
+            .where(VMRow.ipv6_prefix_index.isnot(None))
         )
+    if int(result.scalar() or 0) >= usable:
+        raise HTTPException(503, "No customer IPv6 capacity available right now")
 
 
 # --- Block B (Wave 2): runtime metrics ---
@@ -711,6 +747,7 @@ async def create_vm(
     _validate_vm_order(order, cfg)
 
     await _enforce_paid_vm_cap(orch, cfg)
+    await _enforce_prefix_capacity(orch, cfg)
 
     # Price-lock: a quote-bound create charges the amount quoted to the user,
     # not a recomputation (which could drift). The breakdown is still recomputed
@@ -1267,6 +1304,7 @@ async def create_crypto_intent(
     _validate_vm_order(body.order_payload, cfg)
 
     await _enforce_paid_vm_cap(orch, cfg)
+    await _enforce_prefix_capacity(orch, cfg)
     total, _ = await _compute_vm_price(orch, cfg, body.order_payload)
 
     app_state: AppState = get_app_state(request)

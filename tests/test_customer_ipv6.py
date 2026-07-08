@@ -313,3 +313,107 @@ async def test_create_vm_refuses_unsupported_os_before_persisting(
     async with session_factory() as session:
         count = (await session.execute(select(func.count()).select_from(VMRow))).scalar_one()
     assert count == 0
+
+
+def test_validate_customer_network_settings_rejects_oversized_supernet():
+    """Indexes persist in a 32-bit column; supernets shorter than /33 overflow."""
+    with pytest.raises(ValueError, match="32-bit"):
+        validate_customer_network_settings(
+            supernet="2a00::/32",
+            gateway="2a00::1",
+            dns="2a00::1",
+        )
+
+
+def test_vm_order_validation_requires_configured_template(monkeypatch):
+    """Real mode: an OS with static-config support but no template UUID must be
+    rejected before payment, not inside create_vm after the charge."""
+    from fastapi import HTTPException
+
+    from hyrule_cloud.api import routes
+    from hyrule_cloud.models import VMCreateRequest
+
+    monkeypatch.setattr(routes, "_real_provisioning_enabled", lambda: True)
+
+    class _XCPNG:
+        templates = {"debian-13": ""}  # name known, UUID unconfigured
+
+    class _Cfg:
+        blocked_ports = [25]
+        xcpng = _XCPNG()
+
+    order = VMCreateRequest(duration_days=1, os="debian-13", ssh_pubkey="ssh-ed25519 AAAA t")
+    with pytest.raises(HTTPException) as exc:
+        routes._validate_vm_order(order, _Cfg())
+    assert exc.value.status_code == 400
+    assert "not available" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_prefix_capacity_enforced_before_payment(session_factory):
+    """A full /64 pool must refuse new orders with 503 BEFORE the payment gate
+    runs — allocation happens post-charge in create_vm."""
+    from fastapi import HTTPException
+
+    from hyrule_cloud.api.routes import _enforce_prefix_capacity
+
+    class _Cfg:
+        customer_ipv6_supernet = "2a0c:b641:b51::/63"  # usable = 1 (index 0 reserved)
+
+    class _Orch:
+        def __init__(self, db):
+            self.db = db
+
+    orch = _Orch(session_factory)
+    await _enforce_prefix_capacity(orch, _Cfg())  # empty pool: fine
+
+    async with session_factory() as session:
+        session.add(
+            VMRow(
+                vm_id="vm_full",
+                owner_wallet="wallet",
+                status=VMStatus.READY,
+                size=VMSize.XS,
+                os="debian-13",
+                ipv6_prefix_index=1,
+                ipv6_prefix="2a0c:b641:b51:1::/64",
+                ssh_pubkey="ssh-ed25519 AAAA t",
+                open_ports=[22],
+                cost_total=Decimal("0.05"),
+            )
+        )
+        await session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await _enforce_prefix_capacity(orch, _Cfg())
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_simulated_ipv6_stays_inside_assigned_prefix(session_factory):
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+
+    async with session_factory() as session:
+        session.add(
+            VMRow(
+                vm_id="vm_sim",
+                owner_wallet="wallet",
+                status=VMStatus.PROVISIONING,
+                size=VMSize.XS,
+                os="debian-13",
+                ipv6_prefix_index=3,
+                ipv6_prefix="2a0c:b641:b51:3::/64",
+                ssh_pubkey="ssh-ed25519 AAAA t",
+                open_ports=[22],
+                cost_total=Decimal("0.05"),
+            )
+        )
+        await session.commit()
+
+    await orch._simulate_provisioning("vm_sim")
+
+    async with session_factory() as session:
+        row = await session.get(VMRow, "vm_sim")
+        assert row.ipv6 == "2a0c:b641:b51:3::2"
+        assert row.status == VMStatus.READY
