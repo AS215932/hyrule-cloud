@@ -219,9 +219,12 @@ async def test_x402_manifest_lists_network_intel_resources():
 
 
 @pytest.mark.asyncio
-async def test_mail_account_quote_contract():
+async def test_quotes_for_unbuilt_endpoints_return_501():
+    """A quote whose paid_endpoint always 501s is itself a dead end: clients
+    on the quote→pay→create flow would be handed a payable-looking order
+    that can never succeed."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        res = await client.post(
+        mail_quote = await client.post(
             "/v1/mail/accounts/quote",
             json={
                 "plan": "agent-basic",
@@ -230,8 +233,10 @@ async def test_mail_account_quote_contract():
                 "domain": "agentmail.hyrule.host",
             },
         )
-    assert res.status_code == 200
-    body = res.json()
-    assert body["paid_endpoint"] == "/v1/mail/accounts"
-    assert body["billable_units"][0]["name"] == "mail_account_agent_basic_day"
-    assert body["billable_units"][0]["quantity"] == 30
+        speedtest_quote = await client.post("/v1/speedtest/quote", json={"target": "hyrule"})
+        web_report_quote = await client.post(
+            "/v1/web/reports/quote", json={"target": "https://example.com"}
+        )
+    for res in (mail_quote, speedtest_quote, web_report_quote):
+        assert res.status_code == 501
+        assert res.json()["error"] == "not_implemented"

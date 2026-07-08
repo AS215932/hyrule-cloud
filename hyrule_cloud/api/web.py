@@ -68,8 +68,10 @@ async def quote_web_check(request: Request, body: WebCheckRequest) -> PaidEndpoi
 
 
 @router.post("/reports/quote", response_model=PaidEndpointQuote)
-async def quote_web_report(request: Request, body: WebReportRequest) -> PaidEndpointQuote:
-    return diagnostic_quote(request, price_attr="price_web_report", default="0.03", name="web_report", paid_endpoint="/v1/web/reports")
+async def quote_web_report(request: Request, body: WebReportRequest) -> Response:
+    # The paid endpoint this quotes is 501 while async report retrieval is
+    # unbuilt; a payable-looking quote for it would send agents into a dead end.
+    return not_implemented("web.reports.quote")
 
 
 @router.post("/tls/deep/quote", response_model=PaidEndpointQuote)
