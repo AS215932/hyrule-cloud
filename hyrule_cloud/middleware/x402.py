@@ -22,11 +22,13 @@ import os
 import secrets
 import time
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import structlog
 from fastapi import Request, Response
+from x402.extensions.bazaar import bazaar_resource_server_extension
 from x402.http import (
     PAYMENT_REQUIRED_HEADER,
     PAYMENT_RESPONSE_HEADER,
@@ -155,6 +157,9 @@ class PaymentGate:
         self._facilitator_host = urlparse(config.facilitator_url).hostname or ""
         self.facilitator = HTTPFacilitatorClient(_facilitator_config(config))
         self.server = x402ResourceServer(self.facilitator)
+        # Bazaar discovery: enriches declared extensions with the HTTP method
+        # so CDP can index the endpoint at settlement time.
+        self.server.register_extension(bazaar_resource_server_extension)
         for net_cfg in self.config.networks:
             # We assume ExactEvmServerScheme works out of the box for these during Phase 1
             # (In production, Solana would use an ExactSolanaServerScheme)
@@ -205,6 +210,24 @@ class PaymentGate:
             requirements.extend(self.server.build_payment_requirements(resource_cfg))
         return requirements
 
+    def _discovery_extensions(self, request: Request) -> dict[str, Any] | None:
+        """Look up and enrich the Bazaar discovery declaration for this route."""
+        from hyrule_cloud.services.discovery import discovery_for
+
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or request.url.path
+        declared = discovery_for(request.method, path)
+        if not declared:
+            return None
+        enrich = getattr(self.server, "enrich_extensions", None)
+        if enrich is None:
+            return declared
+        try:
+            return enrich(declared, SimpleNamespace(method=request.method))
+        except Exception:
+            log.warning("bazaar_extension_enrich_failed", exc_info=True)
+            return declared
+
     async def _payment_required_response(
         self,
         requirements: list[PaymentRequirements],
@@ -213,12 +236,14 @@ class PaymentGate:
         extra_body: dict[str, Any] | None,
         request_url: str | None = None,
         error: str | None = None,
+        extensions: dict[str, Any] | None = None,
     ) -> Response:
         resource = ResourceInfo(url=request_url or "", description=description or None)
         payment_required = self.server.create_payment_required_response(
             requirements,
             resource=resource,
             error=error,
+            extensions=extensions,
         )
         if inspect.isawaitable(payment_required):
             payment_required = await payment_required
@@ -256,6 +281,7 @@ class PaymentGate:
         extra_body: dict[str, Any] | None = None,
         request_url: str | None = None,
         error: str | None = None,
+        extensions: dict[str, Any] | None = None,
     ) -> Response:
         """
         Build a Payment Required response using x402 SDK types.
@@ -287,6 +313,7 @@ class PaymentGate:
             extra_body,
             request_url=request_url,
             error=error,
+            extensions=extensions,
         )
 
     @staticmethod
@@ -345,6 +372,10 @@ class PaymentGate:
                 )
                 return "0xDEV_TEST_WALLET"
 
+        # Bazaar discovery declaration for this route (None when undeclared);
+        # attached to every 402 so CDP indexes the endpoint at settlement.
+        extensions = self._discovery_extensions(request)
+
         payment_header = self._payment_header(request)
         if not payment_header:
             await self._record("required_402", request, amount)
@@ -353,6 +384,7 @@ class PaymentGate:
                 description,
                 extra_body,
                 request_url=self._canonical_url(request),
+                extensions=extensions,
             )
 
         if not await self._ensure_initialized():
@@ -372,6 +404,7 @@ class PaymentGate:
                     extra_body,
                     request_url=self._canonical_url(request),
                     error="Unsupported payment payload version",
+                    extensions=extensions,
                 )
 
             matching_requirements = self.server.find_matching_requirements(
@@ -389,6 +422,7 @@ class PaymentGate:
                     extra_body,
                     request_url=self._canonical_url(request),
                     error="No matching payment requirements",
+                    extensions=extensions,
                 )
 
             verification = await self.server.verify_payment(
@@ -416,6 +450,7 @@ class PaymentGate:
                     extra_body,
                     request_url=self._canonical_url(request),
                     error=verification.invalid_reason or "Payment verification failed",
+                    extensions=extensions,
                 )
 
             settlement = await self.server.settle_payment(

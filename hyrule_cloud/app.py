@@ -240,8 +240,10 @@ async def health():
 @app.get("/.well-known/x402.json")
 async def x402_manifest():
     """x402 service manifest for agent discovery."""
+    from hyrule_cloud.services.discovery import discovery_for
+
     config: HyruleConfig = app.state._typed_state.config
-    return {
+    manifest = {
         "x402Version": 2,
         "name": "Hyrule Cloud",
         "description": (
@@ -438,3 +440,9 @@ async def x402_manifest():
         "facilitator": getattr(config.payment, "facilitator_url", ""),
         "contact": "https://github.com/as215932",
     }
+    # Bazaar/x402scan: flag resources whose 402 responses carry a discovery
+    # extension declaration (services/discovery.py).
+    for resource in manifest["resources"]:
+        if discovery_for(resource.get("method", ""), resource["path"]) is not None:
+            resource["discoverable"] = True
+    return manifest
