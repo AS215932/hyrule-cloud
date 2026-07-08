@@ -65,8 +65,10 @@ class MockOrchestrator:
 class MockGate:
     def __init__(self):
         self.settled = 0
+        self.checked = 0
 
     async def check_payment(self, request, amount, description, extra_body):
+        self.checked += 1
         # Allow requests with X-Mock-Wallet header to mimic paid requests
         if request.headers.get("X-Mock-Wallet"):
             request.state.payment_tx = "0xMockHash"
@@ -91,6 +93,7 @@ class MockNetworkProvider:
         self.reason = None
         self.requests = []
         self.next_response = None  # per-test override (e.g. simulate a failure)
+        self.validation_error = None  # per-test override for pre-flight validation
 
     async def mode_status(self, mode):
         provider = self
@@ -98,6 +101,9 @@ class MockNetworkProvider:
             available = provider.available
             reason = provider.reason
         return Status()
+
+    async def validate_request(self, req):
+        return self.validation_error
 
     async def execute_request(self, req):
         self.requests.append(req)
@@ -377,3 +383,27 @@ async def test_network_request_post_forwards_after_atomic_payment(override_state
     assert len(override_state.network_provider.requests) == 1
     # Atomic check_payment was used, not the deferred settle_verified path.
     assert override_state.payment_gate.settled == 0
+
+
+@pytest.mark.asyncio
+async def test_network_request_post_validates_before_settling(override_state):
+    """A POST rejected by local validation (bad URL / SSRF-blocked host) must be
+    refused WITHOUT charging — validation runs before settlement."""
+    override_state.network_provider.validation_error = NetworkResponse(
+        status_code=403,
+        headers={},
+        body="",
+        elapsed_seconds=0.0,
+        proxy_mode="direct",
+        error="Host localhost is disallowed",
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/network/request",
+            headers={"X-Mock-Wallet": "0xWallet"},
+            json={"url": "http://localhost", "proxy_mode": "direct", "method": "POST"},
+        )
+    assert res.status_code == 403
+    # Never charged (check_payment not reached) and never forwarded.
+    assert override_state.payment_gate.checked == 0
+    assert override_state.network_provider.requests == []

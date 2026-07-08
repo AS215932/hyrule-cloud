@@ -1331,9 +1331,14 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
             # payment must be FINAL before we send it — never execute an
             # upstream side effect against an authorization that then fails to
             # settle (a concurrent replay, a slow-fetch allowance change, a
-            # settle-time facilitator error). Settle atomically up front; the
-            # trade-off — a rare charge for a POST we then fail to deliver — is
-            # preferable to an unpaid side effect.
+            # settle-time facilitator error). But settle only AFTER local
+            # validation, so a rejected request (bad method, invalid URL,
+            # SSRF-blocked host) is never charged. Validate -> settle -> forward.
+            validation_error = await provider.validate_request(body)
+            if validation_error is not None:
+                if validation_error.status_code in (400, 403):
+                    raise HTTPException(validation_error.status_code, validation_error.error)
+                raise HTTPException(502, validation_error.error or "network proxy request failed")
             payment = await gate.check_payment(request, amount, description, extra_body)
             if isinstance(payment, Response):
                 return payment
