@@ -261,6 +261,24 @@ def _real_provisioning_enabled() -> bool:
     return use_real_provisioning()
 
 
+def _vm_service_open(gate: object) -> bool:
+    """Whether the paid VM service may take money right now.
+
+    Real VM provisioning is the last launch step (HCP_LAUNCH_PROOF_REAL_XCPNG=1).
+    Until then the app still boots — it serves the network-intel, proxy, and
+    domain services — but the live x402 gate must not charge, nor hand out a
+    crypto deposit address, for a VM we can only simulate. Test doubles (fake
+    gates) keep the simulated flow so the suite still exercises provisioning,
+    mirroring the reservation-through-payment guard in create_vm.
+    """
+    return _real_provisioning_enabled() or not isinstance(gate, PaymentGate)
+
+
+def _require_vm_service_open(gate: object) -> None:
+    if not _vm_service_open(gate):
+        raise HTTPException(503, "VM provisioning is not yet generally available")
+
+
 def _validate_vm_order(order: VMCreateRequest, cfg) -> None:
     if order.domain_mode == DomainMode.CUSTOM and not order.domain:
         raise HTTPException(400, "domain required when domain_mode=custom")
@@ -745,6 +763,11 @@ async def create_vm(
             raise HTTPException(422, "Order body does not match the quote")
         order = VMCreateRequest(**quote_row.order_payload)
 
+    # Closed until real provisioning is enabled — never charge for a simulated
+    # VM. Placed after the consumed-quote replay above so an already-paid,
+    # already-provisioned order can still be recovered when the service is shut.
+    _require_vm_service_open(gate)
+
     _validate_vm_order(order, cfg)
 
     await _enforce_paid_vm_cap(orch, cfg)
@@ -849,6 +872,7 @@ async def create_vm_quote(
     request: Request,
     orch=Depends(get_orch),
     cfg=Depends(get_cfg),
+    gate=Depends(get_gate),
     account=Depends(current_account),
 ) -> Response:
     """Issue #14: price a VM order once and persist it as a durable quote.
@@ -858,6 +882,9 @@ async def create_vm_quote(
     Idempotent on `client_order_id`: same key + same spec returns the existing
     quote (200); same key + a different spec is a 409 conflict.
     """
+    # Don't lock a price for a VM that can't be provisioned yet (simulation).
+    _require_vm_service_open(gate)
+
     order = body.order_payload
     _validate_vm_order(order, cfg)
 
@@ -924,6 +951,11 @@ async def extend_vm(
     # Block A0: row already loaded + management-gated by the dep above.
     # vm_id (path param) is used downstream in the payment description /
     # response shape.
+
+    # A simulated VM must not be charged to extend either — same guard as
+    # create/quote/intent. Refuse before check_payment so no money moves.
+    _require_vm_service_open(gate)
+
     price_map = {
         VMSize.XS: cfg.payment.price_vm_xs,
         VMSize.SM: cfg.payment.price_vm_sm,
@@ -1288,6 +1320,43 @@ from hyrule_cloud.services.intents import (
     get_intent_by_client_order_id,
 )
 
+# Intent states that carry no committed payment: a same-key replay only
+# re-serves the deposit address. While the VM service is closed (simulation)
+# such a replay must respect the closed-service guard rather than re-advertise a
+# deposit for a VM that can't be real-provisioned. Every other state (settled,
+# provisioning, or terminal recovery) always resolves so a deposit is never
+# orphaned.
+_INTENT_AWAITING_STATUSES = frozenset(
+    {
+        CryptoIntentStatus.CREATED,
+        CryptoIntentStatus.WAITING_PAYMENT,
+        CryptoIntentStatus.PENDING,
+    }
+)
+
+
+def _intent_awaiting_payment(row: CryptoIntentRow) -> bool:
+    """True only for intents with no funds in flight — safe to refuse while the
+    VM service is closed.
+
+    An awaiting-status intent can already carry an *unconfirmed* deposit: the
+    poller records ``amount_received_crypto`` (and ``tx_hash``) before
+    confirmations clear, keeping status at ``WAITING_PAYMENT`` (see
+    ``services/intents.py``). Any received amount or tx hash means the customer
+    has already sent crypto, so the replay must resolve rather than 503 — never
+    strand a paid-but-unconfirmed deposit.
+    """
+    try:
+        status = CryptoIntentStatus(row.status)
+    except ValueError:
+        return False
+    if status not in _INTENT_AWAITING_STATUSES:
+        return False
+    # Funds already seen on-chain (even unconfirmed) make it recoverable.
+    if getattr(row, "amount_received_crypto", None):
+        return False
+    return not getattr(row, "tx_hash", None)
+
 
 def _intent_to_response(row: CryptoIntentRow, request: Request | None = None) -> CryptoIntentResponse:
     """Render a CryptoIntentRow as the public response. Builds management_url
@@ -1332,6 +1401,7 @@ async def create_crypto_intent(
     request: Request,
     orch=Depends(get_orch),
     cfg=Depends(get_cfg),
+    gate=Depends(get_gate),
     account=Depends(current_account),
 ) -> CryptoIntentResponse:
     """Block E: open a payment intent for BTC or XMR.
@@ -1346,10 +1416,24 @@ async def create_crypto_intent(
     # Idempotent replay FIRST: a retry with a known client_order_id must
     # return the original intent even if capacity/validation state changed
     # since — the deposit address may already be funded.
-    if body.client_order_id:
-        existing_intent = await get_intent_by_client_order_id(orch.db, body.client_order_id)
-        if existing_intent is not None:
-            return _intent_to_response(existing_intent, request)
+    existing_intent = (
+        await get_intent_by_client_order_id(orch.db, body.client_order_id)
+        if body.client_order_id
+        else None
+    )
+    # A committed intent (funds received / provisioning / terminal recovery)
+    # always resolves so a deposit is never orphaned — even after the VM service
+    # closes. One still awaiting payment falls through to the guard below so a
+    # closed service never re-issues a deposit address for a simulated VM.
+    if existing_intent is not None and not _intent_awaiting_payment(existing_intent):
+        return _intent_to_response(existing_intent, request)
+
+    # Closed until real provisioning is enabled: don't hand out (or re-hand-out)
+    # a deposit address for a VM we can only simulate.
+    _require_vm_service_open(gate)
+
+    if existing_intent is not None:
+        return _intent_to_response(existing_intent, request)
 
     # Same validation as the x402 create path — including the real-mode OS
     # support check, so an unsupported order is rejected BEFORE a deposit
