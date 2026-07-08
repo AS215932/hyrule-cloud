@@ -40,10 +40,9 @@ from hyrule_cloud.middleware.x402 import (
 
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 
-# Mainnet-only aliases per CAIP-2 chain. When probing the authenticated CDP
-# facilitator these are the ONLY acceptable matches — accepting a testnet
-# sibling there would green-light advertising Base mainnet against a
-# facilitator that can't settle it.
+# Friendly mainnet aliases per CAIP-2 chain, used ONLY to improve failure
+# diagnostics: the x402 server matches supported kinds by exact network ID,
+# so an alias in /supported is never sufficient for the probe to pass.
 _MAINNET_ALIASES: dict[str, set[str]] = {
     "eip155:8453": {"base", "base-mainnet"},
     "eip155:137": {"polygon", "polygon-mainnet"},
@@ -158,13 +157,19 @@ def main() -> int:
             print(f"  OK   {network}")
             continue
         if is_cdp:
-            # Production facilitator: mainnet must be advertised directly —
-            # a testnet sibling is NOT proof it can settle real payments.
-            match = next((s for s in _MAINNET_ALIASES.get(network, set()) if s in supported), None)
-            if match:
-                print(f"  OK   {network} (via mainnet alias: {match})")
-                continue
-            print(f"  FAIL {network} — CDP does not advertise this mainnet chain")
+            # Production facilitator: the exact network ID must be advertised.
+            # The x402 server matches supported kinds by exact ID when building
+            # requirements, so an alias-only match here would greenlight a
+            # config that 503s on every paid endpoint at runtime. Neither a
+            # testnet sibling nor a friendly alias counts.
+            alias = next((s for s in _MAINNET_ALIASES.get(network, set()) if s in supported), None)
+            if alias:
+                print(
+                    f"  FAIL {network} — CDP advertises only alias '{alias}', not the "
+                    f"exact ID the server matches on"
+                )
+            else:
+                print(f"  FAIL {network} — CDP does not advertise this mainnet chain")
             failures.append(network)
             continue
         siblings = testnet_siblings.get(network, set())
