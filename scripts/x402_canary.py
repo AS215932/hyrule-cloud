@@ -60,6 +60,7 @@ TESTS: dict[str, dict] = {
     "rdap":      {"path": "/v1/rdap/lookup", "body": {"subject": {"type": "domain", "value": "example.com"}}, "usd": "0.003", "group": "intel"},
     "whois":     {"path": "/v1/whois/lookup","body": {"subject": {"type": "domain", "value": "example.com"}}, "usd": "0.005", "group": "intel"},
     "web":       {"path": "/v1/web/check",   "body": {"target": "https://example.com"}, "usd": "0.005", "group": "intel"},
+    "web-tls":   {"path": "/v1/web/tls/deep","body": {"host": "example.com"}, "usd": "0.10", "group": "intel"},
     "mx":        {"path": "/v1/mx/check",    "body": {"tool": "mx", "target": "example.com"}, "usd": "0.005", "group": "intel"},
     "path":      {"path": "/v1/path/ping",   "body": {"target": "example.com"}, "usd": "0.005", "group": "intel"},
     "ports":     {"path": "/v1/ports/check", "body": {"target": "example.com", "port": 443}, "usd": "0.003", "group": "intel"},
@@ -71,7 +72,10 @@ TESTS: dict[str, dict] = {
     "proxy-direct": {"path": "/v1/network/request", "body": {"url": "https://example.com", "method": "GET", "proxy_mode": "direct"}, "usd": "0.01", "group": "proxy"},
     "proxy-tor":    {"path": "/v1/network/request", "body": {"url": "https://example.com", "method": "GET", "proxy_mode": "tor"}, "usd": "0.05", "group": "proxy"},
     # --- 3c domain (REAL registration, side effects) ---
-    "domain":    {"path": "/v1/domain/register", "body": {"name": None, "extension": "dev", "duration_years": 1}, "usd": "6.00", "group": "domain", "spendy": True},
+    # /v1/domain/register prices dynamically from Openprovider at request time
+    # (registrar fee + markup, ~$10 fallback), so the cap is set generously; the
+    # operator still confirms the actual spend interactively before it runs.
+    "domain":    {"path": "/v1/domain/register", "body": {"name": None, "extension": "dev", "duration_years": 1}, "usd": "15.00", "group": "domain", "spendy": True},
     # --- 3d VM (provisions a real VM) ---
     "vm":        {"path": "/v1/vm/create", "body": {"duration_days": 1, "size": "xs", "os": "debian-13", "ssh_pubkey": None, "domain_mode": "auto", "open_ports": [80, 443]}, "usd": "0.05", "group": "vm", "spendy": True},
 }
@@ -136,11 +140,13 @@ async def _run_one(name: str, *, destroy: bool, domain_name: str | None) -> bool
         return False
 
     if name == "vm":
-        await _poll_and_report_vm(r, destroy=destroy)
+        # The 202 only means the create was accepted + charged; the Phase-3d
+        # gate isn't passed until the VM actually reaches ready. Propagate that.
+        return await _poll_and_report_vm(r, destroy=destroy)
     return True
 
 
-async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool) -> None:
+async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool) -> bool:
     data = create_resp.json()
     vm_id = data.get("vm_id")
     status_url = data.get("status_url") or f"{API}/v1/vm/{vm_id}/status"
@@ -173,11 +179,12 @@ async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool) -> 
                     d = await poll.request("DELETE", f"{API}/v1/vm/{vm_id}",
                                            headers={"Authorization": f"Bearer {mgmt_token}"})
                     print(f"\n    destroy -> HTTP {d.status_code} {d.text[:200]}")
-                return
+                return True
             if st in ("failed",):
                 print(f"    ❌ provisioning FAILED: {json.dumps(sj)[:400]}")
-                return
+                return False
     print("    ⏱ timed out waiting for the VM to become ready — check status_url manually.")
+    return False
 
 
 def _select(target: str) -> list[str]:
