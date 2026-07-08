@@ -1292,25 +1292,35 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
         reason = mode_status.reason or "network proxy mode unavailable"
         raise HTTPException(503, f"Proxy mode {body.proxy_mode.value} unavailable: {reason}")
 
-    result = await gate.check_payment(
+    # Verify the payment but DON'T settle yet: an agent must not be charged for
+    # a proxied request we then fail to deliver (a dead tor circuit, a gateway
+    # timeout). We settle only after the sidecar returns the caller's answer.
+    verified = await gate.verify_only(
         request,
         amount=amount,
         description=f"Network Proxy Request ({body.proxy_mode.value}) to {body.url}",
         extra_body={
             "url": body.url,
             "proxy_mode": body.proxy_mode.value,
-        }
+        },
     )
 
-    if isinstance(result, Response):
-        return result
+    if isinstance(verified, Response):
+        return verified
 
-    # payment valid, proceed
     resp = await provider.execute_request(body)
-    
-    if resp.error and resp.status_code in [400, 403]:
-        raise HTTPException(resp.status_code, resp.error)
-        
+
+    if resp.error is not None:
+        # Not delivered — never charge. A validation rejection is the caller's
+        # mistake (400/403); anything else is our proxy/gateway failing.
+        if resp.status_code in (400, 403):
+            raise HTTPException(resp.status_code, resp.error)
+        raise HTTPException(502, resp.error or "network proxy request failed")
+
+    # Delivered the caller's answer (even a target 4xx/5xx is a real result):
+    # settle now. A settle failure here means we delivered without charging —
+    # acceptable, and never a charge-for-nothing.
+    await gate.settle_verified(request, verified)
     return resp
 from hyrule_cloud.db import CryptoIntentRow
 from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus

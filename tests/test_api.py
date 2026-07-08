@@ -7,7 +7,8 @@ from httpx import ASGITransport, AsyncClient
 
 from hyrule_cloud.app import app
 from hyrule_cloud.middleware.anon_token import hash_anon_token
-from hyrule_cloud.models import NetworkResponse, VMStatus
+from hyrule_cloud.middleware.x402 import VerifiedPayment
+from hyrule_cloud.models import NetworkResponse, ProxyMode, VMStatus
 
 # Block A0: known token used by the mock VM. Tests that exercise the
 # management-gated routes pass this as Authorization: Bearer / ?token=.
@@ -62,6 +63,9 @@ class MockOrchestrator:
         return None
 
 class MockGate:
+    def __init__(self):
+        self.settled = 0
+
     async def check_payment(self, request, amount, description, extra_body):
         # Allow requests with X-Mock-Wallet header to mimic paid requests
         if request.headers.get("X-Mock-Wallet"):
@@ -69,11 +73,24 @@ class MockGate:
             return request.headers.get("X-Mock-Wallet")
         return Response(status_code=402)
 
+    async def verify_only(self, request, amount, description="", extra_body=None):
+        # Two-phase flow (verify now, settle after delivery) for the proxy route.
+        wallet = request.headers.get("X-Mock-Wallet")
+        if wallet:
+            return VerifiedPayment(payer=wallet, amount=amount)
+        return Response(status_code=402)
+
+    async def settle_verified(self, request, verified):
+        self.settled += 1
+        request.state.payment_tx = "0xMockHash"
+        return True
+
 class MockNetworkProvider:
     def __init__(self):
         self.available = True
         self.reason = None
         self.requests = []
+        self.next_response = None  # per-test override (e.g. simulate a failure)
 
     async def mode_status(self, mode):
         provider = self
@@ -84,6 +101,8 @@ class MockNetworkProvider:
 
     async def execute_request(self, req):
         self.requests.append(req)
+        if self.next_response is not None:
+            return self.next_response
         return NetworkResponse(
             status_code=200,
             headers={"content-type": "text/plain"},
@@ -212,3 +231,64 @@ async def test_network_request_unavailable_mode_returns_503_before_payment(overr
         )
         assert res.status_code == 503
         assert "tor SOCKS listener unavailable" in res.text
+
+
+@pytest.mark.asyncio
+async def test_network_request_proxy_failure_is_not_charged(override_state):
+    """A dead tor circuit / gateway failure (mode_status said available, the
+    fetch then failed) must return an error WITHOUT settling — the canary was
+    charged $0.05 for a 504 here."""
+    override_state.network_provider.next_response = NetworkResponse(
+        status_code=502,
+        headers={},
+        body="",
+        elapsed_seconds=0.0,
+        proxy_mode=ProxyMode.TOR,
+        error="Network proxy error: HTTP 504",
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/network/request",
+            headers={"X-Mock-Wallet": "0xWallet"},
+            json={"url": "http://example.com", "proxy_mode": "tor"},
+        )
+    assert res.status_code == 502
+    # The request was attempted, but the payment must not have settled.
+    assert len(override_state.network_provider.requests) == 1
+    assert override_state.payment_gate.settled == 0
+
+
+@pytest.mark.asyncio
+async def test_network_request_client_error_is_not_charged(override_state):
+    """A validation rejection (400/403) is the caller's mistake — surface it,
+    but never settle for a request we refused to run."""
+    override_state.network_provider.next_response = NetworkResponse(
+        status_code=403,
+        headers={},
+        body="",
+        elapsed_seconds=0.0,
+        proxy_mode=ProxyMode.DIRECT,
+        error="Host is disallowed",
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/network/request",
+            headers={"X-Mock-Wallet": "0xWallet"},
+            json={"url": "http://example.com", "proxy_mode": "direct"},
+        )
+    assert res.status_code == 403
+    assert override_state.payment_gate.settled == 0
+
+
+@pytest.mark.asyncio
+async def test_network_request_delivered_response_settles(override_state):
+    """A delivered answer (even a target 4xx) settles exactly once."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/network/request",
+            headers={"X-Mock-Wallet": "0xWallet"},
+            json={"url": "http://example.com", "proxy_mode": "direct"},
+        )
+    assert res.status_code == 200
+    assert res.json()["body"] == "ok"
+    assert override_state.payment_gate.settled == 1

@@ -339,3 +339,58 @@ async def test_vms_active_excludes_dead_rows(metrics_app_state) -> None:
     assert 'hyrule_vms_active{status="running"} 1' in body
     assert 'status="destroyed"' not in body
     assert 'hyrule_vms_active{status="failed"}' not in body
+
+
+@pytest.mark.asyncio
+async def test_verify_only_defers_settlement(session_factory) -> None:
+    """verify_only must return a handle WITHOUT moving money or writing a
+    settled/settle_failed row — this is what lets the proxy route refuse to
+    charge when delivery fails. settle_verified then records the settlement."""
+    from hyrule_cloud.middleware.x402 import VerifiedPayment
+
+    server = _FakeServer()
+    gate = _gate(server)
+    gate.ledger = PaymentLedger(session_factory)
+    req = _request({PAYMENT_SIGNATURE_HEADER: _payment_header(server.requirements[0])})
+
+    verified = await gate.verify_only(req, Decimal("0.05"), "Network proxy request")
+    assert isinstance(verified, VerifiedPayment)
+    assert verified.payer == PAYER
+    # The crux: nothing is recorded until the resource is delivered.
+    assert [e.event_type for e in await _events(session_factory)] == []
+
+    ok = await gate.settle_verified(req, verified)
+    assert ok is True
+    events = await _events(session_factory)
+    assert [e.event_type for e in events] == ["settled"]
+    assert events[0].tx_hash == "0xSETTLED"
+
+
+@pytest.mark.asyncio
+async def test_settle_verified_failure_writes_settle_failed(session_factory) -> None:
+    from hyrule_cloud.middleware.x402 import VerifiedPayment
+
+    server = _FakeServer(settle_success=False)
+    gate = _gate(server)
+    gate.ledger = PaymentLedger(session_factory)
+    req = _request({PAYMENT_SIGNATURE_HEADER: _payment_header(server.requirements[0])})
+
+    verified = await gate.verify_only(req, Decimal("0.05"), "Network proxy request")
+    assert isinstance(verified, VerifiedPayment)
+    ok = await gate.settle_verified(req, verified)
+    assert ok is False
+    events = await _events(session_factory)
+    assert [e.event_type for e in events] == ["settle_failed"]
+
+
+@pytest.mark.asyncio
+async def test_verify_only_invalid_returns_response(session_factory) -> None:
+    server = _FakeServer(valid=False)
+    gate = _gate(server)
+    gate.ledger = PaymentLedger(session_factory)
+    req = _request({PAYMENT_SIGNATURE_HEADER: _payment_header(server.requirements[0])})
+
+    result = await gate.verify_only(req, Decimal("0.05"), "Network proxy request")
+    assert isinstance(result, Response)
+    events = await _events(session_factory)
+    assert [e.event_type for e in events] == ["verify_failed"]

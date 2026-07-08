@@ -21,6 +21,7 @@ import json
 import os
 import secrets
 import time
+from dataclasses import dataclass
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -134,6 +135,23 @@ def _facilitator_config(config: PaymentConfig) -> FacilitatorConfig:
                 config.facilitator_url,
             )
     return FacilitatorConfig(url=config.facilitator_url, auth_provider=auth_provider)
+
+
+@dataclass
+class VerifiedPayment:
+    """A payment that passed verification but has NOT been settled yet.
+
+    Returned by ``PaymentGate.verify_only``. Hand it to
+    ``PaymentGate.settle_verified`` once the paid resource has actually been
+    delivered, so a post-payment delivery failure (a proxy 5xx, a provisioning
+    error) never moves the customer's money.
+    """
+
+    payer: str
+    amount: Decimal
+    payment_payload: PaymentPayload | None = None
+    matching_requirements: PaymentRequirements | None = None
+    dev_bypass: bool = False
 
 
 class PaymentGate:
@@ -555,6 +573,197 @@ class PaymentGate:
         except Exception:
             log.error("payment_processing_error", exc_info=True)
             return self._json_response(502, {"error": "Payment processing error"})
+
+    async def verify_only(
+        self,
+        request: Request,
+        amount: Decimal,
+        description: str = "",
+        extra_body: dict[str, Any] | None = None,
+    ) -> Response | VerifiedPayment:
+        """Verify a payment WITHOUT settling it.
+
+        For endpoints that must deliver before charging: call this first, run
+        the work, then call ``settle_verified`` only on success. Returns a
+        ``VerifiedPayment`` handle when the payment is valid, or a ``Response``
+        (402 challenge / 503 / 502) to return to the client otherwise. No money
+        moves until ``settle_verified`` is called.
+        """
+        # Dev bypass for testing (never enable in production). Settlement is
+        # deferred to settle_verified so a failed delivery isn't recorded.
+        if self.config.dev_bypass_secret:
+            bypass = request.headers.get("X-DEV-BYPASS")
+            if bypass == self.config.dev_bypass_secret:
+                log.warning("dev_bypass_payment", amount=str(amount))
+                return VerifiedPayment(
+                    payer="0xDEV_TEST_WALLET", amount=amount, dev_bypass=True
+                )
+
+        extensions = self._discovery_extensions(request)
+        payment_header = self._payment_header(request)
+        if not payment_header:
+            response = await self.build_402_response(
+                amount,
+                description,
+                extra_body,
+                request_url=self._canonical_url(request),
+                extensions=extensions,
+            )
+            if response.status_code == 402:
+                await self._record("required_402", request, amount)
+            return response
+
+        if not await self._ensure_initialized():
+            return self._json_response(503, {"error": "Payment facilitator unavailable"})
+
+        try:
+            requirements = self._build_requirements(amount)
+            try:
+                payment_payload = decode_payment_signature_header(payment_header)
+            except Exception:
+                await self._record(
+                    "verify_failed", request, amount, error="Malformed payment header"
+                )
+                return await self._payment_required_response(
+                    requirements,
+                    amount,
+                    description,
+                    extra_body,
+                    request_url=self._canonical_url(request),
+                    error="Malformed payment header",
+                    extensions=extensions,
+                )
+            if not isinstance(payment_payload, PaymentPayload):
+                await self._record(
+                    "verify_failed", request, amount, error="Unsupported payment payload version"
+                )
+                return await self._payment_required_response(
+                    requirements,
+                    amount,
+                    description,
+                    extra_body,
+                    request_url=self._canonical_url(request),
+                    error="Unsupported payment payload version",
+                    extensions=extensions,
+                )
+
+            matching_requirements = self.server.find_matching_requirements(
+                requirements,
+                payment_payload,
+            )
+            if matching_requirements is None:
+                await self._record(
+                    "verify_failed", request, amount, error="No matching payment requirements"
+                )
+                return await self._payment_required_response(
+                    requirements,
+                    amount,
+                    description,
+                    extra_body,
+                    request_url=self._canonical_url(request),
+                    error="No matching payment requirements",
+                    extensions=extensions,
+                )
+
+            verification = await self.server.verify_payment(
+                payment_payload,
+                matching_requirements,
+            )
+            if not verification.is_valid:
+                log.warning(
+                    "payment_verification_failed",
+                    invalid_reason=verification.invalid_reason,
+                    invalid_message=verification.invalid_message,
+                )
+                await self._record(
+                    "verify_failed",
+                    request,
+                    amount,
+                    network=matching_requirements.network,
+                    payer=verification.payer,
+                    error=verification.invalid_reason or "Payment verification failed",
+                )
+                return await self._payment_required_response(
+                    requirements,
+                    amount,
+                    description,
+                    extra_body,
+                    request_url=self._canonical_url(request),
+                    error=verification.invalid_reason or "Payment verification failed",
+                    extensions=extensions,
+                )
+
+            return VerifiedPayment(
+                payer=verification.payer or "",
+                amount=amount,
+                payment_payload=payment_payload,
+                matching_requirements=matching_requirements,
+            )
+        except Exception:
+            log.error("payment_processing_error", exc_info=True)
+            return self._json_response(502, {"error": "Payment processing error"})
+
+    async def settle_verified(self, request: Request, verified: VerifiedPayment) -> bool:
+        """Settle a payment already verified by ``verify_only``.
+
+        Call ONLY after the paid resource has been delivered. Attaches the
+        settlement headers to ``request.state`` (surfaced by the ASGI
+        middleware) and records the ledger event. Returns whether settlement
+        succeeded; on failure the resource was already delivered, so the caller
+        keeps the response — a rare uncharged delivery, never a double-charge.
+        """
+        if verified.dev_bypass:
+            request.state.payment_tx = "dev_bypass_0x0"
+            await self._record(
+                "dev_bypass",
+                request,
+                verified.amount,
+                payer="0xDEV_TEST_WALLET",
+                tx_hash="dev_bypass_0x0",
+            )
+            return True
+
+        settlement = await self.server.settle_payment(
+            verified.payment_payload,
+            verified.matching_requirements,
+        )
+        settlement_header = encode_payment_response_header(settlement)
+        request.state.payment_response_headers = {
+            PAYMENT_RESPONSE_HEADER: settlement_header,
+            X_PAYMENT_RESPONSE_HEADER: settlement_header,
+        }
+
+        if not settlement.success:
+            log.warning(
+                "payment_settlement_failed",
+                error_reason=settlement.error_reason,
+                error_message=settlement.error_message,
+            )
+            await self._record(
+                "settle_failed",
+                request,
+                verified.amount,
+                network=verified.matching_requirements.network,
+                asset=verified.matching_requirements.asset,
+                payer=settlement.payer or verified.payer,
+                error=settlement.error_reason or "Payment settlement failed",
+            )
+            return False
+
+        wallet = settlement.payer or verified.payer
+        tx_hash = settlement.transaction or ""
+        log.info("payment_settled", wallet=wallet, amount=str(verified.amount), tx_hash=tx_hash)
+        await self._record(
+            "settled",
+            request,
+            verified.amount,
+            network=verified.matching_requirements.network,
+            asset=verified.matching_requirements.asset,
+            payer=wallet,
+            tx_hash=tx_hash,
+        )
+        request.state.payment_tx = tx_hash
+        return True
 
     @staticmethod
     def _extract_wallet(payment_header: str) -> str | None:
