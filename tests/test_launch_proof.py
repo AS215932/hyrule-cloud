@@ -414,3 +414,25 @@ async def test_verify_aaaa_fails_closed_without_dns_server() -> None:
 
     provider = DNSProvider(HyruleConfig(dns_server="", dns_tsig_key="dGVzdA=="))
     assert await provider.verify_aaaa("vm123", "2a0c:b641:b51::2") is False
+
+
+def test_explicit_dns_verification_failure_is_not_papered_over() -> None:
+    """A measured dns_aaaa_verified=False must win over the ipv6+hostname
+    inference — otherwise a failed authoritative check reports verified."""
+    from hyrule_cloud.services.launch_proof import build_launch_proof
+
+    class _Row:
+        status = VMStatus.READY
+        ipv6 = "2a0c:b641:b51:1::2"
+        hostname = "abc.deploy.hyrule.host"
+        payment_tx = "0xSETTLED"
+        cost_total = Decimal("0.05")
+        error = None
+        metadata_ = {"launch_proof": {"dns_aaaa_verified": False, "ssh_smoke_status": "passed"}}
+
+    proof = build_launch_proof(_Row())
+    assert proof["dns_aaaa_verified"] is False
+    # Without a measurement, inference from ipv6+hostname still applies.
+    _Row.metadata_ = {}
+    proof = build_launch_proof(_Row())
+    assert proof["dns_aaaa_verified"] is True

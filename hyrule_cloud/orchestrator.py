@@ -401,11 +401,14 @@ class Orchestrator:
         """TCP reachability probe of the VM's sshd for the launch proof.
 
         sshd usually comes up after the IPv6 address appears (cloud-init is
-        still running), so keep retrying for a bounded window. Connectivity
-        only — no SSH handshake, no credentials.
+        still running), so keep retrying until a monotonic deadline —
+        blackholed connect attempts burn wall-clock too, and must not extend
+        the window beyond timeout_seconds. Connectivity only — no SSH
+        handshake, no credentials.
         """
-        elapsed = 0
-        while elapsed <= timeout_seconds:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
             try:
                 _, writer = await asyncio.wait_for(
                     asyncio.open_connection(ipv6, port), timeout=5
@@ -414,9 +417,9 @@ class Orchestrator:
                 await writer.wait_closed()
                 return True
             except (TimeoutError, OSError):
+                if loop.time() + interval_seconds >= deadline:
+                    return False
                 await asyncio.sleep(interval_seconds)
-                elapsed += interval_seconds
-        return False
 
     async def _wait_for_ipv6(
         self,
