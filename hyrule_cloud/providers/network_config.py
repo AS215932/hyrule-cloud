@@ -52,6 +52,32 @@ def parse_dns_servers(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+def validate_customer_network_settings(*, supernet: str, gateway: str, dns: str) -> None:
+    """Fail fast on malformed customer-network settings.
+
+    Called at startup so an operator typo surfaces as a boot failure instead
+    of a paid VM failing in background provisioning after the charge.
+    Raises ValueError on any problem.
+    """
+    net = IPv6Network(supernet, strict=True)
+    usable = customer_prefix_count(net) - len(RESERVED_PREFIX_INDEXES)
+    if usable <= 0:
+        raise ValueError(
+            f"customer supernet {net} has no usable /64 prefixes "
+            f"(index 0 is reserved; the supernet must be /63 or shorter)"
+        )
+    gateway_ip = IPv6Address(gateway)
+    if gateway_ip not in net:
+        raise ValueError(f"customer gateway {gateway_ip} is not inside {net}")
+    servers = parse_dns_servers(dns)
+    if not servers:
+        raise ValueError("at least one customer DNS server is required")
+    for server in servers:
+        # DNS may live outside the supernet (public/DNS64 resolver) but must
+        # be a valid IPv6 address.
+        IPv6Address(server)
+
+
 def render_debian_network_config(
     *,
     address: str,
@@ -75,11 +101,12 @@ def render_debian_network_config(
     if customer_supernet is not None:
         if not network.subnet_of(customer_supernet):
             raise ValueError(f"VM prefix {network} is not inside {customer_supernet}")
+        # The gateway must be on-link (the default route is via on-link), but
+        # DNS resolvers only need to be reachable IPv6 addresses — a public
+        # or NAT64/DNS64 resolver outside the customer allocation is a normal
+        # production configuration.
         if gateway_ip not in customer_supernet:
             raise ValueError(f"gateway {gateway_ip} is not inside {customer_supernet}")
-        for dns_ip in dns_ips:
-            if dns_ip not in customer_supernet:
-                raise ValueError(f"DNS server {dns_ip} is not inside {customer_supernet}")
 
     address_with_prefix = f"{address_ip}/{network.prefixlen}"
     config: dict[str, Any] = {
