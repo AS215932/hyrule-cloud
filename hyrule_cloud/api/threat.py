@@ -33,24 +33,34 @@ router = APIRouter(prefix="/v1/threat", tags=["Threat and reputation"])
 
 @router.get("/capabilities", response_model=ProductCapabilityResponse)
 async def get_threat_capabilities() -> ProductCapabilityResponse:
-    return ProductCapabilityResponse(
-        service="threat",
-        purpose="Paid open-source-first domain/IP/certificate reputation, RBL, CT, RDAP/WHOIS, and licensed-source-ready threat intelligence.",
-        separation_of_concerns="/v1/threat summarizes reputation/threat context; /v1/ip and /v1/mx expose network/mail-specific primitives.",
-        free_endpoints=[
-            CapabilityEndpoint(path="/v1/threat/capabilities", method="GET", description="Threat diagnostic capabilities"),
-            CapabilityEndpoint(path="/v1/threat/sources", method="GET", description="Configured and disabled source status"),
-            CapabilityEndpoint(path="/v1/threat/pricing", method="GET", description="Threat lookup pricing"),
-            CapabilityEndpoint(path="/v1/threat/lookup/quote", method="POST", description="Quote a threat lookup"),
-        ],
-        paid_endpoints=[
+    # Don't advertise paid endpoints (or their quote) while no reputation
+    # source is configured — they all 501 before charging. Mirrors the manifest
+    # gate and the mail/speedtest capabilities pattern.
+    enabled = threat_intel_enabled()
+    free_endpoints = [
+        CapabilityEndpoint(path="/v1/threat/capabilities", method="GET", description="Threat diagnostic capabilities"),
+        CapabilityEndpoint(path="/v1/threat/sources", method="GET", description="Configured and disabled source status"),
+        CapabilityEndpoint(path="/v1/threat/pricing", method="GET", description="Threat lookup pricing"),
+    ]
+    paid_endpoints: list[CapabilityEndpoint] = []
+    if enabled:
+        free_endpoints.append(
+            CapabilityEndpoint(path="/v1/threat/lookup/quote", method="POST", description="Quote a threat lookup")
+        )
+        paid_endpoints = [
             CapabilityEndpoint(path="/v1/threat/lookup", method="POST", paid=True, description="Run domain/IP/cert reputation lookup"),
             CapabilityEndpoint(path="/v1/threat/domain/{domain}", method="GET", paid=True, description="Domain reputation shortcut"),
             CapabilityEndpoint(path="/v1/threat/ip/{address}", method="GET", paid=True, description="IP reputation shortcut"),
             CapabilityEndpoint(path="/v1/threat/cert/{sha256}", method="GET", paid=True, description="Certificate reputation shortcut"),
             CapabilityEndpoint(path="/v1/threat/rbl", method="GET", paid=True, description="RBL/DNSBL view"),
             CapabilityEndpoint(path="/v1/threat/ct", method="GET", paid=True, description="Certificate Transparency view"),
-        ],
+        ]
+    return ProductCapabilityResponse(
+        service="threat",
+        purpose="Paid open-source-first domain/IP/certificate reputation, RBL, CT, RDAP/WHOIS, and licensed-source-ready threat intelligence.",
+        separation_of_concerns="/v1/threat summarizes reputation/threat context; /v1/ip and /v1/mx expose network/mail-specific primitives.",
+        free_endpoints=free_endpoints,
+        paid_endpoints=paid_endpoints,
     )
 
 
@@ -65,7 +75,9 @@ async def get_threat_pricing(request: Request) -> ThreatPricingResponse:
 
 
 @router.post("/lookup/quote", response_model=PaidEndpointQuote)
-async def quote_threat_lookup(request: Request, body: ThreatLookupRequest) -> PaidEndpointQuote:
+async def quote_threat_lookup(request: Request, body: ThreatLookupRequest) -> PaidEndpointQuote | Response:
+    if not threat_intel_enabled():
+        return not_implemented("threat.lookup")
     return diagnostic_quote(request, price_attr="price_threat_lookup", default="0.01", name="threat_lookup", paid_endpoint="/v1/threat/lookup")
 
 

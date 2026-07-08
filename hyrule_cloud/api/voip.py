@@ -33,21 +33,31 @@ router = APIRouter(prefix="/v1/voip", tags=["VoIP/SIP diagnostics"])
 
 @router.get("/capabilities", response_model=ProductCapabilityResponse)
 async def get_voip_capabilities() -> ProductCapabilityResponse:
+    # /v1/voip/check does real SIP DNS/TLS work and is always available; the
+    # number-intelligence endpoint (and its quote) only appear once a provider
+    # is configured, since it 501s before charging until then.
+    free_endpoints = [
+        CapabilityEndpoint(path="/v1/voip/capabilities", method="GET", description="VoIP diagnostic capabilities"),
+        CapabilityEndpoint(path="/v1/voip/sources", method="GET", description="Configured VoIP/number provider source status"),
+        CapabilityEndpoint(path="/v1/voip/pricing", method="GET", description="VoIP diagnostic pricing"),
+        CapabilityEndpoint(path="/v1/voip/check/quote", method="POST", description="Quote SIP/VoIP diagnostic check"),
+    ]
+    paid_endpoints = [
+        CapabilityEndpoint(path="/v1/voip/check", method="POST", paid=True, description="Run SIP DNS/TLS/OPTIONS/STUN diagnostics"),
+    ]
+    if number_intel_enabled():
+        free_endpoints.append(
+            CapabilityEndpoint(path="/v1/voip/number/lookup/quote", method="POST", description="Quote number intelligence lookup")
+        )
+        paid_endpoints.append(
+            CapabilityEndpoint(path="/v1/voip/number/lookup", method="POST", paid=True, description="Run carrier/CNAM/spam/E911 lookup through configured providers")
+        )
     return ProductCapabilityResponse(
         service="voip",
         purpose="Paid SIP DNS, SIP TLS/OPTIONS, STUN/TURN, and pluggable number carrier/CNAM/spam/E911 diagnostics.",
         separation_of_concerns="/v1/voip diagnoses VoIP/SIP and number-provider context; /v1/dns handles raw DNS lookups; /v1/ports checks single transport reachability.",
-        free_endpoints=[
-            CapabilityEndpoint(path="/v1/voip/capabilities", method="GET", description="VoIP diagnostic capabilities"),
-            CapabilityEndpoint(path="/v1/voip/sources", method="GET", description="Configured VoIP/number provider source status"),
-            CapabilityEndpoint(path="/v1/voip/pricing", method="GET", description="VoIP diagnostic pricing"),
-            CapabilityEndpoint(path="/v1/voip/check/quote", method="POST", description="Quote SIP/VoIP diagnostic check"),
-            CapabilityEndpoint(path="/v1/voip/number/lookup/quote", method="POST", description="Quote number intelligence lookup"),
-        ],
-        paid_endpoints=[
-            CapabilityEndpoint(path="/v1/voip/check", method="POST", paid=True, description="Run SIP DNS/TLS/OPTIONS/STUN diagnostics"),
-            CapabilityEndpoint(path="/v1/voip/number/lookup", method="POST", paid=True, description="Run carrier/CNAM/spam/E911 lookup through configured providers"),
-        ],
+        free_endpoints=free_endpoints,
+        paid_endpoints=paid_endpoints,
     )
 
 
@@ -71,7 +81,9 @@ async def quote_voip_check(request: Request, body: VoIPCheckRequest) -> PaidEndp
 
 
 @router.post("/number/lookup/quote", response_model=PaidEndpointQuote)
-async def quote_voip_number(request: Request, body: VoIPNumberLookupRequest) -> PaidEndpointQuote:
+async def quote_voip_number(request: Request, body: VoIPNumberLookupRequest) -> PaidEndpointQuote | Response:
+    if not number_intel_enabled():
+        return not_implemented("voip.number.lookup")
     return diagnostic_quote(request, price_attr="price_voip_number_lookup", default="0.05", name="voip_number_lookup", paid_endpoint="/v1/voip/number/lookup")
 
 

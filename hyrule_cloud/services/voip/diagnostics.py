@@ -16,12 +16,15 @@ from hyrule_cloud.models import (
     DNSLookupRecordType,
     DNSLookupRequest,
     SourceHealth,
-    SourceStatus,
     VoIPCheck,
     VoIPCheckRequest,
     VoIPNumberLookupRequest,
 )
-from hyrule_cloud.services.diagnostics.sources import source_not_configured, source_ok
+from hyrule_cloud.services.diagnostics.sources import (
+    source_not_configured,
+    source_ok,
+    source_usable,
+)
 from hyrule_cloud.services.dns.lookup import lookup
 from hyrule_cloud.services.safety import assert_safe_active_probe_target, normalize_host
 
@@ -47,10 +50,7 @@ def number_intel_enabled() -> bool:
     work and is unaffected.)
     """
     sources = voip_sources()
-    return any(
-        sources[provider].status != SourceStatus.SOURCE_NOT_CONFIGURED
-        for provider in _NUMBER_PROVIDERS
-    )
+    return any(source_usable(sources[provider]) for provider in _NUMBER_PROVIDERS)
 
 
 async def voip_check(body: VoIPCheckRequest) -> DiagnosticResponse:

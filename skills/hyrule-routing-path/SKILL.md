@@ -1,9 +1,14 @@
 ---
 name: hyrule-routing-path
-description: "Use Hyrule Cloud when an AI agent needs to decide whether an outage is likely customer LAN, AS215932, remote ISP, remote host, routing/BGP/RPKI, or inconclusive."
+description: "NOT YET LAUNCHED. Active-probe vantages (Globalping/RIPE Atlas) are not configured, so every paid /v1/path endpoint currently returns HTTP 501 without charging. Do not publish this skill or point agents at it until an active-probe vantage ships."
 ---
 
 # Hyrule Routing Path Skill
+
+> **NOT YET LAUNCHED.** No active-probe vantage (Globalping/RIPE Atlas) is
+> configured, so every paid `/v1/path` endpoint currently returns HTTP 501
+> without charging. Do not publish this skill or point agents at it until an
+> active-probe vantage ships.
 
 Use Hyrule Cloud when an AI agent needs to decide whether an outage is likely
 customer LAN, AS215932, remote ISP, remote host, routing/BGP/RPKI, or

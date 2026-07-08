@@ -12,12 +12,15 @@ from hyrule_cloud.models import (
     DiagnosticTarget,
     DiagnosticTargetType,
     SourceHealth,
-    SourceStatus,
     ThreatLookupRequest,
     ThreatSubjectType,
     ThreatView,
 )
-from hyrule_cloud.services.diagnostics.sources import source_not_configured, source_ok
+from hyrule_cloud.services.diagnostics.sources import (
+    source_not_configured,
+    source_ok,
+    source_usable,
+)
 
 _LICENSED_SOURCES = [
     "spamhaus_commercial",
@@ -50,9 +53,7 @@ def threat_intel_enabled() -> bool:
     before charging rather than billing for a non-answer.
     """
     sources = threat_sources()
-    return any(
-        sources[name].status != SourceStatus.SOURCE_NOT_CONFIGURED for name in _LICENSED_SOURCES
-    )
+    return any(source_usable(sources[name]) for name in _LICENSED_SOURCES)
 
 
 async def threat_lookup(body: ThreatLookupRequest) -> DiagnosticResponse:

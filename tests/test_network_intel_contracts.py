@@ -297,3 +297,99 @@ async def test_threat_lookup_readvertises_and_charges_once_source_configured(mon
     assert lookup.status_code == 402
     paths = {resource["path"] for resource in manifest.json()["resources"]}
     assert "/v1/threat/lookup" in paths
+
+
+def test_source_usable_only_accepts_configured_working_statuses():
+    from hyrule_cloud.services.diagnostics.sources import (
+        source_degraded,
+        source_disabled,
+        source_error,
+        source_not_configured,
+        source_ok,
+        source_unavailable,
+        source_usable,
+    )
+
+    assert source_usable(source_ok()) is True
+    assert source_usable(source_degraded("slow")) is True
+    # Configured-but-not-working statuses must not enable a paid route.
+    assert source_usable(source_disabled()) is False
+    assert source_usable(source_error("boom")) is False
+    assert source_usable(source_unavailable("down")) is False
+    assert source_usable(source_not_configured()) is False
+
+
+def test_threat_predicate_rejects_configured_but_unhealthy_source(monkeypatch):
+    import hyrule_cloud.services.threat.lookup as tl
+    from hyrule_cloud.services.diagnostics.sources import source_disabled
+
+    base = tl.threat_sources()
+    base["spamhaus_commercial"] = source_disabled()  # present but not usable
+    monkeypatch.setattr(tl, "threat_sources", lambda: dict(base))
+    assert tl.threat_intel_enabled() is False
+
+
+def test_path_gate_is_per_requested_vantage(monkeypatch):
+    import hyrule_cloud.services.path.diagnostics as pd
+    from hyrule_cloud.models import DiagnosticVantage
+    from hyrule_cloud.services.diagnostics.sources import source_ok
+
+    real_sources = pd._sources
+
+    def fake_sources(vantages):
+        out = real_sources(vantages)
+        for v in vantages:
+            if v == DiagnosticVantage.GLOBALPING:
+                out[v.value] = source_ok()  # pretend Globalping is configured
+        return out
+
+    monkeypatch.setattr(pd, "_sources", fake_sources)
+
+    # A request for only built-in vantages can't produce probe data => gated,
+    # even though an active prober is configured process-wide.
+    assert pd.path_active_probe_enabled([DiagnosticVantage.EXTMON]) is False
+    assert pd.path_active_probe_enabled([DiagnosticVantage.GLOBALPING]) is True
+    assert pd.path_active_probe_enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_gated_quote_routes_501_before_charging():
+    old_state = getattr(app.state, "_typed_state", None)
+    if hasattr(app.state, "_typed_state"):
+        delattr(app.state, "_typed_state")
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            responses = {
+                "/v1/threat/lookup/quote": await client.post(
+                    "/v1/threat/lookup/quote",
+                    json={"subject": {"type": "domain", "value": "example.com"}},
+                ),
+                "/v1/voip/number/lookup/quote": await client.post(
+                    "/v1/voip/number/lookup/quote", json={"number": "+31201234567"}
+                ),
+                "/v1/path/report/quote": await client.post(
+                    "/v1/path/report/quote", json={"target": "example.com"}
+                ),
+            }
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+    for endpoint, res in responses.items():
+        assert res.status_code == 501, f"{endpoint} -> {res.status_code}"
+        assert res.json()["error"] == "not_implemented", endpoint
+
+
+@pytest.mark.asyncio
+async def test_capabilities_hide_gated_paid_endpoints():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        threat = (await client.get("/v1/threat/capabilities")).json()
+        voip = (await client.get("/v1/voip/capabilities")).json()
+        path = (await client.get("/v1/path/capabilities")).json()
+
+    assert {e["path"] for e in threat["paid_endpoints"]} == set()
+    voip_paid = {e["path"] for e in voip["paid_endpoints"]}
+    assert "/v1/voip/check" in voip_paid  # real SIP work stays advertised
+    assert "/v1/voip/number/lookup" not in voip_paid  # gated
+    assert {e["path"] for e in path["paid_endpoints"]} == set()
+    # The gated quote also disappears from the free list.
+    assert not any(e["path"] == "/v1/path/report/quote" for e in path["free_endpoints"])

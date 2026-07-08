@@ -34,6 +34,11 @@ curl -X POST https://cloud.hyrule.host/v1/voip/check \
 
 ## Paid number lookup contract
 
+> **NOT YET AVAILABLE.** No carrier/CNAM/spam/E911 provider is configured, so
+> `/v1/voip/number/lookup` (and its quote) currently return HTTP 501 without
+> charging. The rest of this skill — SIP DNS/TLS via `/v1/voip/check` — is live.
+> Strip this section when publishing until a number-intelligence provider ships.
+
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/voip/number/lookup \
   -H 'Content-Type: application/json' \

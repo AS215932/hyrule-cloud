@@ -1,9 +1,13 @@
 ---
 name: hyrule-threat-reputation
-description: "Use Hyrule Cloud when an AI agent needs open-source-first domain, IP, RBL, certificate transparency, RDAP/WHOIS, or reputation context."
+description: "NOT YET LAUNCHED. No reputation source is configured, so /v1/threat/lookup currently returns HTTP 501 without charging. Do not publish this skill or point agents at it until a reputation source ships."
 ---
 
 # Hyrule Threat Reputation Skill
+
+> **NOT YET LAUNCHED.** No reputation source is configured, so the paid
+> `/v1/threat/*` endpoints currently return HTTP 501 without charging. Do not
+> publish this skill or point agents at it until a reputation source ships.
 
 Use Hyrule Cloud when an AI agent needs open-source-first domain, IP, RBL,
 certificate transparency, RDAP/WHOIS, or reputation context.
