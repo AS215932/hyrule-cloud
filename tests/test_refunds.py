@@ -17,8 +17,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import Base, CryptoIntentRow, PaymentEventRow, VMRow
-from hyrule_cloud.models import CryptoIntentStatus, VMCreateRequest, VMSize, VMStatus
+from hyrule_cloud.db import Base, CryptoIntentRow, PaymentEventRow, VMQuoteRow, VMRow
+from hyrule_cloud.models import (
+    CryptoIntentStatus,
+    QuoteStatus,
+    VMCreateRequest,
+    VMSize,
+    VMStatus,
+)
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
@@ -318,3 +324,105 @@ async def test_create_vm_can_defer_provisioning(session_factory, monkeypatch) ->
 
     orch.start_provisioning(row.vm_id)
     assert spawned == [row.vm_id]  # explicit start works
+
+
+@pytest.mark.asyncio
+async def test_native_refund_surfaces_received_crypto_amount(session_factory, monkeypatch) -> None:
+    """A native intent accepted via overpayment stores amount_received_crypto
+    (what the customer actually sent on-chain). A manual refund would be short if
+    the worklist showed only the quote, so the received amount rides in extra."""
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    async with session_factory() as session:
+        session.add(
+            _paid_provisioning_vm("vm_over", wallet=NATIVE_DEPOSIT_ADDR, tx="btc-over", cost="0.05")
+        )
+        session.add(
+            CryptoIntentRow(
+                intent_id="int_over1",
+                asset="BTC",
+                amount_crypto=Decimal("0.0001"),  # quoted
+                amount_received_crypto=Decimal("0.00025"),  # customer overpaid on-chain
+                amount_usd=Decimal("0.05"),
+                address=NATIVE_DEPOSIT_ADDR,
+                status=CryptoIntentStatus.PROVISIONED,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                vm_id="vm_over",
+                tx_hash="btc-over",
+            )
+        )
+        await session.commit()
+
+    await orch._provision_vm("vm_over")
+
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1
+    # The actual on-chain amount, not just the quote, is available to the operator
+    # (stored as a string; DB Numeric(24,12) pads scale, so compare numerically).
+    assert Decimal(owed[0].extra["amount_received_crypto"]) == Decimal("0.00025")
+
+
+@pytest.mark.asyncio
+async def test_evm_fallback_prefers_quote_amount_over_cost_total(session_factory, monkeypatch) -> None:
+    """When the settled ledger row was lost, a quote-bound VM's refund must use
+    the locked quote amount actually charged, not the VM's recomputed cost_total
+    (they diverge if pricing changed during the quote TTL)."""
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    order = VMCreateRequest(
+        duration_days=1, size=VMSize.XS, os="debian-13", ssh_pubkey="ssh-ed25519 AAAA test"
+    )
+    async with session_factory() as session:
+        # cost_total (recomputed) is 0.10, but the locked quote charged 0.05.
+        session.add(_paid_provisioning_vm("vm_q", wallet=EVM_WALLET, tx="0xLOST2", cost="0.10"))
+        session.add(
+            VMQuoteRow(
+                quote_id="q_locked",
+                order_payload=order.model_dump(mode="json"),
+                amount_usd=Decimal("0.05"),
+                status=QuoteStatus.CREATED,
+                vm_id="vm_q",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
+    await orch._provision_vm("vm_q")
+
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1
+    assert owed[0].amount_usd == Decimal("0.05")  # locked quote, not cost_total 0.10
+
+
+@pytest.mark.asyncio
+async def test_settled_refund_without_payer_still_records(session_factory, monkeypatch) -> None:
+    """If the SDK settles but exposes no payer address, the settled charge (with
+    tx + network metadata) must still land on the refund worklist for manual
+    investigation rather than being dropped."""
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    await _seed_settled(
+        session_factory,
+        tx="0xNOPAYER",
+        amount="0.05",
+        network="base-sepolia",
+        asset="USDC",
+        payer="",  # SDK settled but did not expose a payer
+    )
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    async with session_factory() as session:
+        session.add(_paid_provisioning_vm("vm_np", wallet=EVM_WALLET, tx="0xNOPAYER", cost="0.05"))
+        await session.commit()
+
+    await orch._provision_vm("vm_np")
+
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1  # not dropped
+    assert owed[0].payer_wallet == "unknown"
+    assert owed[0].tx_hash == "0xNOPAYER"
+    assert owed[0].amount_usd == Decimal("0.05")

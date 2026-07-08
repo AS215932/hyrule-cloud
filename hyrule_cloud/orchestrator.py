@@ -494,7 +494,10 @@ class Orchestrator:
         if settled is not None:
             await self.refunds.record_owed(
                 resource_path="/v1/vm/create",
-                payer=settled.payer_wallet,
+                # A settled charge exists — record the obligation even if the
+                # SDK didn't expose a payer address; the tx/network metadata let
+                # the operator investigate rather than dropping the debt.
+                payer=settled.payer_wallet or "unknown",
                 amount=settled.amount_usd,
                 network=settled.network,
                 asset=settled.asset,
@@ -505,11 +508,15 @@ class Orchestrator:
             return
         if _looks_like_evm_wallet(owner_wallet):
             # An x402 charge whose settled ledger row was lost (best-effort
-            # write): fall back to the VM's recorded cost so we still owe it.
+            # write). Prefer the locked quote amount actually charged over the
+            # VM's recomputed cost_total — they diverge if pricing changed during
+            # the quote TTL, exactly the ledger-missing path this covers.
+            quote = await self.get_quote_for_vm(vm_id)
+            charged = quote.amount_usd if quote is not None else amount
             await self.refunds.record_owed(
                 resource_path="/v1/vm/create",
                 payer=owner_wallet,
-                amount=amount,
+                amount=charged,
                 original_tx=payment_tx,
                 reason=reason,
                 vm_id=vm_id,
@@ -542,11 +549,15 @@ class Orchestrator:
             amount = intent.amount_usd
             deposit_address = intent.address
             intent_tx = intent.tx_hash
+            received_crypto = intent.amount_received_crypto
             await session.commit()
         log.warning("native_intent_refund_manual", vm_id=vm_id, intent_id=intent_id, asset=asset, reason=reason)
         # payer is the intent_id (a bounded reference the operator resolves to
         # the REFUND_MANUAL intent) — NOT the deposit address, which for XMR can
         # exceed payer_wallet's column width; the address rides in extra.
+        # amount_usd is the quote; overpay/late re-quote can mean the customer
+        # actually sent more on-chain, so surface the received crypto amount so a
+        # manual refund isn't silently short.
         await self.refunds.record_owed(
             resource_path="/v1/vm/create",
             payer=intent_id,
@@ -556,7 +567,13 @@ class Orchestrator:
             original_tx=intent_tx,
             reason=reason,
             vm_id=vm_id,
-            extra={"intent_id": intent_id, "native_deposit_address": deposit_address},
+            extra={
+                "intent_id": intent_id,
+                "native_deposit_address": deposit_address,
+                "amount_received_crypto": (
+                    str(received_crypto) if received_crypto is not None else None
+                ),
+            },
         )
         return True
 
