@@ -15,8 +15,6 @@ AS215932-backed external vantage data.
 - `SKILL-nat-cgnat.md` → `/v1/nat`
 - `SKILL-threat-reputation.md` → `/v1/threat`
 - `SKILL-voip-sip.md` → `/v1/voip`
-- `SKILL-speedtest.md` → `/v1/speedtest`
-- `SKILL-mail.md` → `/v1/mail`
 
 ## Typical ISP support flow
 
@@ -31,8 +29,6 @@ AS215932-backed external vantage data.
    `/v1/nat/port-forward/check`.
 7. For NAT/CGNAT, start with free `/v1/nat/ip`, then paid `/v1/nat/lookup`.
 8. For reputation, use `/v1/threat/lookup`; for VoIP, use `/v1/voip/check`.
-9. For throughput to Hyrule/AS215932, use `/v1/speedtest`.
-10. Use `/v1/mail` only for Hyrule-hosted Agent Mail mailbox operations.
 
 ## Discovery
 
@@ -48,7 +44,6 @@ AS215932-backed external vantage data.
 - Authoritative DNS mutation: `/v1/zone`
 - Recursive/read-only DNS diagnostics: `/v1/dns`
 - Mail deliverability diagnostics: `/v1/mx`
-- Paid mailboxes: `/v1/mail`
 - BGP/routing intelligence: `/v1/bgp`
 - Path/packet-loss evidence: `/v1/path`
 - Web/TLS/header/CDN diagnostics: `/v1/web`
@@ -56,7 +51,6 @@ AS215932-backed external vantage data.
 - NAT/CGNAT hints: `/v1/nat`
 - Threat/reputation context: `/v1/threat`
 - VoIP/SIP diagnostics: `/v1/voip`
-- Speedtest to Hyrule/AS215932: `/v1/speedtest`
 - IP/registry intelligence: `/v1/ip`, `/v1/rdap`, `/v1/whois`
 
 ## Abuse and source policy

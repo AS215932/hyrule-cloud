@@ -12,7 +12,6 @@ from hyrule_cloud.api._contract import (
 )
 from hyrule_cloud.models import (
     CapabilityEndpoint,
-    DiagnosticJobKind,
     DiagnosticJobResponse,
     DiagnosticResponse,
     DiagnosticVantage,
@@ -24,7 +23,6 @@ from hyrule_cloud.models import (
     PathVantagesResponse,
     ProductCapabilityResponse,
 )
-from hyrule_cloud.services.diagnostics.jobs import build_job_response
 from hyrule_cloud.services.path.diagnostics import path_probe, path_report
 
 router = APIRouter(prefix="/v1/path", tags=["Path diagnostics"])
@@ -48,7 +46,6 @@ async def get_path_capabilities() -> ProductCapabilityResponse:
             CapabilityEndpoint(path="/v1/path/mtr", method="POST", paid=True, description="Run/queue MTR packet-loss evidence"),
             CapabilityEndpoint(path="/v1/path/asymmetry", method="POST", paid=True, description="Collect path asymmetry evidence where possible"),
             CapabilityEndpoint(path="/v1/path/report", method="POST", paid=True, description="Create synchronous path report"),
-            CapabilityEndpoint(path="/v1/path/jobs", method="POST", paid=True, description="Create async path evidence-pack job"),
         ],
     )
 
@@ -123,10 +120,9 @@ async def create_path_report(request: Request, body: PathReportRequest) -> Diagn
 
 @router.post("/jobs", response_model=DiagnosticJobResponse)
 async def create_path_job(request: Request, body: PathReportRequest) -> DiagnosticJobResponse | Response:
-    amount = payment_price(request, "price_path_report", "0.05")
-    if payment := await require_paid_diagnostic(request, price_attr="price_path_report", default="0.05", description="Hyrule async routing/path evidence pack"):
-        return payment
-    return build_job_response(service="path", kind=DiagnosticJobKind.PATH_REPORT, charged_amount_usd=amount)
+    # Async report jobs have no retrieval backend yet: refuse before charging.
+    # Use POST /v1/path/report for the synchronous evidence pack.
+    return not_implemented("path.jobs.create")
 
 
 @router.get("/jobs/{job_id}", response_model=DiagnosticJobResponse)

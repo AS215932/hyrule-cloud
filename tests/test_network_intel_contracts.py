@@ -121,7 +121,6 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
             nat = await client.post("/v1/nat/lookup", json={"customer_reported_wan_ip": "100.64.1.1"})
             threat = await client.post("/v1/threat/lookup", json={"subject": {"type": "domain", "value": "example.com"}})
             voip = await client.post("/v1/voip/check", json={"target": "example.com"})
-            speedtest = await client.post("/v1/speedtest", json={"target": "hyrule"})
             bgp = await client.post("/v1/bgp/lookup", json={"subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"}})
     finally:
         if old_state is not None:
@@ -136,8 +135,46 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
     assert nat.status_code == 402
     assert threat.status_code == 402
     assert voip.status_code == 402
-    assert speedtest.status_code == 402
     assert bgp.status_code == 402
+
+
+@pytest.mark.asyncio
+async def test_unbuilt_paid_endpoints_return_501_before_charging():
+    """Endpoints without a real backend must refuse with 501 *before* the payment
+    gate runs — a 402 here would mean an agent can pay for a dead end."""
+    old_state = getattr(app.state, "_typed_state", None)
+    if hasattr(app.state, "_typed_state"):
+        delattr(app.state, "_typed_state")
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            responses = {
+                "/v1/mail/accounts": await client.post(
+                    "/v1/mail/accounts",
+                    json={"plan": "agent-basic", "duration_days": 1, "local_part": "a", "domain": "agentmail.hyrule.host"},
+                ),
+                "/v1/mail/messages/send": await client.post(
+                    "/v1/mail/messages/send",
+                    json={
+                        "mailbox_id": "mb_x",
+                        "from": "agent@agentmail.hyrule.host",
+                        "to": ["a@example.com"],
+                        "subject": "s",
+                        "text": "t",
+                    },
+                ),
+                "/v1/web/reports": await client.post("/v1/web/reports", json={"target": "https://example.com"}),
+                "/v1/path/jobs": await client.post("/v1/path/jobs", json={"target": "example.com"}),
+                "/v1/speedtest": await client.post("/v1/speedtest", json={"target": "hyrule"}),
+                "/v1/speedtest/jobs": await client.post("/v1/speedtest/jobs", json={"target": "hyrule"}),
+                "/v1/voip/report": await client.post("/v1/voip/report", json={"target": "example.com"}),
+                "/v1/voip/jobs": await client.post("/v1/voip/jobs", json={"target": "example.com"}),
+            }
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+    for endpoint, res in responses.items():
+        assert res.status_code == 501, f"{endpoint} returned {res.status_code}, expected 501 before any charge"
+        assert res.json()["error"] == "not_implemented", endpoint
 
 
 @pytest.mark.asyncio
@@ -169,8 +206,16 @@ async def test_x402_manifest_lists_network_intel_resources():
     assert "/v1/nat/lookup" in paths
     assert "/v1/threat/lookup" in paths
     assert "/v1/voip/check" in paths
-    assert "/v1/speedtest" in paths
-    assert "/v1/mail/accounts" in paths
+    # Unbuilt services must never be advertised in the discovery manifest:
+    # they 501 before charging, so listing them would advertise dead ends.
+    assert "/v1/speedtest" not in paths
+    assert "/v1/speedtest/jobs" not in paths
+    assert "/v1/mail/accounts" not in paths
+    assert "/v1/mail/messages/send" not in paths
+    assert "/v1/web/reports" not in paths
+    assert "/v1/path/jobs" not in paths
+    assert "/v1/voip/report" not in paths
+    assert "/v1/voip/jobs" not in paths
 
 
 @pytest.mark.asyncio

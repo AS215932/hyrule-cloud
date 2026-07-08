@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
-from hyrule_cloud.api._contract import not_implemented, payment_price, require_payment
+from hyrule_cloud.api._contract import not_implemented, payment_price
 from hyrule_cloud.models import (
     CapabilityEndpoint,
     GenericActionResponse,
@@ -61,19 +61,13 @@ async def get_mail_products(request: Request) -> MailProductsResponse:
 async def get_mail_capabilities() -> ProductCapabilityResponse:
     return ProductCapabilityResponse(
         service="mail",
-        purpose="Paid email accounts for AI agents with SMTP/IMAP plus first-class API send, fetch, search, webhooks, logs, aliases, identities, and quarantine.",
+        purpose="Email accounts for AI agents with SMTP/IMAP plus first-class API send, fetch, search, webhooks, logs, aliases, identities, and quarantine. Not yet purchasable: the mail backend is under construction.",
         separation_of_concerns="/v1/mail operates mailboxes; /v1/mx diagnoses mail deliverability; /v1/domain buys domains; /v1/zone manages DNS records.",
         free_endpoints=[
             CapabilityEndpoint(path="/v1/mail/products", method="GET", description="Agent mailbox product catalog"),
             CapabilityEndpoint(path="/v1/mail/pricing", method="GET", description="Mail product pricing"),
-            CapabilityEndpoint(path="/v1/mail/accounts/quote", method="POST", description="Quote mailbox creation"),
         ],
-        paid_endpoints=[
-            CapabilityEndpoint(path="/v1/mail/accounts", method="POST", paid=True, description="Create paid mailbox"),
-            CapabilityEndpoint(path="/v1/mail/messages/send", method="POST", paid=True, description="Send mail through mailbox API"),
-            CapabilityEndpoint(path="/v1/mail/messages", method="GET", paid=True, description="List/fetch mailbox messages"),
-            CapabilityEndpoint(path="/v1/mail/accounts/{mailbox_id}/webhooks", method="POST", paid=True, description="Register inbound/delivery webhooks"),
-        ],
+        paid_endpoints=[],
     )
 
 
@@ -105,11 +99,7 @@ async def quote_mail_account(request: Request, body: MailAccountCreateRequest) -
 
 @router.post("/accounts", response_model=MailAccountResponse)
 async def create_mail_account(request: Request, body: MailAccountCreateRequest) -> JSONResponse | Response:
-    day_price = payment_price(request, "price_mail_agent_basic_day", "0.05")
-    amount = day_price * body.duration_days
-    result = await require_payment(request, amount, "Hyrule Agent Mail mailbox creation")
-    if isinstance(result, Response):
-        return result
+    # Not implemented yet: refuse before charging so no payment is taken for a 501.
     return not_implemented("mail.accounts.create")
 
 
@@ -235,10 +225,7 @@ async def search_mail_messages(body: MailSearchRequest) -> JSONResponse:
 
 @router.post("/messages/send", response_model=MailMessageResponse)
 async def send_mail_message(request: Request, body: MailSendRequest) -> JSONResponse | Response:
-    amount = payment_price(request, "price_mail_outbound_message", "0.001")
-    result = await require_payment(request, amount, "Hyrule Agent Mail API send")
-    if isinstance(result, Response):
-        return result
+    # Not implemented yet: refuse before charging so no payment is taken for a 501.
     return not_implemented("mail.messages.send")
 
 

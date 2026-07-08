@@ -122,9 +122,9 @@ class HyruleClient:
         )
 
     async def check_zone(self, name: str, extension: str) -> dict[str, Any]:
-        """Check DNS zone availability and price."""
+        """Check DNS zone availability and price (same as domain availability)."""
         return await self._request(
-            "GET", "/v1/zone/check", params={"name": name, "extension": extension}
+            "GET", "/v1/domain/check", params={"domain": f"{name}.{extension}"}
         )
 
     # -- Paid endpoints --
@@ -199,7 +199,7 @@ class HyruleClient:
         Agents can then create records in the zone via the records API.
         """
         return await self._request(
-            "POST", "/v1/zone/buy", json={"name": name, "extension": extension}
+            "POST", "/v1/domain/register", json={"name": name, "extension": extension}
         )
 
     async def create_record(

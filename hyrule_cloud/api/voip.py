@@ -12,7 +12,6 @@ from hyrule_cloud.api._contract import (
 )
 from hyrule_cloud.models import (
     CapabilityEndpoint,
-    DiagnosticJobKind,
     DiagnosticJobResponse,
     DiagnosticResponse,
     PaidEndpointQuote,
@@ -22,7 +21,6 @@ from hyrule_cloud.models import (
     VoIPPricingResponse,
     VoIPSourcesResponse,
 )
-from hyrule_cloud.services.diagnostics.jobs import build_job_response
 from hyrule_cloud.services.voip.diagnostics import voip_check, voip_number_lookup, voip_sources
 
 router = APIRouter(prefix="/v1/voip", tags=["VoIP/SIP diagnostics"])
@@ -44,8 +42,6 @@ async def get_voip_capabilities() -> ProductCapabilityResponse:
         paid_endpoints=[
             CapabilityEndpoint(path="/v1/voip/check", method="POST", paid=True, description="Run SIP DNS/TLS/OPTIONS/STUN diagnostics"),
             CapabilityEndpoint(path="/v1/voip/number/lookup", method="POST", paid=True, description="Run carrier/CNAM/spam/E911 lookup through configured providers"),
-            CapabilityEndpoint(path="/v1/voip/report", method="POST", paid=True, description="Create VoIP evidence pack"),
-            CapabilityEndpoint(path="/v1/voip/jobs", method="POST", paid=True, description="Create async VoIP evidence-pack job"),
         ],
     )
 
@@ -90,17 +86,15 @@ async def run_voip_number_lookup(request: Request, body: VoIPNumberLookupRequest
 
 @router.post("/report", response_model=DiagnosticResponse)
 async def run_voip_report(request: Request, body: VoIPCheckRequest) -> DiagnosticResponse | Response:
-    if payment := await require_paid_diagnostic(request, price_attr="price_voip_report", default="0.08", description="Hyrule VoIP evidence pack"):
-        return payment
-    return await voip_check(body)
+    # The evidence pack is not built yet (this would just re-run /check at 8x
+    # the price): refuse before charging. Use POST /v1/voip/check instead.
+    return not_implemented("voip.report.create")
 
 
 @router.post("/jobs", response_model=DiagnosticJobResponse)
 async def create_voip_job(request: Request, body: VoIPCheckRequest) -> DiagnosticJobResponse | Response:
-    amount = payment_price(request, "price_voip_report", "0.08")
-    if payment := await require_paid_diagnostic(request, price_attr="price_voip_report", default="0.08", description="Hyrule async VoIP evidence pack"):
-        return payment
-    return build_job_response(service="voip", kind=DiagnosticJobKind.VOIP_REPORT, charged_amount_usd=amount)
+    # Async report jobs have no retrieval backend yet: refuse before charging.
+    return not_implemented("voip.jobs.create")
 
 
 @router.get("/jobs/{job_id}", response_model=DiagnosticJobResponse)

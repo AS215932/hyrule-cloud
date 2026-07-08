@@ -92,9 +92,8 @@ async def get_mx_capabilities() -> ProductCapabilityResponse:
             CapabilityEndpoint(path="/v1/mx/{tool}/{target}", method="GET", paid=True, description="SuperTool-style single check"),
             CapabilityEndpoint(path="/v1/mx/bounce/parse", method="POST", paid=True, description="Parse and classify a mail bounce/rejection message"),
             CapabilityEndpoint(path="/v1/mx/recommend-records", method="POST", paid=True, description="Recommend SPF, DKIM, DMARC, MTA-STS, TLS-RPT, and BIMI DNS records"),
-            CapabilityEndpoint(path="/v1/mx/reports/mail-delivery", method="POST", paid=True, description="Create full mail-delivery diagnostic report"),
-            CapabilityEndpoint(path="/v1/mx/jobs", method="POST", paid=True, description="Create async mail troubleshooting report"),
-            CapabilityEndpoint(path="/v1/mx/jobs/{job_id}", method="GET", paid=True, description="Fetch report status/results"),
+            CapabilityEndpoint(path="/v1/mx/reports/mail-delivery", method="POST", paid=True, description="Run full mail-delivery diagnostic report (results returned inline)"),
+            CapabilityEndpoint(path="/v1/mx/jobs", method="POST", paid=True, description="Run full mail troubleshooting report (synchronous, results returned inline)"),
         ],
     )
 
