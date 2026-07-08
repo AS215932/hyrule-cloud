@@ -105,14 +105,60 @@ def _paid_provisioning_vm(vm_id: str, *, wallet: str, tx: str | None, cost: str)
     )
 
 
+EVM_WALLET = "0x" + "ab" * 20  # 0x + 40 hex == a real EVM refund address
+NATIVE_DEPOSIT_ADDR = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"  # BTC, not a refund dest
+
+
+def _looks_like_evm_wallet_import():
+    from hyrule_cloud.orchestrator import _looks_like_evm_wallet
+
+    return _looks_like_evm_wallet
+
+
+def test_looks_like_evm_wallet() -> None:
+    is_evm = _looks_like_evm_wallet_import()
+    assert is_evm(EVM_WALLET) is True
+    assert is_evm(NATIVE_DEPOSIT_ADDR) is False  # native deposit address
+    assert is_evm("0xPayer") is False  # too short
+    assert is_evm("0x" + "zz" * 20) is False  # not hex
+    assert is_evm("") is False
+    assert is_evm(None) is False
+
+
+async def _seed_settled(factory, *, tx: str, amount: str, network: str, asset: str, payer: str) -> None:
+    """Write the settled x402 event that check_payment records at VM create."""
+    await PaymentLedger(factory).record_event(
+        event_type="settled",
+        resource_path="/v1/vm/create",
+        method="POST",
+        amount=Decimal(amount),
+        network=network,
+        asset=asset,
+        payer=payer,
+        tx_hash=tx,
+    )
+
+
 @pytest.mark.asyncio
-async def test_failed_paid_vm_records_refund_owed(session_factory, monkeypatch) -> None:
+async def test_failed_paid_vm_refunds_from_settled_ledger(session_factory, monkeypatch) -> None:
+    """The refund uses the authoritative settled charge (amount + network +
+    asset + payer wallet), NOT the recomputed VMRow.cost_total."""
     monkeypatch.setattr(
         "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
     )
+    await _seed_settled(
+        session_factory,
+        tx="0xCHARGE",
+        amount="0.05",
+        network="base-sepolia",
+        asset="USDC",
+        payer=EVM_WALLET,
+    )
     orch = Orchestrator(HyruleConfig(), session_factory)
     async with session_factory() as session:
-        session.add(_paid_provisioning_vm("vm_refundme", wallet="0xPayer", tx="0xCHARGE", cost="0.05"))
+        # cost_total deliberately differs from the settled amount (e.g. a price
+        # change between charge and failure) — the refund must follow the charge.
+        session.add(_paid_provisioning_vm("vm_refundme", wallet=EVM_WALLET, tx="0xCHARGE", cost="0.10"))
         await session.commit()
 
     await orch._provision_vm("vm_refundme")
@@ -122,10 +168,56 @@ async def test_failed_paid_vm_records_refund_owed(session_factory, monkeypatch) 
         assert row.status == VMStatus.FAILED
     owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
     assert len(owed) == 1
-    assert owed[0].payer_wallet == "0xPayer"
-    assert owed[0].amount_usd == Decimal("0.05")
+    assert owed[0].payer_wallet == EVM_WALLET
+    assert owed[0].amount_usd == Decimal("0.05")  # settled amount, not cost_total 0.10
+    assert owed[0].network == "base-sepolia"
+    assert owed[0].asset == "USDC"
     assert owed[0].tx_hash == "0xCHARGE"
     assert owed[0].service_group == "vm"
+
+
+@pytest.mark.asyncio
+async def test_failed_native_intent_vm_records_no_evm_refund(session_factory, monkeypatch) -> None:
+    """A native BTC/XMR intent carries a deposit address (not a refund dest) and
+    settles off the x402 ledger, so no EVM refund_owed is recorded here — its
+    REFUND_MANUAL intent path handles the return."""
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    async with session_factory() as session:
+        session.add(
+            _paid_provisioning_vm("vm_native", wallet=NATIVE_DEPOSIT_ADDR, tx="btc-txid-abc", cost="0.05")
+        )
+        await session.commit()
+
+    await orch._provision_vm("vm_native")
+
+    async with session_factory() as session:
+        row = await session.get(VMRow, "vm_native")
+        assert row.status == VMStatus.FAILED
+    assert [e for e in await _events(session_factory) if e.event_type == "refund_owed"] == []
+
+
+@pytest.mark.asyncio
+async def test_failed_evm_vm_without_settled_row_falls_back_to_cost(session_factory, monkeypatch) -> None:
+    """If the settled ledger write was lost, an EVM payer still gets a refund
+    obligation from the VM's recorded cost (best-effort, never lose the debt)."""
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    async with session_factory() as session:
+        session.add(_paid_provisioning_vm("vm_evm", wallet=EVM_WALLET, tx="0xLOST", cost="0.05"))
+        await session.commit()
+
+    await orch._provision_vm("vm_evm")
+
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1
+    assert owed[0].payer_wallet == EVM_WALLET
+    assert owed[0].amount_usd == Decimal("0.05")
+    assert owed[0].tx_hash == "0xLOST"
 
 
 @pytest.mark.asyncio

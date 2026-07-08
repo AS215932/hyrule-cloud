@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import DomainRow, VMQuoteRow, VMRow
+from hyrule_cloud.db import DomainRow, PaymentEventRow, VMQuoteRow, VMRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
@@ -55,6 +55,22 @@ log = structlog.get_logger()
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _looks_like_evm_wallet(value: str | None) -> bool:
+    """Whether a string is a customer EVM refund address (0x + 40 hex).
+
+    Native BTC/XMR intents carry a Hyrule-generated *deposit* address in
+    owner_wallet, not a refund destination, so they must not be treated as an
+    x402 refund payer — they refund through the intent REFUND_MANUAL path.
+    """
+    if not value or not value.startswith("0x") or len(value) != 42:
+        return False
+    try:
+        int(value[2:], 16)
+    except ValueError:
+        return False
+    return True
 
 
 class Orchestrator:
@@ -414,7 +430,7 @@ class Orchestrator:
 
         except Exception as e:
             log.error("provision_failed", vm_id=vm_id, error=str(e), exc_info=True)
-            owner_wallet, amount, payment_tx = "", None, None
+            owner_wallet, amount, payment_tx, settled = "", None, None, None
             async with self.db() as session:
                 row = await session.get(VMRow, vm_id)
                 if row is not None:
@@ -423,17 +439,69 @@ class Orchestrator:
                     owner_wallet = row.owner_wallet
                     amount = row.cost_total
                     payment_tx = row.payment_tx
+                if payment_tx:
+                    # The authoritative charge: what x402 actually settled for
+                    # this VM (amount + chain), not the possibly-recomputed
+                    # VMRow.cost_total.
+                    settled = (
+                        await session.execute(
+                            select(PaymentEventRow)
+                            .where(
+                                PaymentEventRow.tx_hash == payment_tx,
+                                PaymentEventRow.event_type == "settled",
+                            )
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
                 await session.commit()
-            # The customer paid (x402 settled at create) for a VM we could not
-            # deliver: record the refund we now owe them (no-op for free VMs).
+            await self._record_vm_refund(
+                vm_id, owner_wallet, amount, payment_tx, settled, reason=str(e)
+            )
+
+    async def _record_vm_refund(
+        self,
+        vm_id: str,
+        owner_wallet: str,
+        amount: Decimal | None,
+        payment_tx: str | None,
+        settled: PaymentEventRow | None,
+        *,
+        reason: str,
+    ) -> None:
+        """Record the refund owed for a failed paid VM.
+
+        Prefer the settled x402 ledger row (authoritative amount + network +
+        asset). A native BTC/XMR intent has no such row and carries a deposit
+        address, not a refund destination, so it is left to the intent
+        REFUND_MANUAL path rather than recorded as an EVM refund here.
+        """
+        if settled is not None:
             await self.refunds.record_owed(
                 resource_path="/v1/vm/create",
-                payer=owner_wallet or None,
-                amount=amount,
+                payer=settled.payer_wallet,
+                amount=settled.amount_usd,
+                network=settled.network,
+                asset=settled.asset,
                 original_tx=payment_tx,
-                reason=str(e),
+                reason=reason,
                 vm_id=vm_id,
             )
+            return
+        if _looks_like_evm_wallet(owner_wallet):
+            # An x402 charge whose settled ledger row was lost (best-effort
+            # write): fall back to the VM's recorded cost so we still owe it.
+            await self.refunds.record_owed(
+                resource_path="/v1/vm/create",
+                payer=owner_wallet,
+                amount=amount,
+                original_tx=payment_tx,
+                reason=reason,
+                vm_id=vm_id,
+            )
+            return
+        # Free subdomain VM, or a native-intent deposit address handled by the
+        # intent refund path — nothing to record here.
+        log.info("vm_refund_not_recorded_here", vm_id=vm_id, owner_wallet=owner_wallet or None)
 
     async def _simulate_provisioning(self, vm_id: str) -> None:
         """Controlled simulation of provisioning (issue #28).
