@@ -299,6 +299,45 @@ async def test_threat_lookup_readvertises_and_charges_once_source_configured(mon
     assert "/v1/threat/lookup" in paths
 
 
+@pytest.mark.asyncio
+async def test_manifest_advertises_path_endpoints_by_their_default_request(monkeypatch):
+    """Even with an active prober configured, only endpoints whose DEFAULT
+    request actually probes may be advertised. /v1/path/report defaults to a
+    vantage set that includes globalping, but the ping-family defaults to extmon
+    (never probes), so it must stay out of the manifest — an agent following
+    discovery with defaults would otherwise hit a 501."""
+    import hyrule_cloud.services.path.diagnostics as pd
+    from hyrule_cloud.models import DiagnosticVantage
+    from hyrule_cloud.services.diagnostics.sources import source_ok
+
+    real_sources = pd._sources
+
+    def fake_sources(vantages):
+        out = real_sources(vantages)
+        for v in vantages:
+            if v == DiagnosticVantage.GLOBALPING:
+                out[v.value] = source_ok()  # pretend Globalping is configured
+        return out
+
+    monkeypatch.setattr(pd, "_sources", fake_sources)
+    old_state = getattr(app.state, "_typed_state", None)
+    if hasattr(app.state, "_typed_state"):
+        delattr(app.state, "_typed_state")
+    try:
+        app.state._typed_state = SimpleNamespace(config=HyruleConfig())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            manifest = await client.get("/.well-known/x402.json")
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+        elif hasattr(app.state, "_typed_state"):
+            delattr(app.state, "_typed_state")
+    paths = {resource["path"] for resource in manifest.json()["resources"]}
+    assert "/v1/path/report" in paths  # default vantages include globalping
+    assert "/v1/path/ping" not in paths  # default is extmon-only -> 501
+    assert "/v1/path/trace" not in paths
+
+
 def test_source_usable_only_accepts_configured_working_statuses():
     from hyrule_cloud.services.diagnostics.sources import (
         source_degraded,

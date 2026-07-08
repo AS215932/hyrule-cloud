@@ -31,10 +31,9 @@ cross-references resolve:
 6. `hyrule-web-reachability`
 7. `hyrule-port-reachability`
 8. `hyrule-nat-cgnat`
-9. `hyrule-voip-sip` — SIP/`/v1/voip/check` only; strip `/v1/voip/number/lookup`
-   (501 until a number-intel provider is configured)
-10. `hyrule-agentic-support`
-11. `hyrule-mail-deliverability`
+9. `hyrule-voip-sip` — SIP/`/v1/voip/check` only (the number-lookup section is
+   already stripped from the source SKILL.md until a number-intel provider ships)
+10. `hyrule-mail-deliverability`
 
 ## Withheld — do NOT publish
 
@@ -44,6 +43,9 @@ cross-references resolve:
   (Globalping/RIPE Atlas) is configured; only a "probe accepted" contract today
 - `hyrule-threat-reputation` — `/v1/threat/lookup` returns 501 until a licensed
   reputation source is configured; the lookup service makes no external calls today
+- `hyrule-agentic-support` — the umbrella cross-references not-yet-launched flows
+  (`/v1/path/report`, `/v1/threat/lookup`, `/v1/mx` reports); publish it only once
+  those subskills ship, so it never points agents at a 501 route
 
 These carry a NOT YET LAUNCHED banner. Publish only once the backends ship and
 the endpoints are re-advertised in `/.well-known/x402.json`.

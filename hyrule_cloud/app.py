@@ -462,16 +462,22 @@ async def x402_manifest():
         unconfigured.add("/v1/threat/lookup")
     if not number_intel_enabled():
         unconfigured.add("/v1/voip/number/lookup")
-    if not path_active_probe_enabled():
+    # Gate each path endpoint on whether ITS OWN default request would probe:
+    # the ping-family defaults to [extmon] (never an active vantage), so the
+    # advertised default request 501s even when Globalping/RIPE is configured —
+    # only /v1/path/report defaults to a vantage set that includes globalping.
+    # Advertise an endpoint only when the request an agent gets from discovery
+    # actually returns data.
+    from hyrule_cloud.models import PathProbeRequest, PathReportRequest
+
+    probe_default_vantages = PathProbeRequest.model_fields["vantages"].default_factory()
+    report_default_vantages = PathReportRequest.model_fields["vantages"].default_factory()
+    if not path_active_probe_enabled(probe_default_vantages):
         unconfigured.update(
-            {
-                "/v1/path/ping",
-                "/v1/path/trace",
-                "/v1/path/mtr",
-                "/v1/path/asymmetry",
-                "/v1/path/report",
-            }
+            {"/v1/path/ping", "/v1/path/trace", "/v1/path/mtr", "/v1/path/asymmetry"}
         )
+    if not path_active_probe_enabled(report_default_vantages):
+        unconfigured.add("/v1/path/report")
     if unconfigured:
         manifest["resources"] = [
             r for r in manifest["resources"] if r.get("path") not in unconfigured
