@@ -347,3 +347,33 @@ async def test_network_request_rejects_concurrent_authorization_reuse(override_s
     assert first_res.status_code == 200
     # Only one fetch actually ran for the shared authorization.
     assert len(override_state.network_provider.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_network_request_post_settles_before_forwarding(override_state):
+    """A POST is non-idempotent — it must be paid BEFORE forwarding, so a
+    payment failure never triggers the upstream side effect."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/network/request",
+            json={"url": "http://example.com", "proxy_mode": "direct", "method": "POST"},
+        )
+    assert res.status_code == 402
+    # The unpaid POST must NOT have been forwarded to the sidecar.
+    assert override_state.network_provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_network_request_post_forwards_after_atomic_payment(override_state):
+    """A paid POST forwards via the atomic (settle-first) path, not the deferred
+    settle-after-delivery path used for idempotent GET/HEAD."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/network/request",
+            headers={"X-Mock-Wallet": "0xWallet"},
+            json={"url": "http://example.com", "proxy_mode": "direct", "method": "POST"},
+        )
+    assert res.status_code == 200
+    assert len(override_state.network_provider.requests) == 1
+    # Atomic check_payment was used, not the deferred settle_verified path.
+    assert override_state.payment_gate.settled == 0

@@ -1317,20 +1317,42 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
         reason = mode_status.reason or "network proxy mode unavailable"
         raise HTTPException(503, f"Proxy mode {body.proxy_mode.value} unavailable: {reason}")
 
-    # Verify the payment but DON'T settle yet: an agent must not be charged for
-    # a proxied request we then fail to deliver (a dead tor circuit, a gateway
-    # timeout). We settle only after the sidecar returns the caller's answer.
+    description = f"Network Proxy Request ({body.proxy_mode.value}) to {body.url}"
+    extra_body = {"url": body.url, "proxy_mode": body.proxy_mode.value}
+    # GET/HEAD are idempotent and side-effect-free; anything else (POST) mutates
+    # remote state when forwarded.
+    is_idempotent = body.method.upper() in ("GET", "HEAD")
+
     # The guard stops a second concurrent request from reusing the same
     # authorization to drive a duplicate fetch before this one settles.
     async with _proxy_authorization_guard(request):
+        if not is_idempotent:
+            # Non-idempotent (POST): forwarding it mutates remote state, so the
+            # payment must be FINAL before we send it — never execute an
+            # upstream side effect against an authorization that then fails to
+            # settle (a concurrent replay, a slow-fetch allowance change, a
+            # settle-time facilitator error). Settle atomically up front; the
+            # trade-off — a rare charge for a POST we then fail to deliver — is
+            # preferable to an unpaid side effect.
+            payment = await gate.check_payment(request, amount, description, extra_body)
+            if isinstance(payment, Response):
+                return payment
+            resp = await provider.execute_request(body)
+            if resp.error is not None:
+                if resp.status_code in (400, 403):
+                    raise HTTPException(resp.status_code, resp.error)
+                raise HTTPException(502, resp.error or "network proxy request failed")
+            return resp
+
+        # Idempotent (GET/HEAD): verify the payment but DON'T settle yet — an
+        # agent must not be charged for a fetch we then fail to deliver (a dead
+        # tor circuit, a gateway timeout). Re-sending it is safe, so we settle
+        # only after the sidecar returns the caller's answer.
         verified = await gate.verify_only(
             request,
             amount=amount,
-            description=f"Network Proxy Request ({body.proxy_mode.value}) to {body.url}",
-            extra_body={
-                "url": body.url,
-                "proxy_mode": body.proxy_mode.value,
-            },
+            description=description,
+            extra_body=extra_body,
         )
 
         if isinstance(verified, Response):
