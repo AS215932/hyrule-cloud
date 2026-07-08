@@ -371,12 +371,17 @@ class Orchestrator:
         # Simulate brief provisioning work
         await asyncio.sleep(0.1)
 
-        fake_ipv6 = f"2001:db8::{random.randint(0x1000, 0x9999):04x}"
-
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if not row:
                 return
+            # Keep the simulated address consistent with the allocated
+            # customer /64 — the status API exposes both, and an address
+            # outside the assigned prefix would be visibly wrong data.
+            if row.ipv6_prefix:
+                fake_ipv6 = str(vm_address_for_prefix(IPv6Network(row.ipv6_prefix, strict=True)))
+            else:
+                fake_ipv6 = f"2001:db8::{random.randint(0x1000, 0x9999):04x}"
             row.ipv6 = fake_ipv6
             row.status = VMStatus.READY
             row.provisioned_at = _now()
