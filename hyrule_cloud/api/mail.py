@@ -33,7 +33,6 @@ from hyrule_cloud.models import (
     MailWebhookResponse,
     PaidEndpointQuote,
     ProductCapabilityResponse,
-    QuoteLineItem,
 )
 
 router = APIRouter(prefix="/v1/mail", tags=["Agent Mail"])
@@ -81,20 +80,10 @@ async def get_mail_pricing(request: Request) -> MailPricingResponse:
 
 
 @router.post("/accounts/quote", response_model=PaidEndpointQuote)
-async def quote_mail_account(request: Request, body: MailAccountCreateRequest) -> PaidEndpointQuote:
-    day_price = payment_price(request, "price_mail_agent_basic_day", "0.05")
-    amount = day_price * body.duration_days
-    return PaidEndpointQuote(
-        amount_usd=str(amount),
-        billable_units=[
-            QuoteLineItem(
-                name="mail_account_agent_basic_day",
-                quantity=body.duration_days,
-                unit_price_usd=str(day_price),
-            )
-        ],
-        paid_endpoint="/v1/mail/accounts",
-    )
+async def quote_mail_account(request: Request, body: MailAccountCreateRequest) -> JSONResponse:
+    # The paid endpoint this quotes is 501 while the mail backend is unbuilt;
+    # a payable-looking quote for it would send agents into a dead end.
+    return not_implemented("mail.accounts.quote")
 
 
 @router.post("/accounts", response_model=MailAccountResponse)
