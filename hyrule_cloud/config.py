@@ -257,6 +257,11 @@ class HyruleConfig(BaseSettings):
     # Empty = static fallback (CI / local dev).
     prometheus_url: str = ""
 
+    # Bearer token mon's Prometheus presents to scrape /metrics (payments
+    # ledger aggregates). Empty = endpoint disabled; 8402 is publicly
+    # reachable behind Caddy, so never expose the exporter unauthenticated.
+    metrics_token: str = ""
+
     # Internal Go sidecar for x402-gated /v1/network/request execution.
     # Hyrule Cloud verifies/settles x402; the sidecar performs egress.
     network_proxy_url: str = "http://127.0.0.1:8450"
