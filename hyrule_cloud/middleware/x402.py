@@ -22,11 +22,13 @@ import os
 import secrets
 import time
 from decimal import Decimal
-from typing import Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import structlog
 from fastapi import Request, Response
+from x402.extensions.bazaar import bazaar_resource_server_extension
 from x402.http import (
     PAYMENT_REQUIRED_HEADER,
     PAYMENT_RESPONSE_HEADER,
@@ -45,6 +47,9 @@ from x402.schemas import PaymentPayload, PaymentRequirements, ResourceConfig, Re
 from x402.server import x402ResourceServer
 
 from hyrule_cloud.config import PaymentConfig
+
+if TYPE_CHECKING:
+    from hyrule_cloud.services.payments_ledger import PaymentLedger
 
 log = structlog.get_logger()
 
@@ -140,10 +145,21 @@ class PaymentGate:
     a 402 Response (no/bad payment) or the payer's wallet address.
     """
 
-    def __init__(self, config: PaymentConfig) -> None:
+    def __init__(
+        self,
+        config: PaymentConfig,
+        public_base_url: str = "",
+        ledger: PaymentLedger | None = None,
+    ) -> None:
         self.config = config
+        self.public_base_url = public_base_url.rstrip("/")
+        self.ledger = ledger
+        self._facilitator_host = urlparse(config.facilitator_url).hostname or ""
         self.facilitator = HTTPFacilitatorClient(_facilitator_config(config))
         self.server = x402ResourceServer(self.facilitator)
+        # Bazaar discovery: enriches declared extensions with the HTTP method
+        # so CDP can index the endpoint at settlement time.
+        self.server.register_extension(bazaar_resource_server_extension)
         for net_cfg in self.config.networks:
             # We assume ExactEvmServerScheme works out of the box for these during Phase 1
             # (In production, Solana would use an ExactSolanaServerScheme)
@@ -194,6 +210,24 @@ class PaymentGate:
             requirements.extend(self.server.build_payment_requirements(resource_cfg))
         return requirements
 
+    def _discovery_extensions(self, request: Request) -> dict[str, Any] | None:
+        """Look up and enrich the Bazaar discovery declaration for this route."""
+        from hyrule_cloud.services.discovery import discovery_for
+
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or request.url.path
+        declared = discovery_for(request.method, path)
+        if not declared:
+            return None
+        enrich = getattr(self.server, "enrich_extensions", None)
+        if enrich is None:
+            return declared
+        try:
+            return enrich(declared, SimpleNamespace(method=request.method))
+        except Exception:
+            log.warning("bazaar_extension_enrich_failed", exc_info=True)
+            return declared
+
     async def _payment_required_response(
         self,
         requirements: list[PaymentRequirements],
@@ -202,12 +236,14 @@ class PaymentGate:
         extra_body: dict[str, Any] | None,
         request_url: str | None = None,
         error: str | None = None,
+        extensions: dict[str, Any] | None = None,
     ) -> Response:
         resource = ResourceInfo(url=request_url or "", description=description or None)
         payment_required = self.server.create_payment_required_response(
             requirements,
             resource=resource,
             error=error,
+            extensions=extensions,
         )
         if inspect.isawaitable(payment_required):
             payment_required = await payment_required
@@ -245,6 +281,7 @@ class PaymentGate:
         extra_body: dict[str, Any] | None = None,
         request_url: str | None = None,
         error: str | None = None,
+        extensions: dict[str, Any] | None = None,
     ) -> Response:
         """
         Build a Payment Required response using x402 SDK types.
@@ -276,11 +313,44 @@ class PaymentGate:
             extra_body,
             request_url=request_url,
             error=error,
+            extensions=extensions,
         )
 
     @staticmethod
     def _payment_header(request: Request) -> str | None:
         return request.headers.get(PAYMENT_SIGNATURE_HEADER) or request.headers.get(X_PAYMENT_HEADER)
+
+    # Ledger writes are best-effort observability: a slow/exhausted payments
+    # DB must never hold a settled response hostage. Writes that exceed this
+    # bound are dropped with a warning.
+    _LEDGER_WRITE_TIMEOUT_SECONDS = 2.0
+
+    async def _record(self, event_type: str, request: Request, amount: Decimal, **kwargs: Any) -> None:
+        """Bounded ledger write; no-op without a ledger, never raises."""
+        if self.ledger is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self.ledger.record(
+                    event_type=event_type,
+                    request=request,
+                    amount=amount,
+                    facilitator_host=self._facilitator_host,
+                    **kwargs,
+                ),
+                timeout=self._LEDGER_WRITE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            log.warning("payment_ledger_write_dropped", event_type=event_type, exc_info=True)
+
+    def _canonical_url(self, request: Request) -> str:
+        """Resource URL for 402 responses. Behind the TLS proxy the raw request
+        URL is http://<backend-host>; discovery indexers key on the canonical
+        public URL, so prefer the configured public origin."""
+        if not self.public_base_url:
+            return str(request.url)
+        query = f"?{request.url.query}" if request.url.query else ""
+        return f"{self.public_base_url}{request.url.path}{query}"
 
     async def check_payment(
         self,
@@ -308,16 +378,30 @@ class PaymentGate:
             if bypass == self.config.dev_bypass_secret:
                 log.warning("dev_bypass_payment", amount=str(amount))
                 request.state.payment_tx = "dev_bypass_0x0"
+                await self._record(
+                    "dev_bypass", request, amount, payer="0xDEV_TEST_WALLET", tx_hash="dev_bypass_0x0"
+                )
                 return "0xDEV_TEST_WALLET"
+
+        # Bazaar discovery declaration for this route (None when undeclared);
+        # attached to every 402 so CDP indexes the endpoint at settlement.
+        extensions = self._discovery_extensions(request)
 
         payment_header = self._payment_header(request)
         if not payment_header:
-            return await self.build_402_response(
+            response = await self.build_402_response(
                 amount,
                 description,
                 extra_body,
-                request_url=str(request.url),
+                request_url=self._canonical_url(request),
+                extensions=extensions,
             )
+            # Only a real 402 counts as a challenge issued: a facilitator
+            # outage yields a 503 here, and recording it as required_402
+            # would corrupt the conversion funnel.
+            if response.status_code == 402:
+                await self._record("required_402", request, amount)
+            return response
 
         if not await self._ensure_initialized():
             return self._json_response(503, {"error": "Payment facilitator unavailable"})
@@ -326,13 +410,17 @@ class PaymentGate:
             requirements = self._build_requirements(amount)
             payment_payload = decode_payment_signature_header(payment_header)
             if not isinstance(payment_payload, PaymentPayload):
+                await self._record(
+                    "verify_failed", request, amount, error="Unsupported payment payload version"
+                )
                 return await self._payment_required_response(
                     requirements,
                     amount,
                     description,
                     extra_body,
-                    request_url=str(request.url),
+                    request_url=self._canonical_url(request),
                     error="Unsupported payment payload version",
+                    extensions=extensions,
                 )
 
             matching_requirements = self.server.find_matching_requirements(
@@ -340,13 +428,17 @@ class PaymentGate:
                 payment_payload,
             )
             if matching_requirements is None:
+                await self._record(
+                    "verify_failed", request, amount, error="No matching payment requirements"
+                )
                 return await self._payment_required_response(
                     requirements,
                     amount,
                     description,
                     extra_body,
-                    request_url=str(request.url),
+                    request_url=self._canonical_url(request),
                     error="No matching payment requirements",
+                    extensions=extensions,
                 )
 
             verification = await self.server.verify_payment(
@@ -359,13 +451,22 @@ class PaymentGate:
                     invalid_reason=verification.invalid_reason,
                     invalid_message=verification.invalid_message,
                 )
+                await self._record(
+                    "verify_failed",
+                    request,
+                    amount,
+                    network=matching_requirements.network,
+                    payer=verification.payer,
+                    error=verification.invalid_reason or "Payment verification failed",
+                )
                 return await self._payment_required_response(
                     requirements,
                     amount,
                     description,
                     extra_body,
-                    request_url=str(request.url),
+                    request_url=self._canonical_url(request),
                     error=verification.invalid_reason or "Payment verification failed",
+                    extensions=extensions,
                 )
 
             settlement = await self.server.settle_payment(
@@ -384,6 +485,15 @@ class PaymentGate:
                     error_reason=settlement.error_reason,
                     error_message=settlement.error_message,
                 )
+                await self._record(
+                    "settle_failed",
+                    request,
+                    amount,
+                    network=matching_requirements.network,
+                    asset=matching_requirements.asset,
+                    payer=settlement.payer or verification.payer,
+                    error=settlement.error_reason or "Payment settlement failed",
+                )
                 return self._json_response(
                     402,
                     {"error": settlement.error_reason or "Payment settlement failed"},
@@ -397,6 +507,15 @@ class PaymentGate:
                 "payment_settled",
                 wallet=wallet,
                 amount=str(amount),
+                tx_hash=tx_hash,
+            )
+            await self._record(
+                "settled",
+                request,
+                amount,
+                network=matching_requirements.network,
+                asset=matching_requirements.asset,
+                payer=wallet,
                 tx_hash=tx_hash,
             )
 

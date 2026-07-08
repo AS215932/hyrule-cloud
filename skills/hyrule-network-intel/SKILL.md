@@ -1,3 +1,8 @@
+---
+name: hyrule-network-intel
+description: Use Hyrule Cloud for paid, agent-friendly network intelligence primitives.
+---
+
 # Hyrule Network Intelligence Skill
 
 Use Hyrule Cloud for paid, agent-friendly network intelligence primitives.

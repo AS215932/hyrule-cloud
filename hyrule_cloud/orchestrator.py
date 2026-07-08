@@ -24,6 +24,7 @@ from hyrule_cloud.models import (
     CostBreakdown,
     DomainMode,
     DomainStatus,
+    SSHSmokeStatus,
     VMCreateRequest,
     VMSize,
     VMStatus,
@@ -310,6 +311,15 @@ class Orchestrator:
             subdomain = self._generate_hostname(vm_id)
             await self.dns.create_aaaa(subdomain, ipv6)
 
+            # Launch proof (issue #28): measure instead of inferring — probe
+            # TCP :22 and confirm the AAAA on the authoritative server. An
+            # unreachable sshd doesn't fail the VM, but the customer-visible
+            # proof reports it honestly.
+            ssh_ok, dns_verified = await asyncio.gather(
+                self._probe_ssh(ipv6),
+                self.dns.verify_aaaa(subdomain, ipv6),
+            )
+
             # Update DB with final state
             async with self.db() as session:
                 row = await session.get(VMRow, vm_id)
@@ -321,6 +331,14 @@ class Orchestrator:
                 # /v1/stats/runtime can roll a rolling avg over recent
                 # provisioning durations.
                 row.provisioned_at = _now()
+                meta = dict(row.metadata_ or {})
+                lp = dict(meta.get("launch_proof", {}))
+                lp["ssh_smoke_status"] = (
+                    SSHSmokeStatus.PASSED.value if ssh_ok else SSHSmokeStatus.FAILED.value
+                )
+                lp["dns_aaaa_verified"] = bool(dns_verified)
+                meta["launch_proof"] = lp
+                row.metadata_ = meta
 
                 if row.domain_mode == DomainMode.CUSTOM and row.domain:
                     await self._register_custom_domain(row)
@@ -376,6 +394,37 @@ class Orchestrator:
             await session.commit()
 
         log.info("provision_simulate_complete", vm_id=vm_id, ipv6=fake_ipv6)
+
+    async def _probe_ssh(
+        self,
+        ipv6: str,
+        *,
+        timeout_seconds: int = 90,
+        interval_seconds: int = 5,
+        port: int = 22,
+    ) -> bool:
+        """TCP reachability probe of the VM's sshd for the launch proof.
+
+        sshd usually comes up after the IPv6 address appears (cloud-init is
+        still running), so keep retrying until a monotonic deadline —
+        blackholed connect attempts burn wall-clock too, and must not extend
+        the window beyond timeout_seconds. Connectivity only — no SSH
+        handshake, no credentials.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ipv6, port), timeout=5
+                )
+                writer.close()
+                await writer.wait_closed()
+                return True
+            except (TimeoutError, OSError):
+                if loop.time() + interval_seconds >= deadline:
+                    return False
+                await asyncio.sleep(interval_seconds)
 
     async def _wait_for_ipv6(
         self,

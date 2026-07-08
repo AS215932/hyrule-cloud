@@ -62,6 +62,8 @@ class _FakeServer:
         self.initialized = False
         self.verify_payment_calls = 0
         self.settle_payment_calls = 0
+        self.last_resource: ResourceInfo | None = None
+        self.last_extensions: dict | None = None
         self.requirements = [
             PaymentRequirements(
                 scheme="exact",
@@ -85,13 +87,27 @@ class _FakeServer:
         requirements: list[PaymentRequirements],
         resource: ResourceInfo | None = None,
         error: str | None = None,
+        extensions: dict | None = None,
     ) -> PaymentRequired:
+        self.last_resource = resource
+        self.last_extensions = extensions
         return PaymentRequired(
             x402_version=2,
             error=error,
             resource=resource,
             accepts=requirements,
+            extensions=extensions,
         )
+
+    def enrich_extensions(self, declared: dict, transport_context: object) -> dict:
+        from x402.extensions.bazaar import bazaar_resource_server_extension
+
+        return {
+            key: bazaar_resource_server_extension.enrich_declaration(value, transport_context)
+            if key == "bazaar"
+            else value
+            for key, value in declared.items()
+        }
 
     def find_matching_requirements(
         self,
@@ -137,8 +153,9 @@ class _AsyncPaymentRequiredServer(_FakeServer):
         requirements: list[PaymentRequirements],
         resource: ResourceInfo | None = None,
         error: str | None = None,
+        extensions: dict | None = None,
     ) -> PaymentRequired:
-        return super().create_payment_required_response(requirements, resource, error)
+        return super().create_payment_required_response(requirements, resource, error, extensions)
 
 
 class _FailingInitServer(_FakeServer):
@@ -146,12 +163,13 @@ class _FailingInitServer(_FakeServer):
         raise RuntimeError("facilitator down")
 
 
-def _gate(server: _FakeServer) -> PaymentGate:
+def _gate(server: _FakeServer, public_base_url: str = "") -> PaymentGate:
     gate = PaymentGate(
         PaymentConfig(
             receiver_address=RECEIVER,
             facilitator_url="https://facilitator.payai.network",
-        )
+        ),
+        public_base_url=public_base_url,
     )
     gate.server = server  # type: ignore[assignment]
     return gate
@@ -255,6 +273,34 @@ async def test_no_payment_returns_standard_and_legacy_payment_required_headers()
 
 
 @pytest.mark.asyncio
+async def test_402_resource_url_prefers_public_base_url() -> None:
+    """Behind the TLS proxy the raw request URL is http://<backend>; the 402
+    resource URL must be the canonical public origin so Bazaar/x402scan index
+    the right identity."""
+    server = _FakeServer()
+    gate = _gate(server, public_base_url="https://cloud.hyrule.host")
+
+    result = await gate.check_payment(_request(), Decimal("0.05"), "VM creation")
+
+    assert isinstance(result, Response)
+    assert result.status_code == 402
+    assert server.last_resource is not None
+    assert server.last_resource.url == "https://cloud.hyrule.host/v1/vm/create"
+
+
+@pytest.mark.asyncio
+async def test_402_resource_url_falls_back_to_request_url() -> None:
+    server = _FakeServer()
+    gate = _gate(server)
+
+    result = await gate.check_payment(_request(), Decimal("0.05"), "VM creation")
+
+    assert isinstance(result, Response)
+    assert server.last_resource is not None
+    assert server.last_resource.url == "http://testserver/v1/vm/create"
+
+
+@pytest.mark.asyncio
 async def test_no_payment_awaits_async_payment_required_builder() -> None:
     gate = _gate(_AsyncPaymentRequiredServer())
 
@@ -352,3 +398,52 @@ async def test_app_middleware_propagates_payment_response_headers() -> None:
     exposed = result.headers["Access-Control-Expose-Headers"]
     assert PAYMENT_RESPONSE_HEADER in exposed
     assert X_PAYMENT_RESPONSE_HEADER in exposed
+
+
+@pytest.mark.asyncio
+async def test_402_carries_bazaar_discovery_extension_for_declared_route() -> None:
+    server = _FakeServer()
+    gate = _gate(server)
+
+    result = await gate.check_payment(_request(), Decimal("0.05"), "VM creation")
+
+    assert isinstance(result, Response)
+    assert result.status_code == 402
+    assert server.last_extensions is not None
+    bazaar = server.last_extensions["bazaar"]
+    # The server extension must have enriched the declaration with the method.
+    assert bazaar["info"]["input"]["method"] == "POST"
+    assert bazaar["info"]["input"]["bodyType"] == "json"
+    assert "duration_days" in bazaar["info"]["input"]["body"]
+
+
+@pytest.mark.asyncio
+async def test_402_has_no_extensions_for_undeclared_route() -> None:
+    server = _FakeServer()
+    gate = _gate(server)
+    req = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/vm/quote",
+            "query_string": b"",
+            "headers": [(b"host", b"testserver")],
+            "server": ("testserver", 80),
+            "client": ("127.0.0.1", 12345),
+        }
+    )
+
+    result = await gate.check_payment(req, Decimal("0.05"), "quote")
+
+    assert isinstance(result, Response)
+    assert server.last_extensions is None
+
+
+def test_discovery_registry_only_declares_real_endpoints() -> None:
+    """Declaring an endpoint IS advertising it — unbuilt services must not appear."""
+    from hyrule_cloud.services.discovery import DISCOVERY
+
+    declared_paths = {path for _, path in DISCOVERY}
+    for dead in ("/v1/mail/accounts", "/v1/mail/messages/send", "/v1/speedtest", "/v1/web/reports", "/v1/voip/report", "/v1/path/jobs"):
+        assert dead not in declared_paths
