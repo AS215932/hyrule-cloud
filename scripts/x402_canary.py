@@ -199,9 +199,9 @@ async def _create_quote(order_payload: dict) -> str | None:
 
 
 async def _zone_write_after_register(reg_resp: httpx.Response, domain_name: str | None) -> bool:
-    """After a real registration, write one AAAA record so the DNS/zone path is
-    exercised too (Phase-3c gate). Prints a dig command for the operator rather
-    than resolving here (public propagation is not instant)."""
+    """After a real registration, write one AAAA record and poll public DNS
+    until it resolves — the full Phase-3c gate (register -> zone write -> public
+    resolution). Returns False if the record never resolves."""
     data = reg_resp.json()
     zone = data.get("domain") or (f"{domain_name}.dev" if domain_name else None)
     token = data.get("management_token")
@@ -224,8 +224,38 @@ async def _zone_write_after_register(reg_resp: httpx.Response, domain_name: str 
     print(f"    zone-record -> HTTP {resp.status_code} {resp.text[:200]}")
     if resp.status_code >= 400:
         return False
-    print(f"    verify propagation:  dig +short AAAA canary.{zone}")
-    return True
+    fqdn = f"canary.{zone}"
+    print(f"    --- polling public DNS for {fqdn} AAAA {record['value']} ---")
+    if await _resolve_aaaa(fqdn, record["value"]):
+        print(f"    ✅ {fqdn} resolves to {record['value']}")
+        return True
+    # The Phase-3c gate requires public resolution, not just a 2xx write — a
+    # broken delegation or propagation failure must fail the canary.
+    print(f"    !! {fqdn} did not resolve to {record['value']} in time "
+          "(delegation/propagation?); FAILING.")
+    return False
+
+
+async def _resolve_aaaa(fqdn: str, expected: str, *, attempts: int = 12, delay: float = 5.0) -> bool:
+    """Poll public DNS until ``fqdn`` resolves to the expected AAAA. Returns True
+    once seen, False after ``attempts`` * ``delay`` seconds."""
+    import ipaddress
+
+    import dns.asyncresolver
+
+    want = ipaddress.IPv6Address(expected)
+    resolver = dns.asyncresolver.Resolver()
+    for i in range(attempts):
+        try:
+            answer = await resolver.resolve(fqdn, "AAAA")
+            got = {ipaddress.IPv6Address(r.address) for r in answer}
+            print(f"    [dns {i}] {fqdn} AAAA -> {sorted(str(g) for g in got)}")
+            if want in got:
+                return True
+        except Exception as e:
+            print(f"    [dns {i}] {fqdn} AAAA not resolvable yet: {e}")
+        await asyncio.sleep(delay)
+    return False
 
 
 async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool, yes: bool) -> bool:
