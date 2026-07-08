@@ -440,6 +440,15 @@ async def x402_manifest():
         "facilitator": getattr(config.payment, "facilitator_url", ""),
         "contact": "https://github.com/as215932",
     }
+    # Don't advertise the paid VM route while provisioning is simulated — the
+    # route itself refuses (503) until the Phase-3d real-provisioning flip, so
+    # discovery must not point agents at a service that can't take their money.
+    from hyrule_cloud.services.launch_proof import use_real_provisioning
+
+    if not use_real_provisioning():
+        manifest["resources"] = [
+            r for r in manifest["resources"] if r.get("path") != "/v1/vm/create"
+        ]
     # Bazaar/x402scan: flag resources whose 402 responses carry a discovery
     # extension declaration (services/discovery.py).
     for resource in manifest["resources"]:

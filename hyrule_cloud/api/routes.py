@@ -261,6 +261,24 @@ def _real_provisioning_enabled() -> bool:
     return use_real_provisioning()
 
 
+def _vm_service_open(gate: object) -> bool:
+    """Whether the paid VM service may take money right now.
+
+    Real VM provisioning is the last launch step (HCP_LAUNCH_PROOF_REAL_XCPNG=1).
+    Until then the app still boots — it serves the network-intel, proxy, and
+    domain services — but the live x402 gate must not charge, nor hand out a
+    crypto deposit address, for a VM we can only simulate. Test doubles (fake
+    gates) keep the simulated flow so the suite still exercises provisioning,
+    mirroring the reservation-through-payment guard in create_vm.
+    """
+    return _real_provisioning_enabled() or not isinstance(gate, PaymentGate)
+
+
+def _require_vm_service_open(gate: object) -> None:
+    if not _vm_service_open(gate):
+        raise HTTPException(503, "VM provisioning is not yet generally available")
+
+
 def _validate_vm_order(order: VMCreateRequest, cfg) -> None:
     if order.domain_mode == DomainMode.CUSTOM and not order.domain:
         raise HTTPException(400, "domain required when domain_mode=custom")
@@ -716,6 +734,10 @@ async def create_vm(
     # A0 management-token flow unchanged.
     account = Depends(current_account),
 ):
+    # Closed until real provisioning is enabled — never charge for a simulated
+    # VM. Refuse before any payment (even before the 402) so no money moves.
+    _require_vm_service_open(gate)
+
     # Issue #14: when a durable quote_id is supplied, the stored spec is
     # authoritative and the price is locked to the quote. Otherwise this is the
     # legacy compute-price-from-body flow, unchanged.
@@ -849,6 +871,7 @@ async def create_vm_quote(
     request: Request,
     orch=Depends(get_orch),
     cfg=Depends(get_cfg),
+    gate=Depends(get_gate),
     account=Depends(current_account),
 ) -> Response:
     """Issue #14: price a VM order once and persist it as a durable quote.
@@ -858,6 +881,9 @@ async def create_vm_quote(
     Idempotent on `client_order_id`: same key + same spec returns the existing
     quote (200); same key + a different spec is a 409 conflict.
     """
+    # Don't lock a price for a VM that can't be provisioned yet (simulation).
+    _require_vm_service_open(gate)
+
     order = body.order_payload
     _validate_vm_order(order, cfg)
 
@@ -1332,6 +1358,7 @@ async def create_crypto_intent(
     request: Request,
     orch=Depends(get_orch),
     cfg=Depends(get_cfg),
+    gate=Depends(get_gate),
     account=Depends(current_account),
 ) -> CryptoIntentResponse:
     """Block E: open a payment intent for BTC or XMR.
@@ -1350,6 +1377,11 @@ async def create_crypto_intent(
         existing_intent = await get_intent_by_client_order_id(orch.db, body.client_order_id)
         if existing_intent is not None:
             return _intent_to_response(existing_intent, request)
+
+    # Closed until real provisioning is enabled: don't hand out a deposit
+    # address for a VM we can only simulate. Existing intents (above) still
+    # resolve so a funded deposit is never orphaned.
+    _require_vm_service_open(gate)
 
     # Same validation as the x402 create path — including the real-mode OS
     # support check, so an unsupported order is rejected BEFORE a deposit

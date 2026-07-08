@@ -7,6 +7,7 @@ import pytest
 import pytest_asyncio
 from fastapi import Response
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.api.routes import _enforce_paid_vm_cap
@@ -388,3 +389,98 @@ async def test_expiry_suspend_and_destroy_paths_are_exercised(launch_state):
     await Orchestrator.check_expiries(fake)
     assert fake.xcpng.suspended == ["uuid-suspend"]
     assert fake.destroyed == ["vm_destroy"]
+
+
+# --- Paid VM service is closed while provisioning is simulated (Phase 1) ---
+#
+# The app boots in simulation to serve the intel/proxy/domain services, but the
+# live x402 gate must never charge (or hand out a crypto deposit address) for a
+# VM it can only fake. The gate opens at the Phase-3d real-provisioning flip.
+
+_VM_ORDER = {
+    "duration_days": 1,
+    "size": "xs",
+    "os": "debian-13",
+    "ssh_pubkey": "ssh-ed25519 AAAA test",
+    "domain_mode": "auto",
+    "open_ports": [80, 443],
+}
+
+
+def _real_gate():
+    """A real x402 PaymentGate (not a test double) — the live-money path.
+
+    Construction is network-free; the facilitator is only contacted lazily.
+    """
+    from hyrule_cloud.config import PaymentConfig
+    from hyrule_cloud.middleware.x402 import PaymentGate
+
+    return PaymentGate(
+        PaymentConfig(receiver_address="0xFf4555af30A1066A889324a3Fe88c76796159f15")
+    )
+
+
+def test_vm_service_open_truth_table(monkeypatch):
+    from hyrule_cloud.api import routes
+
+    real_gate = _real_gate()
+    monkeypatch.setattr(routes, "_real_provisioning_enabled", lambda: False)
+    # Live gate + simulation → closed; a test double is always treated as open.
+    assert routes._vm_service_open(real_gate) is False
+    assert routes._vm_service_open(object()) is True
+    # Real provisioning enabled → the live gate may take money.
+    monkeypatch.setattr(routes, "_real_provisioning_enabled", lambda: True)
+    assert routes._vm_service_open(real_gate) is True
+
+
+@pytest.mark.asyncio
+async def test_vm_create_refuses_before_charging_while_simulated(launch_state):
+    launch_state.payment_gate = _real_gate()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/vm/create", json=_VM_ORDER, headers={"X-Mock-Paid": "1"}
+        )
+    assert res.status_code == 503
+    assert "not yet generally available" in res.json()["detail"]
+    # Refused at the top of the handler — no row was ever written.
+    async with launch_state.orchestrator.db() as session:
+        count = (await session.execute(select(func.count()).select_from(VMRow))).scalar()
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_vm_quote_refused_while_simulated(launch_state):
+    launch_state.payment_gate = _real_gate()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post("/v1/vm/quote", json={"order_payload": _VM_ORDER})
+    assert res.status_code == 503
+    assert "not yet generally available" in res.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_vm_crypto_intent_refused_while_simulated(launch_state):
+    launch_state.payment_gate = _real_gate()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/intent/create", json={"asset": "BTC", "order_payload": _VM_ORDER}
+        )
+    assert res.status_code == 503
+    assert "not yet generally available" in res.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_manifest_hides_vm_create_until_real_provisioning(launch_state, monkeypatch):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        sim = await client.get("/.well-known/x402.json")
+        assert sim.status_code == 200
+        sim_paths = {r["path"] for r in sim.json()["resources"]}
+        assert "/v1/vm/create" not in sim_paths
+        # Other paid services stay advertised while VMs are held back.
+        assert "/v1/network/request" in sim_paths
+
+        monkeypatch.setattr(
+            "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+        )
+        real = await client.get("/.well-known/x402.json")
+        real_paths = {r["path"] for r in real.json()["resources"]}
+    assert "/v1/vm/create" in real_paths
