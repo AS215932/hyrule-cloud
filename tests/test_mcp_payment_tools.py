@@ -232,3 +232,39 @@ async def test_get_intent_status_handles_404(monkeypatch):
     _patch_client_factory(monkeypatch, _Stub())
     out = await get_intent_status("ci_missing")
     assert "intent not found" in out
+
+
+@pytest.mark.asyncio
+async def test_gated_diagnostic_tools_hidden_when_sources_unconfigured():
+    """The shipped MCP surface must mirror the x402 manifest gate: with no
+    diagnostic source configured (the default), the gated diagnostic tools are
+    NOT registered, so agents aren't invited to call a route that 501s. Live
+    tools (e.g. voip_sip_check) stay."""
+    from hyrule_cloud import mcp_server
+    from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
+    from hyrule_cloud.services.threat.lookup import threat_intel_enabled
+    from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
+
+    # Precondition: these are off by default (no licensed/active source).
+    assert not path_active_probe_enabled()
+    assert not threat_intel_enabled()
+    assert not number_intel_enabled()
+
+    names = {t.name for t in await mcp_server.mcp.list_tools()}
+    assert "path_report" not in names
+    assert "threat_reputation_lookup" not in names
+    assert "voip_number_lookup" not in names
+    # A live diagnostic tool remains advertised.
+    assert "voip_sip_check" in names
+
+
+def test_gated_tool_helper_registers_only_when_enabled():
+    from hyrule_cloud.mcp_server import _gated_tool
+
+    async def sample() -> str:
+        return "x"
+
+    # Disabled -> pass-through (not registered), returns the function unchanged.
+    assert _gated_tool(False)(sample) is sample
+    # Enabled -> returns a real mcp.tool() decorator (callable that registers).
+    assert callable(_gated_tool(True))
