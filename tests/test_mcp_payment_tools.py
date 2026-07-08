@@ -241,12 +241,19 @@ async def test_gated_diagnostic_tools_hidden_when_sources_unconfigured():
     NOT registered, so agents aren't invited to call a route that 501s. Live
     tools (e.g. voip_sip_check) stay."""
     from hyrule_cloud import mcp_server
+    from hyrule_cloud.models import PathReportRequest
     from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
     from hyrule_cloud.services.threat.lookup import threat_intel_enabled
     from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
 
-    # Precondition: these are off by default (no licensed/active source).
-    assert not path_active_probe_enabled()
+    # Precondition: these are off by default (no licensed/active source). path is
+    # gated on the path_report endpoint's OWN default vantages (extmon,
+    # as215932, globalping) — not merely "any active prober" — so a partial
+    # config (e.g. only RIPE Atlas) that still 501s the default request keeps the
+    # tool hidden, exactly as the manifest/capabilities gate does.
+    assert not path_active_probe_enabled(
+        PathReportRequest.model_fields["vantages"].default_factory()
+    )
     assert not threat_intel_enabled()
     assert not number_intel_enabled()
 

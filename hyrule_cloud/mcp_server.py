@@ -29,6 +29,7 @@ import os
 from mcp.server.fastmcp import FastMCP
 
 from hyrule_cloud.client import HyruleClient, HyruleError
+from hyrule_cloud.models import PathReportRequest
 from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
 from hyrule_cloud.services.threat.lookup import threat_intel_enabled
 from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
@@ -746,7 +747,7 @@ async def mx_parse_bounce(message: str, sender_domain: str | None = None, recipi
         return _err(e)
 
 
-@_gated_tool(path_active_probe_enabled())
+@_gated_tool(path_active_probe_enabled(PathReportRequest.model_fields["vantages"].default_factory()))
 async def path_report(target: str) -> str:
     """Paid routing/path evidence pack using extmon, AS215932, BGP/RPKI, and optional multi-vantage evidence."""
     try:
