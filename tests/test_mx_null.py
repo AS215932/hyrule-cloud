@@ -38,6 +38,25 @@ async def test_null_mx_is_a_clean_finding(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_root_exchange_with_nonzero_preference_is_malformed(monkeypatch):
+    """A single ``10 .`` is NOT a null MX — RFC 7505 requires preference 0. It
+    must warn as malformed, not report a clean "accepts no mail" INFO (and must
+    not try to resolve the empty exchange host)."""
+    async def fake_lookup(req):
+        assert req.type == DNSLookupRecordType.MX  # never resolves an empty host
+        return _answers("10 .")
+
+    monkeypatch.setattr(mxc, "dns_lookup", fake_lookup)
+
+    resp = await mxc._mx("example.com")
+
+    codes = [f.code for f in resp.findings]
+    assert codes == ["mx_null_bad_preference"]
+    assert "mx_null" not in codes
+    assert resp.status == MXStatus.WARNING
+
+
+@pytest.mark.asyncio
 async def test_null_mx_mixed_with_real_records_warns_without_crashing(monkeypatch):
     async def fake_lookup(req):
         if req.type == DNSLookupRecordType.MX:
