@@ -132,7 +132,7 @@ async def create_vm(
     """
     Provision a bare VM with SSH access.
 
-    Sizes: xs (1vCPU/512MB/10GB), sm (1vCPU/1GB/20GB), md (2vCPU/2GB/40GB), lg (4vCPU/4GB/80GB).
+    Sizes: xs (1vCPU/1GB/10GB), sm (1vCPU/1GB/20GB), md (2vCPU/2GB/40GB), lg (4vCPU/4GB/80GB).
     Domain modes: 'auto' (free subdomain), 'custom' (register domain, extra cost).
     Returns 402 with payment instructions if no payment is attached.
     """

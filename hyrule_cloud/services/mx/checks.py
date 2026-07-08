@@ -64,6 +64,12 @@ def _overall(findings: list[MXFinding]) -> MXStatus:
     return MXStatus.OK
 
 
+def _is_null_mx(values: list[str]) -> bool:
+    """RFC 7505 null MX: a single record whose exchange is the root (``.``),
+    rendered by dnspython as ``0 .`` — the domain explicitly accepts no mail."""
+    return len(values) == 1 and values[0].split()[-1].rstrip(".") == ""
+
+
 def _dns_summary(tool: MXTool, target: str, values: list[str]) -> str:
     if values:
         return f"{tool.value.upper()} lookup for {target} returned {len(values)} record(s)."
@@ -97,10 +103,21 @@ async def _mx(target: str) -> MXCheckResponse:
     findings: list[MXFinding] = []
     if not values:
         findings.append(_finding(MXStatus.CRITICAL, "mx_missing", "No MX records found.", "Publish MX records for inbound mail delivery."))
+    elif _is_null_mx(values):
+        # RFC 7505: a single "0 ." record means the domain explicitly accepts
+        # no mail. That is a valid, deliberate configuration — a clean finding,
+        # not an error (and there is no exchange host to resolve).
+        findings.append(_finding(MXStatus.INFO, "mx_null", "Domain publishes a null MX (RFC 7505): it explicitly accepts no mail.", records=values))
     else:
         findings.append(_finding(MXStatus.OK, "mx_present", f"Found {len(values)} MX record(s).", records=values))
         for mx_value in values:
             host = mx_value.split()[-1].rstrip(".")
+            if not host:
+                # A null exchange (".") mixed with real MX records is malformed:
+                # RFC 7505 requires the null MX to be the only record. Report it
+                # rather than resolving an empty DNS name (which would raise).
+                findings.append(_finding(MXStatus.WARNING, "mx_null_mixed", "A null MX (.) is mixed with other MX records; RFC 7505 requires it to be the only record.", record=mx_value))
+                continue
             a = await dns_lookup(DNSLookupRequest(name=host, type=DNSLookupRecordType.A))
             aaaa = await dns_lookup(DNSLookupRequest(name=host, type=DNSLookupRecordType.AAAA))
             if not a.answers and not aaaa.answers:
