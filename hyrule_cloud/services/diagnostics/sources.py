@@ -10,12 +10,15 @@ from hyrule_cloud.models import SourceHealth, SourceStatus
 # data (possibly degraded). Everything else — not_configured, disabled,
 # unavailable, error, unknown, informational — means "cannot answer", so a paid
 # route backed only by such sources must 501 before charging.
+# Statuses where a configured source can actually answer right now. STALE and
+# DEGRADED still return (old/partial) data; RATE_LIMITED is deliberately
+# EXCLUDED — a throttled source can't return fresh data, and these gates exist
+# to 501 before charging when the backing source can't answer.
 _USABLE_SOURCE_STATUSES = frozenset(
     {
         SourceStatus.OK,
         SourceStatus.STALE,
         SourceStatus.DEGRADED,
-        SourceStatus.RATE_LIMITED,
     }
 )
 

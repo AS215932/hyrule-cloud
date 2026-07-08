@@ -34,25 +34,38 @@ router = APIRouter(prefix="/v1/path", tags=["Path diagnostics"])
 
 @router.get("/capabilities", response_model=ProductCapabilityResponse)
 async def get_path_capabilities() -> ProductCapabilityResponse:
-    # Without a configured active-probe vantage every paid path endpoint 501s
-    # before charging, so don't advertise them (or the report quote) yet.
+    # Advertise each paid path endpoint only when ITS default request would
+    # actually probe. The ping-family defaults to [extmon] (never an active
+    # vantage) so its default body 501s even with a prober configured, while
+    # /v1/path/report defaults to a set that includes globalping. Mirror the
+    # manifest's per-endpoint gate so capabilities never list a route whose
+    # default request 501s.
+    probe_enabled = path_active_probe_enabled(
+        PathProbeRequest.model_fields["vantages"].default_factory()
+    )
+    report_enabled = path_active_probe_enabled(
+        PathReportRequest.model_fields["vantages"].default_factory()
+    )
     _free_endpoints = [
         CapabilityEndpoint(path="/v1/path/capabilities", method="GET", description="Path diagnostic capabilities"),
         CapabilityEndpoint(path="/v1/path/vantages", method="GET", description="Supported diagnostic vantages"),
         CapabilityEndpoint(path="/v1/path/pricing", method="GET", description="Path diagnostic pricing"),
     ]
     _paid_endpoints: list[CapabilityEndpoint] = []
-    if path_active_probe_enabled():
-        _free_endpoints.append(
-            CapabilityEndpoint(path="/v1/path/report/quote", method="POST", description="Quote a path evidence pack")
-        )
-        _paid_endpoints = [
+    if probe_enabled:
+        _paid_endpoints.extend([
             CapabilityEndpoint(path="/v1/path/ping", method="POST", paid=True, description="Run/queue ping evidence from approved vantages"),
             CapabilityEndpoint(path="/v1/path/trace", method="POST", paid=True, description="Run/queue traceroute evidence"),
             CapabilityEndpoint(path="/v1/path/mtr", method="POST", paid=True, description="Run/queue MTR packet-loss evidence"),
             CapabilityEndpoint(path="/v1/path/asymmetry", method="POST", paid=True, description="Collect path asymmetry evidence where possible"),
-            CapabilityEndpoint(path="/v1/path/report", method="POST", paid=True, description="Create synchronous path report"),
-        ]
+        ])
+    if report_enabled:
+        _free_endpoints.append(
+            CapabilityEndpoint(path="/v1/path/report/quote", method="POST", description="Quote a path evidence pack")
+        )
+        _paid_endpoints.append(
+            CapabilityEndpoint(path="/v1/path/report", method="POST", paid=True, description="Create synchronous path report")
+        )
     return ProductCapabilityResponse(
         service="path",
         purpose="Paid routing/path diagnostics using extmon, AS215932, public BGP/RPKI, router-table snapshots, and optional Globalping/RIPE Atlas evidence.",

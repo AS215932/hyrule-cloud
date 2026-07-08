@@ -339,6 +339,7 @@ async def test_manifest_advertises_path_endpoints_by_their_default_request(monke
 
 
 def test_source_usable_only_accepts_configured_working_statuses():
+    from hyrule_cloud.models import SourceHealth, SourceStatus
     from hyrule_cloud.services.diagnostics.sources import (
         source_degraded,
         source_disabled,
@@ -350,12 +351,44 @@ def test_source_usable_only_accepts_configured_working_statuses():
     )
 
     assert source_usable(source_ok()) is True
-    assert source_usable(source_degraded("slow")) is True
-    # Configured-but-not-working statuses must not enable a paid route.
+    assert source_usable(source_degraded("slow")) is True  # serves partial data
+    # Configured-but-not-answering statuses must not enable a paid route.
     assert source_usable(source_disabled()) is False
     assert source_usable(source_error("boom")) is False
     assert source_usable(source_unavailable("down")) is False
     assert source_usable(source_not_configured()) is False
+    # RATE_LIMITED is configured but can't return fresh data right now, so it
+    # must not keep a paid route advertised/chargeable.
+    assert source_usable(SourceHealth(status=SourceStatus.RATE_LIMITED, message="quota")) is False
+
+
+@pytest.mark.asyncio
+async def test_path_capabilities_gated_per_endpoint_default_vantages(monkeypatch):
+    """With globalping configured, /v1/path/capabilities advertises the report
+    (its default vantages include globalping) but NOT the ping-family (default
+    [extmon] 501s) — mirroring the manifest's per-endpoint gate."""
+    import hyrule_cloud.services.path.diagnostics as pd
+    from hyrule_cloud.api.path import get_path_capabilities
+    from hyrule_cloud.models import DiagnosticVantage
+    from hyrule_cloud.services.diagnostics.sources import source_ok
+
+    real_sources = pd._sources
+
+    def fake_sources(vantages):
+        out = real_sources(vantages)
+        for v in vantages:
+            if v == DiagnosticVantage.GLOBALPING:
+                out[v.value] = source_ok()
+        return out
+
+    monkeypatch.setattr(pd, "_sources", fake_sources)
+    caps = await get_path_capabilities()
+    paid = {e.path for e in caps.paid_endpoints}
+    free = {e.path for e in caps.free_endpoints}
+    assert "/v1/path/report" in paid
+    assert "/v1/path/report/quote" in free
+    assert "/v1/path/ping" not in paid
+    assert "/v1/path/trace" not in paid
 
 
 def test_threat_predicate_rejects_configured_but_unhealthy_source(monkeypatch):
