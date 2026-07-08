@@ -320,6 +320,18 @@ class PaymentGate:
     def _payment_header(request: Request) -> str | None:
         return request.headers.get(PAYMENT_SIGNATURE_HEADER) or request.headers.get(X_PAYMENT_HEADER)
 
+    def has_payment_credentials(self, request: Request) -> bool:
+        """True when this request will actually be charged if valid — a
+        payment header is present, or the dev bypass matches. Routes use this
+        to reserve scarce resources only for paying requests, not for the
+        unpaid discovery round-trip that just fetches the 402."""
+        if self._payment_header(request):
+            return True
+        return bool(
+            self.config.dev_bypass_secret
+            and request.headers.get("X-DEV-BYPASS") == self.config.dev_bypass_secret
+        )
+
     # Ledger writes are best-effort observability: a slow/exhausted payments
     # DB must never hold a settled response hostage. Writes that exceed this
     # bound are dropped with a warning.
