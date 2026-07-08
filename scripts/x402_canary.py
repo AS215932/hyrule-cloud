@@ -21,11 +21,15 @@ Usage
   python x402_canary.py proxy                # direct + tor network requests
   python x402_canary.py domain --name mytest12345   # REAL registration ($6)
   python x402_canary.py vm                   # provision a real VM + print SSH target
-  python x402_canary.py vm --destroy         # ...and tear it down afterwards
+  python x402_canary.py vm --quote --destroy # via the locked-quote flow, then tear down
+  python x402_canary.py path-report          # gated probe: run by name once a prober is live
   python x402_canary.py all                  # every non-spendy test (intel + proxy)
 
 Nothing is spent until you name a test. `domain` and `vm` cost real money and
-have side effects, so they require an explicit name / confirmation.
+have side effects, so they require an explicit name / confirmation. The VM gate
+only passes when the VM reaches ready AND its launch-proof (SSH smoke + DNS
+AAAA) verifies; a paid 2xx without a settlement header also fails. `gated` tests
+(de-advertised endpoints that 501 until configured) run only when named.
 """
 
 from __future__ import annotations
@@ -63,6 +67,11 @@ TESTS: dict[str, dict] = {
     "web-tls":   {"path": "/v1/web/tls/deep","body": {"host": "example.com"}, "usd": "0.10", "group": "intel"},
     "mx":        {"path": "/v1/mx/check",    "body": {"tool": "mx", "target": "example.com"}, "usd": "0.005", "group": "intel"},
     "path":      {"path": "/v1/path/ping",   "body": {"target": "example.com"}, "usd": "0.005", "group": "intel"},
+    # /v1/path/report is de-advertised until an active-probe vantage
+    # (Globalping/RIPE Atlas) is configured — it returns 501 before charging
+    # (PR #42), so it's kept OUT of the default `intel` sweep and only runs when
+    # named explicitly (`x402_canary.py path-report`) once a prober is live.
+    "path-report": {"path": "/v1/path/report", "body": {"target": "example.com", "vantages": ["extmon", "as215932"], "checks": ["ping", "traceroute"]}, "usd": "0.02", "group": "intel", "gated": True},
     "ports":     {"path": "/v1/ports/check", "body": {"target": "example.com", "port": 443}, "usd": "0.003", "group": "intel"},
     "nat":       {"path": "/v1/nat/lookup",  "body": {"customer_reported_wan_ip": "100.64.1.1"}, "usd": "0.003", "group": "intel"},
     "threat":    {"path": "/v1/threat/lookup","body": {"subject": {"type": "domain", "value": "example.com"}}, "usd": "0.01", "group": "intel"},
@@ -97,34 +106,49 @@ def _client(usd: str) -> x402Client:
     return client
 
 
-def _settlement(resp: httpx.Response) -> str:
+def _settlement(resp: httpx.Response) -> tuple[bool, str]:
+    """(settled_ok, human detail). ``settled_ok`` is True only when the paid
+    response actually carried a successful x402 settlement. A 2xx WITHOUT one
+    means the route wasn't charged — ungated, or the settlement-header
+    middleware is broken — and the canary must not count it as a pass."""
     raw = resp.headers.get("x-payment-response") or resp.headers.get("payment-response")
     if not raw:
-        return "(no settlement header)"
+        return False, "(no settlement header)"
     try:
         s = decode_payment_response_header(raw)
         tx = getattr(s, "transaction", None) or getattr(s, "tx_hash", None)
         net = getattr(s, "network", None)
         payer = getattr(s, "payer", None)
         ok = getattr(s, "success", None)
-        return f"settled success={ok} tx={tx} network={net} payer={payer}"
+        settled_ok = bool(ok) if ok is not None else bool(tx)
+        return settled_ok, f"settled success={ok} tx={tx} network={net} payer={payer}"
     except Exception as e:
-        return f"(settlement header present but undecodable: {e}) raw={raw[:80]}"
+        return False, f"(settlement header present but undecodable: {e}) raw={raw[:80]}"
 
 
-async def _run_one(name: str, *, destroy: bool, domain_name: str | None) -> bool:
+async def _run_one(name: str, *, destroy: bool, domain_name: str | None, use_quote: bool, yes: bool) -> bool:
     t = TESTS[name]
     body = json.loads(json.dumps(t["body"]))  # deep copy
+    quote_id: str | None = None
     if name == "vm":
         if not SSH_PUBKEY:
             sys.exit("ERROR: set SSH_PUBKEY for the vm test (the key injected into the VM).")
         body["ssh_pubkey"] = SSH_PUBKEY
+        if use_quote:
+            # Exercise the documented public quote flow (Phase 3d gate): lock a
+            # price via POST /v1/vm/quote, then pay the create against quote_id.
+            quote_id = await _create_quote(body)
+            if not quote_id:
+                return False
+            body["quote_id"] = quote_id
     if name == "domain":
         if not domain_name:
             sys.exit("ERROR: domain test needs --name <label> (registers <label>.dev for REAL money).")
         body["name"] = domain_name
 
     print(f"\n=== {name}  POST {t['path']}  (~${t['usd']})  cap={_cap_units(t['usd'])} units ===")
+    if quote_id:
+        print(f"    quote_id: {quote_id}")
     print(f"    body: {json.dumps(body)}")
     client = _client(t["usd"])
     async with x402HttpxClient(client, base_url=API, timeout=60.0) as http:
@@ -133,20 +157,78 @@ async def _run_one(name: str, *, destroy: bool, domain_name: str | None) -> bool
         except Exception as e:
             print(f"    !! request failed: {e!r}")
             return False
-    print(f"    HTTP {r.status_code}   {_settlement(r)}")
+    settled_ok, settle_detail = _settlement(r)
+    print(f"    HTTP {r.status_code}   {settle_detail}")
     text = r.text
     print(f"    body: {text[:600]}{'...' if len(text) > 600 else ''}")
     if r.status_code >= 400:
         return False
+    if not settled_ok:
+        # A paid endpoint that returns 2xx without a successful settlement was
+        # not actually charged — a broken gate, not a passing canary.
+        print("    !! paid 2xx with no successful settlement — route not charged; FAILING.")
+        return False
 
     if name == "vm":
         # The 202 only means the create was accepted + charged; the Phase-3d
-        # gate isn't passed until the VM actually reaches ready. Propagate that.
-        return await _poll_and_report_vm(r, destroy=destroy)
+        # gate isn't passed until the VM reaches ready AND its launch-proof
+        # (SSH smoke + DNS AAAA) verifies. Propagate that.
+        return await _poll_and_report_vm(r, destroy=destroy, yes=yes)
+    if name == "domain":
+        # Phase-3c gate is register -> zone-record write -> public resolve.
+        return await _zone_write_after_register(r, domain_name)
     return True
 
 
-async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool) -> bool:
+async def _create_quote(order_payload: dict) -> str | None:
+    """POST /v1/vm/quote (free) and return the locked quote_id."""
+    async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
+        try:
+            q = await http.post("/v1/vm/quote", json={"order_payload": order_payload})
+        except Exception as e:
+            print(f"    !! quote request failed: {e!r}")
+            return None
+    if q.status_code >= 400:
+        print(f"    !! quote HTTP {q.status_code}: {q.text[:300]}")
+        return None
+    quote_id = q.json().get("quote_id")
+    if not quote_id:
+        print(f"    !! quote returned no quote_id: {q.text[:300]}")
+        return None
+    return quote_id
+
+
+async def _zone_write_after_register(reg_resp: httpx.Response, domain_name: str | None) -> bool:
+    """After a real registration, write one AAAA record so the DNS/zone path is
+    exercised too (Phase-3c gate). Prints a dig command for the operator rather
+    than resolving here (public propagation is not instant)."""
+    data = reg_resp.json()
+    zone = data.get("domain") or (f"{domain_name}.dev" if domain_name else None)
+    token = data.get("management_token")
+    if not zone or not token:
+        print("    !! registration response lacked domain/management_token — cannot write zone record.")
+        return False
+    record = {"type": "AAAA", "name": "canary", "value": "2a0c:b641:b50::1", "ttl": 300}
+    print(f"    --- writing AAAA canary.{zone} -> {record['value']} ---")
+    async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
+        try:
+            resp = await http.post(
+                "/v1/zone/record",
+                params={"zone": zone},
+                json=record,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        except Exception as e:
+            print(f"    !! zone-record request failed: {e!r}")
+            return False
+    print(f"    zone-record -> HTTP {resp.status_code} {resp.text[:200]}")
+    if resp.status_code >= 400:
+        return False
+    print(f"    verify propagation:  dig +short AAAA canary.{zone}")
+    return True
+
+
+async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool, yes: bool) -> bool:
     data = create_resp.json()
     vm_id = data.get("vm_id")
     status_url = data.get("status_url") or f"{API}/v1/vm/{vm_id}/status"
@@ -166,20 +248,26 @@ async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool) -> 
             ipv6 = sj.get("ipv6")
             print(f"    [{i}] status={st} hostname={host} ipv6={ipv6}")
             if st in ("ready", "running", "provisioned"):
-                print("\n    ✅ VM READY — manually verify over IPv6:")
+                # The status endpoint returns launch-proof fields FLAT (issue
+                # #28). The VM reaching READY is not enough: real provisioning
+                # can mark READY while the SSH smoke test or DNS AAAA check
+                # failed. The Phase-3d gate only passes if both verify.
+                dns_ok = bool(sj.get("dns_aaaa_verified"))
+                ssh_smoke = sj.get("ssh_smoke_status")
+                proof_ok = dns_ok and ssh_smoke == "passed"
+                icon = "✅" if proof_ok else "⚠️"
+                print(f"\n    {icon} VM {st.upper()} — launch-proof: "
+                      f"ssh_smoke_status={ssh_smoke} dns_aaaa_verified={dns_ok}")
+                print("       manually verify over IPv6:")
                 print(f"        ssh root@{host or ipv6}")
-                lp = sj.get("launch_proof") or {}
-                if lp:
-                    print(f"        launch_proof: {json.dumps(lp)}")
                 if mgmt_token:
                     print(f"        management: {API}/v1/vm/{vm_id}?token={mgmt_token}")
                     print(f"        destroy:    curl -X DELETE {API}/v1/vm/{vm_id} "
                           f"-H 'Authorization: Bearer {mgmt_token}'")
-                if destroy and mgmt_token:
-                    d = await poll.request("DELETE", f"{API}/v1/vm/{vm_id}",
-                                           headers={"Authorization": f"Bearer {mgmt_token}"})
-                    print(f"\n    destroy -> HTTP {d.status_code} {d.text[:200]}")
-                return True
+                if not proof_ok:
+                    print("    !! launch-proof did NOT verify (ssh smoke / DNS AAAA); FAILING gate.")
+                destroy_ok = await _maybe_destroy(poll, vm_id, mgmt_token, destroy=destroy, yes=yes)
+                return proof_ok and destroy_ok
             if st in ("failed",):
                 print(f"    ❌ provisioning FAILED: {json.dumps(sj)[:400]}")
                 return False
@@ -187,11 +275,37 @@ async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool) -> 
     return False
 
 
+async def _maybe_destroy(poll: httpx.AsyncClient, vm_id: str, mgmt_token: str | None, *, destroy: bool, yes: bool) -> bool:
+    """Tear down the gate VM if requested. Pauses first (unless --yes) so the
+    operator can run the manual SSH check, and treats a non-2xx DELETE as a
+    failure — otherwise a billable VM is left running behind a 'passed' canary."""
+    if not destroy:
+        return True
+    if not mgmt_token:
+        print("    !! --destroy requested but no management_token — cannot tear down; FAILING.")
+        return False
+    if not yes:
+        try:
+            input("\n    Press Enter to DESTROY the VM after you've verified SSH (Ctrl-C to keep it)... ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n    left the VM running (destroy skipped).")
+            return True
+    d = await poll.request("DELETE", f"{API}/v1/vm/{vm_id}",
+                           headers={"Authorization": f"Bearer {mgmt_token}"})
+    print(f"    destroy -> HTTP {d.status_code} {d.text[:200]}")
+    if d.status_code >= 400:
+        print("    !! destroy did NOT succeed — the paid VM may still be active/billable.")
+        return False
+    return True
+
+
 def _select(target: str) -> list[str]:
+    # `gated` tests (a de-advertised endpoint that 501s until configured) never
+    # join a group/all sweep — they only run when named explicitly.
     if target == "all":  # non-spendy only
-        return [n for n, t in TESTS.items() if not t.get("spendy")]
+        return [n for n, t in TESTS.items() if not t.get("spendy") and not t.get("gated")]
     if target in {"intel", "proxy", "domain", "vm"}:
-        return [n for n, t in TESTS.items() if t["group"] == target]
+        return [n for n, t in TESTS.items() if t["group"] == target and not t.get("gated")]
     if target in TESTS:
         return [target]
     sys.exit(f"unknown test '{target}'. Try: list, all, intel, proxy, domain, vm, or one of "
@@ -203,15 +317,19 @@ async def _main() -> None:
     ap.add_argument("target", help="a test name, a group (intel|proxy|domain|vm), 'all', or 'list'")
     ap.add_argument("--name", help="domain label to register (domain test)")
     ap.add_argument("--destroy", action="store_true", help="destroy the VM after it comes up (vm test)")
-    ap.add_argument("--yes", action="store_true", help="skip the spend confirmation prompt")
+    ap.add_argument("--quote", action="store_true", help="pay the vm create against a locked quote_id (POST /v1/vm/quote first)")
+    ap.add_argument("--yes", action="store_true", help="skip the spend + destroy confirmation prompts")
     args = ap.parse_args()
 
     if args.target == "list":
         print(f"API: {API}\n")
         print(f"{'name':14} {'price':>8}  path")
         for n, t in TESTS.items():
-            flag = "  [REAL $]" if t.get("spendy") else ""
-            print(f"{n:14} {'$'+t['usd']:>8}  {t['path']}{flag}")
+            flags = "".join([
+                "  [REAL $]" if t.get("spendy") else "",
+                "  [gated: run by name only]" if t.get("gated") else "",
+            ])
+            print(f"{n:14} {'$'+t['usd']:>8}  {t['path']}{flags}")
         return
 
     names = _select(args.target)
@@ -228,7 +346,7 @@ async def _main() -> None:
 
     ok = 0
     for n in names:
-        if await _run_one(n, destroy=args.destroy, domain_name=args.name):
+        if await _run_one(n, destroy=args.destroy, domain_name=args.name, use_quote=args.quote, yes=args.yes):
             ok += 1
     print(f"\n=== done: {ok}/{len(names)} succeeded ===")
 
