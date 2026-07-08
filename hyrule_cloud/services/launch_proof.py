@@ -9,6 +9,7 @@ only behind HCP_LAUNCH_PROOF_REAL_XCPNG=1.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 from hyrule_cloud.models import (
     LaunchProofStatus,
@@ -17,11 +18,36 @@ from hyrule_cloud.models import (
     VMStatus,
 )
 
+if TYPE_CHECKING:
+    from hyrule_cloud.config import HyruleConfig
+
 _LAUNCH_PROOF_REAL = os.environ.get("HCP_LAUNCH_PROOF_REAL_XCPNG") == "1"
 
 
 def use_real_provisioning() -> bool:
     return _LAUNCH_PROOF_REAL
+
+
+def enforce_real_provisioning_guard(config: HyruleConfig) -> None:
+    """Fail fast at startup instead of charging real USDC for simulated VMs.
+
+    With HYRULE_REQUIRE_REAL_PROVISIONING=1 (production), refuse to boot when
+    either simulation mode or the payment dev bypass is still active — both
+    would let paying customers receive nothing real.
+    """
+    if not config.require_real_provisioning:
+        return
+    if not use_real_provisioning():
+        raise RuntimeError(
+            "HYRULE_REQUIRE_REAL_PROVISIONING=1 but HCP_LAUNCH_PROOF_REAL_XCPNG "
+            "is not enabled — refusing to charge for simulated VMs"
+        )
+    if config.payment.dev_bypass_secret:
+        raise RuntimeError(
+            "HYRULE_REQUIRE_REAL_PROVISIONING=1 but PAYMENT_DEV_BYPASS_SECRET is "
+            "set — the dev bypass makes every paid endpoint free and must not "
+            "reach production"
+        )
 
 
 def _safe_getattr(obj: object, name: str, default: object = None) -> object:

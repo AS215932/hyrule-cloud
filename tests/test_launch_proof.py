@@ -329,3 +329,45 @@ async def test_create_with_quote_no_payment_402(lp_state, client):
     row = await quotes_service.get_quote(lp_state.orchestrator.db, quote["quote_id"])
     assert row is not None
     assert row.status == "created"
+
+
+# --- HYRULE_REQUIRE_REAL_PROVISIONING startup guard ---
+
+
+def _guard_config(*, require: bool, dev_bypass: str = "") -> object:
+    from hyrule_cloud.config import HyruleConfig, PaymentConfig
+
+    return HyruleConfig(
+        require_real_provisioning=require,
+        payment=PaymentConfig(dev_bypass_secret=dev_bypass),
+    )
+
+
+def test_guard_noop_when_not_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hyrule_cloud.services import launch_proof
+
+    monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", False)
+    launch_proof.enforce_real_provisioning_guard(_guard_config(require=False, dev_bypass="x"))
+
+
+def test_guard_rejects_simulation_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hyrule_cloud.services import launch_proof
+
+    monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", False)
+    with pytest.raises(RuntimeError, match="HCP_LAUNCH_PROOF_REAL_XCPNG"):
+        launch_proof.enforce_real_provisioning_guard(_guard_config(require=True))
+
+
+def test_guard_rejects_dev_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hyrule_cloud.services import launch_proof
+
+    monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", True)
+    with pytest.raises(RuntimeError, match="PAYMENT_DEV_BYPASS_SECRET"):
+        launch_proof.enforce_real_provisioning_guard(_guard_config(require=True, dev_bypass="x"))
+
+
+def test_guard_passes_in_real_mode_without_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hyrule_cloud.services import launch_proof
+
+    monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", True)
+    launch_proof.enforce_real_provisioning_guard(_guard_config(require=True))
