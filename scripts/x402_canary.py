@@ -285,11 +285,20 @@ async def _maybe_destroy(poll: httpx.AsyncClient, vm_id: str, mgmt_token: str | 
         print("    !! --destroy requested but no management_token — cannot tear down; FAILING.")
         return False
     if not yes:
+        if not sys.stdin.isatty():
+            # A non-interactive runner (CI/Ansible) can't answer the prompt;
+            # skipping teardown would silently leak a billable VM behind a
+            # "passed" gate. Require --yes for unattended teardown.
+            print("    !! --destroy from a non-interactive runner needs --yes to confirm "
+                  "teardown; refusing to leave a billable VM ambiguous. FAILING.")
+            return False
         try:
             input("\n    Press Enter to DESTROY the VM after you've verified SSH (Ctrl-C to keep it)... ")
         except (EOFError, KeyboardInterrupt):
-            print("\n    left the VM running (destroy skipped).")
-            return True
+            # Requested teardown was skipped — the paid VM is still running, so
+            # the gate must not report success.
+            print("\n    destroy skipped by operator — the paid VM is still running; FAILING the gate.")
+            return False
     d = await poll.request("DELETE", f"{API}/v1/vm/{vm_id}",
                            headers={"Authorization": f"Bearer {mgmt_token}"})
     print(f"    destroy -> HTTP {d.status_code} {d.text[:200]}")
@@ -349,6 +358,10 @@ async def _main() -> None:
         if await _run_one(n, destroy=args.destroy, domain_name=args.name, use_quote=args.quote, yes=args.yes):
             ok += 1
     print(f"\n=== done: {ok}/{len(names)} succeeded ===")
+    if ok != len(names):
+        # Exit non-zero so a CI/Ansible/shell phase gate actually stops on
+        # failure instead of treating a 0/N canary run as a pass.
+        sys.exit(1)
 
 
 if __name__ == "__main__":

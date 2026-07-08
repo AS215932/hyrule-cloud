@@ -91,7 +91,10 @@ via the Vault-rendered `.env`) — no Ansible run.
 paid endpoint (a `max_amount` policy caps each call at its price +10%). Set
 `CANARY_KEY` to the funded wallet and run `python scripts/x402_canary.py dns`
 for the cheapest first spend, `intel`/`proxy` for the Phase-3 groups, or
-`vm --destroy` for the 3d gate. The raw curl below is the manual equivalent.
+`vm --quote --destroy` for the 3d gate — `--quote` exercises the documented
+`POST /v1/vm/quote` → paid create flow, and the script pauses for the manual
+IPv6 SSH check before tearing the VM down. It exits non-zero if any canary
+fails, so it can gate a rollout. The raw curl below is the manual equivalent.
 
 Cheapest endpoint, $0.001:
 
@@ -169,7 +172,9 @@ discovery.py and skip its skill).
    `HYRULE_REQUIRE_REAL_PROVISIONING=1` (app refuses to boot otherwise),
    `HYRULE_MAX_PAID_ACTIVE_VMS=10` (soft-launch cap; raise stepwise
    10→25→… while provisioning success stays >95%).
-3. **Gate**:
+3. **Gate** (`python scripts/x402_canary.py vm --quote --destroy` automates the
+   quote→pay→poll→pause-for-SSH→destroy sequence and only reports success when
+   the launch-proof verifies and the DELETE returns 2xx):
    - `POST /v1/vm/quote` (xs, 1 day = $0.05) → pay via x402/CDP
    - poll `GET /v1/vm/{id}/status` until `launch_proof_status=provisioned`
      with `ssh_smoke_status=passed` and `dns_aaaa_verified=true` (now
