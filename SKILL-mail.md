@@ -1,5 +1,9 @@
 # Hyrule Agent Mail Skill
 
+> **NOT YET LAUNCHED.** The mail backend is under construction: every paid
+> `/v1/mail` endpoint currently returns HTTP 501 without charging. Do not
+> publish this skill or point agents at it until the product ships.
+
 Hyrule Agent Mail is the planned paid mailbox product for AI agents. The API
 contract is stable now; the backend adapter can be Stalwart, Postfix/Dovecot,
 Rspamd, or another mail backend hidden behind this API.

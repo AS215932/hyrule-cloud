@@ -12,7 +12,6 @@ from hyrule_cloud.api._contract import (
 )
 from hyrule_cloud.models import (
     CapabilityEndpoint,
-    DiagnosticJobKind,
     DiagnosticJobResponse,
     DiagnosticResponse,
     PaidEndpointQuote,
@@ -23,7 +22,6 @@ from hyrule_cloud.models import (
     WebReportRequest,
     WebTLSDeepRequest,
 )
-from hyrule_cloud.services.diagnostics.jobs import build_job_response
 from hyrule_cloud.services.web.checks import run_web_check, run_web_tls_deep
 
 router = APIRouter(prefix="/v1/web", tags=["Web reachability"])
@@ -39,7 +37,6 @@ async def get_web_capabilities() -> ProductCapabilityResponse:
             CapabilityEndpoint(path="/v1/web/capabilities", method="GET", description="Web diagnostic capabilities"),
             CapabilityEndpoint(path="/v1/web/pricing", method="GET", description="Web diagnostic pricing"),
             CapabilityEndpoint(path="/v1/web/check/quote", method="POST", description="Quote a web diagnostic check"),
-            CapabilityEndpoint(path="/v1/web/reports/quote", method="POST", description="Quote a web evidence pack"),
             CapabilityEndpoint(path="/v1/web/tls/deep/quote", method="POST", description="Quote a Hyrule-native SSL Labs-style scan"),
         ],
         paid_endpoints=[
@@ -51,8 +48,7 @@ async def get_web_capabilities() -> ProductCapabilityResponse:
             CapabilityEndpoint(path="/v1/web/headers", method="GET", paid=True, description="Security header check"),
             CapabilityEndpoint(path="/v1/web/cdn", method="GET", paid=True, description="CDN/WAF response hint check"),
             CapabilityEndpoint(path="/v1/web/down", method="GET", paid=True, description="Site-down evidence check"),
-            CapabilityEndpoint(path="/v1/web/reports", method="POST", paid=True, description="Create web reachability evidence-pack job"),
-            CapabilityEndpoint(path="/v1/web/tls/deep", method="POST", paid=True, description="Create deep TLS scanner job"),
+            CapabilityEndpoint(path="/v1/web/tls/deep", method="POST", paid=True, description="Run Hyrule-native deep TLS scan (synchronous)"),
         ],
     )
 
@@ -72,8 +68,10 @@ async def quote_web_check(request: Request, body: WebCheckRequest) -> PaidEndpoi
 
 
 @router.post("/reports/quote", response_model=PaidEndpointQuote)
-async def quote_web_report(request: Request, body: WebReportRequest) -> PaidEndpointQuote:
-    return diagnostic_quote(request, price_attr="price_web_report", default="0.03", name="web_report", paid_endpoint="/v1/web/reports")
+async def quote_web_report(request: Request, body: WebReportRequest) -> Response:
+    # The paid endpoint this quotes is 501 while async report retrieval is
+    # unbuilt; a payable-looking quote for it would send agents into a dead end.
+    return not_implemented("web.reports.quote")
 
 
 @router.post("/tls/deep/quote", response_model=PaidEndpointQuote)
@@ -125,10 +123,8 @@ async def web_down(request: Request, url: str) -> DiagnosticResponse | Response:
 
 @router.post("/reports", response_model=DiagnosticJobResponse)
 async def create_web_report(request: Request, body: WebReportRequest) -> DiagnosticJobResponse | Response:
-    amount = payment_price(request, "price_web_report", "0.03")
-    if payment := await require_paid_diagnostic(request, price_attr="price_web_report", default="0.03", description="Hyrule web reachability evidence pack"):
-        return payment
-    return build_job_response(service="web", kind=DiagnosticJobKind.WEB_REPORT, charged_amount_usd=amount)
+    # Async report jobs have no retrieval backend yet: refuse before charging.
+    return not_implemented("web.reports.create")
 
 
 @router.post("/tls/deep", response_model=DiagnosticResponse)

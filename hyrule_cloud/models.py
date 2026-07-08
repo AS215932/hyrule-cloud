@@ -323,7 +323,6 @@ class CostBreakdown(BaseModel):
 class PricingResponse(BaseModel):
     vm_prices: dict[str, str]  # size -> $/day
     domain_auto: str
-    vpn_per_day: str
     proxy_prices: dict[str, str] | None = None
     currency: str = "USDC"
     network: str = "Base (eip155:8453)"

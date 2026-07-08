@@ -88,7 +88,6 @@ Returns current prices for all resources.
     "lg (4vCPU/4GB/80GB)": "$0.40/day"
   },
   "domain_auto": "$0.00 (subdomain under deploy.hyrule.host)",
-  "vpn_per_day": "$0.02/day",
   "proxy_prices": {
     "direct": "$0.01/request",
     "tor": "$0.05/request",
@@ -170,8 +169,8 @@ Check domain availability.
 {"status": "free", "is_premium": false, "price": "9.99", "currency": "USD"}
 ```
 
-#### GET /v1/zone/check?name=example&extension=dev
-Check DNS zone availability and price.
+Domain availability doubles as DNS zone availability: registering a domain
+through Hyrule Cloud sets up the zone on our authoritative DNS.
 
 ### Paid Endpoints
 
@@ -257,14 +256,16 @@ Response shape:
 }
 ```
 
-#### POST /v1/zone/buy
-Buy a DNS zone — registers the domain and sets up Hyrule Cloud's authoritative DNS.
+#### POST /v1/domain/register
+Buy a domain + DNS zone — registers the domain via Openprovider and sets up
+Hyrule Cloud's authoritative DNS.
 
 ```json
-{"name": "mysite", "extension": "dev"}
+{"name": "mysite", "extension": "dev", "duration_years": 1}
 ```
 
-Response includes the nameservers to use. After buying, manage records via:
+Response includes a `management_token` — keep it, it authorizes record
+management. After registering, manage records via:
 
 #### POST /v1/zone/record
 Create a DNS record in a zone you own.
@@ -296,7 +297,7 @@ Get provisioning log for a VM.
 4. POST /v1/vm/create + X-PAYMENT header    # → 202 + status_url
 5. Poll GET /v1/vm/{id}                     # wait for "ready"
 6. ssh root@<hostname>                      # deploy your app
-7. (optional) POST /v1/zone/buy             # buy a DNS zone
+7. (optional) POST /v1/domain/register      # buy a domain + DNS zone
 8. (optional) POST /v1/zone/record          # point domain at VM
 9. (optional) POST /v1/network/request      # paid Direct/Tor/I2P/Yggdrasil request
 ```

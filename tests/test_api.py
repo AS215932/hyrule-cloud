@@ -121,6 +121,8 @@ async def test_get_pricing(override_state):
             "i2p": "$0.05/request",
             "yggdrasil": "$0.03/request",
         }
+        # VPN has no endpoint yet — it must not be priced until it exists.
+        assert "vpn_per_day" not in data
 
 @pytest.mark.asyncio
 async def test_get_pricing_uses_configured_deploy_domain(override_state):

@@ -8,10 +8,7 @@ marketing/support wrapper over the canonical `/v1/mx` API.
 
 - `/v1/mx` diagnoses mail delivery, DNS authentication, SMTP reachability,
   blacklists, bounce messages, and record recommendations.
-- `/v1/mail` creates and operates Hyrule Agent Mail mailboxes.
 - `/v1/dns` performs lower-level read-only DNS lookups.
-
-Do not use `/v1/mail` for third-party domain deliverability diagnostics.
 
 ## Discovery
 

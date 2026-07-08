@@ -1,5 +1,10 @@
 # Hyrule Speedtest Skill
 
+> **NOT YET LAUNCHED.** The measurement backend (payload/upload endpoints) is
+> under construction: paid `/v1/speedtest` endpoints currently return HTTP 501
+> without charging. Do not publish this skill or point agents at it until the
+> product ships.
+
 Use Hyrule Cloud when an AI agent needs throughput, latency, jitter, and path
 evidence between a client and Hyrule/AS215932 endpoints.
 
