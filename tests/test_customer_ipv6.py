@@ -417,3 +417,194 @@ async def test_simulated_ipv6_stays_inside_assigned_prefix(session_factory):
         row = await session.get(VMRow, "vm_sim")
         assert row.ipv6 == "2a0c:b641:b51:3::2"
         assert row.status == VMStatus.READY
+
+
+class _StubXCPNGDestroy:
+    async def destroy_vm(self, uuid: str) -> None:
+        pass
+
+
+class _StubDNSDelete:
+    async def delete_aaaa(self, subdomain: str) -> None:
+        pass
+
+
+class _FailingOpenprovider:
+    async def delete_zone_record(self, **kwargs) -> None:
+        raise RuntimeError("openprovider down")
+
+
+class _OkOpenprovider:
+    def __init__(self) -> None:
+        self.deleted: list[dict] = []
+
+    async def delete_zone_record(self, **kwargs) -> None:
+        self.deleted.append(kwargs)
+
+
+def _vm_row(vm_id: str, *, prefix_index: int, **overrides) -> VMRow:
+    from hyrule_cloud.models import DomainMode
+
+    defaults = dict(
+        vm_id=vm_id,
+        owner_wallet="wallet",
+        status=VMStatus.READY,
+        size=VMSize.XS,
+        os="debian-13",
+        ipv6_prefix_index=prefix_index,
+        ipv6_prefix=f"2a0c:b641:b51:{prefix_index:x}::/64",
+        hostname=f"{vm_id}.deploy.hyrule.host",
+        ssh_pubkey="ssh-ed25519 AAAA t",
+        open_ports=[22],
+        cost_total=Decimal("0.05"),
+        domain_mode=DomainMode.AUTO,
+        xcpng_uuid="xcp-uuid",
+    )
+    defaults.update(overrides)
+    return VMRow(**defaults)
+
+
+@pytest.mark.asyncio
+async def test_destroy_quarantines_prefix_when_custom_dns_cleanup_fails(session_factory):
+    from hyrule_cloud.models import DomainMode
+
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+    orch.xcpng = _StubXCPNGDestroy()
+    orch.dns = _StubDNSDelete()
+    orch.openprovider = _FailingOpenprovider()
+
+    async with session_factory() as session:
+        session.add(
+            _vm_row("vm_cd", prefix_index=9, domain_mode=DomainMode.CUSTOM, domain="cust.dev")
+        )
+        await session.commit()
+
+    assert await orch.destroy_vm("vm_cd") is True
+
+    async with session_factory() as session:
+        row = await session.get(VMRow, "vm_cd")
+        assert row.status == VMStatus.DESTROYED
+        # Custom AAAA may still resolve to ::2 — the /64 stays quarantined.
+        assert row.ipv6_prefix_index == 9
+
+
+@pytest.mark.asyncio
+async def test_destroy_releases_prefix_after_custom_dns_cleanup(session_factory):
+    from hyrule_cloud.models import DomainMode
+
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+    orch.xcpng = _StubXCPNGDestroy()
+    orch.dns = _StubDNSDelete()
+    op = _OkOpenprovider()
+    orch.openprovider = op
+
+    async with session_factory() as session:
+        session.add(
+            _vm_row("vm_cd2", prefix_index=10, domain_mode=DomainMode.CUSTOM, domain="cust2.dev")
+        )
+        await session.commit()
+
+    assert await orch.destroy_vm("vm_cd2") is True
+    assert op.deleted == [{"zone_name": "cust2.dev", "name": "", "rtype": "AAAA"}]
+
+    async with session_factory() as session:
+        row = await session.get(VMRow, "vm_cd2")
+        assert row.ipv6_prefix_index is None
+
+
+@pytest.mark.asyncio
+async def test_destroy_quarantines_prefix_for_uuidless_provisioning_row(session_factory):
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+    orch.xcpng = _StubXCPNGDestroy()
+    orch.dns = _StubDNSDelete()
+
+    async with session_factory() as session:
+        session.add(
+            _vm_row("vm_race", prefix_index=11, status=VMStatus.PROVISIONING, xcpng_uuid=None)
+        )
+        await session.commit()
+
+    assert await orch.destroy_vm("vm_race") is True
+
+    async with session_factory() as session:
+        row = await session.get(VMRow, "vm_race")
+        # The clone may still appear on this prefix — keep it quarantined.
+        assert row.ipv6_prefix_index == 11
+
+
+@pytest.mark.asyncio
+async def test_reservation_lifecycle(session_factory, monkeypatch):
+    """reserve → release frees the /64; reserve → activate attaches payment
+    and starts provisioning."""
+    from hyrule_cloud.models import VMCreateRequest
+
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+    spawned: list[str] = []
+    monkeypatch.setattr(orch, "_spawn_provisioning", spawned.append)
+
+    order = VMCreateRequest(duration_days=1, os="debian-13", ssh_pubkey="ssh-ed25519 AAAA t")
+
+    reserved, token = await orch.reserve_vm(order)
+    assert reserved.owner_wallet == ""
+    assert reserved.ipv6_prefix_index is not None
+    assert token.startswith("hyr_vm_")
+    assert spawned == []  # reservations must not provision
+
+    await orch.release_vm_reservation(reserved.vm_id)
+    async with session_factory() as session:
+        assert await session.get(VMRow, reserved.vm_id) is None
+
+    reserved2, _ = await orch.reserve_vm(order)
+    activated = await orch.activate_vm_reservation(
+        reserved2.vm_id, owner_wallet="0xPAYER", payment_tx="0xTX"
+    )
+    assert activated.owner_wallet == "0xPAYER"
+    assert activated.payment_tx == "0xTX"
+    assert spawned == [reserved2.vm_id]
+
+    # Paid rows are not releasable as reservations.
+    await orch.release_vm_reservation(reserved2.vm_id)
+    async with session_factory() as session:
+        assert await session.get(VMRow, reserved2.vm_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_expiry_sweep_purges_abandoned_reservations(session_factory):
+    from datetime import UTC, datetime, timedelta
+
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+    orch.xcpng = _StubXCPNGDestroy()
+    orch.dns = _StubDNSDelete()
+
+    stale = datetime.now(UTC) - timedelta(minutes=30)
+    async with session_factory() as session:
+        old_res = _vm_row(
+            "vm_stale_res",
+            prefix_index=12,
+            owner_wallet="",
+            status=VMStatus.PROVISIONING,
+            xcpng_uuid=None,
+            expires_at=None,
+        )
+        old_res.created_at = stale
+        fresh_res = _vm_row(
+            "vm_fresh_res",
+            prefix_index=13,
+            owner_wallet="",
+            status=VMStatus.PROVISIONING,
+            xcpng_uuid=None,
+            expires_at=None,
+        )
+        session.add_all([old_res, fresh_res])
+        await session.commit()
+
+    await orch.check_expiries()
+
+    async with session_factory() as session:
+        assert await session.get(VMRow, "vm_stale_res") is None
+        assert await session.get(VMRow, "vm_fresh_res") is not None

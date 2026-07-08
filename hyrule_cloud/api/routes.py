@@ -27,6 +27,7 @@ from hyrule_cloud.middleware.anon_token import (
     hash_anon_token,
 )
 from hyrule_cloud.middleware.auth import current_account
+from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.models import (
     VM_SPECS,
     AcceptedPaymentMethods,
@@ -757,6 +758,25 @@ async def create_vm(
     total = quote_row.amount_usd if quote_row is not None else computed
     specs = VM_SPECS[order.size]
 
+    # Reservation-through-payment: a request that is about to be CHARGED
+    # atomically claims its VM row + customer /64 (unique index) BEFORE the
+    # facilitator settles, so a concurrent purchase can never leave a paid
+    # order without capacity. Unpaid discovery requests (no payment header)
+    # skip this and just receive the 402. Fake gates in tests may not expose
+    # has_payment_credentials — they keep the legacy allocate-after-payment path.
+    reservation_row: VMRow | None = None
+    reservation_token: str | None = None
+    # isinstance on purpose: reservation semantics are coupled to the real
+    # gate; test doubles (mocks / X-Mock-Paid fakes) keep the legacy
+    # allocate-after-payment path.
+    if isinstance(gate, PaymentGate) and gate.has_payment_credentials(request):
+        try:
+            reservation_row, reservation_token = await orch.reserve_vm(
+                order, owner_account_id=account.account_id if account else None
+            )
+        except RuntimeError:
+            raise HTTPException(503, "No customer IPv6 capacity available right now")
+
     result = await gate.check_payment(
         request,
         amount=total,
@@ -771,6 +791,8 @@ async def create_vm(
     if isinstance(result, Response):
         # No/invalid payment yet (402) — the quote stays CREATED so the EVM
         # 402→sign→retry round-trip can post again with the same quote_id.
+        if reservation_row is not None:
+            await orch.release_vm_reservation(reservation_row.vm_id)
         return result
 
     wallet = result
@@ -781,6 +803,8 @@ async def create_vm(
         # Lost the race: another paid create already claimed the quote. Return the
         # VM it provisioned (idempotent); if it's still mid-provision, the caller
         # polls the status URL.
+        if reservation_row is not None:
+            await orch.release_vm_reservation(reservation_row.vm_id)
         latest = await get_quote(orch.db, quote_row.quote_id)
         if latest is not None and latest.vm_id:
             async with orch.db() as session:
@@ -789,11 +813,28 @@ async def create_vm(
                 return _vm_create_response(existing_vm, request, management_token=None)
         raise HTTPException(409, "Quote is being provisioned; poll the VM status")
 
-    row, management_token = await orch.create_vm(
-        order, owner_wallet=wallet,
-        owner_account_id=account.account_id if account else None,
-    )
-    row.payment_tx = getattr(request.state, "payment_tx", None)
+    if reservation_row is not None:
+        activated = await orch.activate_vm_reservation(
+            reservation_row.vm_id,
+            owner_wallet=wallet,
+            payment_tx=getattr(request.state, "payment_tx", None),
+        )
+        if activated is not None:
+            row, management_token = activated, reservation_token
+        else:
+            # Reservation vanished (e.g. sweeper raced an extremely slow
+            # payment) — fall back to allocate-after-payment.
+            row, management_token = await orch.create_vm(
+                order, owner_wallet=wallet,
+                owner_account_id=account.account_id if account else None,
+            )
+            row.payment_tx = getattr(request.state, "payment_tx", None)
+    else:
+        row, management_token = await orch.create_vm(
+            order, owner_wallet=wallet,
+            owner_account_id=account.account_id if account else None,
+        )
+        row.payment_tx = getattr(request.state, "payment_tx", None)
     if quote_row is not None:
         await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
 
@@ -1242,7 +1283,11 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
     return resp
 from hyrule_cloud.db import CryptoIntentRow
 from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
-from hyrule_cloud.services.intents import IntentExistsError, create_intent
+from hyrule_cloud.services.intents import (
+    IntentExistsError,
+    create_intent,
+    get_intent_by_client_order_id,
+)
 
 
 def _intent_to_response(row: CryptoIntentRow, request: Request | None = None) -> CryptoIntentResponse:
@@ -1298,6 +1343,14 @@ async def create_crypto_intent(
     asset = body.asset.upper()
     if asset not in ("BTC", "XMR"):
         raise HTTPException(400, "Unsupported asset. Use BTC or XMR.")
+
+    # Idempotent replay FIRST: a retry with a known client_order_id must
+    # return the original intent even if capacity/validation state changed
+    # since — the deposit address may already be funded.
+    if body.client_order_id:
+        existing_intent = await get_intent_by_client_order_id(orch.db, body.client_order_id)
+        if existing_intent is not None:
+            return _intent_to_response(existing_intent, request)
 
     # Same validation as the x402 create path — including the real-mode OS
     # support check, so an unsupported order is rejected BEFORE a deposit
