@@ -307,8 +307,15 @@ class Orchestrator:
         vm_id: str,
         owner_wallet: str,
         payment_tx: str | None = None,
+        *,
+        start_provisioning: bool = True,
     ) -> VMRow | None:
-        """Attach the settled payment to a reservation and start provisioning."""
+        """Attach the settled payment to a reservation and start provisioning.
+
+        Pass start_provisioning=False to let the caller link a quote to the VM
+        first: provisioning can fail immediately, and the refund path needs the
+        locked quote amount, so the link must be committed before it starts.
+        """
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if row is None:
@@ -318,7 +325,8 @@ class Orchestrator:
                 row.payment_tx = payment_tx
             await session.commit()
             await session.refresh(row)
-        self._spawn_provisioning(vm_id)
+        if start_provisioning:
+            self._spawn_provisioning(vm_id)
         return row
 
     async def release_vm_reservation(self, vm_id: str) -> None:
@@ -527,6 +535,23 @@ class Orchestrator:
         # REFUND_MANUAL and record the debt (native refunds are sent by the
         # operator, not auto-EVM) so a paid customer is never silently dropped.
         if await self._record_native_refund(vm_id, reason=reason):
+            return
+        if payment_tx:
+            # A charge settled (payment_tx present) but couldn't be attributed to
+            # an EVM wallet or a native intent — e.g. the SDK settled without
+            # exposing a payer ("unknown") AND the best-effort settled ledger row
+            # was lost. Record it against the tx from the locked quote (or cost)
+            # so a paid failure is never dropped from the worklist.
+            quote = await self.get_quote_for_vm(vm_id)
+            charged = quote.amount_usd if quote is not None else amount
+            await self.refunds.record_owed(
+                resource_path="/v1/vm/create",
+                payer=owner_wallet or "unknown",
+                amount=charged,
+                original_tx=payment_tx,
+                reason=reason,
+                vm_id=vm_id,
+            )
             return
         # Free subdomain VM (nothing charged) with no linked intent.
         log.info("vm_refund_not_recorded_here", vm_id=vm_id, owner_wallet=owner_wallet or None)

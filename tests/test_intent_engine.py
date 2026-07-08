@@ -346,6 +346,44 @@ async def test_poll_overpay_settles_and_provisions(intent_state):
 
 
 @pytest.mark.asyncio
+async def test_xmr_intent_provisions_with_bounded_owner_wallet(intent_state):
+    """XMR subaddresses (~95 chars) must not be written to VMRow.owner_wallet
+    (String(64)) — in Postgres the insert would fail before the intent links its
+    vm_id and before any refund could be recorded. owner_wallet carries the
+    bounded intent_id; the real deposit address stays on the intent."""
+    long_xmr = "8" + "B" * 94  # 95 chars, exceeds owner_wallet String(64)
+    intent_state.native_crypto.next_xmr_addr_per_index = [(long_xmr, 3)]
+    row = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="XMR",
+        order_payload=_vm_create_request(),
+        amount_usd=Decimal("0.05"),
+        client_order_id=None,
+        owner_account_id=None,
+    )
+    assert row.address == long_xmr
+    # XMR scans are keyed by subaddress index, not the address string.
+    intent_state.native_crypto.scan_results[f"xmr:{row.xmr_subaddr_index}"] = AddressScanResult(
+        address=row.address, received_total=row.amount_crypto * Decimal("1.20"), confirmations=10
+    )
+
+    updated = await poll_one_intent(
+        intent_id=row.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+    assert updated.status == CryptoIntentStatus.PROVISIONED
+    async with intent_state.orchestrator.db() as db:
+        vm = await db.get(VMRow, updated.vm_id)
+    assert vm.owner_wallet == row.intent_id  # bounded reference, not the 95-char address
+    assert len(vm.owner_wallet) <= 64
+
+
+@pytest.mark.asyncio
 async def test_poll_underpay_flips_to_refund_manual(intent_state):
     """LENIENT: paying less than quote requires operator action."""
     row = await _seed_intent(intent_state, asset="BTC")

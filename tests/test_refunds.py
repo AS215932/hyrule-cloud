@@ -426,3 +426,48 @@ async def test_settled_refund_without_payer_still_records(session_factory, monke
     assert owed[0].payer_wallet == "unknown"
     assert owed[0].tx_hash == "0xNOPAYER"
     assert owed[0].amount_usd == Decimal("0.05")
+
+
+@pytest.mark.asyncio
+async def test_charged_vm_without_ledger_or_payer_still_records(session_factory, monkeypatch) -> None:
+    """A settled charge whose best-effort ledger row was lost AND whose payer the
+    SDK never exposed (owner_wallet='unknown', but payment_tx set) must still land
+    on the refund worklist rather than being dropped as a 'free' VM."""
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    async with session_factory() as session:
+        session.add(_paid_provisioning_vm("vm_unk", wallet="unknown", tx="0xCHARGED", cost="0.05"))
+        await session.commit()
+
+    await orch._provision_vm("vm_unk")
+
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1  # not dropped
+    assert owed[0].payer_wallet == "unknown"
+    assert owed[0].tx_hash == "0xCHARGED"
+    assert owed[0].amount_usd == Decimal("0.05")
+
+
+@pytest.mark.asyncio
+async def test_activate_reservation_can_defer_provisioning(session_factory, monkeypatch) -> None:
+    """The create route links a quote to the VM before provisioning starts, so a
+    fast failure can find the locked quote amount (get_quote_for_vm otherwise
+    races link_quote_vm). activate_vm_reservation must honor
+    start_provisioning=False and only spawn on the explicit start."""
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    spawned: list[str] = []
+    monkeypatch.setattr(orch, "_spawn_provisioning", lambda vm_id: spawned.append(vm_id))
+    async with session_factory() as session:
+        session.add(_paid_provisioning_vm("vm_res", wallet="", tx=None, cost="0.05"))
+        await session.commit()
+
+    row = await orch.activate_vm_reservation(
+        "vm_res", owner_wallet=EVM_WALLET, payment_tx="0xTX", start_provisioning=False
+    )
+    assert row is not None
+    assert spawned == []  # deferred until the quote is linked
+
+    orch.start_provisioning("vm_res")
+    assert spawned == ["vm_res"]

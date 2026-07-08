@@ -340,7 +340,11 @@ async def _trigger_provisioning(
         if row is None or row.order_payload is None:
             return
 
-    # Provision the VM. The wallet address is the deposit address (informational).
+    # Provision the VM. owner_wallet carries the bounded intent_id, NOT the
+    # deposit address: XMR subaddresses (~95 chars) overflow VMRow.owner_wallet
+    # (String(64)) and the insert would fail before the intent is linked or any
+    # refund could be recorded. The refund path finds the intent by vm_id and
+    # reads the real deposit address from it.
     try:
         order = VMCreateRequest.model_validate(row.order_payload)
         # Create the VM row but DON'T start provisioning yet: link the intent to
@@ -348,7 +352,7 @@ async def _trigger_provisioning(
         # error) can always find the paying intent and record its refund.
         vm_row, anon_token = await orch.create_vm(
             order,
-            owner_wallet=row.address,
+            owner_wallet=row.intent_id,
             owner_account_id=row.owner_account_id,
             start_provisioning=False,
         )

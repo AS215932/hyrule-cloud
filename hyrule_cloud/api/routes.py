@@ -835,11 +835,15 @@ async def create_vm(
                 return _vm_create_response(existing_vm, request, management_token=None)
         raise HTTPException(409, "Quote is being provisioned; poll the VM status")
 
+    # Defer provisioning until the quote is linked below: a fast provisioning
+    # failure must be able to find the locked quote amount to refund accurately
+    # (get_quote_for_vm races link_quote_vm otherwise).
     if reservation_row is not None:
         activated = await orch.activate_vm_reservation(
             reservation_row.vm_id,
             owner_wallet=wallet,
             payment_tx=getattr(request.state, "payment_tx", None),
+            start_provisioning=False,
         )
         if activated is not None:
             row, management_token = activated, reservation_token
@@ -849,16 +853,20 @@ async def create_vm(
             row, management_token = await orch.create_vm(
                 order, owner_wallet=wallet,
                 owner_account_id=account.account_id if account else None,
+                start_provisioning=False,
             )
             row.payment_tx = getattr(request.state, "payment_tx", None)
     else:
         row, management_token = await orch.create_vm(
             order, owner_wallet=wallet,
             owner_account_id=account.account_id if account else None,
+            start_provisioning=False,
         )
         row.payment_tx = getattr(request.state, "payment_tx", None)
     if quote_row is not None:
         await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
+    # Quote linked (if any) — now safe to start provisioning.
+    orch.start_provisioning(row.vm_id)
 
     # Block A0: status_url is the public sanitized view; management_url embeds
     # the one-time anon token. The UI must surface management_url prominently
