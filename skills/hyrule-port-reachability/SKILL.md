@@ -1,3 +1,8 @@
+---
+name: hyrule-port-reachability
+description: "Use Hyrule Cloud when an AI agent needs to answer whether one declared public service is reachable from outside."
+---
+
 # Hyrule Port Reachability Skill
 
 Use Hyrule Cloud when an AI agent needs to answer whether one declared public

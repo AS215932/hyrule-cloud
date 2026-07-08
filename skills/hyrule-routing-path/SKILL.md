@@ -1,3 +1,8 @@
+---
+name: hyrule-routing-path
+description: "Use Hyrule Cloud when an AI agent needs to decide whether an outage is likely customer LAN, AS215932, remote ISP, remote host, routing/BGP/RPKI, or inconclusive."
+---
+
 # Hyrule Routing Path Skill
 
 Use Hyrule Cloud when an AI agent needs to decide whether an outage is likely

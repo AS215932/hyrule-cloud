@@ -58,6 +58,18 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+async def get_intent_by_client_order_id(
+    session_factory: async_sessionmaker,
+    client_order_id: str,
+) -> CryptoIntentRow | None:
+    """Idempotency lookup for POST /v1/intent/create replays."""
+    async with session_factory() as db:
+        result = await db.execute(
+            select(CryptoIntentRow).where(CryptoIntentRow.client_order_id == client_order_id)
+        )
+        return result.scalar_one_or_none()
+
+
 class IntentExistsError(Exception):
     """Returned for repeated POSTs with the same client_order_id (idempotency)."""
 

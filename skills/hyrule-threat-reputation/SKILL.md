@@ -1,3 +1,8 @@
+---
+name: hyrule-threat-reputation
+description: "Use Hyrule Cloud when an AI agent needs open-source-first domain, IP, RBL, certificate transparency, RDAP/WHOIS, or reputation context."
+---
+
 # Hyrule Threat Reputation Skill
 
 Use Hyrule Cloud when an AI agent needs open-source-first domain, IP, RBL,

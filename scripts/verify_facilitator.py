@@ -27,12 +27,48 @@ from __future__ import annotations
 
 import sys
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 from hyrule_cloud.config import PaymentConfig
+from hyrule_cloud.middleware.x402 import (
+    _CDP_FACILITATOR_HOST,
+    CdpFacilitatorAuthProvider,
+    _env_or_dotenv,
+)
 
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+
+# Friendly mainnet aliases per CAIP-2 chain, used ONLY to improve failure
+# diagnostics: the x402 server matches supported kinds by exact network ID,
+# so an alias in /supported is never sufficient for the probe to pass.
+_MAINNET_ALIASES: dict[str, set[str]] = {
+    "eip155:8453": {"base", "base-mainnet"},
+    "eip155:137": {"polygon", "polygon-mainnet"},
+    "eip155:42161": {"arbitrum", "arbitrum-mainnet"},
+}
+
+
+def _cdp_auth_headers(facilitator: str) -> dict[str, str]:
+    """Bearer auth for the CDP facilitator's /supported, when configured.
+
+    Reuses the exact JWT construction PaymentGate uses in production, so a
+    passing probe here means the server's own auth path works too.
+    """
+    if (urlparse(facilitator).hostname or "") != _CDP_FACILITATOR_HOST:
+        return {}
+    api_key_id = _env_or_dotenv("CDP_API_KEY_ID")
+    api_key_secret = _env_or_dotenv("CDP_API_KEY_SECRET")
+    if not (api_key_id and api_key_secret):
+        print(
+            "WARNING: CDP facilitator configured but CDP_API_KEY_ID/CDP_API_KEY_SECRET "
+            "are missing — probing unauthenticated (may 401)",
+            file=sys.stderr,
+        )
+        return {}
+    provider = CdpFacilitatorAuthProvider(api_key_id, api_key_secret, facilitator)
+    return provider.get_auth_headers().supported
 
 
 def _normalise_supported_entries(payload: Any) -> set[str]:
@@ -61,12 +97,21 @@ def _normalise_supported_entries(payload: Any) -> set[str]:
 def main() -> int:
     cfg = PaymentConfig()
     facilitator = cfg.facilitator_url.rstrip("/")
+    is_cdp = (urlparse(facilitator).hostname or "") == _CDP_FACILITATOR_HOST
+    auth_headers = _cdp_auth_headers(facilitator)
     print(f"facilitator: {facilitator}")
     print(f"configured chains: {len(cfg.networks)}")
+    if is_cdp:
+        print(f"cdp auth: {'yes' if auth_headers else 'NO (unauthenticated probe)'}")
 
     try:
         # follow_redirects=True: x402.org issues 308 to its canonical host.
-        resp = httpx.get(f"{facilitator}/supported", timeout=_TIMEOUT, follow_redirects=True)
+        resp = httpx.get(
+            f"{facilitator}/supported",
+            timeout=_TIMEOUT,
+            follow_redirects=True,
+            headers=auth_headers or None,
+        )
     except httpx.HTTPError as exc:
         print(f"NETWORK ERROR — facilitator unreachable: {exc}", file=sys.stderr)
         return 2
@@ -110,6 +155,22 @@ def main() -> int:
         network = entry.get("network", "")
         if network in supported:
             print(f"  OK   {network}")
+            continue
+        if is_cdp:
+            # Production facilitator: the exact network ID must be advertised.
+            # The x402 server matches supported kinds by exact ID when building
+            # requirements, so an alias-only match here would greenlight a
+            # config that 503s on every paid endpoint at runtime. Neither a
+            # testnet sibling nor a friendly alias counts.
+            alias = next((s for s in _MAINNET_ALIASES.get(network, set()) if s in supported), None)
+            if alias:
+                print(
+                    f"  FAIL {network} — CDP advertises only alias '{alias}', not the "
+                    f"exact ID the server matches on"
+                )
+            else:
+                print(f"  FAIL {network} — CDP does not advertise this mainnet chain")
+            failures.append(network)
             continue
         siblings = testnet_siblings.get(network, set())
         match = next((s for s in siblings if s in supported), None)

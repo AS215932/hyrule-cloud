@@ -1,3 +1,8 @@
+---
+name: hyrule-voip-sip
+description: "Use Hyrule Cloud when an AI agent needs SIP DNS, SIP TLS, SIP OPTIONS, STUN/TURN, number carrier, CNAM, number spam reputation, or E911 diagnostic context."
+---
+
 # Hyrule VoIP/SIP Skill
 
 Use Hyrule Cloud when an AI agent needs SIP DNS, SIP TLS, SIP OPTIONS,

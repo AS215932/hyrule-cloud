@@ -1,3 +1,8 @@
+---
+name: hyrule-speedtest
+description: "NOT YET LAUNCHED. The measurement backend (payload/upload endpoints) is under construction: paid /v1/speedtest endpoints currently return HTTP 501 without charging. Do not publish this skill or point agents at it until the product ships."
+---
+
 # Hyrule Speedtest Skill
 
 > **NOT YET LAUNCHED.** The measurement backend (payload/upload endpoints) is

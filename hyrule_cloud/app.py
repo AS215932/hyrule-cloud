@@ -22,6 +22,7 @@ from hyrule_cloud.api.dns import router as dns_router
 from hyrule_cloud.api.internal_bgp import router as internal_bgp_router
 from hyrule_cloud.api.ip import router as ip_router
 from hyrule_cloud.api.mail import router as mail_router
+from hyrule_cloud.api.metrics import router as metrics_router
 from hyrule_cloud.api.mx import router as mx_router
 from hyrule_cloud.api.nat import router as nat_router
 from hyrule_cloud.api.path import router as path_router
@@ -67,13 +68,24 @@ from hyrule_cloud.state import AppState
 async def lifespan(app: FastAPI):
     config = HyruleConfig()
 
+    # Production guard: refuse to boot in simulation/dev-bypass mode when the
+    # deployment declares it must provision real VMs.
+    from hyrule_cloud.services.launch_proof import enforce_real_provisioning_guard
+    enforce_real_provisioning_guard(config)
+
     # Database
     engine = create_db_engine(config.database_url)
     await init_db(engine)
     session_factory = create_session_factory(engine)
 
-    # Payment gate (official x402 SDK)
-    payment_gate = PaymentGate(config.payment)
+    # Payment gate (official x402 SDK) + append-only payments ledger
+    from hyrule_cloud.services.payments_ledger import PaymentLedger
+    payment_ledger = PaymentLedger(session_factory)
+    payment_gate = PaymentGate(
+        config.payment,
+        public_base_url=config.public_base_url,
+        ledger=payment_ledger,
+    )
 
     # Network proxy sidecar client. x402 stays in Hyrule Cloud; the sidecar
     # only executes already-authorized egress requests.
@@ -211,6 +223,8 @@ app.include_router(mail_router)
 app.include_router(internal_bgp_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
 app.include_router(auth_router)
+# Payments/fleet Prometheus exporter (bearer-token gated, off by default).
+app.include_router(metrics_router)
 
 # Block B (Wave 2): per-process request-latency middleware feeds
 # `/v1/stats/runtime`. Cheap (one perf_counter per request + O(1) deque
@@ -226,8 +240,10 @@ async def health():
 @app.get("/.well-known/x402.json")
 async def x402_manifest():
     """x402 service manifest for agent discovery."""
+    from hyrule_cloud.services.discovery import discovery_for
+
     config: HyruleConfig = app.state._typed_state.config
-    return {
+    manifest = {
         "x402Version": 2,
         "name": "Hyrule Cloud",
         "description": (
@@ -424,3 +440,9 @@ async def x402_manifest():
         "facilitator": getattr(config.payment, "facilitator_url", ""),
         "contact": "https://github.com/as215932",
     }
+    # Bazaar/x402scan: flag resources whose 402 responses carry a discovery
+    # extension declaration (services/discovery.py).
+    for resource in manifest["resources"]:
+        if discovery_for(resource.get("method", ""), resource["path"]) is not None:
+            resource["discoverable"] = True
+    return manifest

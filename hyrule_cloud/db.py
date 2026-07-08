@@ -251,6 +251,41 @@ class CryptoIntentRow(Base):
     )
 
 
+class PaymentEventRow(Base):
+    """Append-only x402 payment ledger.
+
+    One row per payment-gate outcome. This is the revenue source of truth
+    that /metrics and the operator dashboard aggregate — resource rows
+    (VMRow.payment_tx etc.) only carry the final settlement stamp.
+    """
+
+    __tablename__ = "payment_events"
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    # required_402 | verify_failed | settle_failed | settled | dev_bypass
+    event_type: Mapped[str] = mapped_column(String(16), index=True)
+    resource_path: Mapped[str] = mapped_column(String(256))
+    method: Mapped[str] = mapped_column(String(8))
+    # vm | domain | network_proxy | network_intel | mail | other (from path)
+    service_group: Mapped[str] = mapped_column(String(24), index=True)
+    amount_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    # CAIP-2; solana:<genesis-hash> exceeds 32 chars, so size for the family
+    network: Mapped[str | None] = mapped_column(String(64))
+    asset: Mapped[str | None] = mapped_column(String(66))  # token address or symbol
+    payer_wallet: Mapped[str | None] = mapped_column(String(64), index=True)
+    tx_hash: Mapped[str | None] = mapped_column(String(128))
+    facilitator_host: Mapped[str | None] = mapped_column(String(64))
+    error_reason: Mapped[str | None] = mapped_column(String(256))
+    extra: Mapped[dict | None] = mapped_column(_JSONB)
+
+    __table_args__ = (
+        Index("ix_payment_events_type_created", "event_type", "created_at"),
+    )
+
+
 class VMQuoteRow(Base):
     """Durable order quote (issue #14).
 

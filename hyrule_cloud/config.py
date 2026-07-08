@@ -242,9 +242,25 @@ class HyruleConfig(BaseSettings):
 
     deploy_domain: str = "deploy.hyrule.host"
 
+    # Canonical public origin used for x402 ResourceInfo URLs in 402 responses.
+    # Behind the Caddy TLS proxy the raw request URL is http://<backend>, which
+    # is the wrong canonical resource identity for Bazaar/x402scan indexing.
+    public_base_url: str = "https://cloud.hyrule.host"
+
+    # Launch guard: when true, the app refuses to start unless real XCP-NG
+    # provisioning is enabled (HCP_LAUNCH_PROOF_REAL_XCPNG=1) and the payment
+    # dev bypass is disabled. Set in production so a config regression can
+    # never silently charge real USDC for simulated VMs.
+    require_real_provisioning: bool = False
+
     # Block H (Wave 5): Prometheus on `mon` for /v1/stats/network fleet truth.
     # Empty = static fallback (CI / local dev).
     prometheus_url: str = ""
+
+    # Bearer token mon's Prometheus presents to scrape /metrics (payments
+    # ledger aggregates). Empty = endpoint disabled; 8402 is publicly
+    # reachable behind Caddy, so never expose the exporter unauthenticated.
+    metrics_token: str = ""
 
     # Internal Go sidecar for x402-gated /v1/network/request execution.
     # Hyrule Cloud verifies/settles x402; the sidecar performs egress.

@@ -13,6 +13,7 @@ from decimal import Decimal
 from ipaddress import IPv6Address, IPv6Network
 
 import structlog
+from sqlalchemy import delete as sql_delete
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -24,6 +25,7 @@ from hyrule_cloud.models import (
     CostBreakdown,
     DomainMode,
     DomainStatus,
+    SSHSmokeStatus,
     VMCreateRequest,
     VMSize,
     VMStatus,
@@ -148,24 +150,16 @@ class Orchestrator:
 
         raise RuntimeError(f"No customer /64 prefixes available in {supernet}")
 
-    async def create_vm(
+    async def _insert_vm_row(
         self,
         request: VMCreateRequest,
         owner_wallet: str,
         owner_account_id: str | None = None,
     ) -> tuple[VMRow, str]:
-        """Create a VM record in DB and start background provisioning.
+        """Persist a VM row and atomically claim a customer /64 (unique index).
 
-        Returns (row, anon_management_token). Block A0: the cleartext
-        token is returned to the caller exactly once — it is never
-        stored, only the sha256 lands on the row. Caller (POST
-        /v1/vm/create) must surface it in the response body so the
-        operator can save the management URL.
-
-        Block A1 (Wave 2): `owner_account_id` is set when the caller has
-        a session cookie. The VM still gets a management token — the
-        token + the account both authorize management, redundancy is
-        intentional so the operator can claim/transfer later.
+        Does NOT start provisioning — callers decide when (create_vm does it
+        immediately; reserve_vm defers until payment settles).
         """
         # Defense in depth: routes and intent creation validate this before
         # charging, but create_vm is also reachable from settled intents
@@ -221,15 +215,81 @@ class Orchestrator:
                     continue
                 # Refresh to get server defaults
                 await session.refresh(row)
-                break
-        else:
-            raise RuntimeError("Could not allocate a unique customer IPv6 prefix")
+                return row, anon_token
 
+        raise RuntimeError("Could not allocate a unique customer IPv6 prefix")
+
+    def _spawn_provisioning(self, vm_id: str) -> None:
         task = asyncio.create_task(self._provision_vm(vm_id))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    async def create_vm(
+        self,
+        request: VMCreateRequest,
+        owner_wallet: str,
+        owner_account_id: str | None = None,
+    ) -> tuple[VMRow, str]:
+        """Create a VM record in DB and start background provisioning.
+
+        Returns (row, anon_management_token). Block A0: the cleartext
+        token is returned to the caller exactly once — it is never
+        stored, only the sha256 lands on the row. Caller (POST
+        /v1/vm/create) must surface it in the response body so the
+        operator can save the management URL.
+
+        Block A1 (Wave 2): `owner_account_id` is set when the caller has
+        a session cookie. The VM still gets a management token — the
+        token + the account both authorize management, redundancy is
+        intentional so the operator can claim/transfer later.
+        """
+        row, anon_token = await self._insert_vm_row(request, owner_wallet, owner_account_id)
+        self._spawn_provisioning(row.vm_id)
         return row, anon_token
+
+    async def reserve_vm(
+        self,
+        request: VMCreateRequest,
+        owner_account_id: str | None = None,
+    ) -> tuple[VMRow, str]:
+        """Reserve a VM row + customer /64 BEFORE payment settles.
+
+        The unique prefix index makes the reservation atomic across workers,
+        closing the capacity-check→charge→allocate race: a request that is
+        about to be charged holds its /64 through settlement. Reservations
+        carry owner_wallet="" and no provisioning task; the caller must
+        activate_vm_reservation() on payment success or
+        release_vm_reservation() on failure. Abandoned reservations (crash
+        mid-payment) are purged by check_expiries.
+        """
+        return await self._insert_vm_row(request, owner_wallet="", owner_account_id=owner_account_id)
+
+    async def activate_vm_reservation(
+        self,
+        vm_id: str,
+        owner_wallet: str,
+        payment_tx: str | None = None,
+    ) -> VMRow | None:
+        """Attach the settled payment to a reservation and start provisioning."""
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is None:
+                return None
+            row.owner_wallet = owner_wallet
+            if payment_tx:
+                row.payment_tx = payment_tx
+            await session.commit()
+            await session.refresh(row)
+        self._spawn_provisioning(vm_id)
+        return row
+
+    async def release_vm_reservation(self, vm_id: str) -> None:
+        """Delete an unpaid reservation, freeing its /64 immediately."""
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None and not row.owner_wallet and row.status == VMStatus.PROVISIONING:
+                await session.delete(row)
+                await session.commit()
 
     async def _provision_vm(self, vm_id: str) -> None:
         """Background provisioning: create VM, wait for IPv6, configure DNS.
@@ -310,6 +370,15 @@ class Orchestrator:
             subdomain = self._generate_hostname(vm_id)
             await self.dns.create_aaaa(subdomain, ipv6)
 
+            # Launch proof (issue #28): measure instead of inferring — probe
+            # TCP :22 and confirm the AAAA on the authoritative server. An
+            # unreachable sshd doesn't fail the VM, but the customer-visible
+            # proof reports it honestly.
+            ssh_ok, dns_verified = await asyncio.gather(
+                self._probe_ssh(ipv6),
+                self.dns.verify_aaaa(subdomain, ipv6),
+            )
+
             # Update DB with final state
             async with self.db() as session:
                 row = await session.get(VMRow, vm_id)
@@ -321,6 +390,14 @@ class Orchestrator:
                 # /v1/stats/runtime can roll a rolling avg over recent
                 # provisioning durations.
                 row.provisioned_at = _now()
+                meta = dict(row.metadata_ or {})
+                lp = dict(meta.get("launch_proof", {}))
+                lp["ssh_smoke_status"] = (
+                    SSHSmokeStatus.PASSED.value if ssh_ok else SSHSmokeStatus.FAILED.value
+                )
+                lp["dns_aaaa_verified"] = bool(dns_verified)
+                meta["launch_proof"] = lp
+                row.metadata_ = meta
 
                 if row.domain_mode == DomainMode.CUSTOM and row.domain:
                     await self._register_custom_domain(row)
@@ -376,6 +453,37 @@ class Orchestrator:
             await session.commit()
 
         log.info("provision_simulate_complete", vm_id=vm_id, ipv6=fake_ipv6)
+
+    async def _probe_ssh(
+        self,
+        ipv6: str,
+        *,
+        timeout_seconds: int = 90,
+        interval_seconds: int = 5,
+        port: int = 22,
+    ) -> bool:
+        """TCP reachability probe of the VM's sshd for the launch proof.
+
+        sshd usually comes up after the IPv6 address appears (cloud-init is
+        still running), so keep retrying until a monotonic deadline —
+        blackholed connect attempts burn wall-clock too, and must not extend
+        the window beyond timeout_seconds. Connectivity only — no SSH
+        handshake, no credentials.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ipv6, port), timeout=5
+                )
+                writer.close()
+                await writer.wait_closed()
+                return True
+            except (TimeoutError, OSError):
+                if loop.time() + interval_seconds >= deadline:
+                    return False
+                await asyncio.sleep(interval_seconds)
 
     async def _wait_for_ipv6(
         self,
@@ -523,9 +631,23 @@ class Orchestrator:
                 return False
             xcpng_uuid = row.xcpng_uuid
             hostname = row.hostname
+            status = str(row.status)
+            domain_mode = row.domain_mode
+            domain = row.domain
+
+        # Track whether every user of the deterministic ::2 address is
+        # verifiably gone; the /64 is only released when they are. A
+        # quarantined prefix costs one pool slot; releasing early could hand
+        # a stale DNS name or a still-running guest to the next customer.
+        cleanup_ok = True
 
         if xcpng_uuid:
             await self.xcpng.destroy_vm(xcpng_uuid)
+        elif status == str(VMStatus.PROVISIONING):
+            # Mid-provision race: the clone may exist without xcpng_uuid
+            # having been recorded yet — the guest could still come up on
+            # this prefix after we look.
+            cleanup_ok = False
 
         if hostname:
             subdomain = self._generate_hostname(vm_id)
@@ -533,20 +655,40 @@ class Orchestrator:
                 await self.dns.delete_aaaa(subdomain)
             except Exception:
                 log.warning("dns_cleanup_failed", vm_id=vm_id, exc_info=True)
+                cleanup_ok = False
+
+        if domain_mode == DomainMode.CUSTOM and domain:
+            try:
+                await self.openprovider.delete_zone_record(
+                    zone_name=domain, name="", rtype="AAAA"
+                )
+            except Exception:
+                log.warning(
+                    "custom_domain_dns_cleanup_failed",
+                    vm_id=vm_id,
+                    domain=domain,
+                    exc_info=True,
+                )
+                cleanup_ok = False
 
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if row:
                 row.status = VMStatus.DESTROYED
                 row.destroyed_at = _now()
-                # Release the customer /64 for reuse: the unique index on
-                # ipv6_prefix_index would otherwise pin it to this dead row
-                # forever and eventually exhaust the pool. Only safe here —
-                # the guest and its DNS record are gone. FAILED rows keep the
-                # prefix until destroyed, since a partially-provisioned guest
-                # may still hold the address.
-                row.ipv6_prefix_index = None
-                row.ipv6_prefix = None
+                if cleanup_ok:
+                    # Release the customer /64 for reuse: the unique index on
+                    # ipv6_prefix_index would otherwise pin it to this dead
+                    # row forever and eventually exhaust the pool.
+                    row.ipv6_prefix_index = None
+                    row.ipv6_prefix = None
+                else:
+                    log.warning(
+                        "customer_prefix_quarantined",
+                        vm_id=vm_id,
+                        prefix=row.ipv6_prefix,
+                        reason="cleanup incomplete — stale DNS or guest may still use the address",
+                    )
                 await session.commit()
 
         log.info("vm_destroyed", vm_id=vm_id)
@@ -558,6 +700,19 @@ class Orchestrator:
         """Suspend expired VMs, destroy those past grace period."""
         now = _now()
         grace = timedelta(hours=self.config.vm_grace_period_hours)
+
+        # Purge abandoned pre-payment reservations (a crash between
+        # reserve_vm and settlement leaves an unpaid placeholder pinning a
+        # /64). Live reservations are seconds old; 15 minutes is generous.
+        async with self.db() as session:
+            await session.execute(
+                sql_delete(VMRow).where(
+                    VMRow.owner_wallet == "",
+                    VMRow.status == VMStatus.PROVISIONING,
+                    VMRow.created_at < now - timedelta(minutes=15),
+                )
+            )
+            await session.commit()
 
         async with self.db() as session:
             result = await session.execute(

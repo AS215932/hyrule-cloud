@@ -653,3 +653,30 @@ def test_build_uri_rejects_unknown_asset():
 def test_late_paid_slippage_is_one_percent():
     """The plan locked LENIENT slippage at ±1%. Guard the constant."""
     assert LATE_PAID_SLIPPAGE == Decimal("0.01")
+
+
+@pytest.mark.asyncio
+async def test_get_intent_by_client_order_id_returns_existing(intent_state):
+    """Replay lookup used by POST /v1/intent/create BEFORE validation/caps:
+    a retry must get the original deposit address even if capacity filled up
+    in between."""
+    from hyrule_cloud.services.intents import get_intent_by_client_order_id
+
+    row = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=_vm_create_request(),
+        amount_usd=Decimal("0.05"),
+        client_order_id="replay-key-1",
+        owner_account_id=None,
+    )
+
+    found = await get_intent_by_client_order_id(intent_state.orchestrator.db, "replay-key-1")
+    assert found is not None
+    assert found.intent_id == row.intent_id
+    assert found.address == row.address
+
+    missing = await get_intent_by_client_order_id(intent_state.orchestrator.db, "nope")
+    assert missing is None
