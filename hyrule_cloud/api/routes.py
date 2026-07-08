@@ -1320,13 +1320,13 @@ from hyrule_cloud.services.intents import (
     get_intent_by_client_order_id,
 )
 
-# Intent states with no committed payment yet: a same-key replay only re-serves
-# the deposit address. While the VM service is closed (simulation) such a replay
-# must respect the closed-service guard rather than re-advertise a deposit for a
-# VM that can't be real-provisioned. Every other state (funds received,
+# Intent states that carry no committed payment: a same-key replay only
+# re-serves the deposit address. While the VM service is closed (simulation)
+# such a replay must respect the closed-service guard rather than re-advertise a
+# deposit for a VM that can't be real-provisioned. Every other state (settled,
 # provisioning, or terminal recovery) always resolves so a deposit is never
 # orphaned.
-_INTENT_AWAITING_PAYMENT = frozenset(
+_INTENT_AWAITING_STATUSES = frozenset(
     {
         CryptoIntentStatus.CREATED,
         CryptoIntentStatus.WAITING_PAYMENT,
@@ -1336,10 +1336,26 @@ _INTENT_AWAITING_PAYMENT = frozenset(
 
 
 def _intent_awaiting_payment(row: CryptoIntentRow) -> bool:
+    """True only for intents with no funds in flight — safe to refuse while the
+    VM service is closed.
+
+    An awaiting-status intent can already carry an *unconfirmed* deposit: the
+    poller records ``amount_received_crypto`` (and ``tx_hash``) before
+    confirmations clear, keeping status at ``WAITING_PAYMENT`` (see
+    ``services/intents.py``). Any received amount or tx hash means the customer
+    has already sent crypto, so the replay must resolve rather than 503 — never
+    strand a paid-but-unconfirmed deposit.
+    """
     try:
-        return CryptoIntentStatus(row.status) in _INTENT_AWAITING_PAYMENT
+        status = CryptoIntentStatus(row.status)
     except ValueError:
         return False
+    if status not in _INTENT_AWAITING_STATUSES:
+        return False
+    # Funds already seen on-chain (even unconfirmed) make it recoverable.
+    if getattr(row, "amount_received_crypto", None):
+        return False
+    return not getattr(row, "tx_hash", None)
 
 
 def _intent_to_response(row: CryptoIntentRow, request: Request | None = None) -> CryptoIntentResponse:

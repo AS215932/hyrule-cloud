@@ -575,15 +575,19 @@ def test_intent_awaiting_payment_truth_table():
     from hyrule_cloud.api import routes
 
     class _Row:
-        def __init__(self, status):
+        def __init__(self, status, amount_received_crypto=None, tx_hash=None):
             self.status = status
+            self.amount_received_crypto = amount_received_crypto
+            self.tx_hash = tx_hash
 
+    # No funds in flight → awaiting (safe to refuse while closed).
     for awaiting in (
         CryptoIntentStatus.CREATED,
         CryptoIntentStatus.WAITING_PAYMENT,
         CryptoIntentStatus.PENDING,
     ):
         assert routes._intent_awaiting_payment(_Row(awaiting)) is True
+    # Committed / provisioning / terminal → always resolves.
     for committed in (
         CryptoIntentStatus.SETTLED,
         CryptoIntentStatus.UNDERPAID,
@@ -597,6 +601,27 @@ def test_intent_awaiting_payment_truth_table():
         CryptoIntentStatus.PAID,
     ):
         assert routes._intent_awaiting_payment(_Row(committed)) is False
+    # WAITING_PAYMENT with an unconfirmed deposit already seen is NOT awaiting —
+    # the customer has sent crypto, so the replay must resolve.
+    assert (
+        routes._intent_awaiting_payment(
+            _Row(CryptoIntentStatus.WAITING_PAYMENT, amount_received_crypto=Decimal("0.0005"))
+        )
+        is False
+    )
+    assert (
+        routes._intent_awaiting_payment(
+            _Row(CryptoIntentStatus.WAITING_PAYMENT, tx_hash="deadbeef")
+        )
+        is False
+    )
+    # A zero received amount is still awaiting.
+    assert (
+        routes._intent_awaiting_payment(
+            _Row(CryptoIntentStatus.WAITING_PAYMENT, amount_received_crypto=Decimal("0"))
+        )
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -630,6 +655,21 @@ async def test_intent_replay_respects_commitment_while_simulated(launch_state):
                 order_payload=_VM_ORDER,
             )
         )
+        # WAITING_PAYMENT but the poller has already seen an unconfirmed deposit:
+        # funds are in flight, so this must replay even while closed.
+        session.add(
+            CryptoIntentRow(
+                intent_id="int_unconfirmed",
+                asset="BTC",
+                amount_crypto=Decimal("0.001"),
+                amount_received_crypto=Decimal("0.0005"),
+                address="bc1qunconfirmed",
+                status=CryptoIntentStatus.WAITING_PAYMENT,
+                expires_at=_now() + timedelta(hours=1),
+                client_order_id="unconfirmed-1",
+                order_payload=_VM_ORDER,
+            )
+        )
         await session.commit()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -641,7 +681,14 @@ async def test_intent_replay_respects_commitment_while_simulated(launch_state):
             "/v1/intent/create",
             json={"asset": "BTC", "order_payload": _VM_ORDER, "client_order_id": "created-1"},
         )
+        unconfirmed = await client.post(
+            "/v1/intent/create",
+            json={"asset": "BTC", "order_payload": _VM_ORDER, "client_order_id": "unconfirmed-1"},
+        )
     assert settled.status_code == 200, settled.text
     assert settled.json()["intent_id"] == "int_settled"
     assert created.status_code == 503
     assert "not yet generally available" in created.json()["detail"]
+    # Funds already sent (unconfirmed) → recoverable, not stranded.
+    assert unconfirmed.status_code == 200, unconfirmed.text
+    assert unconfirmed.json()["intent_id"] == "int_unconfirmed"
