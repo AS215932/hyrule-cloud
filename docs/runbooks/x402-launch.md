@@ -15,6 +15,37 @@ Production state at time of writing (2026-07-08):
 - No live paid canary has ever run — the 2026-07-01 validation stopped at
   dry-run
 
+## Provisioning-mode flags — read before deploying
+
+Two Vault-kv values control the VM service, and **both default to `1` in the
+env template**, so a plain deploy comes up in **real provisioning mode**:
+
+| Vault kv (`kv/hyrule-cloud`)    | env var                          | controls |
+|---------------------------------|----------------------------------|----------|
+| `hcp_launch_proof_real_xcpng`   | `HCP_LAUNCH_PROOF_REAL_XCPNG`    | real XCP-NG provisioning vs. simulation (`use_real_provisioning()`) |
+| `require_real_provisioning`     | `HYRULE_REQUIRE_REAL_PROVISIONING` | boot tripwire: refuse to start if real mode is claimed but not actually on |
+
+Intended posture per phase:
+
+- **Phases 1–3c (staging VMs for last):** `hcp_launch_proof_real_xcpng=0` **and**
+  `require_real_provisioning=0`. Simulation boots, and the app's route-level
+  sim-gate returns **503** for `/v1/vm/create|quote|extend` and `/v1/intent/create`
+  and drops `/v1/vm/create` from `/.well-known/x402.json` — so VMs cannot be
+  charged for while the intel/proxy/domain services go live first.
+- **Phase 3d onward (VMs live):** both `=1`. Real mode with the tripwire on; the
+  app **refuses to boot** if they disagree (real claimed but XCP-NG off, or a
+  dev bypass is set).
+
+**Do not set only one flag.** Setting `require_real_provisioning=0` while leaving
+`hcp_launch_proof_real_xcpng` at its default `1` yields real mode with the
+tripwire **off** — VMs live and chargeable before the 3d gate, with no fail-fast
+if XCP-NG later drops out. (This is exactly what happened on the 2026-07-08
+deploy; the fix was `vault kv patch kv/hyrule-cloud require_real_provisioning=1`
++ restart once real XCP-NG was confirmed ready.)
+
+Flipping either flag only needs `systemctl restart hyrule-cloud` (read at import
+via the Vault-rendered `.env`) — no Ansible run.
+
 ---
 
 ## Phase 1 — Deploy the stack, then switch facilitator to CDP
@@ -55,6 +86,12 @@ Production state at time of writing (2026-07-08):
    (mail/speedtest/web-reports gone, `discoverable` flags present).
 
 ### Live canary #1 — payai (first-ever real spend)
+
+`scripts/x402_canary.py` automates the 402→sign→retry→settle flow for every
+paid endpoint (a `max_amount` policy caps each call at its price +10%). Set
+`CANARY_KEY` to the funded wallet and run `python scripts/x402_canary.py dns`
+for the cheapest first spend, `intel`/`proxy` for the Phase-3 groups, or
+`vm --destroy` for the 3d gate. The raw curl below is the manual equivalent.
 
 Cheapest endpoint, $0.001:
 
