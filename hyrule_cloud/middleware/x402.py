@@ -293,17 +293,28 @@ class PaymentGate:
     def _payment_header(request: Request) -> str | None:
         return request.headers.get(PAYMENT_SIGNATURE_HEADER) or request.headers.get(X_PAYMENT_HEADER)
 
+    # Ledger writes are best-effort observability: a slow/exhausted payments
+    # DB must never hold a settled response hostage. Writes that exceed this
+    # bound are dropped with a warning.
+    _LEDGER_WRITE_TIMEOUT_SECONDS = 2.0
+
     async def _record(self, event_type: str, request: Request, amount: Decimal, **kwargs: Any) -> None:
-        """Ledger write; no-op without a ledger, never raises (ledger swallows)."""
+        """Bounded ledger write; no-op without a ledger, never raises."""
         if self.ledger is None:
             return
-        await self.ledger.record(
-            event_type=event_type,
-            request=request,
-            amount=amount,
-            facilitator_host=self._facilitator_host,
-            **kwargs,
-        )
+        try:
+            await asyncio.wait_for(
+                self.ledger.record(
+                    event_type=event_type,
+                    request=request,
+                    amount=amount,
+                    facilitator_host=self._facilitator_host,
+                    **kwargs,
+                ),
+                timeout=self._LEDGER_WRITE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            log.warning("payment_ledger_write_dropped", event_type=event_type, exc_info=True)
 
     def _canonical_url(self, request: Request) -> str:
         """Resource URL for 402 responses. Behind the TLS proxy the raw request

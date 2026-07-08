@@ -20,6 +20,7 @@ from x402.http import PAYMENT_SIGNATURE_HEADER
 
 from hyrule_cloud.app import app
 from hyrule_cloud.db import Base, PaymentEventRow, VMRow
+from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.models import VMSize, VMStatus
 from hyrule_cloud.services.payments_ledger import PaymentLedger, service_group_for_path
 from tests.test_payment_gate_x402 import (
@@ -269,3 +270,26 @@ async def test_facilitator_outage_records_no_required_402(session_factory) -> No
     assert isinstance(result, Response)
     assert result.status_code == 503
     assert await _events(session_factory) == []
+
+
+@pytest.mark.asyncio
+async def test_hung_ledger_cannot_block_a_settled_response(monkeypatch) -> None:
+    """A slow/exhausted payments DB must not hold the customer's response
+    hostage after the facilitator already settled."""
+    import asyncio
+
+    class _HangingLedger:
+        async def record(self, **kwargs) -> None:
+            await asyncio.sleep(30)
+
+    server = _FakeServer()
+    gate = _gate(server)
+    gate.ledger = _HangingLedger()  # type: ignore[assignment]
+    monkeypatch.setattr(PaymentGate, "_LEDGER_WRITE_TIMEOUT_SECONDS", 0.1)
+    req = _request({PAYMENT_SIGNATURE_HEADER: _payment_header(server.requirements[0])})
+
+    result = await asyncio.wait_for(
+        gate.check_payment(req, Decimal("0.05"), "VM creation"), timeout=5
+    )
+
+    assert result == PAYER

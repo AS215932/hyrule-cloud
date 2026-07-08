@@ -59,9 +59,10 @@ async def metrics_middleware(
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     recorder: MetricsRecorder | None = getattr(request.app.state, "metrics", None)
-    # /health and the metrics endpoint itself would skew the sample with
-    # synthetic load if we recorded them — they're cheap and constant-time.
-    skip = request.url.path in ("/health", "/v1/stats/runtime")
+    # /health, the runtime endpoint itself, and Prometheus scrapes of
+    # /metrics would skew the sample with synthetic load if we recorded
+    # them — they're monitoring traffic, not customer API latency.
+    skip = request.url.path in ("/health", "/v1/stats/runtime", "/metrics")
     if recorder is None or skip:
         return await call_next(request)
     start = time.perf_counter()
