@@ -22,6 +22,7 @@ from hyrule_cloud.api.dns import router as dns_router
 from hyrule_cloud.api.internal_bgp import router as internal_bgp_router
 from hyrule_cloud.api.ip import router as ip_router
 from hyrule_cloud.api.mail import router as mail_router
+from hyrule_cloud.api.metrics import router as metrics_router
 from hyrule_cloud.api.mx import router as mx_router
 from hyrule_cloud.api.nat import router as nat_router
 from hyrule_cloud.api.path import router as path_router
@@ -77,8 +78,14 @@ async def lifespan(app: FastAPI):
     await init_db(engine)
     session_factory = create_session_factory(engine)
 
-    # Payment gate (official x402 SDK)
-    payment_gate = PaymentGate(config.payment, public_base_url=config.public_base_url)
+    # Payment gate (official x402 SDK) + append-only payments ledger
+    from hyrule_cloud.services.payments_ledger import PaymentLedger
+    payment_ledger = PaymentLedger(session_factory)
+    payment_gate = PaymentGate(
+        config.payment,
+        public_base_url=config.public_base_url,
+        ledger=payment_ledger,
+    )
 
     # Network proxy sidecar client. x402 stays in Hyrule Cloud; the sidecar
     # only executes already-authorized egress requests.
@@ -216,6 +223,8 @@ app.include_router(mail_router)
 app.include_router(internal_bgp_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
 app.include_router(auth_router)
+# Payments/fleet Prometheus exporter (bearer-token gated, off by default).
+app.include_router(metrics_router)
 
 # Block B (Wave 2): per-process request-latency middleware feeds
 # `/v1/stats/runtime`. Cheap (one perf_counter per request + O(1) deque
