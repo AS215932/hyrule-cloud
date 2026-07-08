@@ -16,6 +16,7 @@ from hyrule_cloud.providers.network_config import (
     prefix_for_index,
     render_debian_network_config,
     supports_static_network_config,
+    validate_customer_network_settings,
     vm_address_for_prefix,
 )
 
@@ -142,3 +143,173 @@ async def test_wait_for_ipv6_requires_expected_address(session_factory):
         timeout=1,
         expected_ipv6="2a0c:b641:b51:1::2",
     ) == "2a0c:b641:b51:1::2"
+
+
+def test_debian_network_config_allows_off_supernet_dns():
+    """Public/DNS64 resolvers outside the customer allocation are a normal
+    production configuration — only the gateway must be on-link."""
+    rendered = render_debian_network_config(
+        address="2a0c:b641:b51:1::2",
+        prefix="2a0c:b641:b51:1::/64",
+        gateway="2a0c:b641:b51::1",
+        dns_servers=["2001:4860:4860::8888"],
+        customer_supernet=IPv6Network("2a0c:b641:b51::/48"),
+    )
+    body = yaml.safe_load(rendered)
+    assert body["ethernets"]["enX0"]["nameservers"]["addresses"] == ["2001:4860:4860::8888"]
+
+
+def test_validate_customer_network_settings_accepts_defaults():
+    cfg = HyruleConfig()
+    validate_customer_network_settings(
+        supernet=cfg.customer_ipv6_supernet,
+        gateway=cfg.customer_ipv6_gateway,
+        dns=cfg.customer_ipv6_dns,
+    )
+
+
+def test_validate_customer_network_settings_accepts_off_net_dns():
+    validate_customer_network_settings(
+        supernet="2a0c:b641:b51::/48",
+        gateway="2a0c:b641:b51::1",
+        dns="2001:4860:4860::8888,2a0c:b641:b51::1",
+    )
+
+
+def test_validate_customer_network_settings_rejects_single_64_pool():
+    with pytest.raises(ValueError, match="no usable"):
+        validate_customer_network_settings(
+            supernet="2a0c:b641:b51::/64",
+            gateway="2a0c:b641:b51::1",
+            dns="2a0c:b641:b51::1",
+        )
+
+
+def test_validate_customer_network_settings_rejects_off_net_gateway():
+    with pytest.raises(ValueError, match="gateway"):
+        validate_customer_network_settings(
+            supernet="2a0c:b641:b51::/48",
+            gateway="2001:db8::1",
+            dns="2a0c:b641:b51::1",
+        )
+
+
+def test_validate_customer_network_settings_rejects_malformed_dns():
+    with pytest.raises(ValueError):
+        validate_customer_network_settings(
+            supernet="2a0c:b641:b51::/48",
+            gateway="2a0c:b641:b51::1",
+            dns="not-an-ip",
+        )
+
+
+@pytest.mark.asyncio
+async def test_destroy_releases_customer_prefix(session_factory):
+    """Destroyed rows must free their /64 (unique index would otherwise pin
+    it forever) so churn cannot exhaust the customer pool."""
+
+    class StubXCPNG:
+        async def destroy_vm(self, uuid: str) -> None:
+            pass
+
+    class StubDNS:
+        async def delete_aaaa(self, subdomain: str) -> None:
+            pass
+
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+    orch.xcpng = StubXCPNG()
+    orch.dns = StubDNS()
+
+    async with session_factory() as session:
+        session.add(
+            VMRow(
+                vm_id="vm_release",
+                owner_wallet="wallet",
+                status=VMStatus.READY,
+                size=VMSize.XS,
+                os="debian-13",
+                ipv6_prefix_index=7,
+                ipv6_prefix="2a0c:b641:b51:7::/64",
+                hostname="rel.deploy.hyrule.host",
+                ssh_pubkey="ssh-ed25519 AAAA test",
+                open_ports=[22],
+                cost_total=Decimal("0.05"),
+            )
+        )
+        await session.commit()
+
+    assert await orch.destroy_vm("vm_release") is True
+
+    async with session_factory() as session:
+        row = await session.get(VMRow, "vm_release")
+        assert row.status == VMStatus.DESTROYED
+        assert row.ipv6_prefix_index is None
+        assert row.ipv6_prefix is None
+
+        # The freed index is allocatable again.
+        session.add(
+            VMRow(
+                vm_id="vm_next",
+                owner_wallet="wallet",
+                status=VMStatus.PROVISIONING,
+                size=VMSize.XS,
+                os="debian-13",
+                ipv6_prefix_index=7,
+                ipv6_prefix="2a0c:b641:b51:7::/64",
+                ssh_pubkey="ssh-ed25519 AAAA test",
+                open_ports=[22],
+                cost_total=Decimal("0.05"),
+            )
+        )
+        await session.commit()
+
+
+def test_vm_order_validation_rejects_unsupported_os_in_real_mode(monkeypatch):
+    """Both payment entry points (x402 create and BTC/XMR intent create) run
+    this validator, so an unsupported OS is rejected before any charge."""
+    from fastapi import HTTPException
+
+    from hyrule_cloud.api import routes
+    from hyrule_cloud.models import VMCreateRequest
+
+    monkeypatch.setattr(routes, "_real_provisioning_enabled", lambda: True)
+    order = VMCreateRequest(
+        duration_days=1,
+        os="openbsd-7.8",
+        ssh_pubkey="ssh-ed25519 AAAA test",
+    )
+
+    class _Cfg:
+        blocked_ports = [25]
+
+    with pytest.raises(HTTPException) as exc:
+        routes._validate_vm_order(order, _Cfg())
+    assert exc.value.status_code == 400
+    assert "not supported" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_create_vm_refuses_unsupported_os_before_persisting(
+    session_factory, monkeypatch
+):
+    """Defense in depth: even a pre-validation settled intent cannot create a
+    paid VM row for an OS real provisioning cannot deliver."""
+    from sqlalchemy import func, select
+
+    from hyrule_cloud.models import VMCreateRequest
+    from hyrule_cloud.services import launch_proof
+
+    monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", True)
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+
+    with pytest.raises(ValueError, match=r"OS template|Unknown OS"):
+        await orch.create_vm(
+            VMCreateRequest(duration_days=1, os="openbsd-7.8", ssh_pubkey="ssh-ed25519 AAAA t"),
+            owner_wallet="0xWALLET",
+        )
+
+    async with session_factory() as session:
+        count = (await session.execute(select(func.count()).select_from(VMRow))).scalar_one()
+    assert count == 0

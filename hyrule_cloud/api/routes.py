@@ -1262,11 +1262,10 @@ async def create_crypto_intent(
     if asset not in ("BTC", "XMR"):
         raise HTTPException(400, "Unsupported asset. Use BTC or XMR.")
 
-    if body.order_payload.domain_mode.value == "custom" and not body.order_payload.domain:
-        raise HTTPException(400, "domain required when domain_mode=custom")
-    for port in body.order_payload.open_ports:
-        if port in cfg.blocked_ports:
-            raise HTTPException(400, f"Port {port} is blocked by policy")
+    # Same validation as the x402 create path — including the real-mode OS
+    # support check, so an unsupported order is rejected BEFORE a deposit
+    # address is handed out, not after the customer's crypto settles.
+    _validate_vm_order(body.order_payload, cfg)
 
     await _enforce_paid_vm_cap(orch, cfg)
     total, _ = await _compute_vm_price(orch, cfg, body.order_payload)
