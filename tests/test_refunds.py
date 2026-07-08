@@ -8,6 +8,7 @@ than left as an empty "will be refunded" promise.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -16,8 +17,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import Base, PaymentEventRow, VMRow
-from hyrule_cloud.models import VMSize, VMStatus
+from hyrule_cloud.db import Base, CryptoIntentRow, PaymentEventRow, VMRow
+from hyrule_cloud.models import CryptoIntentStatus, VMSize, VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
@@ -177,10 +178,11 @@ async def test_failed_paid_vm_refunds_from_settled_ledger(session_factory, monke
 
 
 @pytest.mark.asyncio
-async def test_failed_native_intent_vm_records_no_evm_refund(session_factory, monkeypatch) -> None:
-    """A native BTC/XMR intent carries a deposit address (not a refund dest) and
-    settles off the x402 ledger, so no EVM refund_owed is recorded here — its
-    REFUND_MANUAL intent path handles the return."""
+async def test_failed_native_intent_vm_records_manual_refund(session_factory, monkeypatch) -> None:
+    """A native BTC/XMR intent VM that fails AFTER being marked PROVISIONED must
+    flip its intent to REFUND_MANUAL and record the owed refund (network=native,
+    asset+amount from the intent). The x402 skip must not silently drop the debt
+    of a paying native customer."""
     monkeypatch.setattr(
         "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
     )
@@ -189,6 +191,19 @@ async def test_failed_native_intent_vm_records_no_evm_refund(session_factory, mo
         session.add(
             _paid_provisioning_vm("vm_native", wallet=NATIVE_DEPOSIT_ADDR, tx="btc-txid-abc", cost="0.05")
         )
+        session.add(
+            CryptoIntentRow(
+                intent_id="int_native1",
+                asset="BTC",
+                amount_crypto=Decimal("0.0001"),
+                amount_usd=Decimal("0.05"),
+                address=NATIVE_DEPOSIT_ADDR,
+                status=CryptoIntentStatus.PROVISIONED,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                vm_id="vm_native",
+                tx_hash="btc-txid-abc",
+            )
+        )
         await session.commit()
 
     await orch._provision_vm("vm_native")
@@ -196,7 +211,14 @@ async def test_failed_native_intent_vm_records_no_evm_refund(session_factory, mo
     async with session_factory() as session:
         row = await session.get(VMRow, "vm_native")
         assert row.status == VMStatus.FAILED
-    assert [e for e in await _events(session_factory) if e.event_type == "refund_owed"] == []
+        intent = await session.get(CryptoIntentRow, "int_native1")
+        assert intent.status == CryptoIntentStatus.REFUND_MANUAL
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1
+    assert owed[0].network == "native"
+    assert owed[0].asset == "BTC"
+    assert owed[0].amount_usd == Decimal("0.05")
+    assert owed[0].payer_wallet == NATIVE_DEPOSIT_ADDR
 
 
 @pytest.mark.asyncio

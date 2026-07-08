@@ -19,10 +19,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import DomainRow, PaymentEventRow, VMQuoteRow, VMRow
+from hyrule_cloud.db import CryptoIntentRow, DomainRow, PaymentEventRow, VMQuoteRow, VMRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
+    CryptoIntentStatus,
     DomainMode,
     DomainStatus,
     SSHSmokeStatus,
@@ -472,8 +473,8 @@ class Orchestrator:
 
         Prefer the settled x402 ledger row (authoritative amount + network +
         asset). A native BTC/XMR intent has no such row and carries a deposit
-        address, not a refund destination, so it is left to the intent
-        REFUND_MANUAL path rather than recorded as an EVM refund here.
+        address, not an EVM refund destination, so it's recorded through the
+        intent's REFUND_MANUAL path instead — never dropped.
         """
         if settled is not None:
             await self.refunds.record_owed(
@@ -499,9 +500,47 @@ class Orchestrator:
                 vm_id=vm_id,
             )
             return
-        # Free subdomain VM, or a native-intent deposit address handled by the
-        # intent refund path — nothing to record here.
+        # No x402 charge and a non-EVM owner: a native BTC/XMR intent whose VM
+        # failed after it was already marked PROVISIONED. Flip it to
+        # REFUND_MANUAL and record the debt (native refunds are sent by the
+        # operator, not auto-EVM) so a paid customer is never silently dropped.
+        if await self._record_native_refund(vm_id, reason=reason):
+            return
+        # Free subdomain VM (nothing charged) with no linked intent.
         log.info("vm_refund_not_recorded_here", vm_id=vm_id, owner_wallet=owner_wallet or None)
+
+    async def _record_native_refund(self, vm_id: str, *, reason: str) -> bool:
+        """Transition a failed native-intent VM's intent to REFUND_MANUAL and
+        record the owed refund. Returns False when no native intent is linked to
+        this VM (e.g. a free subdomain VM)."""
+        async with self.db() as session:
+            intent = (
+                await session.execute(
+                    select(CryptoIntentRow).where(CryptoIntentRow.vm_id == vm_id).limit(1)
+                )
+            ).scalar_one_or_none()
+            if intent is None:
+                return False
+            intent.status = CryptoIntentStatus.REFUND_MANUAL
+            asset = intent.asset
+            amount = intent.amount_usd
+            deposit_address = intent.address
+            intent_tx = intent.tx_hash
+            await session.commit()
+        log.warning("native_intent_refund_manual", vm_id=vm_id, asset=asset, reason=reason)
+        # payer is the deposit address — an identifier for the operator's manual
+        # native refund, not an auto-send destination (network="native").
+        await self.refunds.record_owed(
+            resource_path="/v1/vm/create",
+            payer=deposit_address,
+            amount=amount,
+            network="native",
+            asset=asset,
+            original_tx=intent_tx,
+            reason=reason,
+            vm_id=vm_id,
+        )
+        return True
 
     async def _simulate_provisioning(self, vm_id: str) -> None:
         """Controlled simulation of provisioning (issue #28).
