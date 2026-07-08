@@ -1,3 +1,8 @@
+---
+name: hyrule-mail
+description: NOT YET LAUNCHED. The mail backend is under construction: every paid /v1/mail endpoint currently returns HTTP 501 without charging. Do not publish this skill or point agents at it until the product ships.
+---
+
 # Hyrule Agent Mail Skill
 
 > **NOT YET LAUNCHED.** The mail backend is under construction: every paid

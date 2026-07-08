@@ -108,10 +108,16 @@ def build_launch_proof(
         launch_status = LaunchProofStatus.PROVISIONING
 
     # --- DNS AAAA verification ---
-    dns_aaaa_verified = bool(
-        lp_meta.get("dns_aaaa_verified", False)
-        or (_safe_getattr(vm_row, "ipv6", None) and _safe_getattr(vm_row, "hostname", None))
-    )
+    # An explicit measured value (real provisioning writes one) is
+    # authoritative either way; only infer from ipv6+hostname when no
+    # measurement was recorded, so a failed authoritative check is never
+    # papered over by the inference.
+    if "dns_aaaa_verified" in lp_meta:
+        dns_aaaa_verified = bool(lp_meta["dns_aaaa_verified"])
+    else:
+        dns_aaaa_verified = bool(
+            _safe_getattr(vm_row, "ipv6", None) and _safe_getattr(vm_row, "hostname", None)
+        )
 
     # --- SSH smoke test ---
     ssh_smoke: SSHSmokeStatus

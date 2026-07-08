@@ -94,7 +94,8 @@ hyrule_cloud/
     cloudinit.py         cloud-config YAML renderer
     dns.py               RFC 2136 dynamic DNS via nsupdate
     openprovider.py      Domain registration + DNS zone management REST client
-SKILL.md                 OpenClaw skill definition (agent-readable API reference)
+skills/<slug>/SKILL.md   OpenClaw skills (agent-readable API references), one dir per
+                         ClawHub slug; skills/README.md documents publishing
 alembic/
   env.py                 Async migration env for Postgres
   versions/

@@ -108,6 +108,38 @@ class DNSProvider(Provider):
         ])
         log.info("dns_aaaa_created", fqdn=fqdn, ipv6=ipv6_address)
 
+    async def verify_aaaa(self, subdomain: str, expected_ipv6: str) -> bool:
+        """Query the authoritative server directly and confirm the AAAA landed.
+
+        Launch-proof evidence (issue #28): returns False when unverifiable
+        (no server configured, query failure, wrong/missing record) — never
+        guesses.
+        """
+        if not self.server:
+            return False
+        from ipaddress import IPv6Address
+
+        fqdn = self._absolute_name(f"{subdomain}.{self.zone}")
+        try:
+            expected = IPv6Address(expected_ipv6)
+            loop = asyncio.get_running_loop()
+            q = dns.message.make_query(fqdn, dns.rdatatype.AAAA)
+            response = await loop.run_in_executor(
+                None, partial(dns.query.udp, q, self.server, timeout=5)
+            )
+            if response.rcode() != dns.rcode.NOERROR:
+                return False
+            for rrset in response.answer:
+                if rrset.rdtype != dns.rdatatype.AAAA:
+                    continue
+                for rdata in rrset:
+                    if IPv6Address(str(rdata.address)) == expected:
+                        return True
+            return False
+        except Exception:
+            log.warning("dns_aaaa_verify_failed", fqdn=fqdn, exc_info=True)
+            return False
+
     async def delete_aaaa(self, subdomain: str) -> None:
         """Remove AAAA record for a subdomain."""
         fqdn = f"{subdomain}.{self.zone}"

@@ -6,6 +6,7 @@ provisioned) and the failed → safe-message path.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock
@@ -371,3 +372,67 @@ def test_guard_passes_in_real_mode_without_bypass(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", True)
     launch_proof.enforce_real_provisioning_guard(_guard_config(require=True))
+
+
+# --- Real-mode launch-proof evidence helpers (Phase 3d) ---
+
+
+@pytest.mark.asyncio
+async def test_probe_ssh_detects_listening_port() -> None:
+    from hyrule_cloud.orchestrator import Orchestrator
+
+    async def _handle(reader, writer):
+        writer.close()
+
+    server = await asyncio.start_server(_handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        ok = await Orchestrator._probe_ssh(
+            object(), "127.0.0.1", timeout_seconds=5, interval_seconds=1, port=port
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_probe_ssh_fails_closed_when_unreachable() -> None:
+    from hyrule_cloud.orchestrator import Orchestrator
+
+    # Port 1 on localhost: connection refused immediately, loop must give up.
+    ok = await Orchestrator._probe_ssh(
+        object(), "127.0.0.1", timeout_seconds=2, interval_seconds=1, port=1
+    )
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_verify_aaaa_fails_closed_without_dns_server() -> None:
+    from hyrule_cloud.config import HyruleConfig
+    from hyrule_cloud.providers.dns import DNSProvider
+
+    provider = DNSProvider(HyruleConfig(dns_server="", dns_tsig_key="dGVzdA=="))
+    assert await provider.verify_aaaa("vm123", "2a0c:b641:b51::2") is False
+
+
+def test_explicit_dns_verification_failure_is_not_papered_over() -> None:
+    """A measured dns_aaaa_verified=False must win over the ipv6+hostname
+    inference — otherwise a failed authoritative check reports verified."""
+    from hyrule_cloud.services.launch_proof import build_launch_proof
+
+    class _Row:
+        status = VMStatus.READY
+        ipv6 = "2a0c:b641:b51:1::2"
+        hostname = "abc.deploy.hyrule.host"
+        payment_tx = "0xSETTLED"
+        cost_total = Decimal("0.05")
+        error = None
+        metadata_ = {"launch_proof": {"dns_aaaa_verified": False, "ssh_smoke_status": "passed"}}
+
+    proof = build_launch_proof(_Row())
+    assert proof["dns_aaaa_verified"] is False
+    # Without a measurement, inference from ipv6+hostname still applies.
+    _Row.metadata_ = {}
+    proof = build_launch_proof(_Row())
+    assert proof["dns_aaaa_verified"] is True
