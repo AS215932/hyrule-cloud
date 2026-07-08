@@ -1,3 +1,8 @@
+---
+name: hyrule-agentic-support
+description: Hyrule Agentic ISP Support is the umbrella Skill for x402-paid network facts that LLMs cannot infer: live reachability, DNS, BGP, mail deliverability, routing/path evidence, TLS, reputation, VoIP, NAT hints, speedtests, and AS215932-backed …
+---
+
 # Hyrule Agentic ISP Support Skill
 
 Hyrule Agentic ISP Support is the umbrella Skill for x402-paid network facts
@@ -7,14 +12,14 @@ AS215932-backed external vantage data.
 
 ## Focused subskills
 
-- `SKILL-web-reachability.md` → `/v1/web`
-- `SKILL-mail-deliverability.md` → `/v1/mx`
-- `SKILL-dns-registry.md` → `/v1/dns`, `/v1/rdap`, `/v1/whois`
-- `SKILL-routing-path.md` → `/v1/path`, `/v1/bgp`
-- `SKILL-port-reachability.md` → `/v1/ports`
-- `SKILL-nat-cgnat.md` → `/v1/nat`
-- `SKILL-threat-reputation.md` → `/v1/threat`
-- `SKILL-voip-sip.md` → `/v1/voip`
+- `hyrule-web-reachability` → `/v1/web`
+- `hyrule-mail-deliverability` → `/v1/mx`
+- `hyrule-dns-registry` → `/v1/dns`, `/v1/rdap`, `/v1/whois`
+- `hyrule-routing-path` → `/v1/path`, `/v1/bgp`
+- `hyrule-port-reachability` → `/v1/ports`
+- `hyrule-nat-cgnat` → `/v1/nat`
+- `hyrule-threat-reputation` → `/v1/threat`
+- `hyrule-voip-sip` → `/v1/voip`
 
 ## Typical ISP support flow
 

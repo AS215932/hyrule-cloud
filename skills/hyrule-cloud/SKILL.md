@@ -1,3 +1,8 @@
+---
+name: hyrule-cloud
+description: Deploy bare VMs, register domains, and manage DNS zones — all paid via x402 (USDC on Base).
+---
+
 # Hyrule Cloud — Agentic VPS Hosting
 
 Deploy bare VMs, register domains, and manage DNS zones — all paid via x402 (USDC on Base).
