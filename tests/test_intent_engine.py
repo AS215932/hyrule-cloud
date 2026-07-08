@@ -151,11 +151,17 @@ def _vm_create_request():
 
 
 @pytest_asyncio.fixture
-async def intent_state():
-    """In-process SQLite + stub providers wired into AppState."""
+async def intent_state(tmp_path):
+    """In-process SQLite + stub providers wired into AppState.
+
+    File-backed rather than :memory:: the aiosqlite :memory: dialect shares a
+    single connection (StaticPool), so the concurrent-poll tests randomly hit
+    "cannot commit transaction - SQL statements in progress". A file DB gives
+    each session its own connection, like the production Postgres pool.
+    """
     from hyrule_cloud.state import AppState
 
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/intents.db")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
