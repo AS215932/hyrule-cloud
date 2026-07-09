@@ -110,6 +110,31 @@ async def _domain_registration_guard(fqdn: str, client_order_id: str | None):
             lock.release()
 
 
+# In-flight x402 payment authorizations for the proxy route. verify_only defers
+# settlement until after the fetch, so two concurrent requests could reuse the
+# same authorization and both hit the sidecar (duplicate work + POST side
+# effects) before either settles. Reject the second while the first is in
+# flight. In-process (one uvicorn worker) — cross-worker reuse still fails at
+# settle, where only one submission of an authorization can succeed.
+_proxy_inflight_auth: set[str] = set()
+
+
+@asynccontextmanager
+async def _proxy_authorization_guard(request: Request):
+    key = request.headers.get("payment-signature") or request.headers.get("x-payment")
+    if not key:
+        # No payment authorization to double-spend (dev bypass / unpaid probe).
+        yield
+        return
+    if key in _proxy_inflight_auth:
+        raise HTTPException(409, "payment authorization already in flight")
+    _proxy_inflight_auth.add(key)
+    try:
+        yield
+    finally:
+        _proxy_inflight_auth.discard(key)
+
+
 def get_orch(app_state: AppState = Depends(get_app_state)):
     return app_state.orchestrator
 
@@ -835,30 +860,116 @@ async def create_vm(
                 return _vm_create_response(existing_vm, request, management_token=None)
         raise HTTPException(409, "Quote is being provisioned; poll the VM status")
 
-    if reservation_row is not None:
-        activated = await orch.activate_vm_reservation(
-            reservation_row.vm_id,
-            owner_wallet=wallet,
-            payment_tx=getattr(request.state, "payment_tx", None),
-        )
-        if activated is not None:
-            row, management_token = activated, reservation_token
+    # Defer provisioning until the quote is linked below: a fast provisioning
+    # failure must be able to find the locked quote amount to refund accurately
+    # (get_quote_for_vm races link_quote_vm otherwise).
+    #
+    # This whole block runs after x402 has settled but before the background
+    # provisioner (which owns the normal refund path) is scheduled, so any
+    # failure here is wrapped to guarantee a refund record — a paid create must
+    # never be dropped.
+    row: VMRow | None = None
+    management_token: str | None = None
+    try:
+        if reservation_row is not None:
+            activated = await orch.activate_vm_reservation(
+                reservation_row.vm_id,
+                owner_wallet=wallet,
+                payment_tx=getattr(request.state, "payment_tx", None),
+                start_provisioning=False,
+            )
+            if activated is not None:
+                row, management_token = activated, reservation_token
+            else:
+                # Reservation vanished (e.g. sweeper raced an extremely slow
+                # payment) — fall back to allocate-after-payment.
+                row, management_token = await orch.create_vm(
+                    order, owner_wallet=wallet,
+                    owner_account_id=account.account_id if account else None,
+                    start_provisioning=False,
+                )
+                row.payment_tx = getattr(request.state, "payment_tx", None)
         else:
-            # Reservation vanished (e.g. sweeper raced an extremely slow
-            # payment) — fall back to allocate-after-payment.
             row, management_token = await orch.create_vm(
                 order, owner_wallet=wallet,
                 owner_account_id=account.account_id if account else None,
+                start_provisioning=False,
             )
             row.payment_tx = getattr(request.state, "payment_tx", None)
-    else:
-        row, management_token = await orch.create_vm(
-            order, owner_wallet=wallet,
-            owner_account_id=account.account_id if account else None,
+        if quote_row is not None:
+            # Persist the locked charged amount first so a later refund is
+            # accurate even if the quote link below fails.
+            await orch.persist_charged_amount(row.vm_id, quote_row.amount_usd)
+            # The consumed-quote replay path can only rediscover this paid VM
+            # once the quote carries its vm_id, so retry a transient link failure
+            # before giving up rather than leaving the quote consumed-but-unlinked.
+            linked = False
+            for attempt in range(3):
+                try:
+                    await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
+                    linked = True
+                    break
+                except Exception:
+                    log.warning(
+                        "quote_link_attempt_failed",
+                        vm_id=row.vm_id,
+                        quote_id=quote_row.quote_id,
+                        attempt=attempt,
+                        exc_info=True,
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+            if not linked:
+                # Payment already settled and the VM exists — a persistent link
+                # failure must not strand it. Provisioning still starts and this
+                # response carries the vm_id + management URL; only a client that
+                # ALSO loses this response can't rediscover it by quote. Log
+                # loudly for the operator; failing/refunding a working paid VM
+                # over a link write would be worse.
+                log.error(
+                    "quote_link_failed_post_charge",
+                    vm_id=row.vm_id,
+                    quote_id=quote_row.quote_id,
+                )
+        # Always start provisioning so a paid create is never left in
+        # PROVISIONING with no background task and no refund path.
+        orch.start_provisioning(row.vm_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Post-charge, pre-provision failure: no background task exists to record
+        # the refund, so record it here before surfacing the error.
+        failed_vm_id = getattr(row, "vm_id", None)
+        log.error(
+            "vm_create_post_charge_failed",
+            vm_id=failed_vm_id,
+            error=str(exc),
+            exc_info=True,
         )
-        row.payment_tx = getattr(request.state, "payment_tx", None)
-    if quote_row is not None:
-        await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
+        await orch.record_create_failure_refund(
+            owner_wallet=wallet,
+            payment_tx=getattr(request.state, "payment_tx", None),
+            # `total` is what was charged: the locked quote amount, or the
+            # computed price for a legacy/unquoted create. Never None, so an
+            # unquoted create whose settled ledger row was lost still refunds.
+            charged_amount=total,
+            reason=f"vm_create_failed: {exc}",
+            vm_id=failed_vm_id,
+        )
+        if failed_vm_id is not None:
+            # A row was inserted/activated but the background provisioner was
+            # never scheduled — fail it terminally so it doesn't sit in
+            # PROVISIONING pinning its customer /64 (the sweeper won't reclaim a
+            # row with an owner_wallet).
+            await orch.mark_vm_failed(failed_vm_id, f"create failed post-charge: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail="Provisioning failed after payment; a refund has been recorded and will be processed.",
+        )
+
+    # The except above re-raises on any failure, so a fall-through here means the
+    # VM row was created and provisioning was scheduled.
+    assert row is not None
 
     # Block A0: status_url is the public sanitized view; management_url embeds
     # the one-time anon token. The UI must surface management_url prominently
@@ -1292,26 +1403,68 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
         reason = mode_status.reason or "network proxy mode unavailable"
         raise HTTPException(503, f"Proxy mode {body.proxy_mode.value} unavailable: {reason}")
 
-    result = await gate.check_payment(
-        request,
-        amount=amount,
-        description=f"Network Proxy Request ({body.proxy_mode.value}) to {body.url}",
-        extra_body={
-            "url": body.url,
-            "proxy_mode": body.proxy_mode.value,
-        }
-    )
+    description = f"Network Proxy Request ({body.proxy_mode.value}) to {body.url}"
+    extra_body = {"url": body.url, "proxy_mode": body.proxy_mode.value}
+    # GET/HEAD are idempotent and side-effect-free; anything else (POST) mutates
+    # remote state when forwarded.
+    is_idempotent = body.method.upper() in ("GET", "HEAD")
 
-    if isinstance(result, Response):
-        return result
+    # The guard stops a second concurrent request from reusing the same
+    # authorization to drive a duplicate fetch before this one settles.
+    async with _proxy_authorization_guard(request):
+        if not is_idempotent:
+            # Non-idempotent (POST): forwarding it mutates remote state, so the
+            # payment must be FINAL before we send it — never execute an
+            # upstream side effect against an authorization that then fails to
+            # settle (a concurrent replay, a slow-fetch allowance change, a
+            # settle-time facilitator error). But settle only AFTER local
+            # validation, so a rejected request (bad method, invalid URL,
+            # SSRF-blocked host) is never charged. Validate -> settle -> forward.
+            validation_error = await provider.validate_request(body)
+            if validation_error is not None:
+                if validation_error.status_code in (400, 403):
+                    raise HTTPException(validation_error.status_code, validation_error.error)
+                raise HTTPException(502, validation_error.error or "network proxy request failed")
+            payment = await gate.check_payment(request, amount, description, extra_body)
+            if isinstance(payment, Response):
+                return payment
+            resp = await provider.execute_request(body)
+            if resp.error is not None:
+                if resp.status_code in (400, 403):
+                    raise HTTPException(resp.status_code, resp.error)
+                raise HTTPException(502, resp.error or "network proxy request failed")
+            return resp
 
-    # payment valid, proceed
-    resp = await provider.execute_request(body)
-    
-    if resp.error and resp.status_code in [400, 403]:
-        raise HTTPException(resp.status_code, resp.error)
-        
-    return resp
+        # Idempotent (GET/HEAD): verify the payment but DON'T settle yet — an
+        # agent must not be charged for a fetch we then fail to deliver (a dead
+        # tor circuit, a gateway timeout). Re-sending it is safe, so we settle
+        # only after the sidecar returns the caller's answer.
+        verified = await gate.verify_only(
+            request,
+            amount=amount,
+            description=description,
+            extra_body=extra_body,
+        )
+
+        if isinstance(verified, Response):
+            return verified
+
+        resp = await provider.execute_request(body)
+
+        if resp.error is not None:
+            # Not delivered — never charge. A validation rejection is the
+            # caller's mistake (400/403); anything else is our proxy/gateway.
+            if resp.status_code in (400, 403):
+                raise HTTPException(resp.status_code, resp.error)
+            raise HTTPException(502, resp.error or "network proxy request failed")
+
+        # Delivered the caller's answer (even a target 4xx/5xx is a real
+        # result): settle now. If settlement is declined — a reused/invalid
+        # authorization — withhold the paid response rather than hand it over
+        # for free; the failed-settlement headers are already attached.
+        if not await gate.settle_verified(request, verified):
+            raise HTTPException(402, "payment settlement failed")
+        return resp
 from hyrule_cloud.db import CryptoIntentRow
 from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
 from hyrule_cloud.services.intents import (

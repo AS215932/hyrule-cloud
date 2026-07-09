@@ -20,7 +20,11 @@ from hyrule_cloud.models import (
     VoIPCheckRequest,
     VoIPNumberLookupRequest,
 )
-from hyrule_cloud.services.diagnostics.sources import source_not_configured, source_ok
+from hyrule_cloud.services.diagnostics.sources import (
+    source_not_configured,
+    source_ok,
+    source_usable,
+)
 from hyrule_cloud.services.dns.lookup import lookup
 from hyrule_cloud.services.safety import assert_safe_active_probe_target, normalize_host
 
@@ -35,6 +39,34 @@ def voip_sources() -> dict[str, SourceHealth]:
     }
     sources.update({provider: source_not_configured("number intelligence provider API key is not configured") for provider in _NUMBER_PROVIDERS})
     return sources
+
+
+def number_intel_enabled() -> bool:
+    """Whether a real number-intelligence provider is configured.
+
+    voip_number_lookup returns only a contract stub until a carrier/CNAM/spam
+    provider is wired up, so the route returns 501 before charging rather than
+    billing for a disabled-adapter notice. (voip_check does real SIP DNS/TLS
+    work and is unaffected.)
+    """
+    sources = voip_sources()
+    return any(source_usable(sources[provider]) for provider in _NUMBER_PROVIDERS)
+
+
+# Checks in voip_check that execute a real probe. SIP_OPTIONS and STUN_TURN only
+# emit contract findings (no active prober/relay configured in the server-only
+# MVP), so a request limited to those returns no live data.
+_LIVE_VOIP_CHECKS = frozenset({VoIPCheck.SIP_DNS, VoIPCheck.SIP_TLS})
+
+
+def voip_check_has_live_backend(checks: list[VoIPCheck]) -> bool:
+    """Whether the requested checks include at least one that runs real work.
+
+    A voip_check request that only asks for SIP_OPTIONS/STUN_TURN gets nothing
+    but contract findings, so the route must 501 before charging rather than
+    bill for a non-answer — mirroring the number-lookup and path gates.
+    """
+    return any(check in _LIVE_VOIP_CHECKS for check in checks)
 
 
 async def voip_check(body: VoIPCheckRequest) -> DiagnosticResponse:

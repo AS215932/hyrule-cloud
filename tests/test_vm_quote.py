@@ -57,12 +57,24 @@ class _StubOrchestrator:
     def __init__(self, session_factory: async_sessionmaker) -> None:
         self.db = session_factory
         self.created_vms: list[str] = []
+        self.provisioning_started: list[str] = []
+        self.charged_amounts: dict[str, Decimal] = {}
+        self.create_failure_refunds: list[tuple[str | None, str | None]] = []
 
     def compute_price(self, request):
         total = Decimal("0.05") * request.duration_days
         return total, CostBreakdown(vm_cost=f"${total}", domain_cost="$0.00", total=f"${total}")
 
-    async def create_vm(self, request, owner_wallet: str, owner_account_id: str | None = None):
+    def start_provisioning(self, vm_id: str) -> None:
+        self.provisioning_started.append(vm_id)
+
+    async def create_vm(
+        self,
+        request,
+        owner_wallet: str,
+        owner_account_id: str | None = None,
+        start_provisioning: bool = True,
+    ):
         from hyrule_cloud.middleware.anon_token import hash_anon_token
         from hyrule_cloud.models import generate_anon_management_token, generate_vm_id
 
@@ -86,6 +98,27 @@ class _StubOrchestrator:
             await session.commit()
         self.created_vms.append(vm_id)
         return row, anon_token
+
+    async def persist_charged_amount(self, vm_id: str, amount: Decimal) -> None:
+        self.charged_amounts[vm_id] = amount
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.cost_total = amount
+                await session.commit()
+
+    async def record_create_failure_refund(
+        self, *, owner_wallet, payment_tx, charged_amount, reason, vm_id=None
+    ) -> None:
+        self.create_failure_refunds.append((vm_id, payment_tx))
+
+    async def mark_vm_failed(self, vm_id: str, error: str) -> None:
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.status = VMStatus.FAILED
+                row.error = error
+                await session.commit()
 
 
 @pytest_asyncio.fixture
@@ -254,6 +287,75 @@ async def test_create_with_quote_paid_provisions_and_consumes(quote_state, clien
     row = await quotes_service.get_quote(quote_state.orchestrator.db, quote["quote_id"])
     assert QuoteStatus(row.status) == QuoteStatus.CONSUMED
     assert row.vm_id == res.json()["vm_id"]
+
+
+@pytest.mark.asyncio
+async def test_link_quote_failure_still_starts_provisioning(quote_state, client, monkeypatch):
+    """A post-charge link_quote_vm failure must NOT strand the paid VM: since
+    provisioning is now deferred until after the link, a link exception would
+    otherwise leave the VM in PROVISIONING with no background task and no refund
+    path. The create still succeeds and provisioning is started."""
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("transient DB error while linking quote")
+
+    monkeypatch.setattr("hyrule_cloud.api.routes.link_quote_vm", _boom)
+
+    res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+    assert res.status_code == 200, res.text
+    vm_id = res.json()["vm_id"]
+    assert vm_id in quote_state.orchestrator.provisioning_started
+
+
+@pytest.mark.asyncio
+async def test_post_charge_failure_records_refund_and_fails_row(quote_state, client, monkeypatch):
+    """A post-charge failure before the background provisioner is scheduled (here
+    start_provisioning raises) must (a) record a refund and (b) terminally fail
+    the VM row so it doesn't sit in PROVISIONING pinning its customer /64."""
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+
+    def _boom(vm_id):
+        raise RuntimeError("scheduler down")
+
+    monkeypatch.setattr(quote_state.orchestrator, "start_provisioning", _boom)
+
+    res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+    assert res.status_code == 500
+    # A refund was recorded for the charged-but-failed create.
+    assert quote_state.orchestrator.create_failure_refunds
+    # The half-created row is terminally FAILED, not stranded in PROVISIONING.
+    vm_id = quote_state.orchestrator.created_vms[-1]
+    async with quote_state.orchestrator.db() as session:
+        row = await session.get(VMRow, vm_id)
+    assert row.status == VMStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_link_quote_retries_then_succeeds(quote_state, client, monkeypatch):
+    """A transient link failure is retried; once it succeeds the quote carries
+    its vm_id so the paid VM stays rediscoverable via the consumed quote."""
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+
+    calls = {"n": 0}
+    real_link = quotes_service.link_quote_vm
+
+    async def _flaky(db, quote_id, vm_id):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise RuntimeError("transient DB error while linking quote")
+        await real_link(db, quote_id, vm_id)
+
+    monkeypatch.setattr("hyrule_cloud.api.routes.link_quote_vm", _flaky)
+
+    res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+    assert res.status_code == 200, res.text
+    assert calls["n"] == 2  # failed once, retried, succeeded
+    row = await quotes_service.get_quote(quote_state.orchestrator.db, quote["quote_id"])
+    assert row.vm_id == res.json()["vm_id"]  # linked on retry — rediscoverable
 
 
 @pytest.mark.asyncio

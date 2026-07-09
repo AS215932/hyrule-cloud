@@ -724,11 +724,25 @@ class PathReportCheck(enum.StrEnum):
     ROUTER_TABLE = "router_table"
 
 
+# Each path endpoint's default vantage set, hoisted to a module constant so the
+# manifest/capabilities/discovery gates can reference the SAME defaults without
+# calling FieldInfo.default_factory (mypy strict types it as possibly-None /
+# wrong-arity). These stay the single source of truth for the field defaults.
+PATH_PROBE_DEFAULT_VANTAGES: list[DiagnosticVantage] = [DiagnosticVantage.EXTMON]
+PATH_REPORT_DEFAULT_VANTAGES: list[DiagnosticVantage] = [
+    DiagnosticVantage.EXTMON,
+    DiagnosticVantage.AS215932,
+    DiagnosticVantage.GLOBALPING,
+]
+
+
 class PathProbeRequest(BaseModel):
     target: str = Field(min_length=1, max_length=2048)
     probe: PathProbeKind = PathProbeKind.PING
     address_family: DiagnosticAddressFamily = DiagnosticAddressFamily.AUTO
-    vantages: list[DiagnosticVantage] = Field(default_factory=lambda: [DiagnosticVantage.EXTMON])
+    vantages: list[DiagnosticVantage] = Field(
+        default_factory=lambda: list(PATH_PROBE_DEFAULT_VANTAGES)
+    )
     count: int = Field(default=4, ge=1, le=20)
     timeout_ms: int = Field(default=10000, ge=500, le=60000)
 
@@ -736,7 +750,9 @@ class PathProbeRequest(BaseModel):
 class PathReportRequest(BaseModel):
     target: str = Field(min_length=1, max_length=2048)
     address_family: DiagnosticAddressFamily = DiagnosticAddressFamily.AUTO
-    vantages: list[DiagnosticVantage] = Field(default_factory=lambda: [DiagnosticVantage.EXTMON, DiagnosticVantage.AS215932, DiagnosticVantage.GLOBALPING])
+    vantages: list[DiagnosticVantage] = Field(
+        default_factory=lambda: list(PATH_REPORT_DEFAULT_VANTAGES)
+    )
     checks: list[PathReportCheck] = Field(default_factory=lambda: [PathReportCheck.PING, PathReportCheck.TRACEROUTE, PathReportCheck.MTR, PathReportCheck.BGP, PathReportCheck.RPKI, PathReportCheck.ROUTER_TABLE])
     max_duration_seconds: int = Field(default=60, ge=5, le=300)
     include_raw: bool = False

@@ -340,13 +340,22 @@ async def _trigger_provisioning(
         if row is None or row.order_payload is None:
             return
 
-    # Provision the VM. The wallet address is the deposit address (informational).
+    # Provision the VM. owner_wallet carries the bounded intent_id, NOT the
+    # deposit address: XMR subaddresses (~95 chars) overflow VMRow.owner_wallet
+    # (String(64)) and the insert would fail before the intent is linked or any
+    # refund could be recorded. The refund path finds the intent by vm_id and
+    # reads the real deposit address from it.
+    vm_row = None
     try:
         order = VMCreateRequest.model_validate(row.order_payload)
+        # Create the VM row but DON'T start provisioning yet: link the intent to
+        # the vm_id first, so a fast provisioning failure (immediate XO/API
+        # error) can always find the paying intent and record its refund.
         vm_row, anon_token = await orch.create_vm(
             order,
-            owner_wallet=row.address,
+            owner_wallet=row.intent_id,
             owner_account_id=row.owner_account_id,
+            start_provisioning=False,
         )
         async with session_factory() as db:
             r = await db.get(CryptoIntentRow, intent_id)
@@ -358,16 +367,35 @@ async def _trigger_provisioning(
             # this cleartext and immediately nulls the column. Sha256 is on VMRow.
             r.anon_token_cleartext = anon_token
             await db.commit()
+        # The intent↔vm link is committed; now it is safe to provision.
+        orch.start_provisioning(vm_row.vm_id)
         log.info("intent_provisioned", intent_id=intent_id, vm_id=vm_row.vm_id)
     except Exception:
         log.exception("intent_provisioning_failed", intent_id=intent_id)
-        async with session_factory() as db:
-            await db.execute(
-                update(CryptoIntentRow)
-                .where(CryptoIntentRow.intent_id == intent_id)
-                .values(status=CryptoIntentStatus.FAILED)
+        # Funds are already SETTLED. If create_vm raised before a vm_id was
+        # linked (capacity exhausted, DB insert failure, unsupported old order),
+        # _provision_vm never runs, so record the refund obligation here — a paid
+        # native customer must never be left without a refund_owed row. Fall back
+        # to marking the intent FAILED only if recording the refund itself errors.
+        try:
+            await orch.record_native_intent_refund(intent_id, reason="provisioning_failed")
+        except Exception:
+            log.exception("native_refund_record_failed", intent_id=intent_id)
+            async with session_factory() as db:
+                await db.execute(
+                    update(CryptoIntentRow)
+                    .where(CryptoIntentRow.intent_id == intent_id)
+                    .values(status=CryptoIntentStatus.FAILED)
+                )
+                await db.commit()
+        if vm_row is not None:
+            # create_vm inserted a row but a later step failed before the
+            # background provisioner was scheduled; fail it terminally so it
+            # doesn't sit in PROVISIONING (owner_wallet=intent_id) pinning a /64
+            # the sweeper (unpaid rows only) won't reclaim.
+            await orch.mark_vm_failed(
+                vm_row.vm_id, "native provisioning failed post-settlement"
             )
-            await db.commit()
 
 
 async def scan_pending_intents(

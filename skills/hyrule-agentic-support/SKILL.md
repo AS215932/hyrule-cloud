@@ -1,9 +1,14 @@
 ---
 name: hyrule-agentic-support
-description: "Hyrule Agentic ISP Support is the umbrella Skill for x402-paid network facts that LLMs cannot infer: live reachability, DNS, BGP, mail deliverability, routing/path evidence, TLS, reputation, VoIP, NAT hints, speedtests, and AS215932-backed \u2026"
+description: "NOT YET LAUNCHED. Umbrella skill that cross-references not-yet-launched flows (/v1/path/report and /v1/threat/lookup) which return HTTP 501; do not publish until those subskills ship. Hyrule Agentic ISP Support covers x402-paid network facts that LLMs cannot infer: live reachability, DNS, BGP, mail deliverability, routing/path evidence, TLS, reputation, VoIP, NAT hints, and AS215932-backed vantage data."
 ---
 
 # Hyrule Agentic ISP Support Skill
+
+> **NOT YET LAUNCHED.** This umbrella cross-references flows that are still
+> gated: `/v1/path/report` and `/v1/threat/lookup` return HTTP 501 until their
+> backends ship. Do not publish this skill until those subskills launch, so it
+> never points agents at a 501 route.
 
 Hyrule Agentic ISP Support is the umbrella Skill for x402-paid network facts
 that LLMs cannot infer: live reachability, DNS, BGP, mail deliverability,
