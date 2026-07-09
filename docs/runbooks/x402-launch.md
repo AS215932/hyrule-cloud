@@ -15,6 +15,37 @@ Production state at time of writing (2026-07-08):
 - No live paid canary has ever run — the 2026-07-01 validation stopped at
   dry-run
 
+## Provisioning-mode flags — read before deploying
+
+Two Vault-kv values control the VM service, and **both default to `1` in the
+env template**, so a plain deploy comes up in **real provisioning mode**:
+
+| Vault kv (`kv/hyrule-cloud`)    | env var                          | controls |
+|---------------------------------|----------------------------------|----------|
+| `hcp_launch_proof_real_xcpng`   | `HCP_LAUNCH_PROOF_REAL_XCPNG`    | real XCP-NG provisioning vs. simulation (`use_real_provisioning()`) |
+| `require_real_provisioning`     | `HYRULE_REQUIRE_REAL_PROVISIONING` | boot tripwire: refuse to start if real mode is claimed but not actually on |
+
+Intended posture per phase:
+
+- **Phases 1–3c (staging VMs for last):** `hcp_launch_proof_real_xcpng=0` **and**
+  `require_real_provisioning=0`. Simulation boots, and the app's route-level
+  sim-gate returns **503** for `/v1/vm/create|quote|extend` and `/v1/intent/create`
+  and drops `/v1/vm/create` from `/.well-known/x402.json` — so VMs cannot be
+  charged for while the intel/proxy/domain services go live first.
+- **Phase 3d onward (VMs live):** both `=1`. Real mode with the tripwire on; the
+  app **refuses to boot** if they disagree (real claimed but XCP-NG off, or a
+  dev bypass is set).
+
+**Do not set only one flag.** Setting `require_real_provisioning=0` while leaving
+`hcp_launch_proof_real_xcpng` at its default `1` yields real mode with the
+tripwire **off** — VMs live and chargeable before the 3d gate, with no fail-fast
+if XCP-NG later drops out. (This is exactly what happened on the 2026-07-08
+deploy; the fix was `vault kv patch kv/hyrule-cloud require_real_provisioning=1`
++ restart once real XCP-NG was confirmed ready.)
+
+Flipping either flag only needs `systemctl restart hyrule-cloud` (read at import
+via the Vault-rendered `.env`) — no Ansible run.
+
 ---
 
 ## Phase 1 — Deploy the stack, then switch facilitator to CDP
@@ -55,6 +86,15 @@ Production state at time of writing (2026-07-08):
    (mail/speedtest/web-reports gone, `discoverable` flags present).
 
 ### Live canary #1 — payai (first-ever real spend)
+
+`scripts/x402_canary.py` automates the 402→sign→retry→settle flow for every
+paid endpoint (a `max_amount` policy caps each call at its price +10%). Set
+`CANARY_KEY` to the funded wallet and run `python scripts/x402_canary.py dns`
+for the cheapest first spend, `intel`/`proxy` for the Phase-3 groups, or
+`vm --quote --destroy` for the 3d gate — `--quote` exercises the documented
+`POST /v1/vm/quote` → paid create flow, and the script pauses for the manual
+IPv6 SSH check before tearing the VM down. It exits non-zero if any canary
+fails, so it can gate a rollout. The raw curl below is the manual equivalent.
 
 Cheapest endpoint, $0.001:
 
@@ -108,6 +148,12 @@ One paid call each; response must contain substantive real data:
 makes no external calls; if stub-grade, pull it from the manifest +
 discovery.py and skip its skill).
 
+The `intel` sweep includes `path-report`, but the path endpoints only leave 501
+once an active-probe vantage (Globalping/RIPE Atlas) is configured; until then
+the canary reports them **SKIPPED (501)**, not failed. Configure a prober and
+re-run `python scripts/x402_canary.py path-report` to validate the paid path
+evidence before treating 3a as complete.
+
 ### 3b Network proxy
 
 1. On netproxy: `systemctl status hyrule-network-proxy`; token match between
@@ -132,7 +178,9 @@ discovery.py and skip its skill).
    `HYRULE_REQUIRE_REAL_PROVISIONING=1` (app refuses to boot otherwise),
    `HYRULE_MAX_PAID_ACTIVE_VMS=10` (soft-launch cap; raise stepwise
    10→25→… while provisioning success stays >95%).
-3. **Gate**:
+3. **Gate** (`python scripts/x402_canary.py vm --quote --destroy` automates the
+   quote→pay→poll→pause-for-SSH→destroy sequence and only reports success when
+   the launch-proof verifies and the DELETE returns 2xx):
    - `POST /v1/vm/quote` (xs, 1 day = $0.05) → pay via x402/CDP
    - poll `GET /v1/vm/{id}/status` until `launch_proof_status=provisioned`
      with `ssh_smoke_status=passed` and `dns_aaaa_verified=true` (now
