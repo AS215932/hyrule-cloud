@@ -27,6 +27,7 @@ from decimal import Decimal
 
 import structlog
 
+from hyrule_cloud.db import PaymentEventRow
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 
 log = structlog.get_logger()
@@ -98,3 +99,55 @@ class RefundService:
                 extra=event_extra,
             )
         return True
+
+    def build_owed_event(
+        self,
+        *,
+        resource_path: str,
+        payer: str | None,
+        amount: Decimal | None,
+        original_tx: str | None,
+        reason: str,
+        network: str | None = None,
+        asset: str | None = None,
+        vm_id: str | None = None,
+        extra: dict[str, object] | None = None,
+    ) -> PaymentEventRow | None:
+        """Build the ``refund_owed`` ledger row for an ATOMIC write, or None when
+        nothing is owed (unpaid/dev-bypass) or no ledger is wired.
+
+        Unlike ``record_owed`` (which persists best-effort in its own session),
+        this returns the row so the caller can add it to a session that also
+        makes another change — e.g. flipping an intent to its terminal
+        REFUND_MANUAL status — so the obligation and the terminal status commit
+        together or not at all. Emits the ``vm_refund_owed`` alert log when owed.
+        """
+        if not payer or amount is None or amount <= 0:
+            log.info("refund_not_owed_no_payment", vm_id=vm_id, reason=reason)
+            return None
+        log.warning(
+            "vm_refund_owed",
+            vm_id=vm_id,
+            payer=payer,
+            amount=str(amount),
+            network=network,
+            asset=asset,
+            original_tx=original_tx,
+            reason=reason,
+        )
+        if self._ledger is None:
+            return None
+        event_extra: dict[str, object] = {"vm_id": vm_id, "original_tx": original_tx}
+        if extra:
+            event_extra.update(extra)
+        return self._ledger.build_event(
+            event_type=REFUND_OWED_EVENT,
+            resource_path=resource_path,
+            amount=amount,
+            network=network,
+            asset=asset,
+            payer=payer,
+            tx_hash=original_tx or None,
+            error=reason,
+            extra=event_extra,
+        )

@@ -671,3 +671,70 @@ async def test_create_failure_refund_records_with_empty_tx(session_factory) -> N
     assert len(owed) == 1
     assert owed[0].amount_usd == Decimal("0.05")
     assert owed[0].payer_wallet == EVM_WALLET
+
+
+@pytest.mark.asyncio
+async def test_background_refund_records_unattributed_positive_charge(session_factory) -> None:
+    """The _provision_vm failure path: a settlement exposing neither payer nor tx
+    (owner 'unknown', empty tx) but a positive charged amount must still record a
+    refund — a positive charge is enough, not just a tx."""
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    await orch._record_vm_refund(
+        "vm_unattributed",
+        "unknown",
+        Decimal("0.05"),
+        "",  # settled but no tx string exposed
+        None,  # settled ledger row lost
+        reason="provision_failed",
+    )
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1
+    assert owed[0].amount_usd == Decimal("0.05")
+    assert owed[0].payer_wallet == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_background_refund_skips_free_and_dev_bypass(session_factory) -> None:
+    """No refund for a free VM (nothing charged) or a dev-bypass 'payment'."""
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    await orch._record_vm_refund("vm_free", "", Decimal("0"), None, None, reason="x")
+    await orch._record_vm_refund("vm_db", "unknown", Decimal("0.05"), "dev_bypass_abc", None, reason="x")
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert owed == []
+
+
+@pytest.mark.asyncio
+async def test_native_refund_is_atomic_no_partial_flip_on_ledger_failure(
+    session_factory, monkeypatch
+) -> None:
+    """The terminal REFUND_MANUAL flip and the refund_owed write are atomic: if
+    building/writing the obligation fails, the status flip must NOT persist, so
+    the intent is never left terminal-without-refund."""
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    async with session_factory() as session:
+        session.add(
+            CryptoIntentRow(
+                intent_id="int_atomic",
+                asset="BTC",
+                amount_crypto=Decimal("0.0003"),
+                amount_usd=Decimal("0.05"),
+                address="bc1qexample",
+                status=CryptoIntentStatus.PROVISIONING,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                tx_hash="btc-tx",
+            )
+        )
+        await session.commit()
+
+    def _boom(**kwargs):
+        raise RuntimeError("ledger down")
+
+    monkeypatch.setattr(orch.refunds, "build_owed_event", _boom)
+    with pytest.raises(RuntimeError):
+        await orch.record_native_intent_refund("int_atomic", reason="fail")
+
+    async with session_factory() as session:
+        intent = await session.get(CryptoIntentRow, "int_atomic")
+    assert intent.status == CryptoIntentStatus.PROVISIONING  # NOT flipped
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert owed == []

@@ -898,19 +898,38 @@ async def create_vm(
             row.payment_tx = getattr(request.state, "payment_tx", None)
         if quote_row is not None:
             # Persist the locked charged amount first so a later refund is
-            # accurate even if the best-effort quote link below fails.
+            # accurate even if the quote link below fails.
             await orch.persist_charged_amount(row.vm_id, quote_row.amount_usd)
-            try:
-                await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
-            except Exception:
-                # Payment already settled — a transient link failure must not
-                # strand the paid VM. Provisioning still starts below; the
-                # persisted cost_total keeps a later refund on the locked amount.
-                log.warning(
+            # The consumed-quote replay path can only rediscover this paid VM
+            # once the quote carries its vm_id, so retry a transient link failure
+            # before giving up rather than leaving the quote consumed-but-unlinked.
+            linked = False
+            for attempt in range(3):
+                try:
+                    await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
+                    linked = True
+                    break
+                except Exception:
+                    log.warning(
+                        "quote_link_attempt_failed",
+                        vm_id=row.vm_id,
+                        quote_id=quote_row.quote_id,
+                        attempt=attempt,
+                        exc_info=True,
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+            if not linked:
+                # Payment already settled and the VM exists — a persistent link
+                # failure must not strand it. Provisioning still starts and this
+                # response carries the vm_id + management URL; only a client that
+                # ALSO loses this response can't rediscover it by quote. Log
+                # loudly for the operator; failing/refunding a working paid VM
+                # over a link write would be worse.
+                log.error(
                     "quote_link_failed_post_charge",
                     vm_id=row.vm_id,
                     quote_id=quote_row.quote_id,
-                    exc_info=True,
                 )
         # Always start provisioning so a paid create is never left in
         # PROVISIONING with no background task and no refund path.

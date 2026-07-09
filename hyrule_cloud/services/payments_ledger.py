@@ -107,22 +107,19 @@ class PaymentLedger:
         VM fails to provision, long after the request that charged for it.
         """
         try:
-            path = resource_path or ""
             async with self._session_factory() as session:
                 session.add(
-                    PaymentEventRow(
-                        event_id=str(uuid.uuid4()),
+                    self.build_event(
                         event_type=event_type,
-                        resource_path=path[:256],
-                        method=(method or "")[:8],
-                        service_group=service_group_for_path(path),
-                        amount_usd=amount,
+                        resource_path=resource_path,
+                        method=method,
+                        amount=amount,
                         network=network,
                         asset=asset,
-                        payer_wallet=payer,
-                        tx_hash=tx_hash or None,
+                        payer=payer,
+                        tx_hash=tx_hash,
                         facilitator_host=facilitator_host,
-                        error_reason=str(error)[:256] if error else None,
+                        error=error,
                         extra=extra,
                     )
                 )
@@ -130,3 +127,38 @@ class PaymentLedger:
         except Exception:
             # The ledger must never take down the payment flow.
             log.warning("payment_ledger_write_failed", event_type=event_type, exc_info=True)
+
+    def build_event(
+        self,
+        *,
+        event_type: str,
+        resource_path: str,
+        method: str = "",
+        amount: Decimal | None = None,
+        network: str | None = None,
+        asset: str | None = None,
+        payer: str | None = None,
+        tx_hash: str | None = None,
+        facilitator_host: str | None = None,
+        error: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> PaymentEventRow:
+        """Build a PaymentEventRow without persisting it, so a caller can add it
+        to its own session and commit it atomically with related writes (e.g. a
+        refund obligation together with the intent's terminal status flip)."""
+        path = resource_path or ""
+        return PaymentEventRow(
+            event_id=str(uuid.uuid4()),
+            event_type=event_type,
+            resource_path=path[:256],
+            method=(method or "")[:8],
+            service_group=service_group_for_path(path),
+            amount_usd=amount,
+            network=network,
+            asset=asset,
+            payer_wallet=payer,
+            tx_hash=tx_hash or None,
+            facilitator_host=facilitator_host,
+            error_reason=str(error)[:256] if error else None,
+            extra=extra,
+        )

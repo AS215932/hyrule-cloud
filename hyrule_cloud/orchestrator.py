@@ -536,21 +536,24 @@ class Orchestrator:
         # operator, not auto-EVM) so a paid customer is never silently dropped.
         if await self._record_native_refund(vm_id, reason=reason):
             return
-        if payment_tx and not payment_tx.startswith("dev_bypass"):
-            # A charge settled (payment_tx present) but couldn't be attributed to
-            # an EVM wallet or a native intent — e.g. the SDK settled without
-            # exposing a payer ("unknown") AND the best-effort settled ledger row
-            # was lost. Record it against the tx from the locked quote (or cost)
-            # so a paid failure is never dropped from the worklist. Dev-bypass
-            # "payments" (tx=dev_bypass_*) charged nothing, so they must NOT
-            # create a phantom refund_owed row polluting the worklist/metrics.
+        is_dev_bypass = bool(payment_tx and payment_tx.startswith("dev_bypass"))
+        was_charged = bool(payment_tx) or (amount is not None and amount > 0)
+        if was_charged and not is_dev_bypass:
+            # A charge settled but couldn't be attributed to an EVM wallet or a
+            # native intent — e.g. the SDK settled exposing neither a payer
+            # ("unknown") NOR a tx string AND the best-effort settled ledger row
+            # was lost. A positive charged amount (not just a tx) is enough to owe
+            # a refund; record it against the locked quote (or cost_total) so a
+            # paid failure is never dropped from the worklist. Dev-bypass
+            # "payments" (tx=dev_bypass_*) charged nothing, so must NOT create a
+            # phantom refund_owed row polluting the worklist/metrics.
             quote = await self.get_quote_for_vm(vm_id)
             charged = quote.amount_usd if quote is not None else amount
             await self.refunds.record_owed(
                 resource_path="/v1/vm/create",
                 payer=owner_wallet or "unknown",
                 amount=charged,
-                original_tx=payment_tx,
+                original_tx=payment_tx or None,
                 reason=reason,
                 vm_id=vm_id,
             )
@@ -669,22 +672,6 @@ class Orchestrator:
             return False
         return await self.record_native_intent_refund(intent, reason=reason, vm_id=vm_id)
 
-    async def _refund_owed_exists(self, *, payer: str) -> bool:
-        """Whether a refund_owed obligation is already durably recorded for this
-        payer (native intents record with payer=intent_id)."""
-        async with self.db() as session:
-            found = (
-                await session.execute(
-                    select(PaymentEventRow.event_id)
-                    .where(
-                        PaymentEventRow.event_type == "refund_owed",
-                        PaymentEventRow.payer_wallet == payer,
-                    )
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-        return found is not None
-
     async def record_native_intent_refund(
         self, intent_id: str, *, reason: str, vm_id: str | None = None
     ) -> bool:
@@ -695,54 +682,69 @@ class Orchestrator:
         (create_vm raised before a vm_id was ever linked, so the settled funds
         would otherwise get no refund_owed row).
 
-        Idempotent on the refund OBLIGATION, not merely the status: the status
-        flip and the (best-effort, log-and-swallow) ledger write are not atomic,
-        so an intent already in REFUND_MANUAL whose refund_owed row was lost to a
-        transient failure still needs it recreated. We record unless a refund_owed
-        event already exists for this intent, so a successful refund is never
-        double-owed and a lost one is recoverable on the next call.
+        ATOMIC: the terminal status flip and the refund_owed ledger row are
+        written in a single transaction, so a terminal REFUND_MANUAL status can
+        never be committed without its obligation (a transient ledger failure
+        rolls back both, leaving the intent to be retried). Idempotent on the
+        obligation: an intent already REFUND_MANUAL with its row present is a
+        no-op, while one missing its row (e.g. an older best-effort write that
+        was lost) has it recreated.
         """
         async with self.db() as session:
             intent = await session.get(CryptoIntentRow, intent_id)
             if intent is None:
                 return False
-            already_manual = intent.status == CryptoIntentStatus.REFUND_MANUAL
-            if not already_manual:
+            already_owed = (
+                await session.execute(
+                    select(PaymentEventRow.event_id)
+                    .where(
+                        PaymentEventRow.event_type == "refund_owed",
+                        PaymentEventRow.payer_wallet == intent_id,
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none() is not None
+            if intent.status == CryptoIntentStatus.REFUND_MANUAL and already_owed:
+                return False  # fully recorded — don't double-owe
+            # payer is the intent_id (a bounded reference the operator resolves to
+            # the REFUND_MANUAL intent) — NOT the deposit address, which for XMR
+            # can exceed payer_wallet's column width; the address rides in extra.
+            # amount_usd is the quote; overpay/late re-quote can mean the customer
+            # sent more on-chain, so surface the received crypto amount so a manual
+            # refund isn't silently short.
+            event = None
+            if not already_owed:
+                event = self.refunds.build_owed_event(
+                    resource_path="/v1/vm/create",
+                    payer=intent_id,
+                    amount=intent.amount_usd,
+                    network="native",
+                    asset=intent.asset,
+                    original_tx=intent.tx_hash,
+                    reason=reason,
+                    vm_id=vm_id,
+                    extra={
+                        "intent_id": intent_id,
+                        "native_deposit_address": intent.address,
+                        "amount_received_crypto": (
+                            str(intent.amount_received_crypto)
+                            if intent.amount_received_crypto is not None
+                            else None
+                        ),
+                    },
+                )
+            if intent.status != CryptoIntentStatus.REFUND_MANUAL:
+                log.warning(
+                    "native_intent_refund_manual",
+                    vm_id=vm_id,
+                    intent_id=intent_id,
+                    asset=intent.asset,
+                    reason=reason,
+                )
                 intent.status = CryptoIntentStatus.REFUND_MANUAL
-            asset = intent.asset
-            amount = intent.amount_usd
-            deposit_address = intent.address
-            intent_tx = intent.tx_hash
-            received_crypto = intent.amount_received_crypto
+            if event is not None:
+                session.add(event)
             await session.commit()
-        if already_manual and await self._refund_owed_exists(payer=intent_id):
-            return False  # obligation already durably recorded — don't double-owe
-        log.warning(
-            "native_intent_refund_manual", vm_id=vm_id, intent_id=intent_id, asset=asset, reason=reason
-        )
-        # payer is the intent_id (a bounded reference the operator resolves to
-        # the REFUND_MANUAL intent) — NOT the deposit address, which for XMR can
-        # exceed payer_wallet's column width; the address rides in extra.
-        # amount_usd is the quote; overpay/late re-quote can mean the customer
-        # actually sent more on-chain, so surface the received crypto amount so a
-        # manual refund isn't silently short.
-        await self.refunds.record_owed(
-            resource_path="/v1/vm/create",
-            payer=intent_id,
-            amount=amount,
-            network="native",
-            asset=asset,
-            original_tx=intent_tx,
-            reason=reason,
-            vm_id=vm_id,
-            extra={
-                "intent_id": intent_id,
-                "native_deposit_address": deposit_address,
-                "amount_received_crypto": (
-                    str(received_crypto) if received_crypto is not None else None
-                ),
-            },
-        )
         return True
 
     async def _simulate_provisioning(self, vm_id: str) -> None:

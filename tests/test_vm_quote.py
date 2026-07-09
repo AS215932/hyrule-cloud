@@ -334,6 +334,31 @@ async def test_post_charge_failure_records_refund_and_fails_row(quote_state, cli
 
 
 @pytest.mark.asyncio
+async def test_link_quote_retries_then_succeeds(quote_state, client, monkeypatch):
+    """A transient link failure is retried; once it succeeds the quote carries
+    its vm_id so the paid VM stays rediscoverable via the consumed quote."""
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+
+    calls = {"n": 0}
+    real_link = quotes_service.link_quote_vm
+
+    async def _flaky(db, quote_id, vm_id):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise RuntimeError("transient DB error while linking quote")
+        await real_link(db, quote_id, vm_id)
+
+    monkeypatch.setattr("hyrule_cloud.api.routes.link_quote_vm", _flaky)
+
+    res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+    assert res.status_code == 200, res.text
+    assert calls["n"] == 2  # failed once, retried, succeeded
+    row = await quotes_service.get_quote(quote_state.orchestrator.db, quote["quote_id"])
+    assert row.vm_id == res.json()["vm_id"]  # linked on retry — rediscoverable
+
+
+@pytest.mark.asyncio
 async def test_create_with_quote_no_payment_402_leaves_quote_created(quote_state, client):
     quote_state.payment_gate.check_payment = AsyncMock(return_value=Response(status_code=402))
     quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
