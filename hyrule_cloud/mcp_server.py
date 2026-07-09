@@ -29,10 +29,6 @@ import os
 from mcp.server.fastmcp import FastMCP
 
 from hyrule_cloud.client import HyruleClient, HyruleError
-from hyrule_cloud.models import PathReportRequest
-from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
-from hyrule_cloud.services.threat.lookup import threat_intel_enabled
-from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
 
 mcp = FastMCP(
     "Hyrule Cloud",
@@ -59,23 +55,21 @@ def _client() -> HyruleClient:
     )
 
 
-def _gated_tool(enabled: bool):
-    """Register an MCP tool only when its backing diagnostic source is
-    configured, mirroring the x402 manifest gate: agents must not be invited to
-    call a route that would 501 before charging. Evaluated at import; a source
-    configured later is picked up on MCP-server restart (same as the tool set is
-    otherwise static). When disabled, the function is defined but NOT registered.
-    """
-    if enabled:
-        return mcp.tool()
-
-    def _skip(fn):
-        return fn
-
-    return _skip
-
-
 def _err(e: HyruleError) -> str:
+    if e.status_code == 501:
+        # A diagnostic whose backing source isn't configured 501s before
+        # charging. The MCP server is a thin remote client (documented mode:
+        # HYRULE_API_URL=https://cloud.hyrule.host), so it can't know the hosted
+        # API's source state locally — it must NOT gate tool registration on its
+        # own package's stub state. Keep the tool registered and surface a clear
+        # "not live yet" message so an endpoint that IS live on the API is always
+        # reachable, and one that isn't returns an honest, non-charging answer.
+        return (
+            f"This diagnostic isn't available yet: {e.detail}\n\n"
+            "Its backing source (active-probe vantage, threat feed, or number "
+            "provider) isn't configured on the server. No payment was taken; try "
+            "again once it goes live."
+        )
     if e.status_code == 402:
         return (
             f"Payment required. The API returned a 402 response with payment instructions:\n"
@@ -747,7 +741,7 @@ async def mx_parse_bounce(message: str, sender_domain: str | None = None, recipi
         return _err(e)
 
 
-@_gated_tool(path_active_probe_enabled(PathReportRequest.model_fields["vantages"].default_factory()))
+@mcp.tool()
 async def path_report(target: str) -> str:
     """Paid routing/path evidence pack using extmon, AS215932, BGP/RPKI, and optional multi-vantage evidence."""
     try:
@@ -787,7 +781,7 @@ async def nat_cgnat_lookup(payload: dict) -> str:
         return _err(e)
 
 
-@_gated_tool(threat_intel_enabled())
+@mcp.tool()
 async def threat_reputation_lookup(subject_type: str, value: str, views: list[str] | None = None) -> str:
     """Paid open-source-first threat/reputation lookup."""
     try:
@@ -807,7 +801,7 @@ async def voip_sip_check(target: str, checks: list[str] | None = None) -> str:
         return _err(e)
 
 
-@_gated_tool(number_intel_enabled())
+@mcp.tool()
 async def voip_number_lookup(number: str, country: str | None = None) -> str:
     """Paid pluggable carrier/CNAM/spam/E911 number lookup contract."""
     try:

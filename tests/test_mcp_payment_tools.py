@@ -235,43 +235,27 @@ async def test_get_intent_status_handles_404(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_gated_diagnostic_tools_hidden_when_sources_unconfigured():
-    """The shipped MCP surface must mirror the x402 manifest gate: with no
-    diagnostic source configured (the default), the gated diagnostic tools are
-    NOT registered, so agents aren't invited to call a route that 501s. Live
-    tools (e.g. voip_sip_check) stay."""
+async def test_diagnostic_tools_always_registered_for_remote_client():
+    """The MCP server is a thin REMOTE client (documented mode:
+    HYRULE_API_URL=https://cloud.hyrule.host), so it can't know the hosted API's
+    source state locally — it must NOT gate tool registration on its own
+    package's stub predicates, or a diagnostic that is live on the API would be
+    unreachable. All diagnostic tools stay registered; the API's response (incl.
+    a 501) is the source of truth."""
     from hyrule_cloud import mcp_server
-    from hyrule_cloud.models import PathReportRequest
-    from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
-    from hyrule_cloud.services.threat.lookup import threat_intel_enabled
-    from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
-
-    # Precondition: these are off by default (no licensed/active source). path is
-    # gated on the path_report endpoint's OWN default vantages (extmon,
-    # as215932, globalping) — not merely "any active prober" — so a partial
-    # config (e.g. only RIPE Atlas) that still 501s the default request keeps the
-    # tool hidden, exactly as the manifest/capabilities gate does.
-    assert not path_active_probe_enabled(
-        PathReportRequest.model_fields["vantages"].default_factory()
-    )
-    assert not threat_intel_enabled()
-    assert not number_intel_enabled()
 
     names = {t.name for t in await mcp_server.mcp.list_tools()}
-    assert "path_report" not in names
-    assert "threat_reputation_lookup" not in names
-    assert "voip_number_lookup" not in names
-    # A live diagnostic tool remains advertised.
-    assert "voip_sip_check" in names
+    for tool in ("path_report", "threat_reputation_lookup", "voip_number_lookup", "voip_sip_check"):
+        assert tool in names
 
 
-def test_gated_tool_helper_registers_only_when_enabled():
-    from hyrule_cloud.mcp_server import _gated_tool
+def test_err_surfaces_clear_not_live_message_for_501():
+    """A gated diagnostic 501s before charging. _err must turn that into an
+    honest, non-charging 'not available yet' message rather than a raw error, so
+    the agent knows nothing was paid and the endpoint simply isn't live yet."""
+    from hyrule_cloud.client import HyruleError
+    from hyrule_cloud.mcp_server import _err
 
-    async def sample() -> str:
-        return "x"
-
-    # Disabled -> pass-through (not registered), returns the function unchanged.
-    assert _gated_tool(False)(sample) is sample
-    # Enabled -> returns a real mcp.tool() decorator (callable that registers).
-    assert callable(_gated_tool(True))
+    msg = _err(HyruleError(501, "path.report source_not_configured"))
+    assert "isn't available yet" in msg
+    assert "No payment was taken" in msg
