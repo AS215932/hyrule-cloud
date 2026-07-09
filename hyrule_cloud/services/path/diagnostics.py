@@ -19,7 +19,11 @@ from hyrule_cloud.models import (
     PathReportRequest,
     SourceHealth,
 )
-from hyrule_cloud.services.diagnostics.sources import source_not_configured, source_ok
+from hyrule_cloud.services.diagnostics.sources import (
+    source_not_configured,
+    source_ok,
+    source_usable,
+)
 from hyrule_cloud.services.safety import assert_safe_active_probe_target, normalize_host
 
 
@@ -47,6 +51,31 @@ def _sources(vantages: list[DiagnosticVantage]) -> dict[str, SourceHealth]:
         else:
             sources[vantage.value] = source_ok()
     return sources
+
+
+_ACTIVE_PROBE_VANTAGES = (DiagnosticVantage.GLOBALPING, DiagnosticVantage.RIPE_ATLAS)
+
+
+def path_active_probe_enabled(vantages: list[DiagnosticVantage] | None = None) -> bool:
+    """Whether a configured external active-probe vantage is available.
+
+    The built-in vantages (extmon/AS215932) don't actually execute probes, so
+    real reachability data requires Globalping or RIPE Atlas. Until one is
+    configured, path_probe/path_report only return a "probe accepted"
+    acknowledgement, so the routes return 501 before charging.
+
+    With ``vantages`` (the caller's requested set), restrict the check to those
+    — a request for only built-in vantages returns no probe data and so must not
+    be charged even when Globalping/RIPE is otherwise configured. Without it
+    (manifest/discovery), check whether any active prober is configured at all.
+    """
+    candidates = [
+        v for v in _ACTIVE_PROBE_VANTAGES if vantages is None or v in set(vantages)
+    ]
+    if not candidates:
+        return False
+    sources = _sources(candidates)
+    return any(source_usable(sources[v.value]) for v in candidates)
 
 
 async def path_probe(body: PathProbeRequest) -> DiagnosticResponse:
