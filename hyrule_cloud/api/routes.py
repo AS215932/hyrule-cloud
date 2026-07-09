@@ -110,6 +110,31 @@ async def _domain_registration_guard(fqdn: str, client_order_id: str | None):
             lock.release()
 
 
+# In-flight x402 payment authorizations for the proxy route. verify_only defers
+# settlement until after the fetch, so two concurrent requests could reuse the
+# same authorization and both hit the sidecar (duplicate work + POST side
+# effects) before either settles. Reject the second while the first is in
+# flight. In-process (one uvicorn worker) — cross-worker reuse still fails at
+# settle, where only one submission of an authorization can succeed.
+_proxy_inflight_auth: set[str] = set()
+
+
+@asynccontextmanager
+async def _proxy_authorization_guard(request: Request):
+    key = request.headers.get("payment-signature") or request.headers.get("x-payment")
+    if not key:
+        # No payment authorization to double-spend (dev bypass / unpaid probe).
+        yield
+        return
+    if key in _proxy_inflight_auth:
+        raise HTTPException(409, "payment authorization already in flight")
+    _proxy_inflight_auth.add(key)
+    try:
+        yield
+    finally:
+        _proxy_inflight_auth.discard(key)
+
+
 def get_orch(app_state: AppState = Depends(get_app_state)):
     return app_state.orchestrator
 
@@ -1312,26 +1337,68 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
         reason = mode_status.reason or "network proxy mode unavailable"
         raise HTTPException(503, f"Proxy mode {body.proxy_mode.value} unavailable: {reason}")
 
-    result = await gate.check_payment(
-        request,
-        amount=amount,
-        description=f"Network Proxy Request ({body.proxy_mode.value}) to {body.url}",
-        extra_body={
-            "url": body.url,
-            "proxy_mode": body.proxy_mode.value,
-        }
-    )
+    description = f"Network Proxy Request ({body.proxy_mode.value}) to {body.url}"
+    extra_body = {"url": body.url, "proxy_mode": body.proxy_mode.value}
+    # GET/HEAD are idempotent and side-effect-free; anything else (POST) mutates
+    # remote state when forwarded.
+    is_idempotent = body.method.upper() in ("GET", "HEAD")
 
-    if isinstance(result, Response):
-        return result
+    # The guard stops a second concurrent request from reusing the same
+    # authorization to drive a duplicate fetch before this one settles.
+    async with _proxy_authorization_guard(request):
+        if not is_idempotent:
+            # Non-idempotent (POST): forwarding it mutates remote state, so the
+            # payment must be FINAL before we send it — never execute an
+            # upstream side effect against an authorization that then fails to
+            # settle (a concurrent replay, a slow-fetch allowance change, a
+            # settle-time facilitator error). But settle only AFTER local
+            # validation, so a rejected request (bad method, invalid URL,
+            # SSRF-blocked host) is never charged. Validate -> settle -> forward.
+            validation_error = await provider.validate_request(body)
+            if validation_error is not None:
+                if validation_error.status_code in (400, 403):
+                    raise HTTPException(validation_error.status_code, validation_error.error)
+                raise HTTPException(502, validation_error.error or "network proxy request failed")
+            payment = await gate.check_payment(request, amount, description, extra_body)
+            if isinstance(payment, Response):
+                return payment
+            resp = await provider.execute_request(body)
+            if resp.error is not None:
+                if resp.status_code in (400, 403):
+                    raise HTTPException(resp.status_code, resp.error)
+                raise HTTPException(502, resp.error or "network proxy request failed")
+            return resp
 
-    # payment valid, proceed
-    resp = await provider.execute_request(body)
-    
-    if resp.error and resp.status_code in [400, 403]:
-        raise HTTPException(resp.status_code, resp.error)
-        
-    return resp
+        # Idempotent (GET/HEAD): verify the payment but DON'T settle yet — an
+        # agent must not be charged for a fetch we then fail to deliver (a dead
+        # tor circuit, a gateway timeout). Re-sending it is safe, so we settle
+        # only after the sidecar returns the caller's answer.
+        verified = await gate.verify_only(
+            request,
+            amount=amount,
+            description=description,
+            extra_body=extra_body,
+        )
+
+        if isinstance(verified, Response):
+            return verified
+
+        resp = await provider.execute_request(body)
+
+        if resp.error is not None:
+            # Not delivered — never charge. A validation rejection is the
+            # caller's mistake (400/403); anything else is our proxy/gateway.
+            if resp.status_code in (400, 403):
+                raise HTTPException(resp.status_code, resp.error)
+            raise HTTPException(502, resp.error or "network proxy request failed")
+
+        # Delivered the caller's answer (even a target 4xx/5xx is a real
+        # result): settle now. If settlement is declined — a reused/invalid
+        # authorization — withhold the paid response rather than hand it over
+        # for free; the failed-settlement headers are already attached.
+        if not await gate.settle_verified(request, verified):
+            raise HTTPException(402, "payment settlement failed")
+        return resp
 from hyrule_cloud.db import CryptoIntentRow
 from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
 from hyrule_cloud.services.intents import (

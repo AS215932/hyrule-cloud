@@ -109,6 +109,13 @@ class NetworkProvider(Provider):
         self._modes_cache_expires_at = now + self.health_ttl_seconds
         return parsed
 
+    async def validate_request(self, req: NetworkRequest) -> NetworkResponse | None:
+        """Pre-flight validation (method/scheme/URL/SSRF) with NO forwarding, so
+        a caller can reject a bad request BEFORE charging for it. Returns the
+        rejection NetworkResponse (400/403) or None when the request is allowed.
+        """
+        return await self._validate_request(req)
+
     async def execute_request(self, req: NetworkRequest) -> NetworkResponse:
         validation_error = await self._validate_request(req)
         if validation_error is not None:

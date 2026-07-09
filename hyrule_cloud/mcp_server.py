@@ -56,6 +56,21 @@ def _client() -> HyruleClient:
 
 
 def _err(e: HyruleError) -> str:
+    if e.status_code == 501:
+        # A route with no live backend 501s before charging. The MCP server is a
+        # thin remote client (documented mode: HYRULE_API_URL=cloud.hyrule.host),
+        # so it can't know the hosted API's config locally — it must NOT gate
+        # tool registration on its own package's stub state. Keep the tool
+        # registered and surface an honest, non-charging "not available yet"
+        # message. Kept generic: 501 routes (diagnostics, speedtest, mail) fail
+        # for different backend reasons, so the specific cause rides in e.detail
+        # rather than being asserted here.
+        return (
+            f"This isn't available yet: {e.detail}\n\n"
+            "The endpoint returned HTTP 501 (not implemented / backend not "
+            "configured on the server). No payment was taken; try again once it "
+            "goes live."
+        )
     if e.status_code == 402:
         return (
             f"Payment required. The API returned a 402 response with payment instructions:\n"

@@ -232,3 +232,30 @@ async def test_get_intent_status_handles_404(monkeypatch):
     _patch_client_factory(monkeypatch, _Stub())
     out = await get_intent_status("ci_missing")
     assert "intent not found" in out
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_tools_always_registered_for_remote_client():
+    """The MCP server is a thin REMOTE client (documented mode:
+    HYRULE_API_URL=https://cloud.hyrule.host), so it can't know the hosted API's
+    source state locally — it must NOT gate tool registration on its own
+    package's stub predicates, or a diagnostic that is live on the API would be
+    unreachable. All diagnostic tools stay registered; the API's response (incl.
+    a 501) is the source of truth."""
+    from hyrule_cloud import mcp_server
+
+    names = {t.name for t in await mcp_server.mcp.list_tools()}
+    for tool in ("path_report", "threat_reputation_lookup", "voip_number_lookup", "voip_sip_check"):
+        assert tool in names
+
+
+def test_err_surfaces_clear_not_live_message_for_501():
+    """A gated diagnostic 501s before charging. _err must turn that into an
+    honest, non-charging 'not available yet' message rather than a raw error, so
+    the agent knows nothing was paid and the endpoint simply isn't live yet."""
+    from hyrule_cloud.client import HyruleError
+    from hyrule_cloud.mcp_server import _err
+
+    msg = _err(HyruleError(501, "path.report source_not_configured"))
+    assert "isn't available yet" in msg
+    assert "No payment was taken" in msg

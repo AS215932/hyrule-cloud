@@ -21,28 +21,49 @@ from hyrule_cloud.models import (
     VoIPPricingResponse,
     VoIPSourcesResponse,
 )
-from hyrule_cloud.services.voip.diagnostics import voip_check, voip_number_lookup, voip_sources
+from hyrule_cloud.services.voip.diagnostics import (
+    number_intel_enabled,
+    voip_check,
+    voip_check_has_live_backend,
+    voip_number_lookup,
+    voip_sources,
+)
+
+_VOIP_CHECK_NO_LIVE_BACKEND = (
+    "SIP OPTIONS/STUN-TURN active probing is not configured; request at least "
+    "one live check (sip_dns, sip_tls)."
+)
 
 router = APIRouter(prefix="/v1/voip", tags=["VoIP/SIP diagnostics"])
 
 
 @router.get("/capabilities", response_model=ProductCapabilityResponse)
 async def get_voip_capabilities() -> ProductCapabilityResponse:
+    # /v1/voip/check does real SIP DNS/TLS work and is always available; the
+    # number-intelligence endpoint (and its quote) only appear once a provider
+    # is configured, since it 501s before charging until then.
+    free_endpoints = [
+        CapabilityEndpoint(path="/v1/voip/capabilities", method="GET", description="VoIP diagnostic capabilities"),
+        CapabilityEndpoint(path="/v1/voip/sources", method="GET", description="Configured VoIP/number provider source status"),
+        CapabilityEndpoint(path="/v1/voip/pricing", method="GET", description="VoIP diagnostic pricing"),
+        CapabilityEndpoint(path="/v1/voip/check/quote", method="POST", description="Quote SIP/VoIP diagnostic check"),
+    ]
+    paid_endpoints = [
+        CapabilityEndpoint(path="/v1/voip/check", method="POST", paid=True, description="Run SIP DNS/TLS/OPTIONS/STUN diagnostics"),
+    ]
+    if number_intel_enabled():
+        free_endpoints.append(
+            CapabilityEndpoint(path="/v1/voip/number/lookup/quote", method="POST", description="Quote number intelligence lookup")
+        )
+        paid_endpoints.append(
+            CapabilityEndpoint(path="/v1/voip/number/lookup", method="POST", paid=True, description="Run carrier/CNAM/spam/E911 lookup through configured providers")
+        )
     return ProductCapabilityResponse(
         service="voip",
         purpose="Paid SIP DNS, SIP TLS/OPTIONS, STUN/TURN, and pluggable number carrier/CNAM/spam/E911 diagnostics.",
         separation_of_concerns="/v1/voip diagnoses VoIP/SIP and number-provider context; /v1/dns handles raw DNS lookups; /v1/ports checks single transport reachability.",
-        free_endpoints=[
-            CapabilityEndpoint(path="/v1/voip/capabilities", method="GET", description="VoIP diagnostic capabilities"),
-            CapabilityEndpoint(path="/v1/voip/sources", method="GET", description="Configured VoIP/number provider source status"),
-            CapabilityEndpoint(path="/v1/voip/pricing", method="GET", description="VoIP diagnostic pricing"),
-            CapabilityEndpoint(path="/v1/voip/check/quote", method="POST", description="Quote SIP/VoIP diagnostic check"),
-            CapabilityEndpoint(path="/v1/voip/number/lookup/quote", method="POST", description="Quote number intelligence lookup"),
-        ],
-        paid_endpoints=[
-            CapabilityEndpoint(path="/v1/voip/check", method="POST", paid=True, description="Run SIP DNS/TLS/OPTIONS/STUN diagnostics"),
-            CapabilityEndpoint(path="/v1/voip/number/lookup", method="POST", paid=True, description="Run carrier/CNAM/spam/E911 lookup through configured providers"),
-        ],
+        free_endpoints=free_endpoints,
+        paid_endpoints=paid_endpoints,
     )
 
 
@@ -61,17 +82,25 @@ async def get_voip_pricing(request: Request) -> VoIPPricingResponse:
 
 
 @router.post("/check/quote", response_model=PaidEndpointQuote)
-async def quote_voip_check(request: Request, body: VoIPCheckRequest) -> PaidEndpointQuote:
+async def quote_voip_check(request: Request, body: VoIPCheckRequest) -> PaidEndpointQuote | Response:
+    if not voip_check_has_live_backend(body.checks):
+        return not_implemented("voip.check.active", _VOIP_CHECK_NO_LIVE_BACKEND)
     return diagnostic_quote(request, price_attr="price_voip_check", default="0.01", name="voip_check", paid_endpoint="/v1/voip/check")
 
 
 @router.post("/number/lookup/quote", response_model=PaidEndpointQuote)
-async def quote_voip_number(request: Request, body: VoIPNumberLookupRequest) -> PaidEndpointQuote:
+async def quote_voip_number(request: Request, body: VoIPNumberLookupRequest) -> PaidEndpointQuote | Response:
+    if not number_intel_enabled():
+        return not_implemented("voip.number.lookup")
     return diagnostic_quote(request, price_attr="price_voip_number_lookup", default="0.05", name="voip_number_lookup", paid_endpoint="/v1/voip/number/lookup")
 
 
 @router.post("/check", response_model=DiagnosticResponse)
 async def run_voip_check(request: Request, body: VoIPCheckRequest) -> DiagnosticResponse | Response:
+    # A request limited to SIP_OPTIONS/STUN_TURN gets only contract findings —
+    # refuse before charging rather than bill for a non-answer.
+    if not voip_check_has_live_backend(body.checks):
+        return not_implemented("voip.check.active", _VOIP_CHECK_NO_LIVE_BACKEND)
     if payment := await require_paid_diagnostic(request, price_attr="price_voip_check", default="0.01", description="Hyrule VoIP/SIP diagnostic check"):
         return payment
     return await voip_check(body)
@@ -79,6 +108,10 @@ async def run_voip_check(request: Request, body: VoIPCheckRequest) -> Diagnostic
 
 @router.post("/number/lookup", response_model=DiagnosticResponse)
 async def run_voip_number_lookup(request: Request, body: VoIPNumberLookupRequest) -> DiagnosticResponse | Response:
+    # No carrier/CNAM/spam provider is configured, so a paid lookup would only
+    # return a disabled-adapter notice. Refuse before charging until one is set.
+    if not number_intel_enabled():
+        return not_implemented("voip.number.lookup")
     if payment := await require_paid_diagnostic(request, price_attr="price_voip_number_lookup", default="0.05", description="Hyrule VoIP number intelligence lookup"):
         return payment
     return await voip_number_lookup(body)
