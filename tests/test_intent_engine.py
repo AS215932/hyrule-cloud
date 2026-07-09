@@ -489,12 +489,24 @@ async def test_provisioning_fires_exactly_once_even_with_concurrent_polls(intent
     # The critical invariant: exactly ONE VM is created, regardless of how
     # the two concurrent pollers interleave.
     assert len(intent_state.orchestrator.created_vms) == 1
-    # One poll observed the terminal PROVISIONED state; the other may have
-    # raced past the atomic trigger before the winner's create_vm finished
-    # and seen PROVISIONING instead. Both are acceptable.
+    # The winner drives the intent SETTLED → PROVISIONING → PROVISIONED and is
+    # guaranteed to return PROVISIONED. The loser lost the atomic UPDATE...
+    # RETURNING race, so _trigger_provisioning was a no-op for it; the status it
+    # returns is whatever its post-trigger re-fetch (intents.py) happened to
+    # observe of the winner's in-flight transition — SETTLED (winner not yet at
+    # PROVISIONING), PROVISIONING (winner mid-create_vm), or PROVISIONED (winner
+    # done). All three are benign: the invariants that matter (exactly one VM,
+    # winner reached PROVISIONED) already hold above. Pinning the loser to a
+    # single state made this test flaky under CI scheduling.
     terminal_states = {r1.status, r2.status}
     assert CryptoIntentStatus.PROVISIONED in terminal_states
-    assert terminal_states.issubset({CryptoIntentStatus.PROVISIONED, CryptoIntentStatus.PROVISIONING})
+    assert terminal_states.issubset(
+        {
+            CryptoIntentStatus.PROVISIONED,
+            CryptoIntentStatus.PROVISIONING,
+            CryptoIntentStatus.SETTLED,
+        }
+    )
 
 
 # --- HTTP endpoints: route shape + one-shot reveal ---
