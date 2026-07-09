@@ -565,20 +565,42 @@ class Orchestrator:
         async with self.db() as session:
             intent = (
                 await session.execute(
-                    select(CryptoIntentRow).where(CryptoIntentRow.vm_id == vm_id).limit(1)
+                    select(CryptoIntentRow.intent_id)
+                    .where(CryptoIntentRow.vm_id == vm_id)
+                    .limit(1)
                 )
             ).scalar_one_or_none()
+        if intent is None:
+            return False
+        return await self.record_native_intent_refund(intent, reason=reason, vm_id=vm_id)
+
+    async def record_native_intent_refund(
+        self, intent_id: str, *, reason: str, vm_id: str | None = None
+    ) -> bool:
+        """Flip a paid native intent to REFUND_MANUAL and record the owed refund.
+
+        Works even when no VM row exists yet — used both from _provision_vm (VM
+        failed after PROVISIONED) and from the intent service's failure path
+        (create_vm raised before a vm_id was ever linked, so the settled funds
+        would otherwise get no refund_owed row). Idempotent: an intent already in
+        REFUND_MANUAL is left untouched so it can't be double-recorded.
+        """
+        async with self.db() as session:
+            intent = await session.get(CryptoIntentRow, intent_id)
             if intent is None:
                 return False
+            if intent.status == CryptoIntentStatus.REFUND_MANUAL:
+                return False  # already recorded — don't double-owe
             intent.status = CryptoIntentStatus.REFUND_MANUAL
-            intent_id = intent.intent_id
             asset = intent.asset
             amount = intent.amount_usd
             deposit_address = intent.address
             intent_tx = intent.tx_hash
             received_crypto = intent.amount_received_crypto
             await session.commit()
-        log.warning("native_intent_refund_manual", vm_id=vm_id, intent_id=intent_id, asset=asset, reason=reason)
+        log.warning(
+            "native_intent_refund_manual", vm_id=vm_id, intent_id=intent_id, asset=asset, reason=reason
+        )
         # payer is the intent_id (a bounded reference the operator resolves to
         # the REFUND_MANUAL intent) — NOT the deposit address, which for XMR can
         # exceed payer_wallet's column width; the address rides in extra.

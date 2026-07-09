@@ -267,6 +267,26 @@ async def test_create_with_quote_paid_provisions_and_consumes(quote_state, clien
 
 
 @pytest.mark.asyncio
+async def test_link_quote_failure_still_starts_provisioning(quote_state, client, monkeypatch):
+    """A post-charge link_quote_vm failure must NOT strand the paid VM: since
+    provisioning is now deferred until after the link, a link exception would
+    otherwise leave the VM in PROVISIONING with no background task and no refund
+    path. The create still succeeds and provisioning is started."""
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("transient DB error while linking quote")
+
+    monkeypatch.setattr("hyrule_cloud.api.routes.link_quote_vm", _boom)
+
+    res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+    assert res.status_code == 200, res.text
+    vm_id = res.json()["vm_id"]
+    assert vm_id in quote_state.orchestrator.provisioning_started
+
+
+@pytest.mark.asyncio
 async def test_create_with_quote_no_payment_402_leaves_quote_created(quote_state, client):
     quote_state.payment_gate.check_payment = AsyncMock(return_value=Response(status_code=402))
     quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()

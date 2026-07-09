@@ -99,6 +99,7 @@ class _StubOrchestrator:
         self.db = session_factory
         self.created_vms: list[tuple[str, str | None]] = []
         self.provisioning_started: list[str] = []
+        self.native_refunds: list[str] = []
 
     def compute_price(self, request):
         # 0.05/day * 1 day = 0.05 for xs
@@ -106,6 +107,15 @@ class _StubOrchestrator:
 
     def start_provisioning(self, vm_id: str) -> None:
         self.provisioning_started.append(vm_id)
+
+    async def record_native_intent_refund(self, intent_id, *, reason, vm_id=None):
+        self.native_refunds.append(intent_id)
+        async with self.db() as db:
+            intent = await db.get(CryptoIntentRow, intent_id)
+            if intent is not None:
+                intent.status = CryptoIntentStatus.REFUND_MANUAL
+                await db.commit()
+        return True
 
     async def create_vm(
         self,
@@ -728,3 +738,33 @@ async def test_get_intent_by_client_order_id_returns_existing(intent_state):
 
     missing = await get_intent_by_client_order_id(intent_state.orchestrator.db, "nope")
     assert missing is None
+
+
+@pytest.mark.asyncio
+async def test_native_intent_records_refund_when_create_vm_fails(intent_state, monkeypatch):
+    """If create_vm raises AFTER the native funds settle (capacity exhausted, DB
+    insert failure, unsupported old order), the intent service records the native
+    refund — the settled customer must not be left with only a FAILED intent."""
+    row = await _seed_intent(intent_state, asset="BTC")
+    intent_state.native_crypto.scan_results[row.address] = AddressScanResult(
+        address=row.address, received_total=row.amount_crypto * Decimal("1.20"), confirmations=2
+    )
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("capacity exhausted between settlement and create")
+
+    monkeypatch.setattr(intent_state.orchestrator, "create_vm", _boom)
+
+    await poll_one_intent(
+        intent_id=row.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    # The refund path ran (not just a silent FAILED).
+    assert intent_state.orchestrator.native_refunds == [row.intent_id]
+    async with intent_state.orchestrator.db() as db:
+        intent = await db.get(CryptoIntentRow, row.intent_id)
+        assert intent.status == CryptoIntentStatus.REFUND_MANUAL

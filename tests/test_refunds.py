@@ -494,3 +494,44 @@ async def test_dev_bypass_vm_failure_records_no_refund(session_factory, monkeypa
         row = await session.get(VMRow, "vm_dev")
         assert row.status == VMStatus.FAILED
     assert [e for e in await _events(session_factory) if e.event_type == "refund_owed"] == []
+
+
+@pytest.mark.asyncio
+async def test_record_native_intent_refund_without_vm(session_factory) -> None:
+    """If create_vm fails before a vm_id is linked, the settled native intent
+    must still get a refund_owed row — recorded by intent_id with no VM. And it
+    is idempotent so a later _provision_vm failure can't double-owe."""
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    xmr_addr = "8" + "B" * 94
+    async with session_factory() as session:
+        session.add(
+            CryptoIntentRow(
+                intent_id="int_novm",
+                asset="XMR",
+                amount_crypto=Decimal("0.0003"),
+                amount_usd=Decimal("0.05"),
+                address=xmr_addr,
+                status=CryptoIntentStatus.PROVISIONING,  # never reached PROVISIONED
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                tx_hash="xmr-tx",
+            )
+        )
+        await session.commit()
+
+    recorded = await orch.record_native_intent_refund("int_novm", reason="provisioning_failed")
+    assert recorded is True
+
+    async with session_factory() as session:
+        intent = await session.get(CryptoIntentRow, "int_novm")
+        assert intent.status == CryptoIntentStatus.REFUND_MANUAL
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1
+    assert owed[0].payer_wallet == "int_novm"  # bounded, not the 95-char address
+    assert owed[0].network == "native"
+    assert owed[0].extra["native_deposit_address"] == xmr_addr
+
+    # Idempotent: a second call (e.g. a later _provision_vm failure) doesn't
+    # record a duplicate obligation.
+    assert await orch.record_native_intent_refund("int_novm", reason="again") is False
+    owed2 = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed2) == 1

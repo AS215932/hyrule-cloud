@@ -371,13 +371,22 @@ async def _trigger_provisioning(
         log.info("intent_provisioned", intent_id=intent_id, vm_id=vm_row.vm_id)
     except Exception:
         log.exception("intent_provisioning_failed", intent_id=intent_id)
-        async with session_factory() as db:
-            await db.execute(
-                update(CryptoIntentRow)
-                .where(CryptoIntentRow.intent_id == intent_id)
-                .values(status=CryptoIntentStatus.FAILED)
-            )
-            await db.commit()
+        # Funds are already SETTLED. If create_vm raised before a vm_id was
+        # linked (capacity exhausted, DB insert failure, unsupported old order),
+        # _provision_vm never runs, so record the refund obligation here — a paid
+        # native customer must never be left without a refund_owed row. Fall back
+        # to marking the intent FAILED only if recording the refund itself errors.
+        try:
+            await orch.record_native_intent_refund(intent_id, reason="provisioning_failed")
+        except Exception:
+            log.exception("native_refund_record_failed", intent_id=intent_id)
+            async with session_factory() as db:
+                await db.execute(
+                    update(CryptoIntentRow)
+                    .where(CryptoIntentRow.intent_id == intent_id)
+                    .values(status=CryptoIntentStatus.FAILED)
+                )
+                await db.commit()
 
 
 async def scan_pending_intents(

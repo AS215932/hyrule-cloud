@@ -864,8 +864,20 @@ async def create_vm(
         )
         row.payment_tx = getattr(request.state, "payment_tx", None)
     if quote_row is not None:
-        await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
-    # Quote linked (if any) — now safe to start provisioning.
+        try:
+            await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
+        except Exception:
+            # Payment already settled — a transient link failure must not strand
+            # the paid VM. Provisioning still starts below; a later failure just
+            # falls back to cost_total for the refund instead of the locked quote.
+            log.warning(
+                "quote_link_failed_post_charge",
+                vm_id=row.vm_id,
+                quote_id=quote_row.quote_id,
+                exc_info=True,
+            )
+    # Quote linked (best-effort) — always start provisioning so a paid create is
+    # never left in PROVISIONING with no background task and no refund path.
     orch.start_provisioning(row.vm_id)
 
     # Block A0: status_url is the public sanitized view; management_url embeds
