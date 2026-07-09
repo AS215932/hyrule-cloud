@@ -184,6 +184,34 @@ async def test_unbuilt_paid_endpoints_return_501_before_charging():
 
 
 @pytest.mark.asyncio
+async def test_voip_check_stub_only_checks_501_before_charge():
+    """/v1/voip/check runs real SIP DNS/TLS work by default, but SIP_OPTIONS and
+    STUN_TURN only emit contract findings. A request (or quote) limited to those
+    must 501 before charging; any request that includes a live check still
+    charges (402)."""
+    old_state = getattr(app.state, "_typed_state", None)
+    if hasattr(app.state, "_typed_state"):
+        delattr(app.state, "_typed_state")
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            options_only = await client.post("/v1/voip/check", json={"target": "example.com", "checks": ["sip_options"]})
+            stun_only = await client.post("/v1/voip/check", json={"target": "example.com", "checks": ["stun_turn"]})
+            both_stub = await client.post("/v1/voip/check", json={"target": "example.com", "checks": ["sip_options", "stun_turn"]})
+            quote_stub = await client.post("/v1/voip/check/quote", json={"target": "example.com", "checks": ["stun_turn"]})
+            # Default (SIP_DNS + SIP_TLS) and mixed requests keep real work → charge.
+            default_checks = await client.post("/v1/voip/check", json={"target": "example.com"})
+            mixed = await client.post("/v1/voip/check", json={"target": "example.com", "checks": ["sip_dns", "sip_options"]})
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+    for res in (options_only, stun_only, both_stub, quote_stub):
+        assert res.status_code == 501, res.status_code
+        assert res.json()["error"] == "not_implemented"
+    assert default_checks.status_code == 402
+    assert mixed.status_code == 402
+
+
+@pytest.mark.asyncio
 async def test_x402_manifest_lists_network_intel_resources():
     old_state = getattr(app.state, "_typed_state", None)
     app.state._typed_state = SimpleNamespace(config=HyruleConfig())

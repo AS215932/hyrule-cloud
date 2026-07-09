@@ -53,6 +53,22 @@ def number_intel_enabled() -> bool:
     return any(source_usable(sources[provider]) for provider in _NUMBER_PROVIDERS)
 
 
+# Checks in voip_check that execute a real probe. SIP_OPTIONS and STUN_TURN only
+# emit contract findings (no active prober/relay configured in the server-only
+# MVP), so a request limited to those returns no live data.
+_LIVE_VOIP_CHECKS = frozenset({VoIPCheck.SIP_DNS, VoIPCheck.SIP_TLS})
+
+
+def voip_check_has_live_backend(checks: list[VoIPCheck]) -> bool:
+    """Whether the requested checks include at least one that runs real work.
+
+    A voip_check request that only asks for SIP_OPTIONS/STUN_TURN gets nothing
+    but contract findings, so the route must 501 before charging rather than
+    bill for a non-answer — mirroring the number-lookup and path gates.
+    """
+    return any(check in _LIVE_VOIP_CHECKS for check in checks)
+
+
 async def voip_check(body: VoIPCheckRequest) -> DiagnosticResponse:
     target = normalize_host(body.target)
     findings: list[DiagnosticFinding] = []

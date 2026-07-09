@@ -24,8 +24,14 @@ from hyrule_cloud.models import (
 from hyrule_cloud.services.voip.diagnostics import (
     number_intel_enabled,
     voip_check,
+    voip_check_has_live_backend,
     voip_number_lookup,
     voip_sources,
+)
+
+_VOIP_CHECK_NO_LIVE_BACKEND = (
+    "SIP OPTIONS/STUN-TURN active probing is not configured; request at least "
+    "one live check (sip_dns, sip_tls)."
 )
 
 router = APIRouter(prefix="/v1/voip", tags=["VoIP/SIP diagnostics"])
@@ -76,7 +82,9 @@ async def get_voip_pricing(request: Request) -> VoIPPricingResponse:
 
 
 @router.post("/check/quote", response_model=PaidEndpointQuote)
-async def quote_voip_check(request: Request, body: VoIPCheckRequest) -> PaidEndpointQuote:
+async def quote_voip_check(request: Request, body: VoIPCheckRequest) -> PaidEndpointQuote | Response:
+    if not voip_check_has_live_backend(body.checks):
+        return not_implemented("voip.check.active", _VOIP_CHECK_NO_LIVE_BACKEND)
     return diagnostic_quote(request, price_attr="price_voip_check", default="0.01", name="voip_check", paid_endpoint="/v1/voip/check")
 
 
@@ -89,6 +97,10 @@ async def quote_voip_number(request: Request, body: VoIPNumberLookupRequest) -> 
 
 @router.post("/check", response_model=DiagnosticResponse)
 async def run_voip_check(request: Request, body: VoIPCheckRequest) -> DiagnosticResponse | Response:
+    # A request limited to SIP_OPTIONS/STUN_TURN gets only contract findings —
+    # refuse before charging rather than bill for a non-answer.
+    if not voip_check_has_live_backend(body.checks):
+        return not_implemented("voip.check.active", _VOIP_CHECK_NO_LIVE_BACKEND)
     if payment := await require_paid_diagnostic(request, price_attr="price_voip_check", default="0.01", description="Hyrule VoIP/SIP diagnostic check"):
         return payment
     return await voip_check(body)
