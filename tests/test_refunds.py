@@ -596,3 +596,78 @@ async def test_record_native_intent_refund_without_vm(session_factory) -> None:
     assert await orch.record_native_intent_refund("int_novm", reason="again") is False
     owed2 = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
     assert len(owed2) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_intent_refund_recovers_lost_ledger_row(session_factory) -> None:
+    """Idempotency is on the refund OBLIGATION, not just the status: if a prior
+    attempt committed REFUND_MANUAL but its best-effort refund_owed write was
+    lost, a retry must recreate the obligation rather than early-return."""
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    async with session_factory() as session:
+        session.add(
+            CryptoIntentRow(
+                intent_id="int_lost",
+                asset="XMR",
+                amount_crypto=Decimal("0.0003"),
+                amount_usd=Decimal("0.05"),
+                address="8" + "C" * 94,
+                status=CryptoIntentStatus.REFUND_MANUAL,  # already flipped, but...
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                tx_hash="xmr-tx-lost",
+            )
+        )
+        await session.commit()
+    # ...the best-effort refund_owed write was lost — no obligation on record.
+    assert [e for e in await _events(session_factory) if e.event_type == "refund_owed"] == []
+
+    recorded = await orch.record_native_intent_refund("int_lost", reason="retry")
+    assert recorded is True  # recovered the missing obligation
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1
+    assert owed[0].payer_wallet == "int_lost"
+
+    # Now the obligation exists, so a further retry is a true no-op.
+    assert await orch.record_native_intent_refund("int_lost", reason="retry2") is False
+    assert len([e for e in await _events(session_factory) if e.event_type == "refund_owed"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_vm_failed_frees_prefix(session_factory) -> None:
+    """Failing a never-provisioned row must release its /64: leaving the prefix
+    index set would keep _allocate_customer_prefix counting it as used while
+    check_expiries skips FAILED rows — pinning the prefix forever."""
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    async with session_factory() as session:
+        row = _paid_provisioning_vm("vm_prefix", wallet=EVM_WALLET, tx="0xT", cost="0.05")
+        row.ipv6_prefix_index = 7
+        row.ipv6_prefix = "2a0c:b641:b51:7::/64"
+        session.add(row)
+        await session.commit()
+
+    await orch.mark_vm_failed("vm_prefix", "boom")
+
+    async with session_factory() as session:
+        row = await session.get(VMRow, "vm_prefix")
+    assert row.status == VMStatus.FAILED
+    assert row.ipv6_prefix_index is None
+    assert row.ipv6_prefix is None
+
+
+@pytest.mark.asyncio
+async def test_create_failure_refund_records_with_empty_tx(session_factory) -> None:
+    """A real settlement that exposes no transaction string still charged the
+    customer, so a synchronous failure must still refund it — only dev-bypass is
+    skipped."""
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    await orch.record_create_failure_refund(
+        owner_wallet=EVM_WALLET,
+        payment_tx="",  # settled, but the settlement exposed no tx string
+        charged_amount=Decimal("0.05"),
+        reason="vm_create_failed",
+        vm_id=None,
+    )
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1
+    assert owed[0].amount_usd == Decimal("0.05")
+    assert owed[0].payer_wallet == EVM_WALLET

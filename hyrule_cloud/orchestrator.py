@@ -572,6 +572,12 @@ class Orchestrator:
             if row is not None and row.status not in (VMStatus.DESTROYED, VMStatus.FAILED):
                 row.status = VMStatus.FAILED
                 row.error = error
+                # Free the customer /64: _allocate_customer_prefix counts any
+                # non-null prefix index as used and check_expiries skips FAILED
+                # rows, so leaving these set would pin the prefix forever. Nothing
+                # was provisioned yet, so there is no guest/DNS to tear down.
+                row.ipv6_prefix_index = None
+                row.ipv6_prefix = None
                 await session.commit()
 
     async def persist_charged_amount(self, vm_id: str, amount: Decimal) -> None:
@@ -607,19 +613,25 @@ class Orchestrator:
         row (amount + network + asset); else fall back to the locked quote amount
         actually charged. Dev-bypass "payments" charged nothing, so are skipped.
         """
-        if not payment_tx or payment_tx.startswith("dev_bypass"):
+        # Only dev-bypass is skipped — it charged nothing. A real settlement that
+        # exposes no transaction string (middleware stores `settlement.transaction
+        # or ""`) still charged the customer, so it must still be refunded using
+        # payer + amount.
+        if payment_tx and payment_tx.startswith("dev_bypass"):
             return
-        async with self.db() as session:
-            settled = (
-                await session.execute(
-                    select(PaymentEventRow)
-                    .where(
-                        PaymentEventRow.tx_hash == payment_tx,
-                        PaymentEventRow.event_type == "settled",
+        settled = None
+        if payment_tx:
+            async with self.db() as session:
+                settled = (
+                    await session.execute(
+                        select(PaymentEventRow)
+                        .where(
+                            PaymentEventRow.tx_hash == payment_tx,
+                            PaymentEventRow.event_type == "settled",
+                        )
+                        .limit(1)
                     )
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
+                ).scalar_one_or_none()
         if settled is not None:
             await self.refunds.record_owed(
                 resource_path="/v1/vm/create",
@@ -657,6 +669,22 @@ class Orchestrator:
             return False
         return await self.record_native_intent_refund(intent, reason=reason, vm_id=vm_id)
 
+    async def _refund_owed_exists(self, *, payer: str) -> bool:
+        """Whether a refund_owed obligation is already durably recorded for this
+        payer (native intents record with payer=intent_id)."""
+        async with self.db() as session:
+            found = (
+                await session.execute(
+                    select(PaymentEventRow.event_id)
+                    .where(
+                        PaymentEventRow.event_type == "refund_owed",
+                        PaymentEventRow.payer_wallet == payer,
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        return found is not None
+
     async def record_native_intent_refund(
         self, intent_id: str, *, reason: str, vm_id: str | None = None
     ) -> bool:
@@ -665,22 +693,30 @@ class Orchestrator:
         Works even when no VM row exists yet — used both from _provision_vm (VM
         failed after PROVISIONED) and from the intent service's failure path
         (create_vm raised before a vm_id was ever linked, so the settled funds
-        would otherwise get no refund_owed row). Idempotent: an intent already in
-        REFUND_MANUAL is left untouched so it can't be double-recorded.
+        would otherwise get no refund_owed row).
+
+        Idempotent on the refund OBLIGATION, not merely the status: the status
+        flip and the (best-effort, log-and-swallow) ledger write are not atomic,
+        so an intent already in REFUND_MANUAL whose refund_owed row was lost to a
+        transient failure still needs it recreated. We record unless a refund_owed
+        event already exists for this intent, so a successful refund is never
+        double-owed and a lost one is recoverable on the next call.
         """
         async with self.db() as session:
             intent = await session.get(CryptoIntentRow, intent_id)
             if intent is None:
                 return False
-            if intent.status == CryptoIntentStatus.REFUND_MANUAL:
-                return False  # already recorded — don't double-owe
-            intent.status = CryptoIntentStatus.REFUND_MANUAL
+            already_manual = intent.status == CryptoIntentStatus.REFUND_MANUAL
+            if not already_manual:
+                intent.status = CryptoIntentStatus.REFUND_MANUAL
             asset = intent.asset
             amount = intent.amount_usd
             deposit_address = intent.address
             intent_tx = intent.tx_hash
             received_crypto = intent.amount_received_crypto
             await session.commit()
+        if already_manual and await self._refund_owed_exists(payer=intent_id):
+            return False  # obligation already durably recorded — don't double-owe
         log.warning(
             "native_intent_refund_manual", vm_id=vm_id, intent_id=intent_id, asset=asset, reason=reason
         )
