@@ -19,10 +19,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import DomainRow, VMQuoteRow, VMRow
+from hyrule_cloud.db import CryptoIntentRow, DomainRow, PaymentEventRow, VMQuoteRow, VMRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
+    CryptoIntentStatus,
     DomainMode,
     DomainStatus,
     SSHSmokeStatus,
@@ -47,12 +48,30 @@ from hyrule_cloud.providers.network_config import (
 )
 from hyrule_cloud.providers.openprovider import OpenproviderClient
 from hyrule_cloud.providers.xcpng import XCPNGProvider
+from hyrule_cloud.services.payments_ledger import PaymentLedger
+from hyrule_cloud.services.refunds import RefundService
 
 log = structlog.get_logger()
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _looks_like_evm_wallet(value: str | None) -> bool:
+    """Whether a string is a customer EVM refund address (0x + 40 hex).
+
+    Native BTC/XMR intents carry a Hyrule-generated *deposit* address in
+    owner_wallet, not a refund destination, so they must not be treated as an
+    x402 refund payer — they refund through the intent REFUND_MANUAL path.
+    """
+    if not value or not value.startswith("0x") or len(value) != 42:
+        return False
+    try:
+        int(value[2:], 16)
+    except ValueError:
+        return False
+    return True
 
 
 class Orchestrator:
@@ -66,6 +85,10 @@ class Orchestrator:
         self.xcpng = XCPNGProvider(config.xcpng)
         self.dns = DNSProvider(config)
         self.openprovider = OpenproviderClient(config.openprovider)
+        # Refund obligations for paid VMs that fail to provision. The ledger is
+        # a thin writer over the session factory, so a dedicated instance here
+        # is fine and keeps the constructor signature stable for callers/tests.
+        self.refunds = RefundService(PaymentLedger(session_factory))
 
         self._tasks: set[asyncio.Task] = set()
 
@@ -224,11 +247,21 @@ class Orchestrator:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    def start_provisioning(self, vm_id: str) -> None:
+        """Kick off background provisioning for an already-created VM row.
+
+        Used by callers that need to establish a link to the row (e.g. a native
+        crypto intent setting its vm_id) BEFORE provisioning can fail, so the
+        failure path can always find the paying record.
+        """
+        self._spawn_provisioning(vm_id)
+
     async def create_vm(
         self,
         request: VMCreateRequest,
         owner_wallet: str,
         owner_account_id: str | None = None,
+        start_provisioning: bool = True,
     ) -> tuple[VMRow, str]:
         """Create a VM record in DB and start background provisioning.
 
@@ -242,9 +275,14 @@ class Orchestrator:
         a session cookie. The VM still gets a management token — the
         token + the account both authorize management, redundancy is
         intentional so the operator can claim/transfer later.
+
+        ``start_provisioning=False`` returns the row WITHOUT spawning the
+        background task so the caller can first link the row to its paying
+        record, then call ``start_provisioning(vm_id)``.
         """
         row, anon_token = await self._insert_vm_row(request, owner_wallet, owner_account_id)
-        self._spawn_provisioning(row.vm_id)
+        if start_provisioning:
+            self._spawn_provisioning(row.vm_id)
         return row, anon_token
 
     async def reserve_vm(
@@ -269,8 +307,15 @@ class Orchestrator:
         vm_id: str,
         owner_wallet: str,
         payment_tx: str | None = None,
+        *,
+        start_provisioning: bool = True,
     ) -> VMRow | None:
-        """Attach the settled payment to a reservation and start provisioning."""
+        """Attach the settled payment to a reservation and start provisioning.
+
+        Pass start_provisioning=False to let the caller link a quote to the VM
+        first: provisioning can fail immediately, and the refund path needs the
+        locked quote amount, so the link must be committed before it starts.
+        """
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if row is None:
@@ -280,7 +325,8 @@ class Orchestrator:
                 row.payment_tx = payment_tx
             await session.commit()
             await session.refresh(row)
-        self._spawn_provisioning(vm_id)
+        if start_provisioning:
+            self._spawn_provisioning(vm_id)
         return row
 
     async def release_vm_reservation(self, vm_id: str) -> None:
@@ -408,13 +454,298 @@ class Orchestrator:
 
         except Exception as e:
             log.error("provision_failed", vm_id=vm_id, error=str(e), exc_info=True)
+            owner_wallet, amount, payment_tx, settled = "", None, None, None
             async with self.db() as session:
-                await session.execute(
-                    update(VMRow)
-                    .where(VMRow.vm_id == vm_id)
-                    .values(status=VMStatus.FAILED, error=str(e))
-                )
+                row = await session.get(VMRow, vm_id)
+                if row is not None:
+                    row.status = VMStatus.FAILED
+                    row.error = str(e)
+                    owner_wallet = row.owner_wallet
+                    amount = row.cost_total
+                    payment_tx = row.payment_tx
+                if payment_tx:
+                    # The authoritative charge: what x402 actually settled for
+                    # this VM (amount + chain), not the possibly-recomputed
+                    # VMRow.cost_total.
+                    settled = (
+                        await session.execute(
+                            select(PaymentEventRow)
+                            .where(
+                                PaymentEventRow.tx_hash == payment_tx,
+                                PaymentEventRow.event_type == "settled",
+                            )
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
                 await session.commit()
+            await self._record_vm_refund(
+                vm_id, owner_wallet, amount, payment_tx, settled, reason=str(e)
+            )
+
+    async def _record_vm_refund(
+        self,
+        vm_id: str,
+        owner_wallet: str,
+        amount: Decimal | None,
+        payment_tx: str | None,
+        settled: PaymentEventRow | None,
+        *,
+        reason: str,
+    ) -> None:
+        """Record the refund owed for a failed paid VM.
+
+        Prefer the settled x402 ledger row (authoritative amount + network +
+        asset). A native BTC/XMR intent has no such row and carries a deposit
+        address, not an EVM refund destination, so it's recorded through the
+        intent's REFUND_MANUAL path instead — never dropped.
+        """
+        if settled is not None:
+            await self.refunds.record_owed(
+                resource_path="/v1/vm/create",
+                # A settled charge exists — record the obligation even if the
+                # SDK didn't expose a payer address; the tx/network metadata let
+                # the operator investigate rather than dropping the debt.
+                payer=settled.payer_wallet or "unknown",
+                amount=settled.amount_usd,
+                network=settled.network,
+                asset=settled.asset,
+                original_tx=payment_tx,
+                reason=reason,
+                vm_id=vm_id,
+            )
+            return
+        if _looks_like_evm_wallet(owner_wallet):
+            # An x402 charge whose settled ledger row was lost (best-effort
+            # write). Prefer the locked quote amount actually charged over the
+            # VM's recomputed cost_total — they diverge if pricing changed during
+            # the quote TTL, exactly the ledger-missing path this covers.
+            quote = await self.get_quote_for_vm(vm_id)
+            charged = quote.amount_usd if quote is not None else amount
+            await self.refunds.record_owed(
+                resource_path="/v1/vm/create",
+                payer=owner_wallet,
+                amount=charged,
+                original_tx=payment_tx,
+                reason=reason,
+                vm_id=vm_id,
+            )
+            return
+        # No x402 charge and a non-EVM owner: a native BTC/XMR intent whose VM
+        # failed after it was already marked PROVISIONED. Flip it to
+        # REFUND_MANUAL and record the debt (native refunds are sent by the
+        # operator, not auto-EVM) so a paid customer is never silently dropped.
+        if await self._record_native_refund(vm_id, reason=reason):
+            return
+        is_dev_bypass = bool(payment_tx and payment_tx.startswith("dev_bypass"))
+        was_charged = bool(payment_tx) or (amount is not None and amount > 0)
+        if was_charged and not is_dev_bypass:
+            # A charge settled but couldn't be attributed to an EVM wallet or a
+            # native intent — e.g. the SDK settled exposing neither a payer
+            # ("unknown") NOR a tx string AND the best-effort settled ledger row
+            # was lost. A positive charged amount (not just a tx) is enough to owe
+            # a refund; record it against the locked quote (or cost_total) so a
+            # paid failure is never dropped from the worklist. Dev-bypass
+            # "payments" (tx=dev_bypass_*) charged nothing, so must NOT create a
+            # phantom refund_owed row polluting the worklist/metrics.
+            quote = await self.get_quote_for_vm(vm_id)
+            charged = quote.amount_usd if quote is not None else amount
+            await self.refunds.record_owed(
+                resource_path="/v1/vm/create",
+                payer=owner_wallet or "unknown",
+                amount=charged,
+                original_tx=payment_tx or None,
+                reason=reason,
+                vm_id=vm_id,
+            )
+            return
+        # Free subdomain VM (nothing charged) with no linked intent.
+        log.info("vm_refund_not_recorded_here", vm_id=vm_id, owner_wallet=owner_wallet or None)
+
+    async def mark_vm_failed(self, vm_id: str, error: str) -> None:
+        """Terminally fail a VM row that will never be provisioned.
+
+        Used when a paid create errors after the row was inserted/activated but
+        before the background provisioner was scheduled. Such a row sits in
+        PROVISIONING with a non-empty owner_wallet, which the reservation sweeper
+        (unpaid rows only, owner_wallet == "") never reclaims — so without this
+        it pins its customer /64 and keeps counting as live until expiry.
+        """
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None and row.status not in (VMStatus.DESTROYED, VMStatus.FAILED):
+                row.status = VMStatus.FAILED
+                row.error = error
+                # Free the customer /64: _allocate_customer_prefix counts any
+                # non-null prefix index as used and check_expiries skips FAILED
+                # rows, so leaving these set would pin the prefix forever. Nothing
+                # was provisioned yet, so there is no guest/DNS to tear down.
+                row.ipv6_prefix_index = None
+                row.ipv6_prefix = None
+                await session.commit()
+
+    async def persist_charged_amount(self, vm_id: str, amount: Decimal) -> None:
+        """Persist the locked, actually-charged quote amount onto the VM.
+
+        VMRow.cost_total is otherwise recomputed from current pricing, which can
+        drift from what was charged during the quote TTL. Writing the locked
+        amount here — before the best-effort quote link — means a later refund is
+        accurate even if the link fails and the settled ledger row was lost.
+        """
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.cost_total = amount
+                await session.commit()
+
+    async def record_create_failure_refund(
+        self,
+        *,
+        owner_wallet: str,
+        payment_tx: str | None,
+        charged_amount: Decimal | None,
+        reason: str,
+        vm_id: str | None = None,
+    ) -> None:
+        """Record the refund owed when a paid /v1/vm/create fails synchronously.
+
+        The background provisioner (_provision_vm) owns the normal refund path,
+        but it is only scheduled after the reservation/allocation succeeds. A
+        failure between settlement and that scheduling (reservation swept then
+        create hits capacity, activation raises, ...) would otherwise charge the
+        customer with no refund record. Prefer the authoritative settled ledger
+        row (amount + network + asset); else fall back to the locked quote amount
+        actually charged. Dev-bypass "payments" charged nothing, so are skipped.
+        """
+        # Only dev-bypass is skipped — it charged nothing. A real settlement that
+        # exposes no transaction string (middleware stores `settlement.transaction
+        # or ""`) still charged the customer, so it must still be refunded using
+        # payer + amount.
+        if payment_tx and payment_tx.startswith("dev_bypass"):
+            return
+        settled = None
+        if payment_tx:
+            async with self.db() as session:
+                settled = (
+                    await session.execute(
+                        select(PaymentEventRow)
+                        .where(
+                            PaymentEventRow.tx_hash == payment_tx,
+                            PaymentEventRow.event_type == "settled",
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+        if settled is not None:
+            await self.refunds.record_owed(
+                resource_path="/v1/vm/create",
+                payer=settled.payer_wallet or owner_wallet or "unknown",
+                amount=settled.amount_usd,
+                network=settled.network,
+                asset=settled.asset,
+                original_tx=payment_tx,
+                reason=reason,
+                vm_id=vm_id,
+            )
+            return
+        await self.refunds.record_owed(
+            resource_path="/v1/vm/create",
+            payer=owner_wallet or "unknown",
+            amount=charged_amount,
+            original_tx=payment_tx,
+            reason=reason,
+            vm_id=vm_id,
+        )
+
+    async def _record_native_refund(self, vm_id: str, *, reason: str) -> bool:
+        """Transition a failed native-intent VM's intent to REFUND_MANUAL and
+        record the owed refund. Returns False when no native intent is linked to
+        this VM (e.g. a free subdomain VM)."""
+        async with self.db() as session:
+            intent = (
+                await session.execute(
+                    select(CryptoIntentRow.intent_id)
+                    .where(CryptoIntentRow.vm_id == vm_id)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        if intent is None:
+            return False
+        return await self.record_native_intent_refund(intent, reason=reason, vm_id=vm_id)
+
+    async def record_native_intent_refund(
+        self, intent_id: str, *, reason: str, vm_id: str | None = None
+    ) -> bool:
+        """Flip a paid native intent to REFUND_MANUAL and record the owed refund.
+
+        Works even when no VM row exists yet — used both from _provision_vm (VM
+        failed after PROVISIONED) and from the intent service's failure path
+        (create_vm raised before a vm_id was ever linked, so the settled funds
+        would otherwise get no refund_owed row).
+
+        ATOMIC: the terminal status flip and the refund_owed ledger row are
+        written in a single transaction, so a terminal REFUND_MANUAL status can
+        never be committed without its obligation (a transient ledger failure
+        rolls back both, leaving the intent to be retried). Idempotent on the
+        obligation: an intent already REFUND_MANUAL with its row present is a
+        no-op, while one missing its row (e.g. an older best-effort write that
+        was lost) has it recreated.
+        """
+        async with self.db() as session:
+            intent = await session.get(CryptoIntentRow, intent_id)
+            if intent is None:
+                return False
+            already_owed = (
+                await session.execute(
+                    select(PaymentEventRow.event_id)
+                    .where(
+                        PaymentEventRow.event_type == "refund_owed",
+                        PaymentEventRow.payer_wallet == intent_id,
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none() is not None
+            if intent.status == CryptoIntentStatus.REFUND_MANUAL and already_owed:
+                return False  # fully recorded — don't double-owe
+            # payer is the intent_id (a bounded reference the operator resolves to
+            # the REFUND_MANUAL intent) — NOT the deposit address, which for XMR
+            # can exceed payer_wallet's column width; the address rides in extra.
+            # amount_usd is the quote; overpay/late re-quote can mean the customer
+            # sent more on-chain, so surface the received crypto amount so a manual
+            # refund isn't silently short.
+            event = None
+            if not already_owed:
+                event = self.refunds.build_owed_event(
+                    resource_path="/v1/vm/create",
+                    payer=intent_id,
+                    amount=intent.amount_usd,
+                    network="native",
+                    asset=intent.asset,
+                    original_tx=intent.tx_hash,
+                    reason=reason,
+                    vm_id=vm_id,
+                    extra={
+                        "intent_id": intent_id,
+                        "native_deposit_address": intent.address,
+                        "amount_received_crypto": (
+                            str(intent.amount_received_crypto)
+                            if intent.amount_received_crypto is not None
+                            else None
+                        ),
+                    },
+                )
+            if intent.status != CryptoIntentStatus.REFUND_MANUAL:
+                log.warning(
+                    "native_intent_refund_manual",
+                    vm_id=vm_id,
+                    intent_id=intent_id,
+                    asset=intent.asset,
+                    reason=reason,
+                )
+                intent.status = CryptoIntentStatus.REFUND_MANUAL
+            if event is not None:
+                session.add(event)
+            await session.commit()
+        return True
 
     async def _simulate_provisioning(self, vm_id: str) -> None:
         """Controlled simulation of provisioning (issue #28).

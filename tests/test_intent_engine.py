@@ -98,12 +98,40 @@ class _StubOrchestrator:
     def __init__(self, session_factory: async_sessionmaker) -> None:
         self.db = session_factory
         self.created_vms: list[tuple[str, str | None]] = []
+        self.provisioning_started: list[str] = []
+        self.native_refunds: list[str] = []
 
     def compute_price(self, request):
         # 0.05/day * 1 day = 0.05 for xs
         return Decimal("0.05") * request.duration_days, None
 
-    async def create_vm(self, request, owner_wallet: str, owner_account_id: str | None = None):
+    def start_provisioning(self, vm_id: str) -> None:
+        self.provisioning_started.append(vm_id)
+
+    async def mark_vm_failed(self, vm_id: str, error: str) -> None:
+        async with self.db() as db:
+            row = await db.get(VMRow, vm_id)
+            if row is not None:
+                row.status = VMStatus.FAILED
+                row.error = error
+                await db.commit()
+
+    async def record_native_intent_refund(self, intent_id, *, reason, vm_id=None):
+        self.native_refunds.append(intent_id)
+        async with self.db() as db:
+            intent = await db.get(CryptoIntentRow, intent_id)
+            if intent is not None:
+                intent.status = CryptoIntentStatus.REFUND_MANUAL
+                await db.commit()
+        return True
+
+    async def create_vm(
+        self,
+        request,
+        owner_wallet: str,
+        owner_account_id: str | None = None,
+        start_provisioning: bool = True,
+    ):
         from hyrule_cloud.middleware.anon_token import hash_anon_token
         from hyrule_cloud.models import (
             generate_anon_management_token,
@@ -336,6 +364,44 @@ async def test_poll_overpay_settles_and_provisions(intent_state):
 
 
 @pytest.mark.asyncio
+async def test_xmr_intent_provisions_with_bounded_owner_wallet(intent_state):
+    """XMR subaddresses (~95 chars) must not be written to VMRow.owner_wallet
+    (String(64)) — in Postgres the insert would fail before the intent links its
+    vm_id and before any refund could be recorded. owner_wallet carries the
+    bounded intent_id; the real deposit address stays on the intent."""
+    long_xmr = "8" + "B" * 94  # 95 chars, exceeds owner_wallet String(64)
+    intent_state.native_crypto.next_xmr_addr_per_index = [(long_xmr, 3)]
+    row = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="XMR",
+        order_payload=_vm_create_request(),
+        amount_usd=Decimal("0.05"),
+        client_order_id=None,
+        owner_account_id=None,
+    )
+    assert row.address == long_xmr
+    # XMR scans are keyed by subaddress index, not the address string.
+    intent_state.native_crypto.scan_results[f"xmr:{row.xmr_subaddr_index}"] = AddressScanResult(
+        address=row.address, received_total=row.amount_crypto * Decimal("1.20"), confirmations=10
+    )
+
+    updated = await poll_one_intent(
+        intent_id=row.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+    assert updated.status == CryptoIntentStatus.PROVISIONED
+    async with intent_state.orchestrator.db() as db:
+        vm = await db.get(VMRow, updated.vm_id)
+    assert vm.owner_wallet == row.intent_id  # bounded reference, not the 95-char address
+    assert len(vm.owner_wallet) <= 64
+
+
+@pytest.mark.asyncio
 async def test_poll_underpay_flips_to_refund_manual(intent_state):
     """LENIENT: paying less than quote requires operator action."""
     row = await _seed_intent(intent_state, asset="BTC")
@@ -507,6 +573,38 @@ async def test_provisioning_fires_exactly_once_even_with_concurrent_polls(intent
             CryptoIntentStatus.SETTLED,
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_native_provisioning_failure_fails_vm_and_refunds(intent_state, monkeypatch):
+    """If native provisioning fails after the VM row is inserted but before the
+    background task starts (here start_provisioning raises), the intent is
+    refunded AND the orphaned VM row is failed — never left PROVISIONING with
+    owner_wallet=intent_id, which the reservation sweeper won't reclaim."""
+    row = await _seed_intent(intent_state, asset="BTC")
+    intent_state.native_crypto.scan_results[row.address] = AddressScanResult(
+        address=row.address, received_total=row.amount_crypto, confirmations=2
+    )
+
+    def _boom(vm_id):
+        raise RuntimeError("scheduler down")
+
+    monkeypatch.setattr(intent_state.orchestrator, "start_provisioning", _boom)
+
+    await poll_one_intent(
+        intent_id=row.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    assert intent_state.orchestrator.created_vms  # a row was inserted
+    vm_id = intent_state.orchestrator.created_vms[-1][0]
+    async with intent_state.orchestrator.db() as db:
+        vm = await db.get(VMRow, vm_id)
+    assert vm.status == VMStatus.FAILED  # cleaned up, not stranded
+    assert row.intent_id in intent_state.orchestrator.native_refunds  # and refunded
 
 
 # --- HTTP endpoints: route shape + one-shot reveal ---
@@ -692,3 +790,33 @@ async def test_get_intent_by_client_order_id_returns_existing(intent_state):
 
     missing = await get_intent_by_client_order_id(intent_state.orchestrator.db, "nope")
     assert missing is None
+
+
+@pytest.mark.asyncio
+async def test_native_intent_records_refund_when_create_vm_fails(intent_state, monkeypatch):
+    """If create_vm raises AFTER the native funds settle (capacity exhausted, DB
+    insert failure, unsupported old order), the intent service records the native
+    refund — the settled customer must not be left with only a FAILED intent."""
+    row = await _seed_intent(intent_state, asset="BTC")
+    intent_state.native_crypto.scan_results[row.address] = AddressScanResult(
+        address=row.address, received_total=row.amount_crypto * Decimal("1.20"), confirmations=2
+    )
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("capacity exhausted between settlement and create")
+
+    monkeypatch.setattr(intent_state.orchestrator, "create_vm", _boom)
+
+    await poll_one_intent(
+        intent_id=row.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    # The refund path ran (not just a silent FAILED).
+    assert intent_state.orchestrator.native_refunds == [row.intent_id]
+    async with intent_state.orchestrator.db() as db:
+        intent = await db.get(CryptoIntentRow, row.intent_id)
+        assert intent.status == CryptoIntentStatus.REFUND_MANUAL

@@ -59,6 +59,8 @@ class _StubOrchestrator:
     def __init__(self, session_factory: async_sessionmaker) -> None:
         self.db = session_factory
         self.created_vms: list[str] = []
+        self.provisioning_started: list[str] = []
+        self.create_failure_refunds: list[tuple[str | None, str | None]] = []
 
     def compute_price(self, request):
         from hyrule_cloud.models import CostBreakdown
@@ -70,7 +72,16 @@ class _StubOrchestrator:
             total=f"${total:.2f}",
         )
 
-    async def create_vm(self, request, owner_wallet: str, owner_account_id: str | None = None):
+    def start_provisioning(self, vm_id: str) -> None:
+        self.provisioning_started.append(vm_id)
+
+    async def create_vm(
+        self,
+        request,
+        owner_wallet: str,
+        owner_account_id: str | None = None,
+        start_provisioning: bool = True,
+    ):
         from hyrule_cloud.middleware.anon_token import hash_anon_token
         from hyrule_cloud.models import generate_anon_management_token, generate_vm_id
 
@@ -96,6 +107,26 @@ class _StubOrchestrator:
             await session.commit()
         self.created_vms.append(vm_id)
         return row, anon_token
+
+    async def persist_charged_amount(self, vm_id: str, amount: Decimal) -> None:
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.cost_total = amount
+                await session.commit()
+
+    async def record_create_failure_refund(
+        self, *, owner_wallet, payment_tx, charged_amount, reason, vm_id=None
+    ) -> None:
+        self.create_failure_refunds.append((vm_id, payment_tx))
+
+    async def mark_vm_failed(self, vm_id: str, error: str) -> None:
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.status = VMStatus.FAILED
+                row.error = error
+                await session.commit()
 
     async def get_vm(self, vm_id: str) -> VMRow | None:
         async with self.db() as session:

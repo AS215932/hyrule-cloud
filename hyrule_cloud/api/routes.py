@@ -860,30 +860,116 @@ async def create_vm(
                 return _vm_create_response(existing_vm, request, management_token=None)
         raise HTTPException(409, "Quote is being provisioned; poll the VM status")
 
-    if reservation_row is not None:
-        activated = await orch.activate_vm_reservation(
-            reservation_row.vm_id,
-            owner_wallet=wallet,
-            payment_tx=getattr(request.state, "payment_tx", None),
-        )
-        if activated is not None:
-            row, management_token = activated, reservation_token
+    # Defer provisioning until the quote is linked below: a fast provisioning
+    # failure must be able to find the locked quote amount to refund accurately
+    # (get_quote_for_vm races link_quote_vm otherwise).
+    #
+    # This whole block runs after x402 has settled but before the background
+    # provisioner (which owns the normal refund path) is scheduled, so any
+    # failure here is wrapped to guarantee a refund record — a paid create must
+    # never be dropped.
+    row: VMRow | None = None
+    management_token: str | None = None
+    try:
+        if reservation_row is not None:
+            activated = await orch.activate_vm_reservation(
+                reservation_row.vm_id,
+                owner_wallet=wallet,
+                payment_tx=getattr(request.state, "payment_tx", None),
+                start_provisioning=False,
+            )
+            if activated is not None:
+                row, management_token = activated, reservation_token
+            else:
+                # Reservation vanished (e.g. sweeper raced an extremely slow
+                # payment) — fall back to allocate-after-payment.
+                row, management_token = await orch.create_vm(
+                    order, owner_wallet=wallet,
+                    owner_account_id=account.account_id if account else None,
+                    start_provisioning=False,
+                )
+                row.payment_tx = getattr(request.state, "payment_tx", None)
         else:
-            # Reservation vanished (e.g. sweeper raced an extremely slow
-            # payment) — fall back to allocate-after-payment.
             row, management_token = await orch.create_vm(
                 order, owner_wallet=wallet,
                 owner_account_id=account.account_id if account else None,
+                start_provisioning=False,
             )
             row.payment_tx = getattr(request.state, "payment_tx", None)
-    else:
-        row, management_token = await orch.create_vm(
-            order, owner_wallet=wallet,
-            owner_account_id=account.account_id if account else None,
+        if quote_row is not None:
+            # Persist the locked charged amount first so a later refund is
+            # accurate even if the quote link below fails.
+            await orch.persist_charged_amount(row.vm_id, quote_row.amount_usd)
+            # The consumed-quote replay path can only rediscover this paid VM
+            # once the quote carries its vm_id, so retry a transient link failure
+            # before giving up rather than leaving the quote consumed-but-unlinked.
+            linked = False
+            for attempt in range(3):
+                try:
+                    await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
+                    linked = True
+                    break
+                except Exception:
+                    log.warning(
+                        "quote_link_attempt_failed",
+                        vm_id=row.vm_id,
+                        quote_id=quote_row.quote_id,
+                        attempt=attempt,
+                        exc_info=True,
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+            if not linked:
+                # Payment already settled and the VM exists — a persistent link
+                # failure must not strand it. Provisioning still starts and this
+                # response carries the vm_id + management URL; only a client that
+                # ALSO loses this response can't rediscover it by quote. Log
+                # loudly for the operator; failing/refunding a working paid VM
+                # over a link write would be worse.
+                log.error(
+                    "quote_link_failed_post_charge",
+                    vm_id=row.vm_id,
+                    quote_id=quote_row.quote_id,
+                )
+        # Always start provisioning so a paid create is never left in
+        # PROVISIONING with no background task and no refund path.
+        orch.start_provisioning(row.vm_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Post-charge, pre-provision failure: no background task exists to record
+        # the refund, so record it here before surfacing the error.
+        failed_vm_id = getattr(row, "vm_id", None)
+        log.error(
+            "vm_create_post_charge_failed",
+            vm_id=failed_vm_id,
+            error=str(exc),
+            exc_info=True,
         )
-        row.payment_tx = getattr(request.state, "payment_tx", None)
-    if quote_row is not None:
-        await link_quote_vm(orch.db, quote_row.quote_id, row.vm_id)
+        await orch.record_create_failure_refund(
+            owner_wallet=wallet,
+            payment_tx=getattr(request.state, "payment_tx", None),
+            # `total` is what was charged: the locked quote amount, or the
+            # computed price for a legacy/unquoted create. Never None, so an
+            # unquoted create whose settled ledger row was lost still refunds.
+            charged_amount=total,
+            reason=f"vm_create_failed: {exc}",
+            vm_id=failed_vm_id,
+        )
+        if failed_vm_id is not None:
+            # A row was inserted/activated but the background provisioner was
+            # never scheduled — fail it terminally so it doesn't sit in
+            # PROVISIONING pinning its customer /64 (the sweeper won't reclaim a
+            # row with an owner_wallet).
+            await orch.mark_vm_failed(failed_vm_id, f"create failed post-charge: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail="Provisioning failed after payment; a refund has been recorded and will be processed.",
+        )
+
+    # The except above re-raises on any failure, so a fall-through here means the
+    # VM row was created and provisioning was scheduled.
+    assert row is not None
 
     # Block A0: status_url is the public sanitized view; management_url embeds
     # the one-time anon token. The UI must surface management_url prominently
