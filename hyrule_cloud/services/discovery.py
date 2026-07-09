@@ -181,9 +181,7 @@ def _gated_discovery_enabled(path: str) -> bool:
     from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
 
     if path == "/v1/path/ping":
-        return path_active_probe_enabled(
-            models.PathProbeRequest.model_fields["vantages"].default_factory()
-        )
+        return path_active_probe_enabled(models.PATH_PROBE_DEFAULT_VANTAGES)
     if path == "/v1/threat/lookup":
         return threat_intel_enabled()
     if path == "/v1/voip/number/lookup":

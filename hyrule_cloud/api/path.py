@@ -11,6 +11,8 @@ from hyrule_cloud.api._contract import (
     require_paid_diagnostic,
 )
 from hyrule_cloud.models import (
+    PATH_PROBE_DEFAULT_VANTAGES,
+    PATH_REPORT_DEFAULT_VANTAGES,
     CapabilityEndpoint,
     DiagnosticJobResponse,
     DiagnosticResponse,
@@ -40,12 +42,8 @@ async def get_path_capabilities() -> ProductCapabilityResponse:
     # /v1/path/report defaults to a set that includes globalping. Mirror the
     # manifest's per-endpoint gate so capabilities never list a route whose
     # default request 501s.
-    probe_enabled = path_active_probe_enabled(
-        PathProbeRequest.model_fields["vantages"].default_factory()
-    )
-    report_enabled = path_active_probe_enabled(
-        PathReportRequest.model_fields["vantages"].default_factory()
-    )
+    probe_enabled = path_active_probe_enabled(PATH_PROBE_DEFAULT_VANTAGES)
+    report_enabled = path_active_probe_enabled(PATH_REPORT_DEFAULT_VANTAGES)
     _free_endpoints = [
         CapabilityEndpoint(path="/v1/path/capabilities", method="GET", description="Path diagnostic capabilities"),
         CapabilityEndpoint(path="/v1/path/vantages", method="GET", description="Supported diagnostic vantages"),

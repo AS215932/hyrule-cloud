@@ -468,15 +468,16 @@ async def x402_manifest():
     # only /v1/path/report defaults to a vantage set that includes globalping.
     # Advertise an endpoint only when the request an agent gets from discovery
     # actually returns data.
-    from hyrule_cloud.models import PathProbeRequest, PathReportRequest
+    from hyrule_cloud.models import (
+        PATH_PROBE_DEFAULT_VANTAGES,
+        PATH_REPORT_DEFAULT_VANTAGES,
+    )
 
-    probe_default_vantages = PathProbeRequest.model_fields["vantages"].default_factory()
-    report_default_vantages = PathReportRequest.model_fields["vantages"].default_factory()
-    if not path_active_probe_enabled(probe_default_vantages):
+    if not path_active_probe_enabled(PATH_PROBE_DEFAULT_VANTAGES):
         unconfigured.update(
             {"/v1/path/ping", "/v1/path/trace", "/v1/path/mtr", "/v1/path/asymmetry"}
         )
-    if not path_active_probe_enabled(report_default_vantages):
+    if not path_active_probe_enabled(PATH_REPORT_DEFAULT_VANTAGES):
         unconfigured.add("/v1/path/report")
     if unconfigured:
         manifest["resources"] = [
