@@ -471,3 +471,26 @@ async def test_activate_reservation_can_defer_provisioning(session_factory, monk
 
     orch.start_provisioning("vm_res")
     assert spawned == ["vm_res"]
+
+
+@pytest.mark.asyncio
+async def test_dev_bypass_vm_failure_records_no_refund(session_factory, monkeypatch) -> None:
+    """A dev-bypass 'payment' (tx=dev_bypass_*, non-EVM test wallet) charged
+    nothing, so a failed VM must NOT create a phantom refund_owed row that would
+    pollute the operator worklist and payment metrics."""
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    async with session_factory() as session:
+        session.add(
+            _paid_provisioning_vm("vm_dev", wallet="0xDEV_TEST_WALLET", tx="dev_bypass_0x0", cost="0.05")
+        )
+        await session.commit()
+
+    await orch._provision_vm("vm_dev")
+
+    async with session_factory() as session:
+        row = await session.get(VMRow, "vm_dev")
+        assert row.status == VMStatus.FAILED
+    assert [e for e in await _events(session_factory) if e.event_type == "refund_owed"] == []

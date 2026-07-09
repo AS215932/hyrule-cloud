@@ -536,12 +536,14 @@ class Orchestrator:
         # operator, not auto-EVM) so a paid customer is never silently dropped.
         if await self._record_native_refund(vm_id, reason=reason):
             return
-        if payment_tx:
+        if payment_tx and not payment_tx.startswith("dev_bypass"):
             # A charge settled (payment_tx present) but couldn't be attributed to
             # an EVM wallet or a native intent — e.g. the SDK settled without
             # exposing a payer ("unknown") AND the best-effort settled ledger row
             # was lost. Record it against the tx from the locked quote (or cost)
-            # so a paid failure is never dropped from the worklist.
+            # so a paid failure is never dropped from the worklist. Dev-bypass
+            # "payments" (tx=dev_bypass_*) charged nothing, so they must NOT
+            # create a phantom refund_owed row polluting the worklist/metrics.
             quote = await self.get_quote_for_vm(vm_id)
             charged = quote.amount_usd if quote is not None else amount
             await self.refunds.record_owed(
