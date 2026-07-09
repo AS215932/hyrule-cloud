@@ -108,6 +108,14 @@ class _StubOrchestrator:
     def start_provisioning(self, vm_id: str) -> None:
         self.provisioning_started.append(vm_id)
 
+    async def mark_vm_failed(self, vm_id: str, error: str) -> None:
+        async with self.db() as db:
+            row = await db.get(VMRow, vm_id)
+            if row is not None:
+                row.status = VMStatus.FAILED
+                row.error = error
+                await db.commit()
+
     async def record_native_intent_refund(self, intent_id, *, reason, vm_id=None):
         self.native_refunds.append(intent_id)
         async with self.db() as db:
@@ -565,6 +573,38 @@ async def test_provisioning_fires_exactly_once_even_with_concurrent_polls(intent
             CryptoIntentStatus.SETTLED,
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_native_provisioning_failure_fails_vm_and_refunds(intent_state, monkeypatch):
+    """If native provisioning fails after the VM row is inserted but before the
+    background task starts (here start_provisioning raises), the intent is
+    refunded AND the orphaned VM row is failed — never left PROVISIONING with
+    owner_wallet=intent_id, which the reservation sweeper won't reclaim."""
+    row = await _seed_intent(intent_state, asset="BTC")
+    intent_state.native_crypto.scan_results[row.address] = AddressScanResult(
+        address=row.address, received_total=row.amount_crypto, confirmations=2
+    )
+
+    def _boom(vm_id):
+        raise RuntimeError("scheduler down")
+
+    monkeypatch.setattr(intent_state.orchestrator, "start_provisioning", _boom)
+
+    await poll_one_intent(
+        intent_id=row.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    assert intent_state.orchestrator.created_vms  # a row was inserted
+    vm_id = intent_state.orchestrator.created_vms[-1][0]
+    async with intent_state.orchestrator.db() as db:
+        vm = await db.get(VMRow, vm_id)
+    assert vm.status == VMStatus.FAILED  # cleaned up, not stranded
+    assert row.intent_id in intent_state.orchestrator.native_refunds  # and refunded
 
 
 # --- HTTP endpoints: route shape + one-shot reveal ---

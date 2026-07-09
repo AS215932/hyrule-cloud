@@ -120,6 +120,14 @@ class _StubOrchestrator:
     ) -> None:
         self.create_failure_refunds.append((vm_id, payment_tx))
 
+    async def mark_vm_failed(self, vm_id: str, error: str) -> None:
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.status = VMStatus.FAILED
+                row.error = error
+                await session.commit()
+
     async def get_vm(self, vm_id: str) -> VMRow | None:
         async with self.db() as session:
             return await session.get(VMRow, vm_id)

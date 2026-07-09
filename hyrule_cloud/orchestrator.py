@@ -558,6 +558,22 @@ class Orchestrator:
         # Free subdomain VM (nothing charged) with no linked intent.
         log.info("vm_refund_not_recorded_here", vm_id=vm_id, owner_wallet=owner_wallet or None)
 
+    async def mark_vm_failed(self, vm_id: str, error: str) -> None:
+        """Terminally fail a VM row that will never be provisioned.
+
+        Used when a paid create errors after the row was inserted/activated but
+        before the background provisioner was scheduled. Such a row sits in
+        PROVISIONING with a non-empty owner_wallet, which the reservation sweeper
+        (unpaid rows only, owner_wallet == "") never reclaims — so without this
+        it pins its customer /64 and keeps counting as live until expiry.
+        """
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None and row.status not in (VMStatus.DESTROYED, VMStatus.FAILED):
+                row.status = VMStatus.FAILED
+                row.error = error
+                await session.commit()
+
     async def persist_charged_amount(self, vm_id: str, amount: Decimal) -> None:
         """Persist the locked, actually-charged quote amount onto the VM.
 

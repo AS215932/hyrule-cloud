@@ -920,19 +920,29 @@ async def create_vm(
     except Exception as exc:
         # Post-charge, pre-provision failure: no background task exists to record
         # the refund, so record it here before surfacing the error.
+        failed_vm_id = getattr(row, "vm_id", None)
         log.error(
             "vm_create_post_charge_failed",
-            vm_id=getattr(row, "vm_id", None),
+            vm_id=failed_vm_id,
             error=str(exc),
             exc_info=True,
         )
         await orch.record_create_failure_refund(
             owner_wallet=wallet,
             payment_tx=getattr(request.state, "payment_tx", None),
-            charged_amount=quote_row.amount_usd if quote_row is not None else None,
+            # `total` is what was charged: the locked quote amount, or the
+            # computed price for a legacy/unquoted create. Never None, so an
+            # unquoted create whose settled ledger row was lost still refunds.
+            charged_amount=total,
             reason=f"vm_create_failed: {exc}",
-            vm_id=getattr(row, "vm_id", None),
+            vm_id=failed_vm_id,
         )
+        if failed_vm_id is not None:
+            # A row was inserted/activated but the background provisioner was
+            # never scheduled — fail it terminally so it doesn't sit in
+            # PROVISIONING pinning its customer /64 (the sweeper won't reclaim a
+            # row with an owner_wallet).
+            await orch.mark_vm_failed(failed_vm_id, f"create failed post-charge: {exc}")
         raise HTTPException(
             status_code=500,
             detail="Provisioning failed after payment; a refund has been recorded and will be processed.",

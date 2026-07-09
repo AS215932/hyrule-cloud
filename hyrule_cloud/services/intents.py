@@ -345,6 +345,7 @@ async def _trigger_provisioning(
     # (String(64)) and the insert would fail before the intent is linked or any
     # refund could be recorded. The refund path finds the intent by vm_id and
     # reads the real deposit address from it.
+    vm_row = None
     try:
         order = VMCreateRequest.model_validate(row.order_payload)
         # Create the VM row but DON'T start provisioning yet: link the intent to
@@ -387,6 +388,14 @@ async def _trigger_provisioning(
                     .values(status=CryptoIntentStatus.FAILED)
                 )
                 await db.commit()
+        if vm_row is not None:
+            # create_vm inserted a row but a later step failed before the
+            # background provisioner was scheduled; fail it terminally so it
+            # doesn't sit in PROVISIONING (owner_wallet=intent_id) pinning a /64
+            # the sweeper (unpaid rows only) won't reclaim.
+            await orch.mark_vm_failed(
+                vm_row.vm_id, "native provisioning failed post-settlement"
+            )
 
 
 async def scan_pending_intents(

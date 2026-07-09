@@ -112,6 +112,14 @@ class _StubOrchestrator:
     ) -> None:
         self.create_failure_refunds.append((vm_id, payment_tx))
 
+    async def mark_vm_failed(self, vm_id: str, error: str) -> None:
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.status = VMStatus.FAILED
+                row.error = error
+                await session.commit()
+
 
 @pytest_asyncio.fixture
 async def quote_state():
@@ -299,6 +307,30 @@ async def test_link_quote_failure_still_starts_provisioning(quote_state, client,
     assert res.status_code == 200, res.text
     vm_id = res.json()["vm_id"]
     assert vm_id in quote_state.orchestrator.provisioning_started
+
+
+@pytest.mark.asyncio
+async def test_post_charge_failure_records_refund_and_fails_row(quote_state, client, monkeypatch):
+    """A post-charge failure before the background provisioner is scheduled (here
+    start_provisioning raises) must (a) record a refund and (b) terminally fail
+    the VM row so it doesn't sit in PROVISIONING pinning its customer /64."""
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+
+    def _boom(vm_id):
+        raise RuntimeError("scheduler down")
+
+    monkeypatch.setattr(quote_state.orchestrator, "start_provisioning", _boom)
+
+    res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+    assert res.status_code == 500
+    # A refund was recorded for the charged-but-failed create.
+    assert quote_state.orchestrator.create_failure_refunds
+    # The half-created row is terminally FAILED, not stranded in PROVISIONING.
+    vm_id = quote_state.orchestrator.created_vms[-1]
+    async with quote_state.orchestrator.db() as session:
+        row = await session.get(VMRow, vm_id)
+    assert row.status == VMStatus.FAILED
 
 
 @pytest.mark.asyncio
