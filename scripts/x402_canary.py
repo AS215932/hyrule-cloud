@@ -71,7 +71,7 @@ TESTS: dict[str, dict] = {
     # (Globalping/RIPE Atlas) is configured — it returns 501 before charging
     # (PR #42), so it's kept OUT of the default `intel` sweep and only runs when
     # named explicitly (`x402_canary.py path-report`) once a prober is live.
-    "path-report": {"path": "/v1/path/report", "body": {"target": "example.com", "vantages": ["extmon", "as215932"], "checks": ["ping", "traceroute"]}, "usd": "0.02", "group": "intel", "gated": True},
+    "path-report": {"path": "/v1/path/report", "body": {"target": "example.com", "vantages": ["extmon", "as215932"], "checks": ["ping", "traceroute"]}, "usd": "0.05", "group": "intel", "gated": True},
     "ports":     {"path": "/v1/ports/check", "body": {"target": "example.com", "port": 443}, "usd": "0.003", "group": "intel"},
     "nat":       {"path": "/v1/nat/lookup",  "body": {"customer_reported_wan_ip": "100.64.1.1"}, "usd": "0.003", "group": "intel"},
     "threat":    {"path": "/v1/threat/lookup","body": {"subject": {"type": "domain", "value": "example.com"}}, "usd": "0.01", "group": "intel"},
@@ -226,7 +226,7 @@ async def _zone_write_after_register(reg_resp: httpx.Response, domain_name: str 
         return False
     fqdn = f"canary.{zone}"
     print(f"    --- polling public DNS for {fqdn} AAAA {record['value']} ---")
-    if await _resolve_aaaa(fqdn, record["value"]):
+    if await _resolve_aaaa(fqdn, record["value"], zone):
         print(f"    ✅ {fqdn} resolves to {record['value']}")
         return True
     # The Phase-3c gate requires public resolution, not just a 2xx write — a
@@ -236,9 +236,51 @@ async def _zone_write_after_register(reg_resp: httpx.Response, domain_name: str 
     return False
 
 
-async def _resolve_aaaa(fqdn: str, expected: str, *, attempts: int = 12, delay: float = 5.0) -> bool:
-    """Poll public DNS until ``fqdn`` resolves to the expected AAAA. Returns True
-    once seen, False after ``attempts`` * ``delay`` seconds."""
+async def _authoritative_aaaa(fqdn: str, zone: str):
+    """AAAA values for ``fqdn`` seen by querying the zone's OWN nameservers
+    directly. This bypasses recursive negative caches — a recursive resolver
+    that cached NXDOMAIN before the domain was registered can outlast a short
+    poll window, but the authoritative servers reflect the RFC2136 write at
+    once (subject only to registry NS delegation being visible)."""
+    import ipaddress
+
+    import dns.asyncresolver
+
+    found: set = set()
+    try:
+        ns_answer = await dns.asyncresolver.resolve(zone, "NS")
+    except Exception:
+        return found  # delegation not visible yet
+    for ns in ns_answer:
+        ns_host = str(ns.target).rstrip(".")
+        ns_addrs: list[str] = []
+        for rtype in ("AAAA", "A"):
+            try:
+                ns_addrs += [a.address for a in await dns.asyncresolver.resolve(ns_host, rtype)]
+            except Exception:
+                pass
+        if not ns_addrs:
+            continue
+        direct = dns.asyncresolver.Resolver(configure=False)
+        direct.nameservers = ns_addrs
+        try:
+            ans = await direct.resolve(fqdn, "AAAA")
+            found |= {ipaddress.IPv6Address(a.address) for a in ans}
+        except Exception:
+            continue
+    return found
+
+
+async def _resolve_aaaa(
+    fqdn: str, expected: str, zone: str, *, attempts: int = 20, delay: float = 15.0
+) -> bool:
+    """Poll public DNS until ``fqdn`` resolves to the expected AAAA, via the
+    zone's authoritative nameservers AND the default recursive resolver. Returns
+    True once seen, False after ~attempts*delay seconds.
+
+    A freshly registered domain needs registry delegation plus recursive cache
+    expiry, which routinely outlasts 60s; the default deadline here is ~5 min and
+    the authoritative path avoids waiting on recursive negative-cache TTLs."""
     import ipaddress
 
     import dns.asyncresolver
@@ -246,14 +288,16 @@ async def _resolve_aaaa(fqdn: str, expected: str, *, attempts: int = 12, delay: 
     want = ipaddress.IPv6Address(expected)
     resolver = dns.asyncresolver.Resolver()
     for i in range(attempts):
+        got: set = set()
         try:
-            answer = await resolver.resolve(fqdn, "AAAA")
-            got = {ipaddress.IPv6Address(r.address) for r in answer}
-            print(f"    [dns {i}] {fqdn} AAAA -> {sorted(str(g) for g in got)}")
-            if want in got:
-                return True
+            got |= {ipaddress.IPv6Address(a.address) for a in await resolver.resolve(fqdn, "AAAA")}
         except Exception as e:
-            print(f"    [dns {i}] {fqdn} AAAA not resolvable yet: {e}")
+            print(f"    [dns {i}] recursive {fqdn} AAAA not resolvable yet: {e}")
+        got |= await _authoritative_aaaa(fqdn, zone)
+        if got:
+            print(f"    [dns {i}] {fqdn} AAAA -> {sorted(str(g) for g in got)}")
+        if want in got:
+            return True
         await asyncio.sleep(delay)
     return False
 
