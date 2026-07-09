@@ -138,7 +138,7 @@ async def test_get_pricing(override_state):
         res = await client.get("/v1/pricing")
         assert res.status_code == 200
         data = res.json()
-        assert data["vm_prices"]["xs (1vCPU/512MB/10GB)"] == "$0.05/day"
+        assert data["vm_prices"]["xs (1vCPU/1GB/10GB)"] == "$0.05/day"
         assert data["domain_auto"] == "$0.00 (subdomain under deploy.hyrule.host)"
         assert data["proxy_prices"] == {
             "direct": "$0.01/request",

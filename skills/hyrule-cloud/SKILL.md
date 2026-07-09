@@ -53,7 +53,7 @@ X-PAYMENT-REQUIRED: eyJ4NDAyVmVyc2lvbiI6Mn0...   # base64 of the body below
   ],
   "amount": "0.35",
   "cost_breakdown": {"vm_cost": "$0.35", "domain_cost": "$0.00", "total": "$0.35"},
-  "specs": {"vcpu": 1, "memory_mb": 512, "disk_gb": 10, "ipv6": true, "ipv4": false}
+  "specs": {"vcpu": 1, "memory_mb": 1024, "disk_gb": 10, "ipv6": true, "ipv4": false}
 }
 ```
 
@@ -87,7 +87,7 @@ Returns current prices for all resources.
 ```json
 {
   "vm_prices": {
-    "xs (1vCPU/512MB/10GB)": "$0.05/day",
+    "xs (1vCPU/1GB/10GB)": "$0.05/day",
     "sm (1vCPU/1GB/20GB)": "$0.10/day",
     "md (2vCPU/2GB/40GB)": "$0.20/day",
     "lg (4vCPU/4GB/80GB)": "$0.40/day"
@@ -112,7 +112,7 @@ Machine-readable VM catalog — specs + daily price per size (no HTML scraping).
   "currency": "USD",
   "billing": "prepaid-daily",
   "products": [
-    {"size": "xs", "name": "Starter", "vcpu": 1, "ram_mb": 512, "disk_gb": 10, "price_usd_day": "0.05"},
+    {"size": "xs", "name": "Starter", "vcpu": 1, "ram_mb": 1024, "disk_gb": 10, "price_usd_day": "0.05"},
     {"size": "sm", "name": "Basic", "vcpu": 1, "ram_mb": 1024, "disk_gb": 20, "price_usd_day": "0.10"},
     {"size": "md", "name": "Standard", "vcpu": 2, "ram_mb": 2048, "disk_gb": 40, "price_usd_day": "0.20"},
     {"size": "lg", "name": "Performance", "vcpu": 4, "ram_mb": 4096, "disk_gb": 80, "price_usd_day": "0.40"}
@@ -205,7 +205,7 @@ Provision a bare VM with SSH access. Returns 202 with a status URL to poll.
 }
 ```
 
-**Sizes:** `xs` (1vCPU/512MB/10GB), `sm` (1vCPU/1GB/20GB), `md` (2vCPU/2GB/40GB), `lg` (4vCPU/4GB/80GB)
+**Sizes:** `xs` (1vCPU/1GB/10GB), `sm` (1vCPU/1GB/20GB), `md` (2vCPU/2GB/40GB), `lg` (4vCPU/4GB/80GB)
 
 **Domain modes:**
 - `auto` — free subdomain `<hash>.deploy.hyrule.host` (default)

@@ -572,7 +572,7 @@ async def get_payment_networks(
 async def get_pricing(cfg = Depends(get_cfg)) -> PricingResponse:
     return PricingResponse(
         vm_prices={
-            "xs (1vCPU/512MB/10GB)": f"${cfg.payment.price_vm_xs}/day",
+            "xs (1vCPU/1GB/10GB)": f"${cfg.payment.price_vm_xs}/day",
             "sm (1vCPU/1GB/20GB)": f"${cfg.payment.price_vm_sm}/day",
             "md (2vCPU/2GB/40GB)": f"${cfg.payment.price_vm_md}/day",
             "lg (4vCPU/4GB/80GB)": f"${cfg.payment.price_vm_lg}/day",

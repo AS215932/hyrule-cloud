@@ -58,7 +58,7 @@ async def test_products_lists_all_sizes_with_specs_and_prices(products_state, cl
     assert set(by_size) == {"xs", "sm", "md", "lg"}
     # Specs come from VM_SPECS; prices from the configured per-size values.
     assert by_size["xs"]["vcpu"] == 1
-    assert by_size["xs"]["ram_mb"] == 512
+    assert by_size["xs"]["ram_mb"] == 1024
     assert by_size["xs"]["disk_gb"] == 10
     assert by_size["xs"]["price_usd_day"] == "0.05"
     assert by_size["xs"]["name"] == "Starter"

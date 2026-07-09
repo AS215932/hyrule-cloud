@@ -65,7 +65,7 @@ def generate_diagnostic_job_access_token() -> str:
 
 
 class VMSize(enum.StrEnum):
-    XS = "xs"  # 1 vCPU, 512 MB, 10 GB
+    XS = "xs"  # 1 vCPU, 1 GB, 10 GB
     SM = "sm"  # 1 vCPU, 1 GB, 20 GB
     MD = "md"  # 2 vCPU, 2 GB, 40 GB
     LG = "lg"  # 4 vCPU, 4 GB, 80 GB
@@ -173,7 +173,10 @@ class QuoteStatus(enum.StrEnum):
 
 
 VM_SPECS: dict[VMSize, dict] = {
-    VMSize.XS: {"vcpu": 1, "memory_mb": 512, "disk_gb": 10},
+    # 512 MB is below the debian-13 template's inherited memory floor (XCP-NG
+    # rejects the shrink with MEMORY_CONSTRAINT_VIOLATION_ORDER) and OOMs on
+    # cloud-init/apt anyway; 1 GB is the smallest viable Debian tier.
+    VMSize.XS: {"vcpu": 1, "memory_mb": 1024, "disk_gb": 10},
     VMSize.SM: {"vcpu": 1, "memory_mb": 1024, "disk_gb": 20},
     VMSize.MD: {"vcpu": 2, "memory_mb": 2048, "disk_gb": 40},
     VMSize.LG: {"vcpu": 4, "memory_mb": 4096, "disk_gb": 80},
