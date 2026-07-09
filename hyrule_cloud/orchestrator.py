@@ -558,6 +558,73 @@ class Orchestrator:
         # Free subdomain VM (nothing charged) with no linked intent.
         log.info("vm_refund_not_recorded_here", vm_id=vm_id, owner_wallet=owner_wallet or None)
 
+    async def persist_charged_amount(self, vm_id: str, amount: Decimal) -> None:
+        """Persist the locked, actually-charged quote amount onto the VM.
+
+        VMRow.cost_total is otherwise recomputed from current pricing, which can
+        drift from what was charged during the quote TTL. Writing the locked
+        amount here — before the best-effort quote link — means a later refund is
+        accurate even if the link fails and the settled ledger row was lost.
+        """
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.cost_total = amount
+                await session.commit()
+
+    async def record_create_failure_refund(
+        self,
+        *,
+        owner_wallet: str,
+        payment_tx: str | None,
+        charged_amount: Decimal | None,
+        reason: str,
+        vm_id: str | None = None,
+    ) -> None:
+        """Record the refund owed when a paid /v1/vm/create fails synchronously.
+
+        The background provisioner (_provision_vm) owns the normal refund path,
+        but it is only scheduled after the reservation/allocation succeeds. A
+        failure between settlement and that scheduling (reservation swept then
+        create hits capacity, activation raises, ...) would otherwise charge the
+        customer with no refund record. Prefer the authoritative settled ledger
+        row (amount + network + asset); else fall back to the locked quote amount
+        actually charged. Dev-bypass "payments" charged nothing, so are skipped.
+        """
+        if not payment_tx or payment_tx.startswith("dev_bypass"):
+            return
+        async with self.db() as session:
+            settled = (
+                await session.execute(
+                    select(PaymentEventRow)
+                    .where(
+                        PaymentEventRow.tx_hash == payment_tx,
+                        PaymentEventRow.event_type == "settled",
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        if settled is not None:
+            await self.refunds.record_owed(
+                resource_path="/v1/vm/create",
+                payer=settled.payer_wallet or owner_wallet or "unknown",
+                amount=settled.amount_usd,
+                network=settled.network,
+                asset=settled.asset,
+                original_tx=payment_tx,
+                reason=reason,
+                vm_id=vm_id,
+            )
+            return
+        await self.refunds.record_owed(
+            resource_path="/v1/vm/create",
+            payer=owner_wallet or "unknown",
+            amount=charged_amount,
+            original_tx=payment_tx,
+            reason=reason,
+            vm_id=vm_id,
+        )
+
     async def _record_native_refund(self, vm_id: str, *, reason: str) -> bool:
         """Transition a failed native-intent VM's intent to REFUND_MANUAL and
         record the owed refund. Returns False when no native intent is linked to

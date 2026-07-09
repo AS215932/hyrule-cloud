@@ -184,6 +184,67 @@ async def test_failed_paid_vm_refunds_from_settled_ledger(session_factory, monke
 
 
 @pytest.mark.asyncio
+async def test_create_failure_refund_uses_settled_ledger(session_factory) -> None:
+    """A paid /v1/vm/create that fails synchronously — before the background
+    provisioner is scheduled — still records a refund, from the authoritative
+    settled charge even when no VM row exists yet (vm_id=None)."""
+    await _seed_settled(
+        session_factory, tx="0xSYNC", amount="0.05",
+        network="base", asset="USDC", payer=EVM_WALLET,
+    )
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    await orch.record_create_failure_refund(
+        owner_wallet=EVM_WALLET,
+        payment_tx="0xSYNC",
+        charged_amount=Decimal("0.10"),  # differs from settled — settled wins
+        reason="vm_create_failed: capacity exhausted",
+        vm_id=None,
+    )
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1
+    assert owed[0].payer_wallet == EVM_WALLET
+    assert owed[0].amount_usd == Decimal("0.05")  # settled amount, not charged 0.10
+    assert owed[0].network == "base"
+    assert owed[0].asset == "USDC"
+    assert owed[0].tx_hash == "0xSYNC"
+
+
+@pytest.mark.asyncio
+async def test_create_failure_refund_falls_back_to_locked_amount(session_factory) -> None:
+    """No settled row (best-effort ledger write lost) → the synchronous-failure
+    refund still records, using the locked quote amount actually charged."""
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    await orch.record_create_failure_refund(
+        owner_wallet=EVM_WALLET,
+        payment_tx="0xLOST",
+        charged_amount=Decimal("0.07"),
+        reason="vm_create_failed",
+        vm_id=None,
+    )
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert len(owed) == 1
+    assert owed[0].amount_usd == Decimal("0.07")
+    assert owed[0].payer_wallet == EVM_WALLET
+    assert owed[0].tx_hash == "0xLOST"
+
+
+@pytest.mark.asyncio
+async def test_create_failure_refund_skips_dev_bypass(session_factory) -> None:
+    """A dev-bypass "payment" charged nothing, so a synchronous failure owes no
+    refund — no phantom row should pollute the worklist."""
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    await orch.record_create_failure_refund(
+        owner_wallet=EVM_WALLET,
+        payment_tx="dev_bypass_abc",
+        charged_amount=Decimal("0.05"),
+        reason="vm_create_failed",
+        vm_id=None,
+    )
+    owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
+    assert owed == []
+
+
+@pytest.mark.asyncio
 async def test_failed_native_intent_vm_records_manual_refund(session_factory, monkeypatch) -> None:
     """A native BTC/XMR intent VM that fails AFTER being marked PROVISIONED must
     flip its intent to REFUND_MANUAL and record the owed refund (network=native,

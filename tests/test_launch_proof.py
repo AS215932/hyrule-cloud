@@ -60,6 +60,7 @@ class _StubOrchestrator:
         self.db = session_factory
         self.created_vms: list[str] = []
         self.provisioning_started: list[str] = []
+        self.create_failure_refunds: list[tuple[str | None, str | None]] = []
 
     def compute_price(self, request):
         from hyrule_cloud.models import CostBreakdown
@@ -106,6 +107,18 @@ class _StubOrchestrator:
             await session.commit()
         self.created_vms.append(vm_id)
         return row, anon_token
+
+    async def persist_charged_amount(self, vm_id: str, amount: Decimal) -> None:
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.cost_total = amount
+                await session.commit()
+
+    async def record_create_failure_refund(
+        self, *, owner_wallet, payment_tx, charged_amount, reason, vm_id=None
+    ) -> None:
+        self.create_failure_refunds.append((vm_id, payment_tx))
 
     async def get_vm(self, vm_id: str) -> VMRow | None:
         async with self.db() as session:
