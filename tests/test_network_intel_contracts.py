@@ -465,3 +465,19 @@ async def test_capabilities_hide_gated_paid_endpoints():
     assert {e["path"] for e in path["paid_endpoints"]} == set()
     # The gated quote also disappears from the free list.
     assert not any(e["path"] == "/v1/path/report/quote" for e in path["free_endpoints"])
+
+
+def test_bazaar_discovery_hides_gated_diagnostics_by_default():
+    """The Bazaar discovery extension must mirror the manifest gate: with no
+    diagnostic source configured (default), the gated routes are not declared, so
+    an agent can't copy an extension whose default example 501s. Ungated routes
+    still declare."""
+    from hyrule_cloud.services.discovery import discovery_for
+
+    # Gated diagnostics: no declaration until their source is configured.
+    assert discovery_for("POST", "/v1/path/ping") is None
+    assert discovery_for("POST", "/v1/threat/lookup") is None
+    assert discovery_for("POST", "/v1/voip/number/lookup") is None
+    # An ungated diagnostic is still advertised.
+    assert discovery_for("POST", "/v1/dns/lookup") is not None
+    assert discovery_for("POST", "/v1/mx/check") is not None
