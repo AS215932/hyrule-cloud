@@ -148,6 +148,12 @@ One paid call each; response must contain substantive real data:
 makes no external calls; if stub-grade, pull it from the manifest +
 discovery.py and skip its skill).
 
+The `intel` sweep includes `path-report`, but the path endpoints only leave 501
+once an active-probe vantage (Globalping/RIPE Atlas) is configured; until then
+the canary reports them **SKIPPED (501)**, not failed. Configure a prober and
+re-run `python scripts/x402_canary.py path-report` to validate the paid path
+evidence before treating 3a as complete.
+
 ### 3b Network proxy
 
 1. On netproxy: `systemctl status hyrule-network-proxy`; token match between

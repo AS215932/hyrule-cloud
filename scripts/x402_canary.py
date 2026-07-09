@@ -66,12 +66,14 @@ TESTS: dict[str, dict] = {
     "web":       {"path": "/v1/web/check",   "body": {"target": "https://example.com"}, "usd": "0.005", "group": "intel"},
     "web-tls":   {"path": "/v1/web/tls/deep","body": {"host": "example.com"}, "usd": "0.10", "group": "intel"},
     "mx":        {"path": "/v1/mx/check",    "body": {"tool": "mx", "target": "example.com"}, "usd": "0.005", "group": "intel"},
-    "path":      {"path": "/v1/path/ping",   "body": {"target": "example.com"}, "usd": "0.005", "group": "intel"},
-    # /v1/path/report is de-advertised until an active-probe vantage
-    # (Globalping/RIPE Atlas) is configured — it returns 501 before charging
-    # (PR #42), so it's kept OUT of the default `intel` sweep and only runs when
-    # named explicitly (`x402_canary.py path-report`) once a prober is live.
-    "path-report": {"path": "/v1/path/report", "body": {"target": "example.com", "vantages": ["extmon", "as215932"], "checks": ["ping", "traceroute"]}, "usd": "0.05", "group": "intel", "gated": True},
+    "path":      {"path": "/v1/path/ping",   "body": {"target": "example.com", "vantages": ["extmon", "as215932", "globalping"]}, "usd": "0.005", "group": "intel"},
+    # /v1/path/report (Phase-3a path evidence) uses the endpoint's default
+    # vantage set so it actually probes once a vantage (Globalping/RIPE Atlas) is
+    # configured. Until then it returns 501 before charging (PR #42), which the
+    # sweep treats as "not launched yet, skipped" rather than a failure — so the
+    # runbook's required paid /v1/path/report call is validated the moment a
+    # prober goes live, without failing the pre-launch sweep.
+    "path-report": {"path": "/v1/path/report", "body": {"target": "example.com", "vantages": ["extmon", "as215932", "globalping"], "checks": ["ping", "traceroute"]}, "usd": "0.05", "group": "intel"},
     "ports":     {"path": "/v1/ports/check", "body": {"target": "example.com", "port": 443}, "usd": "0.003", "group": "intel"},
     "nat":       {"path": "/v1/nat/lookup",  "body": {"customer_reported_wan_ip": "100.64.1.1"}, "usd": "0.003", "group": "intel"},
     "threat":    {"path": "/v1/threat/lookup","body": {"subject": {"type": "domain", "value": "example.com"}}, "usd": "0.01", "group": "intel"},
@@ -101,8 +103,13 @@ def _client(usd: str) -> x402Client:
         sys.exit("ERROR: set CANARY_KEY to a funded Base wallet private key (0x...).")
     signer = EthAccountSigner(Account.from_key(key))
     client = x402Client()
-    # eip155:* wildcard scheme + a per-call max-amount guardrail.
-    register_exact_evm_client(client, signer, policies=[max_amount(_cap_units(usd))])
+    # Pin to Base mainnet (eip155:8453) + a per-call max-amount guardrail. The
+    # canary key is Base-funded; without the network pin the SDK would sign for
+    # whatever EVM chain the API advertises first (e.g. Polygon/Arbitrum if CDP
+    # enables them before Base), causing a false failure or wrong-chain spend.
+    register_exact_evm_client(
+        client, signer, networks="eip155:8453", policies=[max_amount(_cap_units(usd))]
+    )
     return client
 
 
@@ -126,6 +133,33 @@ def _settlement(resp: httpx.Response) -> tuple[bool, str]:
         return False, f"(settlement header present but undecodable: {e}) raw={raw[:80]}"
 
 
+async def _domain_check_price(name: str, extension: str) -> Decimal | None:
+    """GET /v1/domain/check (free) for the REAL registration price, so the
+    payment cap tracks the actual quote instead of a generous static guess.
+    Returns the total (registrar + markup) USD when available, else None."""
+    async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
+        try:
+            r = await http.get("/v1/domain/check", params={"name": name, "extension": extension})
+        except Exception as e:
+            print(f"    !! /v1/domain/check failed: {e!r}")
+            return None
+    if r.status_code >= 400:
+        print(f"    !! /v1/domain/check HTTP {r.status_code} {r.text[:200]}")
+        return None
+    data = r.json()
+    if not data.get("available"):
+        print(f"    !! {name}.{extension} is not available for registration.")
+        return None
+    total = data.get("total") or data.get("price")
+    if total is None:
+        print("    !! /v1/domain/check returned no price to cap against.")
+        return None
+    try:
+        return Decimal(str(total))
+    except (ArithmeticError, ValueError):
+        return None
+
+
 async def _run_one(name: str, *, destroy: bool, domain_name: str | None, use_quote: bool, yes: bool) -> bool:
     t = TESTS[name]
     body = json.loads(json.dumps(t["body"]))  # deep copy
@@ -141,16 +175,33 @@ async def _run_one(name: str, *, destroy: bool, domain_name: str | None, use_quo
             if not quote_id:
                 return False
             body["quote_id"] = quote_id
+    cap_usd = t["usd"]
     if name == "domain":
         if not domain_name:
             sys.exit("ERROR: domain test needs --name <label> (registers <label>.dev for REAL money).")
         body["name"] = domain_name
+        # /v1/domain/register is dynamically priced, so cap on the ACTUAL quote
+        # from /v1/domain/check rather than a static guess — otherwise a
+        # malformed/higher registrar price could still be auto-signed up to the
+        # generous static cap.
+        extension = body.get("extension", "dev")
+        price = await _domain_check_price(domain_name, extension)
+        if price is None:
+            print("    !! /v1/domain/check gave no available price; refusing to sign blind. FAILING.")
+            return False
+        ceiling = Decimal(t["usd"])
+        if price > ceiling:
+            print(f"    !! domain price ${price} exceeds the ${ceiling} canary ceiling; "
+                  "refusing to overspend. FAILING.")
+            return False
+        cap_usd = str(price)
+        print(f"    /v1/domain/check price: ${price} (cap set to this, not the ${ceiling} default)")
 
-    print(f"\n=== {name}  POST {t['path']}  (~${t['usd']})  cap={_cap_units(t['usd'])} units ===")
+    print(f"\n=== {name}  POST {t['path']}  (~${cap_usd})  cap={_cap_units(cap_usd)} units ===")
     if quote_id:
         print(f"    quote_id: {quote_id}")
     print(f"    body: {json.dumps(body)}")
-    client = _client(t["usd"])
+    client = _client(cap_usd)
     async with x402HttpxClient(client, base_url=API, timeout=60.0) as http:
         try:
             r = await http.post(t["path"], json=body)
@@ -161,6 +212,13 @@ async def _run_one(name: str, *, destroy: bool, domain_name: str | None, use_quo
     print(f"    HTTP {r.status_code}   {settle_detail}")
     text = r.text
     print(f"    body: {text[:600]}{'...' if len(text) > 600 else ''}")
+    if r.status_code == 501:
+        # 501 is the intentional "not launched yet" signal (PR #42: a diagnostic
+        # whose source isn't configured 501s BEFORE charging). No money was
+        # spent, so a launch-readiness sweep treats it as skipped, not failed —
+        # configure the source and re-run to validate it.
+        print(f"    -- {name}: gated / not launched (HTTP 501); SKIPPED, not counted as a failure.")
+        return True
     if r.status_code >= 400:
         return False
     if not settled_ok:
@@ -416,6 +474,13 @@ async def _main() -> None:
         return
 
     names = _select(args.target)
+    # Fail fast BEFORE any paid provisioning: an unattended --destroy without
+    # --yes can't answer the teardown prompt, so _maybe_destroy would refuse and
+    # leave a billable VM running behind a failed gate. Reject up front instead.
+    if args.destroy and not args.yes and not sys.stdin.isatty() and "vm" in names:
+        sys.exit("ERROR: --destroy from a non-interactive runner requires --yes; otherwise the "
+                 "canary would provision a billable VM and then refuse to tear it down. "
+                 "Aborting before any spend.")
     total = sum(Decimal(TESTS[n]["usd"]) for n in names)
     spendy = [n for n in names if TESTS[n].get("spendy")]
     print(f"About to run {len(names)} canary payment(s) on {API}: {', '.join(names)}")
