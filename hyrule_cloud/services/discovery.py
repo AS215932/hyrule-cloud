@@ -169,5 +169,28 @@ DISCOVERY: dict[tuple[str, str], dict[str, Any]] = {
 }
 
 
+def _gated_discovery_enabled(path: str) -> bool:
+    """A gated diagnostic must not be advertised in Bazaar discovery any more
+    than in the x402 manifest: its default example request 501s before charging
+    until the backing source is configured, so an agent copying the declared
+    extension would be handed an unusable request. Returns True when the route is
+    safe to advertise — mirroring the manifest/MCP enablement predicates (gated
+    on each endpoint's OWN default vantages for path)."""
+    from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
+    from hyrule_cloud.services.threat.lookup import threat_intel_enabled
+    from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
+
+    if path == "/v1/path/ping":
+        return path_active_probe_enabled(models.PATH_PROBE_DEFAULT_VANTAGES)
+    if path == "/v1/threat/lookup":
+        return threat_intel_enabled()
+    if path == "/v1/voip/number/lookup":
+        return number_intel_enabled()
+    return True
+
+
 def discovery_for(method: str, path: str) -> dict[str, Any] | None:
-    return DISCOVERY.get((method.upper(), path))
+    decl = DISCOVERY.get((method.upper(), path))
+    if decl is None or not _gated_discovery_enabled(path):
+        return None
+    return decl

@@ -39,4 +39,6 @@ curl -X POST https://cloud.hyrule.host/v1/ports/check \
 
 Use this Skill for “my web/mail/SIP port is closed from outside” tickets. Use
 `/v1/web` for HTTP/TLS details, `/v1/mx` for SMTP/mail delivery details, and
-`/v1/path` for packet loss or routing evidence.
+`/v1/bgp/lookup` for routing/origin questions. (Active packet-loss/path
+evidence via `/v1/path` is not launched yet, so this skill does not send you
+there.)

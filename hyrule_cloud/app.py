@@ -449,6 +449,40 @@ async def x402_manifest():
         manifest["resources"] = [
             r for r in manifest["resources"] if r.get("path") != "/v1/vm/create"
         ]
+    # Don't advertise diagnostic routes whose real data source isn't configured
+    # yet — they return 501 before charging, so pointing agents at them would
+    # only produce failed payments. They re-appear automatically once a source
+    # is wired up (same predicate the routes use).
+    from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
+    from hyrule_cloud.services.threat.lookup import threat_intel_enabled
+    from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
+
+    unconfigured: set[str] = set()
+    if not threat_intel_enabled():
+        unconfigured.add("/v1/threat/lookup")
+    if not number_intel_enabled():
+        unconfigured.add("/v1/voip/number/lookup")
+    # Gate each path endpoint on whether ITS OWN default request would probe:
+    # the ping-family defaults to [extmon] (never an active vantage), so the
+    # advertised default request 501s even when Globalping/RIPE is configured —
+    # only /v1/path/report defaults to a vantage set that includes globalping.
+    # Advertise an endpoint only when the request an agent gets from discovery
+    # actually returns data.
+    from hyrule_cloud.models import (
+        PATH_PROBE_DEFAULT_VANTAGES,
+        PATH_REPORT_DEFAULT_VANTAGES,
+    )
+
+    if not path_active_probe_enabled(PATH_PROBE_DEFAULT_VANTAGES):
+        unconfigured.update(
+            {"/v1/path/ping", "/v1/path/trace", "/v1/path/mtr", "/v1/path/asymmetry"}
+        )
+    if not path_active_probe_enabled(PATH_REPORT_DEFAULT_VANTAGES):
+        unconfigured.add("/v1/path/report")
+    if unconfigured:
+        manifest["resources"] = [
+            r for r in manifest["resources"] if r.get("path") not in unconfigured
+        ]
     # Bazaar/x402scan: flag resources whose 402 responses carry a discovery
     # extension declaration (services/discovery.py).
     for resource in manifest["resources"]:

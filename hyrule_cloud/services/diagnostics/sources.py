@@ -6,6 +6,27 @@ from datetime import UTC, datetime
 
 from hyrule_cloud.models import SourceHealth, SourceStatus
 
+# Statuses in which a source is actually configured AND able to return real
+# data (possibly degraded). Everything else — not_configured, disabled,
+# unavailable, error, unknown, informational — means "cannot answer", so a paid
+# route backed only by such sources must 501 before charging.
+# Statuses where a configured source can actually answer right now. STALE and
+# DEGRADED still return (old/partial) data; RATE_LIMITED is deliberately
+# EXCLUDED — a throttled source can't return fresh data, and these gates exist
+# to 501 before charging when the backing source can't answer.
+_USABLE_SOURCE_STATUSES = frozenset(
+    {
+        SourceStatus.OK,
+        SourceStatus.STALE,
+        SourceStatus.DEGRADED,
+    }
+)
+
+
+def source_usable(health: SourceHealth) -> bool:
+    """Whether a source is configured and can return real data right now."""
+    return health.status in _USABLE_SOURCE_STATUSES
+
 
 def _source(
     status: SourceStatus,

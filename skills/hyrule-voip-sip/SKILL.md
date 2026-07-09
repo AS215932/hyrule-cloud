@@ -1,19 +1,19 @@
 ---
 name: hyrule-voip-sip
-description: "Use Hyrule Cloud when an AI agent needs SIP DNS, SIP TLS, SIP OPTIONS, STUN/TURN, number carrier, CNAM, number spam reputation, or E911 diagnostic context."
+description: "Use Hyrule Cloud when an AI agent needs SIP DNS, SIP TLS, SIP OPTIONS, or STUN/TURN diagnostic context."
 ---
 
 # Hyrule VoIP/SIP Skill
 
-Use Hyrule Cloud when an AI agent needs SIP DNS, SIP TLS, SIP OPTIONS,
-STUN/TURN, number carrier, CNAM, number spam reputation, or E911 diagnostic
-context.
+Use Hyrule Cloud when an AI agent needs SIP DNS, SIP TLS, SIP OPTIONS, or
+STUN/TURN diagnostic context.
 
 ## Source policy
 
-SIP DNS and SIP TLS can run from Hyrule's public diagnostic surface. Number
-carrier/CNAM/spam/E911 providers are pluggable adapters and return
-`source_not_configured` until API keys and compliance requirements are in place.
+SIP DNS and SIP TLS run from Hyrule's public diagnostic surface. Number
+intelligence (carrier/CNAM/spam/E911 via `/v1/voip/number/lookup`) is **not
+launched yet** — the route returns HTTP 501 until a provider is configured, so
+this skill is SIP-only and does not advertise or document number lookups.
 
 ## Discovery
 
@@ -32,18 +32,14 @@ curl -X POST https://cloud.hyrule.host/v1/voip/check \
   -d '{"target":"example.com","checks":["sip_dns","sip_tls"],"sip_port":5061}'
 ```
 
-## Paid number lookup contract
-
-```bash
-curl -X POST https://cloud.hyrule.host/v1/voip/number/lookup \
-  -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
-  -d '{"number":"+15551234567","country":"US","checks":["number_intel","cnam","spam_reputation","e911"]}'
-```
-
 ## Agent guidance
 
-Use this Skill for hosted PBX/SIP trunk, softphone, SIP TLS certificate, SRV
-record, or number-reputation tickets. If the issue is general packet loss or
-routing, use `/v1/path`. If it is a single SIP port reachability question, use
-`/v1/ports/check` with `5060` or `5061`.
+Use this Skill for hosted PBX/SIP trunk, softphone, SIP TLS certificate, or SRV
+record tickets. If it is a single SIP port reachability question, use
+`/v1/ports/check` with `5060` or `5061`; for BGP/routing origin questions use
+`/v1/bgp/lookup`. (Active packet-loss/path evidence via `/v1/path` is not
+launched yet, so this skill does not send you there.)
+
+Number intelligence (carrier/CNAM/spam/E911 via `/v1/voip/number/lookup`) is not
+launched yet — the route returns HTTP 501 until a provider is configured, so
+this skill does not document it.
