@@ -8,12 +8,20 @@ pointers — no management tokens, no native-rail payment details.
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from hyrule_cloud.trust.identity import build_agent_registration, build_jwks
+from hyrule_cloud.trust.x401 import (
+    PROOF_RESULT_HEADER,
+    X401_VERSION,
+    b64url_encode_json,
+    quote_hash,
+)
 
 if TYPE_CHECKING:
     from hyrule_cloud.trust import TrustServices
@@ -87,4 +95,90 @@ async def jwks(request: Request) -> JSONResponse:
         return JSONResponse(content={"keys": []})
     return JSONResponse(
         content=build_jwks(trust.receipts.keys, trust.receipts.config)
+    )
+
+
+class X401ProofSubmission(BaseModel):
+    """PROOF-RESPONSE presentation for one quoted purchase.
+
+    The binding fields must repeat exactly what the PROOF-REQUEST was issued
+    for — the verification token is scoped to sha256(quote|amount|route|
+    method) and is useless for any other purchase.
+    """
+
+    route: str = Field(default="/v1/vm/create")
+    method: str = Field(default="POST")
+    quote_id: str | None = None
+    amount_usd: str | None = None
+    # x401 v0.2 Result Artifact (credential_result / credential_result_uri).
+    result_artifact: dict[str, Any]
+
+
+def _proof_result_headers(payload: dict[str, Any]) -> dict[str, str]:
+    return {PROOF_RESULT_HEADER: b64url_encode_json(payload)}
+
+
+@router.post("/v1/x401/proof")
+async def x401_proof(body: X401ProofSubmission, request: Request) -> JSONResponse:
+    """Verify an x401 Result Artifact and issue a short-lived verification
+    token bound to the quoted purchase. 404 while TRUST_X401_MODE=off."""
+    trust = _trust_from_request(request)
+    x401 = getattr(trust, "x401", None)
+    if x401 is None or not x401.enabled:
+        return _not_found()
+
+    amount: Decimal | None = None
+    if body.amount_usd is not None:
+        try:
+            amount = Decimal(body.amount_usd)
+        except InvalidOperation:
+            return JSONResponse(status_code=422, content={"error": "invalid amount_usd"})
+
+    claims = await x401.verifier.verify(body.result_artifact)
+    if claims is None:
+        # Honest failure: either the artifact is malformed, or no real
+        # credential verifier is configured yet (StructuralVerifier only
+        # satisfies under the test-only TRUST_X401_ACCEPT_STRUCTURAL flag).
+        error_payload = {
+            "scheme": "x401",
+            "version": X401_VERSION,
+            "error": "verification_unavailable_or_failed",
+            "detail": (
+                "The presented Result Artifact was not accepted. No external "
+                "credential verifier is configured on this deployment yet."
+            ),
+        }
+        return JSONResponse(
+            status_code=503,
+            content=error_payload,
+            headers=_proof_result_headers(error_payload),
+        )
+
+    bound = quote_hash(
+        quote_id=body.quote_id, amount=amount, route=body.route, method=body.method
+    )
+    token = await x401.issue_proof_token(
+        bound_quote_hash=bound, route=body.route, method=body.method, claims=claims
+    )
+    token_object = {
+        "scheme": "x401",
+        "version": X401_VERSION,
+        "verification_token": token,
+    }
+    result_payload = {
+        "scheme": "x401",
+        "version": X401_VERSION,
+        "result": "satisfied",
+        "claims": claims,
+        "expires_in": x401.config.x401_proof_token_ttl_seconds,
+    }
+    return JSONResponse(
+        content={
+            **result_payload,
+            # One-shot cleartext; retry the purchase with this in the
+            # PROOF-RESPONSE request header (base64url token_object).
+            "verification_token": token,
+            "proof_response_header": b64url_encode_json(token_object),
+        },
+        headers=_proof_result_headers(result_payload),
     )

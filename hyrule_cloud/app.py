@@ -102,6 +102,10 @@ async def lifespan(app: FastAPI):
         public_base_url=config.public_base_url,
         ledger=payment_ledger,
         receipts=trust.receipts,
+        # x401 advisory block rides every 402 while TRUST_X401_MODE != off.
+        advertised_extensions=(
+            trust.x401.advisory_extension() if trust.x401 is not None else None
+        ),
     )
 
     # Network proxy sidecar client. x402 stays in Hyrule Cloud; the sidecar

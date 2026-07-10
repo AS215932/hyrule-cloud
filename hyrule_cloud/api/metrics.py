@@ -21,7 +21,13 @@ from typing import Any
 from fastapi import APIRouter, Request, Response
 from sqlalchemy import func, select
 
-from hyrule_cloud.db import DomainRow, FulfillmentReceiptRow, PaymentEventRow, VMRow
+from hyrule_cloud.db import (
+    DomainRow,
+    FulfillmentReceiptRow,
+    PaymentEventRow,
+    VMRow,
+    X401ProofLogRow,
+)
 from hyrule_cloud.models import VMStatus
 
 router = APIRouter(tags=["Observability"])
@@ -217,6 +223,25 @@ async def _render(session_factory: Any) -> str:
             await session.execute(select(func.count()).select_from(dup_subquery))
         ).scalar_one()
         lines.append(f"hyrule_payment_duplicate_settled_tx {duplicates}")
+
+        _metric(
+            lines,
+            "hyrule_x401_decisions_total",
+            "x401 policy decisions (shadow + enforce) from x401_proof_log.",
+            "counter",
+        )
+        x401_rows = (
+            await session.execute(
+                select(
+                    X401ProofLogRow.mode, X401ProofLogRow.decision, func.count()
+                ).group_by(X401ProofLogRow.mode, X401ProofLogRow.decision)
+            )
+        ).all()
+        for mode, x401_decision, count in x401_rows:
+            lines.append(
+                f'hyrule_x401_decisions_total{{mode="{_esc(mode)}",'
+                f'decision="{_esc(x401_decision)}"}} {count}'
+            )
 
     return "\n".join(lines) + "\n"
 

@@ -165,6 +165,80 @@ def _payment_rail_from_state(request: Request) -> tuple[str, str | None]:
     return "x402-exact-evm", payment_tx
 
 
+def _x401_from_request(request: Request):
+    """Trust-layer X401Service, or None when trust is absent or mode=off."""
+    state = getattr(request.app.state, "_typed_state", None)
+    trust = getattr(state, "trust", None)
+    x401 = getattr(trust, "x401", None)
+    if x401 is None or not x401.enabled:
+        return None
+    return x401
+
+
+async def _x401_enforce_or_none(
+    x401,
+    request: Request,
+    *,
+    decision,
+    quote_id: str | None,
+    amount: Decimal,
+    route: str,
+    method: str,
+):
+    """Enforce-mode step-up: honor a valid verification token presented in
+    the PROOF-RESPONSE request header, else return 401 + PROOF-REQUEST.
+
+    Returns None when the request may proceed (shadow mode, or a valid
+    proof bound to this exact quote/route/method). Runs BEFORE reservation
+    and BEFORE the payment gate — proof-first-then-pay — so a request
+    carrying a payment header but no proof is never verified or settled.
+    """
+    from hyrule_cloud.trust.x401 import (
+        PROOF_REQUEST_HEADER,
+        PROOF_RESPONSE_HEADER,
+        X401Mode,
+        extract_verification_token,
+    )
+    from hyrule_cloud.trust.x401 import (
+        quote_hash as x401_quote_hash,
+    )
+
+    if x401.mode != X401Mode.ENFORCE:
+        return None
+    bound = x401_quote_hash(quote_id=quote_id, amount=amount, route=route, method=method)
+    presented = request.headers.get(PROOF_RESPONSE_HEADER)
+    if presented:
+        token = extract_verification_token(presented)
+        if token is not None and await x401.check_proof_token(
+            token, bound_quote_hash=bound, route=route, method=method
+        ):
+            await x401.record_enforcement(
+                route=route,
+                method=method,
+                decision="proof_valid",
+                reasons=decision.reasons,
+                amount=amount,
+            )
+            return None
+        outcome = "proof_invalid"
+    else:
+        outcome = "proof_missing"
+    await x401.record_enforcement(
+        route=route, method=method, decision=outcome, reasons=decision.reasons, amount=amount
+    )
+    header_value, payload = x401.build_proof_request(
+        bound_quote_hash=bound, route=route, method=method, reasons=decision.reasons
+    )
+    # Per the pinned x401 v0.2 spec the PROOF-REQUEST header is
+    # authoritative; 401 is the conventional carrier. The body duplicates
+    # the payload for humans/debuggers.
+    return JSONResponse(
+        status_code=401,
+        content={"error": "identity_proof_required", "x401": payload},
+        headers={PROOF_REQUEST_HEADER: header_value},
+    )
+
+
 # --- Quote helpers (issue #14) ---
 
 
@@ -864,6 +938,32 @@ async def create_vm(
     total = quote_row.amount_usd if quote_row is not None else computed
     specs = VM_SPECS[order.size]
 
+    # x401 (trust layer): evaluate the step-up policy BEFORE any reservation
+    # or payment work — proof-first-then-pay ordering, so an agent is never
+    # charged for an order it cannot satisfy the eligibility policy for.
+    # Shadow mode only logs what enforcement WOULD require; the paid flow
+    # below is byte-identical with mode off vs shadow (test-pinned).
+    x401 = _x401_from_request(request)
+    if x401 is not None:
+        decision = await x401.observe(
+            route="/v1/vm/create",
+            method="POST",
+            amount=total,
+            duration_days=order.duration_days,
+        )
+        if decision.requires_proof:
+            proof_response = await _x401_enforce_or_none(
+                x401,
+                request,
+                decision=decision,
+                quote_id=quote_row.quote_id if quote_row is not None else None,
+                amount=total,
+                route="/v1/vm/create",
+                method="POST",
+            )
+            if proof_response is not None:
+                return proof_response
+
     # Reservation-through-payment: a request that is about to be CHARGED
     # atomically claims its VM row + customer /64 (unique index) BEFORE the
     # facilitator settles, so a concurrent purchase can never leave a paid
@@ -1140,6 +1240,17 @@ async def extend_vm(
         VMSize.LG: cfg.payment.price_vm_lg,
     }
     total = price_map[VMSize(row.size)] * body.days
+
+    # x401 shadow: extend shares the elevated-purchase policy (long
+    # extensions / high amounts get logged; enforcement is create-only).
+    x401 = _x401_from_request(request)
+    if x401 is not None:
+        await x401.observe(
+            route=request.url.path,
+            method="POST",
+            amount=total,
+            duration_days=body.days,
+        )
 
     request.state.receipt_correlation = {"vm_id": vm_id}
     result = await gate.check_payment(

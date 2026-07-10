@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from hyrule_cloud.trust.receipts import ReceiptService, load_signing_keys
+from hyrule_cloud.trust.x401 import X401Service
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -25,6 +26,8 @@ class TrustServices:
     """DI container for trust-layer services, carried on AppState.trust."""
 
     receipts: ReceiptService
+    # Optional so test fixtures that only exercise receipts stay small.
+    x401: X401Service | None = None
 
 
 def _api_version() -> str:
@@ -59,4 +62,7 @@ def build_trust_services(
         api_version=_api_version(),
         keys=keys,
     )
-    return TrustServices(receipts=receipts)
+    x401 = X401Service(
+        config.trust, session_factory, public_base_url=config.public_base_url
+    )
+    return TrustServices(receipts=receipts, x401=x401)
