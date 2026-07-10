@@ -545,4 +545,30 @@ async def x402_manifest():
     for resource in manifest["resources"]:
         if discovery_for(resource.get("method", ""), resource["path"]) is not None:
             resource["discoverable"] = True
+    # Trust layer: each block appears ONLY when its flag is on, so the
+    # manifest is byte-identical to the announced surface while flags are
+    # off (guarded by tests/test_trust_identity.py).
+    trust_cfg = getattr(config, "trust", None)
+    base_url = getattr(config, "public_base_url", "").rstrip("/")
+    if trust_cfg is not None and getattr(trust_cfg, "receipts_enabled", False):
+        trust_services = getattr(app.state._typed_state, "trust", None)
+        keys = getattr(getattr(trust_services, "receipts", None), "keys", None)
+        manifest["receipts"] = {
+            "profile": "x402-compute-fulfillment-receipt/0.1",
+            "header": "HYRULE-RECEIPT",
+            "endpoint": f"{base_url}/v1/receipts/{{receipt_id}}",
+            "jwks": f"{base_url}/.well-known/jwks.json",
+            "receiptSigners": [keys.evm_signer] if keys is not None else [],
+        }
+    if trust_cfg is not None and getattr(trust_cfg, "agent_card_enabled", False):
+        identity: dict = {
+            "agentRegistration": f"{base_url}/.well-known/agent-registration.json",
+        }
+        registry = getattr(trust_cfg, "erc8004_registry_caip10", "")
+        agent_id = getattr(trust_cfg, "erc8004_agent_id", None)
+        if registry and agent_id is not None:
+            identity["registrations"] = [
+                {"agentId": agent_id, "agentRegistry": registry}
+            ]
+        manifest["identity"] = identity
     return manifest

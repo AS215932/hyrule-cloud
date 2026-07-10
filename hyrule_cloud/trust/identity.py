@@ -69,3 +69,73 @@ def build_jwks(keys: ReceiptSigningKeys | None, config: TrustConfig) -> dict[str
         entries.append(es256_public_jwk(keys.es256_pem, keys.kid))
     entries.extend(_retired_jwks(config.receipt_retired_jwks_json))
     return {"keys": entries}
+
+
+# ERC-8004 registration document type, pinned to the draft as of 2026-07-10
+# (eips.ethereum.org/EIPS/eip-8004, Draft created 2025-08-13). The spec is
+# still moving — re-verify the well-known filename and required fields
+# against the current draft before flipping TRUST_AGENT_CARD_ENABLED on a
+# new deployment.
+REGISTRATION_TYPE = "https://eips.ethereum.org/EIPS/eip-8004#registration-v1"
+REGISTRATION_WELL_KNOWN_PATH = "/.well-known/agent-registration.json"
+
+
+def build_agent_registration(
+    config: TrustConfig,
+    *,
+    public_base_url: str,
+    api_version: str,
+    keys: ReceiptSigningKeys | None,
+) -> dict[str, Any]:
+    """ERC-8004 agent registration document for the Hyrule Cloud
+    Provisioning Agent.
+
+    Built purely from config — never from chain reads — so a registry or
+    RPC outage can never affect this endpoint (soft-fail invariant). The
+    same-origin serving location is what proves domain control to registry
+    consumers; `registrations` appears only once the on-chain ceremony
+    (scripts/erc8004_register.py, human-controlled) has produced an agentId.
+
+    Domain policy (AGENTS.md): this is customer-facing Hyrule Cloud
+    identity — it lives under hyrule.host, never servify.network or
+    as215932.net.
+    """
+    base = public_base_url.rstrip("/")
+    document: dict[str, Any] = {
+        "type": REGISTRATION_TYPE,
+        "name": "Hyrule Cloud Provisioning Agent",
+        "description": (
+            "Full-stack network infrastructure for AI agents on AS215932: "
+            "bare IPv6-native VMs with SSH, registered domains and "
+            "authoritative DNS, network-intelligence diagnostics, and "
+            "proxied egress — every service paid per request via x402 and "
+            "attested by dual-signed fulfillment receipts."
+        ),
+        "image": f"{base}/apple-touch-icon.png",
+        "services": [
+            {"name": "web", "endpoint": base},
+            {"name": "OpenAPI", "endpoint": f"{base}/openapi.json", "version": api_version},
+            {"name": "x402", "endpoint": f"{base}/.well-known/x402.json"},
+            {"name": "receipts", "endpoint": f"{base}/v1/receipts/{{receipt_id}}"},
+            {"name": "jwks", "endpoint": f"{base}/.well-known/jwks.json"},
+        ],
+        "active": True,
+        "x402Support": True,
+    }
+    if config.erc8004_registry_caip10 and config.erc8004_agent_id is not None:
+        document["registrations"] = [
+            {
+                "agentId": config.erc8004_agent_id,
+                "agentRegistry": config.erc8004_registry_caip10,
+            }
+        ]
+    # supportedTrust is deliberately ABSENT until the receipt-backed
+    # feedback tooling (roadmap M9) actually implements a trust model —
+    # advertise only what is real.
+    if config.receipts_enabled:
+        document["receipts"] = {
+            "profile": "x402-compute-fulfillment-receipt/0.1",
+            "jwks": f"{base}/.well-known/jwks.json",
+            "receiptSigners": [keys.evm_signer] if keys is not None else [],
+        }
+    return document
