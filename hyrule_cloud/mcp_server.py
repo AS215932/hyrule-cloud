@@ -33,8 +33,12 @@ from hyrule_cloud.client import HyruleClient, HyruleError
 mcp = FastMCP(
     "Hyrule Cloud",
     instructions=(
-        "Agentic VPS hosting on AS215932. Deploy bare VMs with SSH access, "
-        "register domains, and manage DNS zones. Payment via x402 (USDC on Base)."
+        "Full-stack network infrastructure for AI agents on AS215932 (RIPE): "
+        "deploy IPv6-native VMs (SSH, automatic HTTPS subdomains), register "
+        "domains and manage DNS, run network-intelligence lookups (BGP/routing, "
+        "IP/ASN & reputation, DNS, RDAP/WHOIS, web & deep TLS, mail "
+        "deliverability, ports/NAT/CGNAT, VoIP/SIP), and proxy requests over "
+        "Direct/Tor/I2P/Yggdrasil. Payment via x402 (USDC on Base)."
     ),
 )
 
