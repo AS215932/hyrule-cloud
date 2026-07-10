@@ -115,6 +115,18 @@ class HyruleClient:
         """Get VM provisioning logs."""
         return await self._request("GET", f"/v1/vm/{vm_id}/logs")
 
+    async def vm_receipts(self, vm_id: str) -> dict[str, Any]:
+        """List trust receipts for a VM (management token / owner session)."""
+        return await self._request("GET", f"/v1/vm/{vm_id}/receipts")
+
+    async def get_receipt(self, receipt_id: str) -> dict[str, Any]:
+        """Fetch a dual-signed trust receipt by its capability id."""
+        return await self._request("GET", f"/v1/receipts/{receipt_id}")
+
+    async def jwks(self) -> dict[str, Any]:
+        """Receipt-verification keys (/.well-known/jwks.json)."""
+        return await self._request("GET", "/.well-known/jwks.json")
+
     async def check_domain(self, name: str, extension: str) -> dict[str, Any]:
         """Check domain availability and price."""
         return await self._request(

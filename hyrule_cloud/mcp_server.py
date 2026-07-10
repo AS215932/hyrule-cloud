@@ -866,6 +866,38 @@ async def mail_send(payload: dict) -> str:
         return _err(e)
 
 
+# --- Tools: Trust receipts ---
+
+
+@mcp.tool()
+async def get_receipt(receipt_id: str) -> str:
+    """Fetch a dual-signed Hyrule Cloud trust receipt by id (hyr_rcpt_...).
+
+    Receipts attest payments and fulfillment outcomes (VM provisioned, domain
+    registered, refund owed). Verify offline: the `jws` is an ES256 compact
+    JWS checked against the key set at `jwks_url`; `evm_signature` is an
+    EIP-712 signature over sha256 of the canonical payload — recovering it
+    must yield `evm_signer`. Receipt ids arrive in the HYRULE-RECEIPT
+    response header of paid calls.
+    """
+    try:
+        async with _client() as hc:
+            return str(await hc.get_receipt(receipt_id))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def list_vm_receipts(vm_id: str) -> str:
+    """List trust receipts (payment / fulfillment / refund) for a VM you
+    manage. Requires the VM management token or owner session."""
+    try:
+        async with _client() as hc:
+            return str(await hc.vm_receipts(vm_id))
+    except HyruleError as e:
+        return _err(e)
+
+
 # --- Entrypoint ---
 
 

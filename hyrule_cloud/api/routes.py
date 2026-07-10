@@ -79,6 +79,7 @@ from hyrule_cloud.services.quotes import (
     link_quote_vm,
 )
 from hyrule_cloud.state import AppState, get_app_state
+from hyrule_cloud.trust.models import ReceiptKind
 
 log = structlog.get_logger()
 
@@ -146,6 +147,22 @@ def get_gate(app_state: AppState = Depends(get_app_state)):
 
 def get_network(app_state: AppState = Depends(get_app_state)):
     return app_state.network_provider
+
+
+def _receipts_from_request(request: Request):
+    """Trust-layer ReceiptService, or None when trust is absent/disabled.
+    Callers treat None as a no-op — receipts never gate behavior."""
+    state = getattr(request.app.state, "_typed_state", None)
+    trust = getattr(state, "trust", None)
+    return getattr(trust, "receipts", None)
+
+
+def _payment_rail_from_state(request: Request) -> tuple[str, str | None]:
+    """(rail, tx_hash) for a just-settled request, from the gate's stamp."""
+    payment_tx = getattr(request.state, "payment_tx", None)
+    if payment_tx and str(payment_tx).startswith("dev_bypass"):
+        return "dev-bypass", None
+    return "x402-exact-evm", payment_tx
 
 
 # --- Quote helpers (issue #14) ---
@@ -756,6 +773,35 @@ async def get_vm_logs(
     )
 
 
+@router.get("/vm/{vm_id}/receipts")
+async def list_vm_receipts(
+    request: Request,
+    row = Depends(_vm_for_management),
+):
+    """Trust receipts for this VM (payment, fulfillment, refund kinds), in
+    chronological order. Management-gated like the other VM detail views;
+    each receipt is independently fetchable at its public /v1/receipts URL."""
+    receipts = _receipts_from_request(request)
+    if receipts is None or not receipts.enabled:
+        return {"vm_id": row.vm_id, "receipts": []}
+    rows = await receipts.list_for_vm(row.vm_id)
+    return {
+        "vm_id": row.vm_id,
+        "receipts": [
+            {
+                "receipt_id": r.receipt_id,
+                "kind": r.kind,
+                "outcome": r.outcome,
+                "rail": r.rail,
+                "amount_usd": str(r.amount_usd) if r.amount_usd is not None else None,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "url": f"/v1/receipts/{r.receipt_id}",
+            }
+            for r in rows
+        ],
+    }
+
+
 # --- x402-gated endpoints ---
 
 
@@ -836,6 +882,13 @@ async def create_vm(
             )
         except RuntimeError:
             raise HTTPException(503, "No customer IPv6 capacity available right now")
+
+    # Trust layer: correlate the payment receipt with the order. The gate
+    # reads this at settle time; harmless when receipts are disabled.
+    request.state.receipt_correlation = {
+        "quote_id": quote_row.quote_id if quote_row is not None else None,
+        "vm_id": reservation_row.vm_id if reservation_row is not None else None,
+    }
 
     result = await gate.check_payment(
         request,
@@ -1088,6 +1141,7 @@ async def extend_vm(
     }
     total = price_map[VMSize(row.size)] * body.days
 
+    request.state.receipt_correlation = {"vm_id": vm_id}
     result = await gate.check_payment(
         request,
         amount=total,
@@ -1105,6 +1159,25 @@ async def extend_vm(
     updated = await orch.extend_vm(vm_id, body.days)
     if not updated:
         raise HTTPException(500, "Failed to extend VM")
+
+    receipts = _receipts_from_request(request)
+    if receipts is not None:
+        rail, tx = _payment_rail_from_state(request)
+        await receipts.mint(
+            kind=ReceiptKind.FULFILLMENT,
+            outcome="extended",
+            resource_path=request.url.path,
+            method="POST",
+            rail=rail,
+            amount_usd=total,
+            payer=result,
+            tx_hash=tx,
+            vm_id=vm_id,
+            evidence={
+                "extension_days": str(body.days),
+                "new_expiry": updated.expires_at.isoformat() if updated.expires_at else "",
+            },
+        )
 
     return {
         "vm_id": vm_id,
@@ -1212,6 +1285,7 @@ async def register_domain(
 
         _, _, currency, registrar_price, markup, total, _ = await _domain_price(orch, cfg, fqdn)
 
+        request.state.receipt_correlation = {"domain": fqdn}
         result = await gate.check_payment(
             request,
             amount=total,
@@ -1278,6 +1352,21 @@ async def register_domain(
                     .values(status=DomainStatus.FAILED.value, error=str(e))
                 )
                 await session.commit()
+            receipts = _receipts_from_request(request)
+            if receipts is not None:
+                rail, tx = _payment_rail_from_state(request)
+                await receipts.mint(
+                    kind=ReceiptKind.FULFILLMENT,
+                    outcome="failed",
+                    resource_path=request.url.path,
+                    method="POST",
+                    rail=rail,
+                    amount_usd=total,
+                    payer=wallet,
+                    tx_hash=tx,
+                    domain_fqdn=fqdn,
+                    outcome_detail=str(e),
+                )
             raise HTTPException(502, f"Domain registration failed: {e}") from e
 
         raw_openprovider_id = (
@@ -1300,6 +1389,21 @@ async def register_domain(
                 )
             )
             await session.commit()
+
+        receipts = _receipts_from_request(request)
+        if receipts is not None:
+            rail, tx = _payment_rail_from_state(request)
+            await receipts.mint(
+                kind=ReceiptKind.FULFILLMENT,
+                outcome="provisioned",
+                resource_path=request.url.path,
+                method="POST",
+                rail=rail,
+                amount_usd=total,
+                payer=wallet,
+                tx_hash=tx,
+                domain_fqdn=fqdn,
+            )
 
     return DomainRegisterResponse(
         domain=fqdn,

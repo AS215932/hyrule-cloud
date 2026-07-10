@@ -50,6 +50,8 @@ from hyrule_cloud.providers.openprovider import OpenproviderClient
 from hyrule_cloud.providers.xcpng import XCPNGProvider
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
+from hyrule_cloud.trust.models import ReceiptKind
+from hyrule_cloud.trust.receipts import ReceiptService
 
 log = structlog.get_logger()
 
@@ -79,16 +81,20 @@ class Orchestrator:
         self,
         config: HyruleConfig,
         session_factory: async_sessionmaker[AsyncSession],
+        receipts: ReceiptService | None = None,
     ) -> None:
         self.config = config
         self.db = session_factory
         self.xcpng = XCPNGProvider(config.xcpng)
         self.dns = DNSProvider(config)
         self.openprovider = OpenproviderClient(config.openprovider)
+        # Trust layer: fulfillment/refund receipts for async outcomes. None
+        # (tests, disabled deployments) means no receipts, nothing else.
+        self.receipts = receipts
         # Refund obligations for paid VMs that fail to provision. The ledger is
         # a thin writer over the session factory, so a dedicated instance here
         # is fine and keeps the constructor signature stable for callers/tests.
-        self.refunds = RefundService(PaymentLedger(session_factory))
+        self.refunds = RefundService(PaymentLedger(session_factory), receipts=receipts)
 
         self._tasks: set[asyncio.Task] = set()
 
@@ -461,6 +467,7 @@ class Orchestrator:
                 await session.commit()
 
             log.info("provision_complete", vm_id=vm_id, ipv6=ipv6)
+            await self._mint_vm_fulfillment_receipt(vm_id, outcome="provisioned")
 
         except Exception as e:
             log.error("provision_failed", vm_id=vm_id, error=str(e), exc_info=True)
@@ -491,6 +498,67 @@ class Orchestrator:
             await self._record_vm_refund(
                 vm_id, owner_wallet, amount, payment_tx, settled, reason=str(e)
             )
+            await self._mint_vm_fulfillment_receipt(vm_id, outcome="failed", detail=str(e))
+
+    async def _mint_vm_fulfillment_receipt(
+        self,
+        vm_id: str,
+        *,
+        outcome: str,
+        detail: str | None = None,
+        simulated: bool = False,
+    ) -> None:
+        """Mint the fulfillment-kind receipt for a VM outcome (provisioned /
+        failed). Determines the rail from how the VM was paid: dev-bypass tx
+        stamp, EVM owner wallet, or a linked native intent. Best-effort — the
+        ReceiptService never raises and a None service is a no-op."""
+        if self.receipts is None or not self.receipts.enabled:
+            return
+        row = await self.get_vm(vm_id)
+        if row is None:
+            return
+        quote = await self.get_quote_for_vm(vm_id)
+        intent_id: str | None = None
+        intent_asset: str | None = None
+        async with self.db() as session:
+            intent = (
+                await session.execute(
+                    select(CryptoIntentRow.intent_id, CryptoIntentRow.asset)
+                    .where(CryptoIntentRow.vm_id == vm_id)
+                    .limit(1)
+                )
+            ).first()
+            if intent is not None:
+                intent_id, intent_asset = intent[0], intent[1]
+        payment_tx = row.payment_tx
+        payer: str | None = row.owner_wallet or None
+        if payment_tx and payment_tx.startswith("dev_bypass"):
+            rail, payment_tx = "dev-bypass", None
+        elif intent_id is not None:
+            # Native rail: the privacy guard in build_payload strips payer/tx.
+            rail = f"native-{(intent_asset or 'btc').lower()}"
+        elif _looks_like_evm_wallet(row.owner_wallet):
+            rail = "x402-exact-evm"
+        else:
+            rail, payer, payment_tx = "x402-exact-evm", None, None
+        amount = quote.amount_usd if quote is not None else row.cost_total
+        await self.receipts.mint(
+            kind=ReceiptKind.FULFILLMENT,
+            outcome=outcome,
+            resource_path="/v1/vm/create",
+            method="POST",
+            rail=rail,
+            amount_usd=amount,
+            payer=payer,
+            tx_hash=payment_tx,
+            quote_id=quote.quote_id if quote is not None else None,
+            vm_id=vm_id,
+            intent_id=intent_id,
+            outcome_detail=detail,
+            simulated=simulated,
+            provision_started_at=getattr(row, "provision_started_at", None),
+            provisioned_at=getattr(row, "provisioned_at", None),
+        )
 
     async def _record_vm_refund(
         self,
@@ -743,6 +811,8 @@ class Orchestrator:
                         ),
                     },
                 )
+            intent_asset = intent.asset
+            intent_amount = intent.amount_usd
             if intent.status != CryptoIntentStatus.REFUND_MANUAL:
                 log.warning(
                     "native_intent_refund_manual",
@@ -755,6 +825,24 @@ class Orchestrator:
             if event is not None:
                 session.add(event)
             await session.commit()
+        if event is not None and self.receipts is not None:
+            # Post-commit (the obligation is durably recorded): mint the
+            # refund-kind receipt. Only for a FRESH obligation, so an
+            # idempotent re-run can't double-mint. Native privacy applies —
+            # no deposit address, no txid; correlation is the intent id.
+            await self.receipts.mint(
+                kind=ReceiptKind.REFUND,
+                outcome="refund_owed",
+                resource_path="/v1/vm/create",
+                method="POST",
+                rail=f"native-{(intent_asset or 'btc').lower()}",
+                amount_usd=intent_amount,
+                asset=intent_asset,
+                intent_id=intent_id,
+                vm_id=vm_id,
+                outcome_detail=reason,
+                payment_event_id=event.event_id,
+            )
         return True
 
     async def _simulate_provisioning(self, vm_id: str) -> None:
@@ -794,6 +882,9 @@ class Orchestrator:
             await session.commit()
 
         log.info("provision_simulate_complete", vm_id=vm_id, ipv6=fake_ipv6)
+        await self._mint_vm_fulfillment_receipt(
+            vm_id, outcome="provisioned", simulated=True
+        )
 
     async def _probe_ssh(
         self,

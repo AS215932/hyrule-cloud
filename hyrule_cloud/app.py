@@ -114,7 +114,7 @@ async def lifespan(app: FastAPI):
     )
 
     # Orchestrator
-    orchestrator = Orchestrator(config, session_factory)
+    orchestrator = Orchestrator(config, session_factory, receipts=trust.receipts)
     await orchestrator.startup()
 
     # Block E: native crypto (BTC/XMR) intent engine + rate provider

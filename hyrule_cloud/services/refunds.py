@@ -24,11 +24,16 @@ touches exactly one place.
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 import structlog
 
 from hyrule_cloud.db import PaymentEventRow
 from hyrule_cloud.services.payments_ledger import PaymentLedger
+from hyrule_cloud.trust.models import ReceiptKind
+
+if TYPE_CHECKING:
+    from hyrule_cloud.trust.receipts import ReceiptService
 
 log = structlog.get_logger()
 
@@ -38,8 +43,12 @@ REFUND_OWED_EVENT = "refund_owed"
 class RefundService:
     """Records refund obligations for failed paid provisioning."""
 
-    def __init__(self, ledger: PaymentLedger | None) -> None:
+    def __init__(
+        self, ledger: PaymentLedger | None, receipts: ReceiptService | None = None
+    ) -> None:
         self._ledger = ledger
+        # Trust layer: refund-kind receipts minted alongside the obligation.
+        self._receipts = receipts
 
     async def record_owed(
         self,
@@ -83,11 +92,12 @@ class RefundService:
             reason=reason,
         )
 
+        event_id: str | None = None
         if self._ledger is not None:
             event_extra: dict[str, object] = {"vm_id": vm_id, "original_tx": original_tx}
             if extra:
                 event_extra.update(extra)
-            await self._ledger.record_event(
+            event_id = await self._ledger.record_event(
                 event_type=REFUND_OWED_EVENT,
                 resource_path=resource_path,
                 amount=amount,
@@ -97,6 +107,28 @@ class RefundService:
                 tx_hash=original_tx or None,
                 error=reason,
                 extra=event_extra,
+            )
+        if self._receipts is not None:
+            rail = "x402-exact-evm"
+            if network == "native":
+                rail = f"native-{(asset or 'btc').lower()}"
+            raw_intent = extra.get("intent_id") if extra else None
+            intent_id = raw_intent if isinstance(raw_intent, str) else None
+            await self._receipts.mint(
+                kind=ReceiptKind.REFUND,
+                outcome="refund_owed",
+                resource_path=resource_path,
+                method="POST",
+                rail=rail,
+                network=network,
+                asset=asset,
+                amount_usd=amount,
+                payer=payer,
+                tx_hash=original_tx or None,
+                payment_event_id=event_id,
+                vm_id=vm_id,
+                intent_id=intent_id,
+                outcome_detail=reason,
             )
         return True
 
