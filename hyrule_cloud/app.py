@@ -10,10 +10,12 @@ import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import FileResponse
 from x402.http import PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER
 
 from hyrule_cloud.api.auth import router as auth_router
@@ -181,6 +183,21 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+# Brand icons (AS215932 "Hyrule Networks" shield). include_in_schema=False keeps
+# them out of the OpenAPI/x402 surface so discovery crawlers don't probe them.
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon_ico() -> FileResponse:
+    return FileResponse(_STATIC_DIR / "favicon.ico", media_type="image/x-icon")
+
+
+@app.get("/apple-touch-icon.png", include_in_schema=False)
+@app.get("/apple-touch-icon-precomposed.png", include_in_schema=False)
+async def apple_touch_icon() -> FileResponse:
+    return FileResponse(_STATIC_DIR / "apple-touch-icon.png", media_type="image/png")
 
 
 @app.middleware("http")
