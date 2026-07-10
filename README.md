@@ -1,8 +1,13 @@
 # Hyrule Cloud
 
-Agentic VPS hosting on Hyrule Networks (AS215932) with x402 payments.
+Full-stack network infrastructure for AI agents on Hyrule Networks (AS215932), paid per request via x402.
 
-Agents discover this service via the x402 Bazaar or `/.well-known/x402.json`, pay with USDC on Base, and receive bare VMs with SSH access, automatic DNS, and IPv6-native networking.
+Agents discover the service via the x402 Bazaar or `/.well-known/x402.json` and pay with USDC on Base. Four service groups:
+
+- **Compute** — bare IPv6-native VMs with SSH, automatic HTTPS subdomains, and optional custom domains.
+- **Domains & DNS** — domain registration and DNS management.
+- **Network intelligence** — BGP/routing over AS215932's own tables plus RouteViews/RIPE RIS, IP geolocation/ASN/reputation, DNS (lookup, propagation, DNSSEC, record recommendations), RDAP/WHOIS, web reachability and deep TLS grading, MXToolbox-compatible mail deliverability (MX/SPF/DKIM/DMARC/blacklist/bounce), port and NAT/CGNAT reachability, and VoIP/SIP diagnostics.
+- **Network proxy** — outbound requests over Direct, Tor, I2P, or Yggdrasil.
 
 ## Architecture
 
