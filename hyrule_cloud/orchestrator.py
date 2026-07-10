@@ -345,6 +345,16 @@ class Orchestrator:
         """
         from hyrule_cloud.services.launch_proof import use_real_provisioning
 
+        # Issue #51: stamp when provisioning actually begins. created_at can
+        # predate settlement by hours (crypto intents, reservations), so the
+        # runtime stats measure the provision window from here. First write
+        # wins — a retried provision keeps the original start.
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None and row.provision_started_at is None:
+                row.provision_started_at = _now()
+                await session.commit()
+
         if not use_real_provisioning():
             await self._simulate_provisioning(vm_id)
             return

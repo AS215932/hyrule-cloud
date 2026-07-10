@@ -104,6 +104,7 @@ def _make_vm(
     status: VMStatus,
     created_at: datetime | None = None,
     provisioned_at: datetime | None = None,
+    provision_started_at: datetime | None = None,
 ) -> VMRow:
     return VMRow(
         vm_id=generate_vm_id(),
@@ -116,6 +117,7 @@ def _make_vm(
         expires_at=_now() + timedelta(days=7),
         cost_total=Decimal("0.35"),
         created_at=created_at or _now(),
+        provision_started_at=provision_started_at,
         provisioned_at=provisioned_at,
     )
 
@@ -211,19 +213,122 @@ async def test_runtime_counts_live_and_build_queue(metrics_state, client):
 
 @pytest.mark.asyncio
 async def test_runtime_avg_provision_seconds(metrics_state, client):
+    """Issue #51: the metric is the median of (provisioned_at -
+    provision_started_at) — the actual provisioning window."""
     _state, factory = metrics_state
     now = _now()
     async with factory() as session:
-        session.add(_make_vm(VMStatus.READY, created_at=now - timedelta(seconds=60), provisioned_at=now))
-        session.add(_make_vm(VMStatus.READY, created_at=now - timedelta(seconds=120), provisioned_at=now))
-        # READY but no provisioned_at — must be excluded from avg
+        session.add(_make_vm(
+            VMStatus.READY,
+            provision_started_at=now - timedelta(seconds=60),
+            provisioned_at=now,
+        ))
+        session.add(_make_vm(
+            VMStatus.READY,
+            provision_started_at=now - timedelta(seconds=120),
+            provisioned_at=now,
+        ))
+        # READY but no provisioned_at — must be excluded
         session.add(_make_vm(VMStatus.READY, created_at=now - timedelta(hours=1)))
         await session.commit()
 
     res = await client.get("/v1/stats/runtime")
     body = res.json()
-    # (60 + 120) / 2 = 90
+    # median(60, 120) = 90
     assert body["avg_provision_seconds"] == 90
+
+
+@pytest.mark.asyncio
+async def test_runtime_avg_ignores_payment_wait_time(metrics_state, client):
+    """Issue #51 regression: a crypto-intent VM whose row sat for hours in
+    WAITING_PAYMENT must contribute only its real provision window. The old
+    (provisioned_at - created_at) formula reported 4720.3s in prod."""
+    _state, factory = metrics_state
+    now = _now()
+    async with factory() as session:
+        session.add(_make_vm(
+            VMStatus.READY,
+            created_at=now - timedelta(hours=2),  # row born at intent time
+            provision_started_at=now - timedelta(seconds=45),  # deposit confirmed
+            provisioned_at=now,
+        ))
+        await session.commit()
+
+    res = await client.get("/v1/stats/runtime")
+    body = res.json()
+    assert body["avg_provision_seconds"] == 45
+
+
+@pytest.mark.asyncio
+async def test_runtime_avg_is_median_not_mean(metrics_state, client):
+    """A single anomalous row (stuck build that eventually recovered) must
+    not swing the advertised number — median, not mean."""
+    _state, factory = metrics_state
+    now = _now()
+    async with factory() as session:
+        for secs in (10, 20, 5000):
+            session.add(_make_vm(
+                VMStatus.READY,
+                provision_started_at=now - timedelta(seconds=secs),
+                provisioned_at=now,
+            ))
+        await session.commit()
+
+    res = await client.get("/v1/stats/runtime")
+    body = res.json()
+    # mean would be 1676.7; the median holds at 20.
+    assert body["avg_provision_seconds"] == 20
+
+
+@pytest.mark.asyncio
+async def test_provision_vm_stamps_provision_started_at(metrics_state):
+    """Issue #51 end-to-end: _provision_vm (simulation path, the test
+    default) stamps provision_started_at when the background task begins,
+    independent of how old the row is."""
+    from hyrule_cloud.config import HyruleConfig
+    from hyrule_cloud.orchestrator import Orchestrator
+
+    _state, factory = metrics_state
+    orch = Orchestrator(HyruleConfig(), factory)
+
+    async with factory() as session:
+        row = _make_vm(VMStatus.PROVISIONING, created_at=_now() - timedelta(hours=2))
+        row.vm_id = "vm_stamp"
+        row.ipv6_prefix_index = 7
+        row.ipv6_prefix = "2a0c:b641:b51:7::/64"
+        session.add(row)
+        await session.commit()
+
+    await orch._provision_vm("vm_stamp")
+
+    async with factory() as session:
+        row = await session.get(VMRow, "vm_stamp")
+        assert row.provision_started_at is not None
+        assert row.provisioned_at is not None
+        assert row.provisioned_at >= row.provision_started_at
+        # The provision window is seconds, not the 2h the row existed.
+        window = (row.provisioned_at - row.provision_started_at).total_seconds()
+        assert window < 60
+
+
+@pytest.mark.asyncio
+async def test_runtime_avg_excludes_legacy_rows_without_start_stamp(metrics_state, client):
+    """Pre-014 rows have provisioned_at but no provision_started_at — they
+    must not contribute (their created_at-based window is the polluted one)."""
+    _state, factory = metrics_state
+    now = _now()
+    async with factory() as session:
+        # Legacy row: provisioned long after creation, no start stamp.
+        session.add(_make_vm(
+            VMStatus.READY,
+            created_at=now - timedelta(hours=2),
+            provisioned_at=now - timedelta(hours=1),
+        ))
+        await session.commit()
+
+    res = await client.get("/v1/stats/runtime")
+    body = res.json()
+    assert body["avg_provision_seconds"] is None
 
 
 @pytest.mark.asyncio
