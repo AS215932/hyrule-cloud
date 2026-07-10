@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
     from hyrule_cloud.providers.network_client import NetworkProvider
     from hyrule_cloud.providers.rates import RateProvider
+    from hyrule_cloud.trust import TrustServices
 
 
 @dataclass
@@ -30,6 +31,10 @@ class AppState:
     # orchestrator. Typed Any so we don't need to import async_sessionmaker
     # at runtime when AppState is constructed in test fixtures.
     session_factory: Any | None = field(default=None)
+    # Agent-trust layer (receipts / identity / x401). Optional so existing
+    # test fixtures that build partial AppStates keep working; routes treat
+    # None as trust-disabled.
+    trust: TrustServices | None = field(default=None)
 
 
 def get_app_state(request: Request) -> AppState:

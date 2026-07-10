@@ -70,9 +70,11 @@ class PaymentLedger:
         facilitator_host: str | None = None,
         error: str | None = None,
         extra: dict[str, Any] | None = None,
-    ) -> None:
-        """Record a payment-gate outcome derived from an HTTP request."""
-        await self.record_event(
+    ) -> str | None:
+        """Record a payment-gate outcome derived from an HTTP request.
+        Returns the event id (None when the write failed) so callers can
+        soft-link related artifacts such as trust receipts."""
+        return await self.record_event(
             event_type=event_type,
             resource_path=request.url.path,
             method=request.method,
@@ -100,33 +102,35 @@ class PaymentLedger:
         facilitator_host: str | None = None,
         error: str | None = None,
         extra: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> str | None:
         """Record an event from explicit fields (no HTTP request required).
 
         Used by background flows — e.g. a refund obligation raised when a paid
         VM fails to provision, long after the request that charged for it.
+        Returns the event id, or None when the best-effort write failed.
         """
         try:
+            event = self.build_event(
+                event_type=event_type,
+                resource_path=resource_path,
+                method=method,
+                amount=amount,
+                network=network,
+                asset=asset,
+                payer=payer,
+                tx_hash=tx_hash,
+                facilitator_host=facilitator_host,
+                error=error,
+                extra=extra,
+            )
             async with self._session_factory() as session:
-                session.add(
-                    self.build_event(
-                        event_type=event_type,
-                        resource_path=resource_path,
-                        method=method,
-                        amount=amount,
-                        network=network,
-                        asset=asset,
-                        payer=payer,
-                        tx_hash=tx_hash,
-                        facilitator_host=facilitator_host,
-                        error=error,
-                        extra=extra,
-                    )
-                )
+                session.add(event)
                 await session.commit()
+            return event.event_id
         except Exception:
             # The ledger must never take down the payment flow.
             log.warning("payment_ledger_write_failed", event_type=event_type, exc_info=True)
+            return None
 
     def build_event(
         self,

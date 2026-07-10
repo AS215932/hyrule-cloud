@@ -333,6 +333,55 @@ class VMQuoteRow(Base):
     __table_args__ = (Index("ix_vm_quotes_status_expires", "status", "expires_at"),)
 
 
+class FulfillmentReceiptRow(Base):
+    """Dual-signed trust receipt (payment / fulfillment / refund kinds).
+
+    Receipts are attestations served back to customers; payment_events stays
+    the revenue source of truth. `payload` is the exact signed document and
+    `jws` / `evm_signature` are independently verifiable against
+    /.well-known/jwks.json and the published receipt-signer address.
+    payment_event_id is a soft link (no FK) because ledger writes are
+    best-effort and droppable.
+    """
+
+    __tablename__ = "fulfillment_receipts"
+
+    receipt_id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16))  # payment | fulfillment | refund
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    resource_path: Mapped[str] = mapped_column(String(256))
+    method: Mapped[str] = mapped_column(String(8))
+    service_group: Mapped[str] = mapped_column(String(24), index=True)
+    outcome: Mapped[str] = mapped_column(String(24))
+    rail: Mapped[str] = mapped_column(String(24))
+    network: Mapped[str | None] = mapped_column(String(64))
+    amount_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    # EVM rails only — native BTC/XMR receipts carry neither (privacy
+    # invariant enforced in trust/receipts.py).
+    payer_wallet: Mapped[str | None] = mapped_column(String(64), index=True)
+    tx_hash: Mapped[str | None] = mapped_column(String(128))
+    payment_event_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    quote_id: Mapped[str | None] = mapped_column(String(36))
+    vm_id: Mapped[str | None] = mapped_column(String(32))
+    intent_id: Mapped[str | None] = mapped_column(String(36))
+    job_id: Mapped[str | None] = mapped_column(String(40))
+    domain_fqdn: Mapped[str | None] = mapped_column(String(256))
+    agent_did: Mapped[str | None] = mapped_column(String(256))
+    key_id: Mapped[str] = mapped_column(String(64))
+    evm_signer: Mapped[str | None] = mapped_column(String(42))
+    evm_signature: Mapped[str | None] = mapped_column(String(178))
+    payload: Mapped[dict] = mapped_column(_JSONB)
+    jws: Mapped[str] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("ix_fulfillment_receipts_vm_id_created", "vm_id", "created_at"),
+        Index("ix_fulfillment_receipts_intent_id", "intent_id"),
+        Index("ix_fulfillment_receipts_group_created", "service_group", "created_at"),
+    )
+
+
 # --- Network intelligence / BGP / MX / Agent Mail tables ---
 
 

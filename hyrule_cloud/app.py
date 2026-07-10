@@ -33,6 +33,7 @@ from hyrule_cloud.api.registry import router as registry_router
 from hyrule_cloud.api.routes import router
 from hyrule_cloud.api.speedtest import router as speedtest_router
 from hyrule_cloud.api.threat import router as threat_router
+from hyrule_cloud.api.trust import router as trust_router
 from hyrule_cloud.api.voip import router as voip_router
 from hyrule_cloud.api.web import router as web_router
 from hyrule_cloud.config import HyruleConfig
@@ -43,6 +44,12 @@ from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
 from hyrule_cloud.services.intents import scan_pending_intents
+from hyrule_cloud.trust import build_trust_services
+from hyrule_cloud.trust.receipts import (
+    LEGACY_RECEIPT_HEADER,
+    RECEIPT_HEADER,
+    enforce_trust_key_guard,
+)
 
 # Newline-delimited JSON to stdout per AS215932's application logging
 # contract (hyrule-infra/docs/application-logging.md). systemd-journald
@@ -74,11 +81,18 @@ async def lifespan(app: FastAPI):
     # deployment declares it must provision real VMs.
     from hyrule_cloud.services.launch_proof import enforce_real_provisioning_guard
     enforce_real_provisioning_guard(config)
+    # Same philosophy for receipts: advertising receipts without working
+    # signing keys would break the trust contract silently.
+    enforce_trust_key_guard(config)
 
     # Database
     engine = create_db_engine(config.database_url)
     await init_db(engine)
     session_factory = create_session_factory(engine)
+
+    # Agent-trust layer (dual-signed receipts + identity). Disabled services
+    # when TRUST_* flags are unset — mint() is then a no-op returning None.
+    trust = build_trust_services(config, session_factory)
 
     # Payment gate (official x402 SDK) + append-only payments ledger
     from hyrule_cloud.services.payments_ledger import PaymentLedger
@@ -87,6 +101,7 @@ async def lifespan(app: FastAPI):
         config.payment,
         public_base_url=config.public_base_url,
         ledger=payment_ledger,
+        receipts=trust.receipts,
     )
 
     # Network proxy sidecar client. x402 stays in Hyrule Cloud; the sidecar
@@ -124,6 +139,7 @@ async def lifespan(app: FastAPI):
         rate_provider=rate_provider,
         native_payment_assets=native_payment_assets,
         session_factory=session_factory,
+        trust=trust,
     )
 
     # Expiry scheduler
@@ -226,6 +242,9 @@ async def attach_payment_response_headers(request: Request, call_next) -> Respon
         if h.strip()
     }
     exposed.update({PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER})
+    # Receipt headers are exposed only when a receipt was actually minted so
+    # trust-disabled deployments emit byte-identical responses.
+    exposed.update(h for h in (RECEIPT_HEADER, LEGACY_RECEIPT_HEADER) if h in headers)
     response.headers["Access-Control-Expose-Headers"] = ", ".join(sorted(exposed))
     return response
 
@@ -251,6 +270,8 @@ app.include_router(internal_bgp_router)
 app.include_router(auth_router)
 # Payments/fleet Prometheus exporter (bearer-token gated, off by default).
 app.include_router(metrics_router)
+# Agent-trust layer: receipts + JWKS (+ agent card / x401 proof later).
+app.include_router(trust_router)
 
 # Block B (Wave 2): per-process request-latency middleware feeds
 # `/v1/stats/runtime`. Cheap (one perf_counter per request + O(1) deque

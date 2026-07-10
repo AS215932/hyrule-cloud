@@ -237,6 +237,68 @@ class PaymentConfig(BaseSettings):
     dev_bypass_secret: str = ""
 
 
+class TrustConfig(BaseSettings):
+    """Agent-trust layer (receipts / ERC-8004 identity / x401 / caller
+    binding). Every surface is off by default; production flips flags via
+    Vault only after the corresponding runbook ceremony. Values here are
+    plain config — the app runtime never reads chain state."""
+
+    model_config = SettingsConfigDict(env_prefix="TRUST_", env_file=".env", extra="ignore")
+
+    # --- Dual-signed fulfillment receipts (M1/M2) ---
+    receipts_enabled: bool = False
+    # ES256 P-256 private key: inline PEM with literal \n escapes (like
+    # CDP_API_KEY_SECRET) or a file path. Public half is served at
+    # /.well-known/jwks.json.
+    receipt_signing_key_pem: str = ""
+    receipt_signing_key_path: str = ""
+    # kid override; default = "hyr-rcpt-" + sha256(SPKI DER)[:16].
+    receipt_key_id: str = ""
+    # Retired public JWKs (JSON list or {"keys": [...]}) kept in the JWKS so
+    # receipts signed before a rotation stay verifiable.
+    receipt_retired_jwks_json: str = ""
+    # Dedicated OPERATIONAL secp256k1 key for the EIP-712 receipt signature.
+    # Never the ERC-8004 registry-owner key.
+    receipt_evm_signing_key: str = ""
+    receipt_evm_signing_key_path: str = ""
+    # Deployed git SHA stamped into receipts (set by the deploy pipeline).
+    deployment_sha: str = ""
+
+    # --- ERC-8004 discovery identity (M3; registration itself is a human
+    # ceremony via scripts/erc8004_register.py) ---
+    agent_card_enabled: bool = False
+    # Customer-facing identity host per AGENTS.md domain policy — always
+    # hyrule.host territory, never servify.network / as215932.net.
+    agent_domain: str = "cloud.hyrule.host"
+    # CAIP-10 identity registry reference, e.g. "eip155:84532:0x..." (Base
+    # Sepolia) or "eip155:8453:0x..." (Base mainnet).
+    erc8004_registry_caip10: str = ""
+    erc8004_agent_id: int | None = None
+    erc8004_owner_address: str = ""
+
+    # --- x401 identity proofs (M5 shadow / M6 step-up) ---
+    # off | shadow | enforce. Shadow logs what enforcement WOULD require
+    # without changing any response. Enforce is a human-controlled flip and
+    # applies only to the step-up policy below.
+    x401_mode: str = "off"
+    # Step-up triggers for /v1/vm/create and /v1/vm/{id}/extend.
+    x401_step_up_vm_duration_days: int = 90
+    x401_step_up_amount_usd: Decimal = Decimal("25")
+    x401_proof_token_ttl_seconds: int = 900
+    # Test-only: lets the structural verifier satisfy proofs without a real
+    # credential verifier. Never enable outside tests.
+    x401_accept_structural: bool = False
+
+    # --- RFC 9421 caller-agent binding (M7) ---
+    # off | observe. Observe records AgentPrincipal on requests/ledger/
+    # receipts; it never blocks or authorizes anything.
+    principal_mode: str = "off"
+
+    # --- Circle Gateway additive payment kind (roadmap M8; reserved) ---
+    gateway_enabled: bool = False
+    gateway_max_amount_usd: Decimal = Decimal("0.05")
+
+
 class HyruleConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="HYRULE_", env_file=".env", extra="ignore")
 
@@ -323,3 +385,4 @@ class HyruleConfig(BaseSettings):
     xcpng: XCPNGConfig = Field(default_factory=XCPNGConfig)
     openprovider: OpenproviderConfig = Field(default_factory=OpenproviderConfig)
     payment: PaymentConfig = Field(default_factory=PaymentConfig)
+    trust: TrustConfig = Field(default_factory=TrustConfig)
