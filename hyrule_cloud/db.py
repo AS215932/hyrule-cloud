@@ -105,10 +105,15 @@ class VMRow(Base):
         DateTime(timezone=True),
         server_default=func.now(),
     )
+    # Issue #51: stamped when background provisioning actually begins.
+    # created_at can predate settlement by hours (native crypto intents wait
+    # for deposits; reservations predate payment), so the runtime stats must
+    # measure the provision window from here, never from row birth.
+    provision_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Block B: stamped by the orchestrator when status flips to READY. The
-    # /v1/stats/runtime endpoint averages (provisioned_at - created_at) over
-    # the most recent rows so the homepage can show a live "avg provision"
-    # number instead of a hardcoded ~60s.
+    # /v1/stats/runtime endpoint reports the median of
+    # (provisioned_at - provision_started_at) over the most recent rows so the
+    # homepage can show a live "avg provision" number instead of a hardcoded ~60s.
     provisioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     destroyed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

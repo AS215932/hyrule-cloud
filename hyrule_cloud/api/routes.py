@@ -379,11 +379,16 @@ async def get_runtime_stats(
       - sample_count: how many samples back the p50
       - live_vms: VMs currently READY
       - build_queue: VMs currently PROVISIONING
-      - avg_provision_seconds: rolling avg of (provisioned_at - created_at)
-        over the last 50 READY VMs (None if no provisioned_at data)
+      - avg_provision_seconds: median of (provisioned_at -
+        provision_started_at) over the last 50 provisioned VMs (None when no
+        row carries both stamps). Issue #51: measured from provisioning
+        start, NOT row creation — created_at can predate settlement by hours
+        (crypto intents, reservations), which once inflated this to 4720.3s.
+        Median (not mean) so a single anomalous row can't swing the number.
       - updated_at: ISO8601 UTC when computed
     """
     from datetime import UTC, datetime
+    from statistics import median
 
     from sqlalchemy import func as sa_func
     from sqlalchemy import select
@@ -415,19 +420,27 @@ async def get_runtime_stats(
                     live_vms += c
                 if status == VMStatus.PROVISIONING:
                     build_queue = c
-            # Rolling avg over the last 50 provisioned VMs.
+            # Issue #51: median provision window over the last 50 provisioned
+            # VMs, measured from provision_started_at (stamped when the
+            # background task begins) — never from created_at, which counts
+            # payment-wait time. Legacy rows without the stamp are excluded;
+            # the metric self-heals as new provisions land.
             recent = await db.execute(
-                select(VMRow.created_at, VMRow.provisioned_at)
-                .where(VMRow.provisioned_at.is_not(None))
+                select(VMRow.provision_started_at, VMRow.provisioned_at)
+                .where(
+                    VMRow.provisioned_at.is_not(None),
+                    VMRow.provision_started_at.is_not(None),
+                )
                 .order_by(VMRow.provisioned_at.desc())
                 .limit(50)
             )
             durations = [
-                (p - c).total_seconds()
-                for c, p in recent.all() if c is not None and p is not None
+                (p - s).total_seconds()
+                for s, p in recent.all()
+                if s is not None and p is not None and p >= s
             ]
             if durations:
-                avg_provision_seconds = round(sum(durations) / len(durations), 1)
+                avg_provision_seconds = round(median(durations), 1)
     except Exception as exc:
         log.warning("runtime_stats_db_failed", error=str(exc))
 
