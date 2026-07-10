@@ -175,11 +175,20 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Hyrule Cloud",
     description=(
-        "Agentic VPS hosting with x402 payments. "
-        "Deploy bare VMs with SSH access, automatic DNS, and "
-        "IPv6-native networking on AS215932. "
-        "Payment via USDC across EVM, Solana, Hyperliquid, or native crypto (BTC, XMR)."
+        "Full-stack network infrastructure for AI agents on AS215932 (RIPE): "
+        "IPv6-native VMs with SSH and automatic HTTPS subdomains, domain "
+        "registration and DNS, a broad network-intelligence suite (BGP/routing, "
+        "IP/ASN & reputation, DNS, RDAP/WHOIS, web & deep TLS, mail "
+        "deliverability, port/NAT/CGNAT, VoIP/SIP), and proxied requests over "
+        "Direct/Tor/I2P/Yggdrasil. "
+        "Pay per request in USDC on Base via x402; VM checkout may also accept "
+        "BTC/XMR when advertised."
     ),
+    contact={
+        "name": "Hyrule Cloud (AS215932)",
+        "url": "https://github.com/AS215932",
+        "email": "svag@servify.nl",
+    },
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -264,11 +273,21 @@ async def x402_manifest():
         "x402Version": 2,
         "name": "Hyrule Cloud",
         "description": (
-            "Bare VM hosting for AI agents. Deploy VMs with SSH access, "
-            "automatic HTTPS subdomains, IPv6-native networking, domain "
-            "registration, and paid direct/Tor/I2P/Yggdrasil network requests. x402 resources "
-            "settle with facilitator-verified USDC; VM checkout may also offer "
-            "BTC/XMR when the live payment catalog advertises native rails."
+            "Full-stack network infrastructure for AI agents, operated "
+            "first-party on AS215932 (RIPE). "
+            "Compute: bare IPv6-native VMs with SSH, automatic HTTPS "
+            "subdomains, and optional registered domains. "
+            "Network intelligence: BGP/routing over AS215932's own tables plus "
+            "RouteViews and RIPE RIS, IP geolocation/ASN/reputation, DNS "
+            "lookup/propagation/DNSSEC and record recommendations, RDAP and "
+            "WHOIS, web reachability and deep TLS grading, MXToolbox-compatible "
+            "mail deliverability (MX/SPF/DKIM/DMARC/blacklist/bounce), port and "
+            "NAT/CGNAT reachability, and VoIP/SIP diagnostics. "
+            "Domains & DNS: registration and management. "
+            "Network proxy: outbound requests over Direct, Tor, I2P, or "
+            "Yggdrasil. "
+            "Pay per request in USDC on Base via x402; VM checkout may also "
+            "accept BTC/XMR when advertised."
         ),
         "resources": [
             {
