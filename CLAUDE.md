@@ -86,9 +86,18 @@ hyrule_cloud/
   client.py              Thin async Python client wrapping the HTTP API
   mcp_server.py          MCP server for Claude/Cursor (tools + resources)
   api/
-    routes.py            All HTTP endpoints (VM, domain, zone)
+    routes.py            Core endpoints (VM, domain, zone, proxy, intents); network-intel
+                         routers live beside it (bgp/ip/dns/registry/web/mx/path/ports/
+                         nat/threat/voip/speedtest/mail) — the manifest is ground truth
+    trust.py             Receipts, JWKS, ERC-8004 agent registration, x401 proof endpoint
   middleware/
-    x402.py              PaymentGate wrapping official x402 SDK
+    x402.py              PaymentGate wrapping official x402 SDK (+ receipt mint at settle)
+  trust/                 Agent-trust layer (mypy-strict; all TRUST_* flags default off):
+    receipts.py          Dual-signed receipts (ES256 JWS + EIP-712), never blocks payment
+    identity.py          JWKS + ERC-8004 registration document (config-only, no chain reads)
+    x401.py              x401 v0.2 policy engine, shadow log, step-up proof tokens
+    principal.py         RFC 9421 → did:web caller binding (observe-only)
+                         See docs/trust-layer.md + docs/x402-compute-fulfillment-receipt.md
   providers/
     xcpng.py             Async XAPI XML-RPC client
     cloudinit.py         cloud-config YAML renderer
@@ -152,7 +161,9 @@ MCP server config for Claude/Cursor:
 - Wallet-based auth on zone record management (currently open)
 - Bazaar extension registration (discoverable: true in route config)
 - Automated abuse detection / VM content scanning
-- Refunds on provisioning failure
+- Trust-layer ops rollout: signing-key ceremony + ERC-8004 on-chain registration
+  (docs/runbooks/trust-keys.md), Circle Gateway additive payment kind, x401
+  enforce with a real credential verifier, receipt-backed ERC-8004 feedback
 - Real log streaming from VMs (current `/logs` is a placeholder)
 - Production deployment config (systemd, TLS termination, rate limiting)
 

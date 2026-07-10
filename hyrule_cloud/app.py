@@ -33,6 +33,7 @@ from hyrule_cloud.api.registry import router as registry_router
 from hyrule_cloud.api.routes import router
 from hyrule_cloud.api.speedtest import router as speedtest_router
 from hyrule_cloud.api.threat import router as threat_router
+from hyrule_cloud.api.trust import router as trust_router
 from hyrule_cloud.api.voip import router as voip_router
 from hyrule_cloud.api.web import router as web_router
 from hyrule_cloud.config import HyruleConfig
@@ -43,6 +44,12 @@ from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
 from hyrule_cloud.services.intents import scan_pending_intents
+from hyrule_cloud.trust import build_trust_services
+from hyrule_cloud.trust.receipts import (
+    LEGACY_RECEIPT_HEADER,
+    RECEIPT_HEADER,
+    enforce_trust_key_guard,
+)
 
 # Newline-delimited JSON to stdout per AS215932's application logging
 # contract (hyrule-infra/docs/application-logging.md). systemd-journald
@@ -74,11 +81,18 @@ async def lifespan(app: FastAPI):
     # deployment declares it must provision real VMs.
     from hyrule_cloud.services.launch_proof import enforce_real_provisioning_guard
     enforce_real_provisioning_guard(config)
+    # Same philosophy for receipts: advertising receipts without working
+    # signing keys would break the trust contract silently.
+    enforce_trust_key_guard(config)
 
     # Database
     engine = create_db_engine(config.database_url)
     await init_db(engine)
     session_factory = create_session_factory(engine)
+
+    # Agent-trust layer (dual-signed receipts + identity). Disabled services
+    # when TRUST_* flags are unset — mint() is then a no-op returning None.
+    trust = build_trust_services(config, session_factory)
 
     # Payment gate (official x402 SDK) + append-only payments ledger
     from hyrule_cloud.services.payments_ledger import PaymentLedger
@@ -87,6 +101,11 @@ async def lifespan(app: FastAPI):
         config.payment,
         public_base_url=config.public_base_url,
         ledger=payment_ledger,
+        receipts=trust.receipts,
+        # x401 advisory block rides every 402 while TRUST_X401_MODE != off.
+        advertised_extensions=(
+            trust.x401.advisory_extension() if trust.x401 is not None else None
+        ),
     )
 
     # Network proxy sidecar client. x402 stays in Hyrule Cloud; the sidecar
@@ -99,7 +118,7 @@ async def lifespan(app: FastAPI):
     )
 
     # Orchestrator
-    orchestrator = Orchestrator(config, session_factory)
+    orchestrator = Orchestrator(config, session_factory, receipts=trust.receipts)
     await orchestrator.startup()
 
     # Block E: native crypto (BTC/XMR) intent engine + rate provider
@@ -124,6 +143,7 @@ async def lifespan(app: FastAPI):
         rate_provider=rate_provider,
         native_payment_assets=native_payment_assets,
         session_factory=session_factory,
+        trust=trust,
     )
 
     # Expiry scheduler
@@ -210,6 +230,25 @@ async def apple_touch_icon() -> FileResponse:
 
 
 @app.middleware("http")
+async def resolve_agent_principal(request: Request, call_next) -> Response:
+    """RFC 9421 → did:web caller binding (TRUST_PRINCIPAL_MODE=observe).
+
+    Registered unconditionally (middleware can't be added post-startup);
+    the fast path is two getattrs when the resolver is absent or the
+    request carries no signature. Observe-only and soft-fail by contract —
+    the principal is recorded for ledger/receipts, never used to allow or
+    deny anything.
+    """
+    state = getattr(request.app.state, "_typed_state", None)
+    resolver = getattr(getattr(state, "trust", None), "principal", None)
+    if resolver is not None and request.headers.get("signature-input"):
+        principal = await resolver.resolve_principal(request)
+        if principal is not None:
+            request.state.agent_principal = principal
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def attach_payment_response_headers(request: Request, call_next) -> Response:
     """Attach x402 settlement headers saved by PaymentGate to successful responses."""
     response = await call_next(request)
@@ -226,6 +265,9 @@ async def attach_payment_response_headers(request: Request, call_next) -> Respon
         if h.strip()
     }
     exposed.update({PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER})
+    # Receipt headers are exposed only when a receipt was actually minted so
+    # trust-disabled deployments emit byte-identical responses.
+    exposed.update(h for h in (RECEIPT_HEADER, LEGACY_RECEIPT_HEADER) if h in headers)
     response.headers["Access-Control-Expose-Headers"] = ", ".join(sorted(exposed))
     return response
 
@@ -251,6 +293,8 @@ app.include_router(internal_bgp_router)
 app.include_router(auth_router)
 # Payments/fleet Prometheus exporter (bearer-token gated, off by default).
 app.include_router(metrics_router)
+# Agent-trust layer: receipts + JWKS (+ agent card / x401 proof later).
+app.include_router(trust_router)
 
 # Block B (Wave 2): per-process request-latency middleware feeds
 # `/v1/stats/runtime`. Cheap (one perf_counter per request + O(1) deque
@@ -524,4 +568,30 @@ async def x402_manifest():
     for resource in manifest["resources"]:
         if discovery_for(resource.get("method", ""), resource["path"]) is not None:
             resource["discoverable"] = True
+    # Trust layer: each block appears ONLY when its flag is on, so the
+    # manifest is byte-identical to the announced surface while flags are
+    # off (guarded by tests/test_trust_identity.py).
+    trust_cfg = getattr(config, "trust", None)
+    base_url = getattr(config, "public_base_url", "").rstrip("/")
+    if trust_cfg is not None and getattr(trust_cfg, "receipts_enabled", False):
+        trust_services = getattr(app.state._typed_state, "trust", None)
+        keys = getattr(getattr(trust_services, "receipts", None), "keys", None)
+        manifest["receipts"] = {
+            "profile": "x402-compute-fulfillment-receipt/0.1",
+            "header": "HYRULE-RECEIPT",
+            "endpoint": f"{base_url}/v1/receipts/{{receipt_id}}",
+            "jwks": f"{base_url}/.well-known/jwks.json",
+            "receiptSigners": [keys.evm_signer] if keys is not None else [],
+        }
+    if trust_cfg is not None and getattr(trust_cfg, "agent_card_enabled", False):
+        identity: dict = {
+            "agentRegistration": f"{base_url}/.well-known/agent-registration.json",
+        }
+        registry = getattr(trust_cfg, "erc8004_registry_caip10", "")
+        agent_id = getattr(trust_cfg, "erc8004_agent_id", None)
+        if registry and agent_id is not None:
+            identity["registrations"] = [
+                {"agentId": agent_id, "agentRegistry": registry}
+            ]
+        manifest["identity"] = identity
     return manifest

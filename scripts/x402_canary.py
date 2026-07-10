@@ -133,6 +133,50 @@ def _settlement(resp: httpx.Response) -> tuple[bool, str]:
         return False, f"(settlement header present but undecodable: {e}) raw={raw[:80]}"
 
 
+async def _receipt_check(resp: httpx.Response) -> bool:
+    """Verify the trust receipt advertised by a paid response, if any.
+
+    Advisory when the server has receipts disabled (no HYRULE-RECEIPT header
+    → note and pass). When a header IS present, the receipt must fetch and
+    BOTH signatures must verify offline — a served-but-unverifiable receipt
+    is a trust-layer regression and fails the canary.
+    """
+    receipt_id = resp.headers.get("hyrule-receipt") or resp.headers.get("x-hyrule-receipt")
+    if not receipt_id:
+        print("    receipt: none (trust receipts disabled on server)")
+        return True
+    try:
+        from hyrule_cloud.trust.receipts import recover_receipt_signer, verify_receipt_jws
+
+        async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
+            body = (await http.get(f"/v1/receipts/{receipt_id}")).raise_for_status().json()
+            jwks = (await http.get("/.well-known/jwks.json")).raise_for_status().json()
+        # Verify against every served key until one matches the JWS kid.
+        payload = None
+        last_error: Exception | None = None
+        for key in jwks.get("keys", []):
+            try:
+                payload = verify_receipt_jws(body["jws"], key)
+                break
+            except Exception as e:  # try the next (retired) key
+                last_error = e
+        if payload is None:
+            print(f"    !! receipt {receipt_id}: JWS verified against NO served key: {last_error}")
+            return False
+        if payload != body["payload"]:
+            print(f"    !! receipt {receipt_id}: JWS payload != served payload")
+            return False
+        signer = recover_receipt_signer(body["payload"], body["evm_signature"])
+        if signer != body["evm_signer"]:
+            print(f"    !! receipt {receipt_id}: EIP-712 signer mismatch ({signer})")
+            return False
+        print(f"    receipt: {receipt_id} verified (JWS + EIP-712 by {signer})")
+        return True
+    except Exception as e:
+        print(f"    !! receipt {receipt_id}: verification errored: {e!r}")
+        return False
+
+
 async def _domain_check_price(name: str, extension: str) -> Decimal | None:
     """GET /v1/domain/check (free) for the REAL registration price, so the
     payment cap tracks the actual quote instead of a generous static guess.
@@ -225,6 +269,8 @@ async def _run_one(name: str, *, destroy: bool, domain_name: str | None, use_quo
         # A paid endpoint that returns 2xx without a successful settlement was
         # not actually charged — a broken gate, not a passing canary.
         print("    !! paid 2xx with no successful settlement — route not charged; FAILING.")
+        return False
+    if not await _receipt_check(r):
         return False
 
     if name == "vm":

@@ -48,9 +48,12 @@ from x402.schemas import PaymentPayload, PaymentRequirements, ResourceConfig, Re
 from x402.server import x402ResourceServer
 
 from hyrule_cloud.config import PaymentConfig
+from hyrule_cloud.trust.models import AgentPrincipal, ReceiptKind
+from hyrule_cloud.trust.receipts import LEGACY_RECEIPT_HEADER, RECEIPT_HEADER
 
 if TYPE_CHECKING:
     from hyrule_cloud.services.payments_ledger import PaymentLedger
+    from hyrule_cloud.trust.receipts import ReceiptService
 
 log = structlog.get_logger()
 
@@ -152,6 +155,9 @@ class VerifiedPayment:
     payment_payload: PaymentPayload | None = None
     matching_requirements: PaymentRequirements | None = None
     dev_bypass: bool = False
+    # Carried through so the receipt minted at settle_verified can describe
+    # the resource the way the 402 challenge did.
+    description: str = ""
 
 
 class PaymentGate:
@@ -168,10 +174,18 @@ class PaymentGate:
         config: PaymentConfig,
         public_base_url: str = "",
         ledger: PaymentLedger | None = None,
+        receipts: ReceiptService | None = None,
+        advertised_extensions: dict[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.public_base_url = public_base_url.rstrip("/")
         self.ledger = ledger
+        # Trust layer (both optional; None ⇒ behavior identical to before):
+        # `receipts` mints a dual-signed receipt on every settle, and
+        # `advertised_extensions` (e.g. the x401 advisory block) is merged
+        # into every 402 challenge alongside per-route Bazaar discovery.
+        self.receipts = receipts
+        self.advertised_extensions = dict(advertised_extensions or {})
         self._facilitator_host = urlparse(config.facilitator_url).hostname or ""
         self.facilitator = HTTPFacilitatorClient(_facilitator_config(config))
         self.server = x402ResourceServer(self.facilitator)
@@ -245,6 +259,18 @@ class PaymentGate:
         except Exception:
             log.warning("bazaar_extension_enrich_failed", exc_info=True)
             return declared
+
+    def _request_extensions(self, request: Request) -> dict[str, Any] | None:
+        """Per-route discovery extensions merged over the gate-wide advertised
+        ones (x401 advisory etc.). None when neither exists so undeclared
+        routes keep emitting extension-free 402s."""
+        declared = self._discovery_extensions(request)
+        if not self.advertised_extensions:
+            return declared
+        merged: dict[str, Any] = dict(self.advertised_extensions)
+        if declared:
+            merged.update(declared)
+        return merged
 
     async def _payment_required_response(
         self,
@@ -355,12 +381,15 @@ class PaymentGate:
     # bound are dropped with a warning.
     _LEDGER_WRITE_TIMEOUT_SECONDS = 2.0
 
-    async def _record(self, event_type: str, request: Request, amount: Decimal, **kwargs: Any) -> None:
-        """Bounded ledger write; no-op without a ledger, never raises."""
+    async def _record(
+        self, event_type: str, request: Request, amount: Decimal, **kwargs: Any
+    ) -> str | None:
+        """Bounded ledger write; no-op without a ledger, never raises.
+        Returns the ledger event id so a minted receipt can soft-link it."""
         if self.ledger is None:
-            return
+            return None
         try:
-            await asyncio.wait_for(
+            return await asyncio.wait_for(
                 self.ledger.record(
                     event_type=event_type,
                     request=request,
@@ -372,6 +401,60 @@ class PaymentGate:
             )
         except Exception:
             log.warning("payment_ledger_write_dropped", event_type=event_type, exc_info=True)
+            return None
+
+    async def _mint_payment_receipt(
+        self,
+        request: Request,
+        amount: Decimal,
+        description: str,
+        *,
+        rail: str,
+        network: str | None,
+        asset: str | None,
+        payer: str | None,
+        tx_hash: str | None,
+        payment_event_id: str | None,
+    ) -> str | None:
+        """Mint a payment-kind receipt for a settle. Correlation ids come from
+        `request.state.receipt_correlation` (routes that know their quote/vm/
+        intent set it before calling the gate). Best-effort: returns None on
+        any failure and the response simply carries no receipt header."""
+        if self.receipts is None:
+            return None
+        raw_correlation = getattr(request.state, "receipt_correlation", None)
+        correlation: dict[str, Any] = (
+            dict(raw_correlation) if isinstance(raw_correlation, dict) else {}
+        )
+        principal = getattr(request.state, "agent_principal", None)
+        agent = principal if isinstance(principal, AgentPrincipal) else None
+        return await self.receipts.mint(
+            kind=ReceiptKind.PAYMENT,
+            outcome="settled",
+            resource_path=request.url.path,
+            method=request.method,
+            rail=rail,
+            description=description or None,
+            network=network,
+            asset=asset,
+            amount_usd=amount,
+            payer=payer,
+            tx_hash=tx_hash,
+            payment_event_id=payment_event_id,
+            quote_id=correlation.get("quote_id"),
+            vm_id=correlation.get("vm_id"),
+            intent_id=correlation.get("intent_id"),
+            job_id=correlation.get("job_id"),
+            domain_fqdn=correlation.get("domain"),
+            facilitator_host=self._facilitator_host or None,
+            agent=agent,
+        )
+
+    @staticmethod
+    def _attach_receipt_header(request: Request, headers: dict[str, str], receipt_id: str) -> None:
+        headers[RECEIPT_HEADER] = receipt_id
+        headers[LEGACY_RECEIPT_HEADER] = receipt_id
+        request.state.payment_response_headers = headers
 
     def _canonical_url(self, request: Request) -> str:
         """Resource URL for 402 responses. Behind the TLS proxy the raw request
@@ -408,14 +491,27 @@ class PaymentGate:
             if bypass == self.config.dev_bypass_secret:
                 log.warning("dev_bypass_payment", amount=str(amount))
                 request.state.payment_tx = "dev_bypass_0x0"
-                await self._record(
+                event_id = await self._record(
                     "dev_bypass", request, amount, payer="0xDEV_TEST_WALLET", tx_hash="dev_bypass_0x0"
                 )
+                receipt_id = await self._mint_payment_receipt(
+                    request,
+                    amount,
+                    description,
+                    rail="dev-bypass",
+                    network=None,
+                    asset=None,
+                    payer="0xDEV_TEST_WALLET",
+                    tx_hash=None,
+                    payment_event_id=event_id,
+                )
+                if receipt_id:
+                    self._attach_receipt_header(request, {}, receipt_id)
                 return "0xDEV_TEST_WALLET"
 
         # Bazaar discovery declaration for this route (None when undeclared);
         # attached to every 402 so CDP indexes the endpoint at settlement.
-        extensions = self._discovery_extensions(request)
+        extensions = self._request_extensions(request)
 
         payment_header = self._payment_header(request)
         if not payment_header:
@@ -556,7 +652,7 @@ class PaymentGate:
                 amount=str(amount),
                 tx_hash=tx_hash,
             )
-            await self._record(
+            event_id = await self._record(
                 "settled",
                 request,
                 amount,
@@ -565,6 +661,20 @@ class PaymentGate:
                 payer=wallet,
                 tx_hash=tx_hash,
             )
+            receipt_id = await self._mint_payment_receipt(
+                request,
+                amount,
+                description,
+                rail="x402-exact-evm",
+                network=matching_requirements.network,
+                asset=matching_requirements.asset,
+                payer=wallet,
+                tx_hash=tx_hash or None,
+                payment_event_id=event_id,
+            )
+            if receipt_id:
+                settlement_headers[RECEIPT_HEADER] = receipt_id
+                settlement_headers[LEGACY_RECEIPT_HEADER] = receipt_id
 
             request.state.payment_tx = tx_hash
             request.state.payment_response_headers = settlement_headers
@@ -596,10 +706,13 @@ class PaymentGate:
             if bypass == self.config.dev_bypass_secret:
                 log.warning("dev_bypass_payment", amount=str(amount))
                 return VerifiedPayment(
-                    payer="0xDEV_TEST_WALLET", amount=amount, dev_bypass=True
+                    payer="0xDEV_TEST_WALLET",
+                    amount=amount,
+                    dev_bypass=True,
+                    description=description,
                 )
 
-        extensions = self._discovery_extensions(request)
+        extensions = self._request_extensions(request)
         payment_header = self._payment_header(request)
         if not payment_header:
             response = await self.build_402_response(
@@ -698,6 +811,7 @@ class PaymentGate:
                 amount=amount,
                 payment_payload=payment_payload,
                 matching_requirements=matching_requirements,
+                description=description,
             )
         except Exception:
             log.error("payment_processing_error", exc_info=True)
@@ -714,13 +828,26 @@ class PaymentGate:
         """
         if verified.dev_bypass:
             request.state.payment_tx = "dev_bypass_0x0"
-            await self._record(
+            event_id = await self._record(
                 "dev_bypass",
                 request,
                 verified.amount,
                 payer="0xDEV_TEST_WALLET",
                 tx_hash="dev_bypass_0x0",
             )
+            receipt_id = await self._mint_payment_receipt(
+                request,
+                verified.amount,
+                verified.description,
+                rail="dev-bypass",
+                network=None,
+                asset=None,
+                payer="0xDEV_TEST_WALLET",
+                tx_hash=None,
+                payment_event_id=event_id,
+            )
+            if receipt_id:
+                self._attach_receipt_header(request, {}, receipt_id)
             return True
 
         try:
@@ -768,7 +895,7 @@ class PaymentGate:
         wallet = settlement.payer or verified.payer
         tx_hash = settlement.transaction or ""
         log.info("payment_settled", wallet=wallet, amount=str(verified.amount), tx_hash=tx_hash)
-        await self._record(
+        event_id = await self._record(
             "settled",
             request,
             verified.amount,
@@ -777,6 +904,23 @@ class PaymentGate:
             payer=wallet,
             tx_hash=tx_hash,
         )
+        receipt_id = await self._mint_payment_receipt(
+            request,
+            verified.amount,
+            verified.description,
+            rail="x402-exact-evm",
+            network=verified.matching_requirements.network,
+            asset=verified.matching_requirements.asset,
+            payer=wallet,
+            tx_hash=tx_hash or None,
+            payment_event_id=event_id,
+        )
+        if receipt_id:
+            # Merge into the settlement headers set above so the ASGI
+            # middleware surfaces the receipt alongside PAYMENT-RESPONSE.
+            self._attach_receipt_header(
+                request, dict(request.state.payment_response_headers), receipt_id
+            )
         request.state.payment_tx = tx_hash
         return True
 

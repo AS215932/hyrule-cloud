@@ -31,6 +31,7 @@ from hyrule_cloud.models import (
 )
 from hyrule_cloud.providers.native_crypto import AddressScanResult, NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.trust.models import ReceiptKind
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -237,10 +238,30 @@ async def poll_one_intent(
             current_rate=await _maybe_requote(row, rates),
         )
         row.status = new_status
-        if new_status == CryptoIntentStatus.SETTLED and not row.paid_at:
+        first_settled = new_status == CryptoIntentStatus.SETTLED and not row.paid_at
+        if first_settled:
             row.paid_at = _now()
         await db.commit()
         await db.refresh(row)
+        settled_asset = row.asset
+        settled_amount = row.amount_usd
+
+    if first_settled:
+        # Trust layer: payment-kind receipt at the first SETTLED observation.
+        # Native privacy — no deposit address, no txid; correlation is the
+        # unguessable intent id the payer already holds.
+        receipts = getattr(orch, "receipts", None)
+        if receipts is not None:
+            await receipts.mint(
+                kind=ReceiptKind.PAYMENT,
+                outcome="settled",
+                resource_path="/v1/intent/create",
+                method="POST",
+                rail=f"native-{(settled_asset or 'btc').lower()}",
+                asset=settled_asset,
+                amount_usd=settled_amount,
+                intent_id=intent_id,
+            )
 
     # SETTLED → trigger atomic provisioning. Exactly-once via UPDATE...RETURNING.
     if row.status == CryptoIntentStatus.SETTLED:

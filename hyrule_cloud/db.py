@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
     Enum,
@@ -331,6 +332,103 @@ class VMQuoteRow(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (Index("ix_vm_quotes_status_expires", "status", "expires_at"),)
+
+
+class FulfillmentReceiptRow(Base):
+    """Dual-signed trust receipt (payment / fulfillment / refund kinds).
+
+    Receipts are attestations served back to customers; payment_events stays
+    the revenue source of truth. `payload` is the exact signed document and
+    `jws` / `evm_signature` are independently verifiable against
+    /.well-known/jwks.json and the published receipt-signer address.
+    payment_event_id is a soft link (no FK) because ledger writes are
+    best-effort and droppable.
+    """
+
+    __tablename__ = "fulfillment_receipts"
+
+    receipt_id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16))  # payment | fulfillment | refund
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    resource_path: Mapped[str] = mapped_column(String(256))
+    method: Mapped[str] = mapped_column(String(8))
+    service_group: Mapped[str] = mapped_column(String(24), index=True)
+    outcome: Mapped[str] = mapped_column(String(24))
+    rail: Mapped[str] = mapped_column(String(24))
+    network: Mapped[str | None] = mapped_column(String(64))
+    amount_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    # EVM rails only — native BTC/XMR receipts carry neither (privacy
+    # invariant enforced in trust/receipts.py).
+    payer_wallet: Mapped[str | None] = mapped_column(String(64), index=True)
+    tx_hash: Mapped[str | None] = mapped_column(String(128))
+    payment_event_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    quote_id: Mapped[str | None] = mapped_column(String(36))
+    vm_id: Mapped[str | None] = mapped_column(String(32))
+    intent_id: Mapped[str | None] = mapped_column(String(36))
+    job_id: Mapped[str | None] = mapped_column(String(40))
+    domain_fqdn: Mapped[str | None] = mapped_column(String(256))
+    agent_did: Mapped[str | None] = mapped_column(String(256))
+    key_id: Mapped[str] = mapped_column(String(64))
+    evm_signer: Mapped[str | None] = mapped_column(String(42))
+    evm_signature: Mapped[str | None] = mapped_column(String(178))
+    payload: Mapped[dict] = mapped_column(_JSONB)
+    jws: Mapped[str] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("ix_fulfillment_receipts_vm_id_created", "vm_id", "created_at"),
+        Index("ix_fulfillment_receipts_intent_id", "intent_id"),
+        Index("ix_fulfillment_receipts_group_created", "service_group", "created_at"),
+    )
+
+
+class X401ProofLogRow(Base):
+    """x401 shadow/enforce decision log (append-only, potentially high
+    volume — BigInteger autoincrement PK, no FKs). In shadow mode this is
+    the ONLY effect x401 has; operators read it to calibrate step-up
+    thresholds before any enforce flip."""
+
+    __tablename__ = "x401_proof_log"
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer(), "sqlite"), primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    route: Mapped[str] = mapped_column(String(256))
+    method: Mapped[str] = mapped_column(String(8))
+    mode: Mapped[str] = mapped_column(String(8))  # shadow | enforce
+    policy_tier: Mapped[str] = mapped_column(String(16))
+    # would_not_require | would_require | proof_missing | proof_valid | proof_invalid
+    decision: Mapped[str] = mapped_column(String(24))
+    reasons: Mapped[dict | None] = mapped_column(_JSONB)
+    amount_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    payer_wallet: Mapped[str | None] = mapped_column(String(64))
+    agent_did: Mapped[str | None] = mapped_column(String(256))
+
+    __table_args__ = (Index("ix_x401_proof_log_route_created", "route", "created_at"),)
+
+
+class X401ProofTokenRow(Base):
+    """Short-lived x401 verification token, bound to one quoted purchase.
+
+    sha256 at rest (repo token convention). Deliberately NOT single-use:
+    the token must survive the 402→sign→retry round-trip, so validity is
+    TTL-bounded and scope-bound (quote_hash + route + method) instead.
+    """
+
+    __tablename__ = "x401_proof_tokens"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    quote_hash: Mapped[str] = mapped_column(String(64))
+    route: Mapped[str] = mapped_column(String(256))
+    method: Mapped[str] = mapped_column(String(8))
+    claims: Mapped[dict | None] = mapped_column(_JSONB)
+    agent_did: Mapped[str | None] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 # --- Network intelligence / BGP / MX / Agent Mail tables ---

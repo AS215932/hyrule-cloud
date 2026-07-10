@@ -17,6 +17,7 @@ from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.db import PaymentEventRow
+from hyrule_cloud.trust.models import AgentPrincipal
 
 log = structlog.get_logger()
 
@@ -70,9 +71,22 @@ class PaymentLedger:
         facilitator_host: str | None = None,
         error: str | None = None,
         extra: dict[str, Any] | None = None,
-    ) -> None:
-        """Record a payment-gate outcome derived from an HTTP request."""
-        await self.record_event(
+    ) -> str | None:
+        """Record a payment-gate outcome derived from an HTTP request.
+        Returns the event id (None when the write failed) so callers can
+        soft-link related artifacts such as trust receipts."""
+        principal = getattr(request.state, "agent_principal", None)
+        if isinstance(principal, AgentPrincipal):
+            # Trust layer (observe mode): stamp the caller-agent binding
+            # onto the ledger event for later reputation analytics.
+            merged: dict[str, Any] = dict(extra or {})
+            merged["agent"] = {
+                "did": principal.did,
+                "key_id": principal.key_id,
+                "verified": principal.verified,
+            }
+            extra = merged
+        return await self.record_event(
             event_type=event_type,
             resource_path=request.url.path,
             method=request.method,
@@ -100,33 +114,35 @@ class PaymentLedger:
         facilitator_host: str | None = None,
         error: str | None = None,
         extra: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> str | None:
         """Record an event from explicit fields (no HTTP request required).
 
         Used by background flows — e.g. a refund obligation raised when a paid
         VM fails to provision, long after the request that charged for it.
+        Returns the event id, or None when the best-effort write failed.
         """
         try:
+            event = self.build_event(
+                event_type=event_type,
+                resource_path=resource_path,
+                method=method,
+                amount=amount,
+                network=network,
+                asset=asset,
+                payer=payer,
+                tx_hash=tx_hash,
+                facilitator_host=facilitator_host,
+                error=error,
+                extra=extra,
+            )
             async with self._session_factory() as session:
-                session.add(
-                    self.build_event(
-                        event_type=event_type,
-                        resource_path=resource_path,
-                        method=method,
-                        amount=amount,
-                        network=network,
-                        asset=asset,
-                        payer=payer,
-                        tx_hash=tx_hash,
-                        facilitator_host=facilitator_host,
-                        error=error,
-                        extra=extra,
-                    )
-                )
+                session.add(event)
                 await session.commit()
+            return event.event_id
         except Exception:
             # The ledger must never take down the payment flow.
             log.warning("payment_ledger_write_failed", event_type=event_type, exc_info=True)
+            return None
 
     def build_event(
         self,

@@ -79,6 +79,7 @@ from hyrule_cloud.services.quotes import (
     link_quote_vm,
 )
 from hyrule_cloud.state import AppState, get_app_state
+from hyrule_cloud.trust.models import ReceiptKind
 
 log = structlog.get_logger()
 
@@ -146,6 +147,96 @@ def get_gate(app_state: AppState = Depends(get_app_state)):
 
 def get_network(app_state: AppState = Depends(get_app_state)):
     return app_state.network_provider
+
+
+def _receipts_from_request(request: Request):
+    """Trust-layer ReceiptService, or None when trust is absent/disabled.
+    Callers treat None as a no-op — receipts never gate behavior."""
+    state = getattr(request.app.state, "_typed_state", None)
+    trust = getattr(state, "trust", None)
+    return getattr(trust, "receipts", None)
+
+
+def _payment_rail_from_state(request: Request) -> tuple[str, str | None]:
+    """(rail, tx_hash) for a just-settled request, from the gate's stamp."""
+    payment_tx = getattr(request.state, "payment_tx", None)
+    if payment_tx and str(payment_tx).startswith("dev_bypass"):
+        return "dev-bypass", None
+    return "x402-exact-evm", payment_tx
+
+
+def _x401_from_request(request: Request):
+    """Trust-layer X401Service, or None when trust is absent or mode=off."""
+    state = getattr(request.app.state, "_typed_state", None)
+    trust = getattr(state, "trust", None)
+    x401 = getattr(trust, "x401", None)
+    if x401 is None or not x401.enabled:
+        return None
+    return x401
+
+
+async def _x401_enforce_or_none(
+    x401,
+    request: Request,
+    *,
+    decision,
+    quote_id: str | None,
+    amount: Decimal,
+    route: str,
+    method: str,
+):
+    """Enforce-mode step-up: honor a valid verification token presented in
+    the PROOF-RESPONSE request header, else return 401 + PROOF-REQUEST.
+
+    Returns None when the request may proceed (shadow mode, or a valid
+    proof bound to this exact quote/route/method). Runs BEFORE reservation
+    and BEFORE the payment gate — proof-first-then-pay — so a request
+    carrying a payment header but no proof is never verified or settled.
+    """
+    from hyrule_cloud.trust.x401 import (
+        PROOF_REQUEST_HEADER,
+        PROOF_RESPONSE_HEADER,
+        X401Mode,
+        extract_verification_token,
+    )
+    from hyrule_cloud.trust.x401 import (
+        quote_hash as x401_quote_hash,
+    )
+
+    if x401.mode != X401Mode.ENFORCE:
+        return None
+    bound = x401_quote_hash(quote_id=quote_id, amount=amount, route=route, method=method)
+    presented = request.headers.get(PROOF_RESPONSE_HEADER)
+    if presented:
+        token = extract_verification_token(presented)
+        if token is not None and await x401.check_proof_token(
+            token, bound_quote_hash=bound, route=route, method=method
+        ):
+            await x401.record_enforcement(
+                route=route,
+                method=method,
+                decision="proof_valid",
+                reasons=decision.reasons,
+                amount=amount,
+            )
+            return None
+        outcome = "proof_invalid"
+    else:
+        outcome = "proof_missing"
+    await x401.record_enforcement(
+        route=route, method=method, decision=outcome, reasons=decision.reasons, amount=amount
+    )
+    header_value, payload = x401.build_proof_request(
+        bound_quote_hash=bound, route=route, method=method, reasons=decision.reasons
+    )
+    # Per the pinned x401 v0.2 spec the PROOF-REQUEST header is
+    # authoritative; 401 is the conventional carrier. The body duplicates
+    # the payload for humans/debuggers.
+    return JSONResponse(
+        status_code=401,
+        content={"error": "identity_proof_required", "x401": payload},
+        headers={PROOF_REQUEST_HEADER: header_value},
+    )
 
 
 # --- Quote helpers (issue #14) ---
@@ -756,6 +847,35 @@ async def get_vm_logs(
     )
 
 
+@router.get("/vm/{vm_id}/receipts")
+async def list_vm_receipts(
+    request: Request,
+    row = Depends(_vm_for_management),
+):
+    """Trust receipts for this VM (payment, fulfillment, refund kinds), in
+    chronological order. Management-gated like the other VM detail views;
+    each receipt is independently fetchable at its public /v1/receipts URL."""
+    receipts = _receipts_from_request(request)
+    if receipts is None or not receipts.enabled:
+        return {"vm_id": row.vm_id, "receipts": []}
+    rows = await receipts.list_for_vm(row.vm_id)
+    return {
+        "vm_id": row.vm_id,
+        "receipts": [
+            {
+                "receipt_id": r.receipt_id,
+                "kind": r.kind,
+                "outcome": r.outcome,
+                "rail": r.rail,
+                "amount_usd": str(r.amount_usd) if r.amount_usd is not None else None,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "url": f"/v1/receipts/{r.receipt_id}",
+            }
+            for r in rows
+        ],
+    }
+
+
 # --- x402-gated endpoints ---
 
 
@@ -818,6 +938,32 @@ async def create_vm(
     total = quote_row.amount_usd if quote_row is not None else computed
     specs = VM_SPECS[order.size]
 
+    # x401 (trust layer): evaluate the step-up policy BEFORE any reservation
+    # or payment work — proof-first-then-pay ordering, so an agent is never
+    # charged for an order it cannot satisfy the eligibility policy for.
+    # Shadow mode only logs what enforcement WOULD require; the paid flow
+    # below is byte-identical with mode off vs shadow (test-pinned).
+    x401 = _x401_from_request(request)
+    if x401 is not None:
+        decision = await x401.observe(
+            route="/v1/vm/create",
+            method="POST",
+            amount=total,
+            duration_days=order.duration_days,
+        )
+        if decision.requires_proof:
+            proof_response = await _x401_enforce_or_none(
+                x401,
+                request,
+                decision=decision,
+                quote_id=quote_row.quote_id if quote_row is not None else None,
+                amount=total,
+                route="/v1/vm/create",
+                method="POST",
+            )
+            if proof_response is not None:
+                return proof_response
+
     # Reservation-through-payment: a request that is about to be CHARGED
     # atomically claims its VM row + customer /64 (unique index) BEFORE the
     # facilitator settles, so a concurrent purchase can never leave a paid
@@ -836,6 +982,13 @@ async def create_vm(
             )
         except RuntimeError:
             raise HTTPException(503, "No customer IPv6 capacity available right now")
+
+    # Trust layer: correlate the payment receipt with the order. The gate
+    # reads this at settle time; harmless when receipts are disabled.
+    request.state.receipt_correlation = {
+        "quote_id": quote_row.quote_id if quote_row is not None else None,
+        "vm_id": reservation_row.vm_id if reservation_row is not None else None,
+    }
 
     result = await gate.check_payment(
         request,
@@ -1088,6 +1241,18 @@ async def extend_vm(
     }
     total = price_map[VMSize(row.size)] * body.days
 
+    # x401 shadow: extend shares the elevated-purchase policy (long
+    # extensions / high amounts get logged; enforcement is create-only).
+    x401 = _x401_from_request(request)
+    if x401 is not None:
+        await x401.observe(
+            route=request.url.path,
+            method="POST",
+            amount=total,
+            duration_days=body.days,
+        )
+
+    request.state.receipt_correlation = {"vm_id": vm_id}
     result = await gate.check_payment(
         request,
         amount=total,
@@ -1105,6 +1270,25 @@ async def extend_vm(
     updated = await orch.extend_vm(vm_id, body.days)
     if not updated:
         raise HTTPException(500, "Failed to extend VM")
+
+    receipts = _receipts_from_request(request)
+    if receipts is not None:
+        rail, tx = _payment_rail_from_state(request)
+        await receipts.mint(
+            kind=ReceiptKind.FULFILLMENT,
+            outcome="extended",
+            resource_path=request.url.path,
+            method="POST",
+            rail=rail,
+            amount_usd=total,
+            payer=result,
+            tx_hash=tx,
+            vm_id=vm_id,
+            evidence={
+                "extension_days": str(body.days),
+                "new_expiry": updated.expires_at.isoformat() if updated.expires_at else "",
+            },
+        )
 
     return {
         "vm_id": vm_id,
@@ -1212,6 +1396,7 @@ async def register_domain(
 
         _, _, currency, registrar_price, markup, total, _ = await _domain_price(orch, cfg, fqdn)
 
+        request.state.receipt_correlation = {"domain": fqdn}
         result = await gate.check_payment(
             request,
             amount=total,
@@ -1278,6 +1463,21 @@ async def register_domain(
                     .values(status=DomainStatus.FAILED.value, error=str(e))
                 )
                 await session.commit()
+            receipts = _receipts_from_request(request)
+            if receipts is not None:
+                rail, tx = _payment_rail_from_state(request)
+                await receipts.mint(
+                    kind=ReceiptKind.FULFILLMENT,
+                    outcome="failed",
+                    resource_path=request.url.path,
+                    method="POST",
+                    rail=rail,
+                    amount_usd=total,
+                    payer=wallet,
+                    tx_hash=tx,
+                    domain_fqdn=fqdn,
+                    outcome_detail=str(e),
+                )
             raise HTTPException(502, f"Domain registration failed: {e}") from e
 
         raw_openprovider_id = (
@@ -1300,6 +1500,21 @@ async def register_domain(
                 )
             )
             await session.commit()
+
+        receipts = _receipts_from_request(request)
+        if receipts is not None:
+            rail, tx = _payment_rail_from_state(request)
+            await receipts.mint(
+                kind=ReceiptKind.FULFILLMENT,
+                outcome="provisioned",
+                resource_path=request.url.path,
+                method="POST",
+                rail=rail,
+                amount_usd=total,
+                payer=wallet,
+                tx_hash=tx,
+                domain_fqdn=fqdn,
+            )
 
     return DomainRegisterResponse(
         domain=fqdn,

@@ -158,6 +158,10 @@ async def heartbeat_bgp_job(request: Request, job_id: str, body: BGPJobHeartbeat
 async def complete_bgp_job(request: Request, job_id: str, body: BGPJobHeartbeat) -> dict[str, str]:
     _require_token(request)
     session_cm = await _session(request)
+    job_payer: str | None = None
+    job_tx: str | None = None
+    job_price = None
+    completed = False
     if session_cm is not None:
         async with session_cm as session:
             row = await session.get(BGPJobRow, job_id)
@@ -165,7 +169,35 @@ async def complete_bgp_job(request: Request, job_id: str, body: BGPJobHeartbeat)
                 row.status = "completed"
                 row.artifact_snapshot_id = body.artifact_snapshot_id
                 row.completed_at = datetime.now(UTC)
+                job_payer, job_tx, job_price = row.owner_wallet, row.payment_tx, row.price_usd
+                completed = True
                 await session.commit()
+    if completed:
+        # Trust layer: fulfillment receipt attesting the exact artifact
+        # delivered for the paid job (payment receipt was minted at create).
+        state = getattr(request.app.state, "_typed_state", None)
+        trust = getattr(state, "trust", None)
+        receipts = getattr(trust, "receipts", None)
+        if receipts is not None:
+            from hyrule_cloud.trust.models import ReceiptKind
+
+            dev = bool(job_tx and job_tx.startswith("dev_bypass"))
+            await receipts.mint(
+                kind=ReceiptKind.FULFILLMENT,
+                outcome="delivered",
+                resource_path="/v1/bgp/jobs",
+                method="POST",
+                rail="dev-bypass" if dev else "x402-exact-evm",
+                amount_usd=job_price,
+                payer=None if dev else job_payer,
+                tx_hash=None if dev else job_tx,
+                job_id=job_id,
+                evidence=(
+                    {"artifact_snapshot_id": str(body.artifact_snapshot_id)}
+                    if body.artifact_snapshot_id
+                    else None
+                ),
+            )
     return {"status": "accepted"}
 
 
