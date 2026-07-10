@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from hyrule_cloud.trust.principal import AgentPrincipalResolver
 from hyrule_cloud.trust.receipts import ReceiptService, load_signing_keys
 from hyrule_cloud.trust.x401 import X401Service
 
@@ -28,6 +29,8 @@ class TrustServices:
     receipts: ReceiptService
     # Optional so test fixtures that only exercise receipts stay small.
     x401: X401Service | None = None
+    # RFC 9421 → did:web caller binding; present only in observe mode.
+    principal: AgentPrincipalResolver | None = None
 
 
 def _api_version() -> str:
@@ -65,4 +68,9 @@ def build_trust_services(
     x401 = X401Service(
         config.trust, session_factory, public_base_url=config.public_base_url
     )
-    return TrustServices(receipts=receipts, x401=x401)
+    principal = None
+    if config.trust.principal_mode == "observe":
+        principal = AgentPrincipalResolver(
+            config.trust, public_base_url=config.public_base_url
+        )
+    return TrustServices(receipts=receipts, x401=x401, principal=principal)

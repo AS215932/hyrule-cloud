@@ -230,6 +230,25 @@ async def apple_touch_icon() -> FileResponse:
 
 
 @app.middleware("http")
+async def resolve_agent_principal(request: Request, call_next) -> Response:
+    """RFC 9421 → did:web caller binding (TRUST_PRINCIPAL_MODE=observe).
+
+    Registered unconditionally (middleware can't be added post-startup);
+    the fast path is two getattrs when the resolver is absent or the
+    request carries no signature. Observe-only and soft-fail by contract —
+    the principal is recorded for ledger/receipts, never used to allow or
+    deny anything.
+    """
+    state = getattr(request.app.state, "_typed_state", None)
+    resolver = getattr(getattr(state, "trust", None), "principal", None)
+    if resolver is not None and request.headers.get("signature-input"):
+        principal = await resolver.resolve_principal(request)
+        if principal is not None:
+            request.state.agent_principal = principal
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def attach_payment_response_headers(request: Request, call_next) -> Response:
     """Attach x402 settlement headers saved by PaymentGate to successful responses."""
     response = await call_next(request)

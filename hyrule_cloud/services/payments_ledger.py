@@ -17,6 +17,7 @@ from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.db import PaymentEventRow
+from hyrule_cloud.trust.models import AgentPrincipal
 
 log = structlog.get_logger()
 
@@ -74,6 +75,17 @@ class PaymentLedger:
         """Record a payment-gate outcome derived from an HTTP request.
         Returns the event id (None when the write failed) so callers can
         soft-link related artifacts such as trust receipts."""
+        principal = getattr(request.state, "agent_principal", None)
+        if isinstance(principal, AgentPrincipal):
+            # Trust layer (observe mode): stamp the caller-agent binding
+            # onto the ledger event for later reputation analytics.
+            merged: dict[str, Any] = dict(extra or {})
+            merged["agent"] = {
+                "did": principal.did,
+                "key_id": principal.key_id,
+                "verified": principal.verified,
+            }
+            extra = merged
         return await self.record_event(
             event_type=event_type,
             resource_path=request.url.path,
