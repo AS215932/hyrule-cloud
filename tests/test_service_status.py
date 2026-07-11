@@ -302,6 +302,23 @@ async def test_empty_prometheus_url_returns_unknown(status_state, client):
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_rules_endpoint_failure_returns_unknown(status_state, client):
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(503, text="unavailable")
+    )
+    alerts_route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert body["stale"] is True
+    assert alerts_route.called is False
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_prometheus_failure_is_cached_briefly(status_state, client):
     _mock_loaded_rules()
     route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
