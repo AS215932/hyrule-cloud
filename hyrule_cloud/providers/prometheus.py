@@ -116,3 +116,43 @@ class PrometheusClient:
         if not isinstance(alerts, list):
             return None
         return [alert for alert in alerts if isinstance(alert, dict)]
+
+    async def alerting_rule_names(self) -> set[str] | None:
+        """Return the alerting-rule names currently loaded by Prometheus.
+
+        A zero-alert response is only evidence of healthy services when the
+        customer-status rules are actually loaded. Callers use this method as
+        a readiness gate so a failed rule deployment cannot look green.
+        """
+        try:
+            resp = await self._http().get(
+                f"{self.base_url}/api/v1/rules",
+                params={"type": "alert"},
+            )
+            if resp.status_code != 200:
+                log.warning("prometheus_rules_non_200", status=resp.status_code)
+                return None
+            body = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("prometheus_rules_failed", error=repr(exc))
+            return None
+
+        if body.get("status") != "success":
+            return None
+        data = body.get("data")
+        groups = data.get("groups") if isinstance(data, dict) else None
+        if not isinstance(groups, list):
+            return None
+
+        names: set[str] = set()
+        for group in groups:
+            rules = group.get("rules") if isinstance(group, dict) else None
+            if not isinstance(rules, list):
+                continue
+            for rule in rules:
+                if not isinstance(rule, dict) or rule.get("type") != "alerting":
+                    continue
+                name = rule.get("name")
+                if isinstance(name, str):
+                    names.add(name)
+        return names

@@ -62,6 +62,15 @@ _RANK = {
 }
 _CACHE_TTL_SECONDS = 15
 _STALE_MAX_SECONDS = 120
+_REQUIRED_PUBLIC_RULES = {
+    "HyrulePublicApiUnavailable",
+    "HyrulePublicComputeControlPlaneUnavailable",
+    "HyrulePublicPaymentFailureRatio",
+    "HyrulePublicComputeHostDegraded",
+    "HyrulePublicRoutingDegraded",
+    "HyrulePublicDNSDegraded",
+    "HyrulePublicDNSOutage",
+}
 _STATUS_CACHE: dict[str, Any] = {
     "value": None,
     "expires_at": 0.0,
@@ -206,7 +215,9 @@ async def get_service_status(request: Request) -> ServiceStatusResponse:
     if prometheus_url:
         client = PrometheusClient(prometheus_url)
         try:
-            alerts = await client.active_alerts()
+            loaded_rules = await client.alerting_rule_names()
+            if loaded_rules is not None and _REQUIRED_PUBLIC_RULES <= loaded_rules:
+                alerts = await client.active_alerts()
         finally:
             await client.aclose()
 

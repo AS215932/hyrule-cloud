@@ -17,6 +17,37 @@ def _prometheus(alerts: list[dict]) -> dict:
     return {"status": "success", "data": {"alerts": alerts}}
 
 
+_PUBLIC_RULES = (
+    "HyrulePublicApiUnavailable",
+    "HyrulePublicComputeControlPlaneUnavailable",
+    "HyrulePublicPaymentFailureRatio",
+    "HyrulePublicComputeHostDegraded",
+    "HyrulePublicRoutingDegraded",
+    "HyrulePublicDNSDegraded",
+    "HyrulePublicDNSOutage",
+)
+
+
+def _prometheus_rules(names: tuple[str, ...] = _PUBLIC_RULES) -> dict:
+    return {
+        "status": "success",
+        "data": {
+            "groups": [
+                {
+                    "name": "hyrule-public-status",
+                    "rules": [{"type": "alerting", "name": name} for name in names],
+                }
+            ]
+        },
+    }
+
+
+def _mock_loaded_rules() -> respx.Route:
+    return respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(200, json=_prometheus_rules())
+    )
+
+
 def _alert(
     *,
     name: str = "HyrulePublicApiUnavailable",
@@ -76,6 +107,7 @@ async def client():
 @pytest.mark.asyncio
 @respx.mock
 async def test_no_public_alerts_is_operational(status_state, client):
+    _mock_loaded_rules()
     respx.get("http://prom.test:9090/api/v1/alerts").mock(
         return_value=Response(200, json=_prometheus([]))
     )
@@ -100,6 +132,7 @@ async def test_no_public_alerts_is_operational(status_state, client):
 @pytest.mark.asyncio
 @respx.mock
 async def test_only_explicit_firing_public_alerts_cross_boundary(status_state, client):
+    _mock_loaded_rules()
     alerts = [
         _alert(),
         _alert(name="Pending", firing="pending"),
@@ -133,6 +166,7 @@ async def test_only_explicit_firing_public_alerts_cross_boundary(status_state, c
 @pytest.mark.asyncio
 @respx.mock
 async def test_highest_incident_state_wins_per_component(status_state, client):
+    _mock_loaded_rules()
     alerts = [
         _alert(name="Routing", state="degraded", components="compute,network_proxy"),
         _alert(name="Proxy", state="outage", components="network_proxy"),
@@ -154,6 +188,7 @@ async def test_highest_incident_state_wins_per_component(status_state, client):
 async def test_recent_success_is_returned_stale_on_prometheus_failure(status_state, client):
     from hyrule_cloud.api.status import _STATUS_CACHE
 
+    _mock_loaded_rules()
     route = respx.get("http://prom.test:9090/api/v1/alerts")
     route.side_effect = [
         Response(200, json=_prometheus([_alert(state="degraded")])),
@@ -175,6 +210,7 @@ async def test_recent_success_is_returned_stale_on_prometheus_failure(status_sta
 async def test_old_or_missing_snapshot_becomes_unknown(status_state, client):
     from hyrule_cloud.api.status import _STATUS_CACHE
 
+    _mock_loaded_rules()
     respx.get("http://prom.test:9090/api/v1/alerts").mock(
         return_value=Response(503, text="unavailable")
     )
@@ -190,6 +226,7 @@ async def test_old_or_missing_snapshot_becomes_unknown(status_state, client):
 @pytest.mark.asyncio
 @respx.mock
 async def test_prometheus_failure_is_cached_briefly(status_state, client):
+    _mock_loaded_rules()
     route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
         return_value=Response(503, text="unavailable")
     )
@@ -205,6 +242,7 @@ async def test_prometheus_failure_is_cached_briefly(status_state, client):
 @pytest.mark.asyncio
 @respx.mock
 async def test_status_cache_avoids_repeated_prometheus_requests(status_state, client):
+    rules_route = _mock_loaded_rules()
     route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
         return_value=Response(200, json=_prometheus([]))
     )
@@ -213,3 +251,21 @@ async def test_status_cache_avoids_repeated_prometheus_requests(status_state, cl
     await client.get("/v1/status")
 
     assert route.call_count == 1
+    assert rules_route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_missing_public_rule_group_never_reports_operational(status_state, client):
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(200, json=_prometheus_rules(("SomeInternalRule",)))
+    )
+    alerts_route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert body["stale"] is True
+    assert alerts_route.called is False
