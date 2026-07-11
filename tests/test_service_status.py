@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ import respx
 from httpx import ASGITransport, AsyncClient, Response
 
 from hyrule_cloud.app import app
+from hyrule_cloud.providers.prometheus import PrometheusClient
 from hyrule_cloud.state import AppState
 
 
@@ -319,6 +321,37 @@ async def test_status_cache_avoids_repeated_prometheus_requests(status_state, cl
 
 
 @pytest.mark.asyncio
+async def test_concurrent_cache_misses_share_one_prometheus_refresh(
+    status_state, client, monkeypatch
+):
+    rule_calls = 0
+    alert_calls = 0
+    rules = _prometheus_rules()["data"]["groups"][0]["rules"]
+
+    async def alerting_rules(_client):
+        nonlocal rule_calls
+        rule_calls += 1
+        await asyncio.sleep(0.01)
+        return rules
+
+    async def active_alerts(_client):
+        nonlocal alert_calls
+        alert_calls += 1
+        await asyncio.sleep(0.01)
+        return []
+
+    monkeypatch.setattr(PrometheusClient, "alerting_rules", alerting_rules)
+    monkeypatch.setattr(PrometheusClient, "active_alerts", active_alerts)
+
+    responses = await asyncio.gather(*(client.get("/v1/status") for _ in range(5)))
+
+    assert {response.status_code for response in responses} == {200}
+    assert {response.json()["status"] for response in responses} == {"operational"}
+    assert rule_calls == 1
+    assert alert_calls == 1
+
+
+@pytest.mark.asyncio
 @respx.mock
 async def test_missing_public_rule_group_never_reports_operational(status_state, client):
     from hyrule_cloud.api.status import _STATUS_CACHE, _build_response
@@ -401,9 +434,7 @@ async def test_unhealthy_public_rule_never_reports_operational(status_state, cli
     respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
         return_value=Response(
             200,
-            json=_prometheus_rules(
-                overrides={"HyrulePublicDNSOutage": {"health": "err"}}
-            ),
+            json=_prometheus_rules(overrides={"HyrulePublicDNSOutage": {"health": "err"}}),
         )
     )
     alerts_route = respx.get("http://prom.test:9090/api/v1/alerts").mock(

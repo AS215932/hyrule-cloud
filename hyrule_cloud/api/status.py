@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import time
 from datetime import UTC, datetime
@@ -105,6 +106,7 @@ _STATUS_CACHE: dict[str, Any] = {
     "expires_at": 0.0,
     "successful_at": 0.0,
 }
+_STATUS_REFRESH_LOCK = asyncio.Lock()
 
 
 def _now() -> datetime:
@@ -117,7 +119,11 @@ def _component_rows(state: ServiceState = ServiceState.OPERATIONAL) -> list[Serv
             id=component_id,
             name=name,
             status=state,
-            message=(description if state == ServiceState.OPERATIONAL else "Current health could not be confirmed."),
+            message=(
+                description
+                if state == ServiceState.OPERATIONAL
+                else "Current health could not be confirmed."
+            ),
         )
         for component_id, (name, description) in _COMPONENTS.items()
     ]
@@ -296,41 +302,54 @@ async def get_service_status(request: Request) -> ServiceStatusResponse:
     if isinstance(cached, ServiceStatusResponse) and now_ts < float(_STATUS_CACHE["expires_at"]):
         return cached
 
-    app_state = getattr(request.app.state, "_typed_state", None)
-    config = getattr(app_state, "config", None)
-    prometheus_url = getattr(config, "prometheus_url", "") or ""
-    alerts: list[dict[str, Any]] | None = None
-    rules_unready = False
-    if prometheus_url:
-        client = PrometheusClient(prometheus_url)
-        try:
-            loaded_rules = await client.alerting_rules()
-            if loaded_rules is not None and not _public_rules_ready(loaded_rules):
-                rules_unready = True
-            elif loaded_rules is not None:
-                alerts = await client.active_alerts()
-        finally:
-            await client.aclose()
+    async with _STATUS_REFRESH_LOCK:
+        # Another request may have refreshed the shared snapshot while this
+        # coroutine waited. Re-read it before touching Prometheus.
+        now_ts = time.time()
+        cached = _STATUS_CACHE.get("value")
+        if isinstance(cached, ServiceStatusResponse) and now_ts < float(
+            _STATUS_CACHE["expires_at"]
+        ):
+            return cached
 
-    if alerts is not None:
-        response = _build_response(alerts)
-        _STATUS_CACHE.update(
-            value=response,
-            expires_at=now_ts + _CACHE_TTL_SECONDS,
-            successful_at=now_ts,
-        )
-        return response
+        app_state = getattr(request.app.state, "_typed_state", None)
+        config = getattr(app_state, "config", None)
+        prometheus_url = getattr(config, "prometheus_url", "") or ""
+        alerts: list[dict[str, Any]] | None = None
+        rules_unready = False
+        if prometheus_url:
+            client = PrometheusClient(prometheus_url)
+            try:
+                loaded_rules = await client.alerting_rules()
+                if loaded_rules is not None and not _public_rules_ready(loaded_rules):
+                    rules_unready = True
+                elif loaded_rules is not None:
+                    alerts = await client.active_alerts()
+            finally:
+                await client.aclose()
 
-    if rules_unready:
+        if alerts is not None:
+            response = _build_response(alerts)
+            _STATUS_CACHE.update(
+                value=response,
+                expires_at=now_ts + _CACHE_TTL_SECONDS,
+                successful_at=now_ts,
+            )
+            return response
+
+        if rules_unready:
+            unknown = _unknown_response()
+            _STATUS_CACHE.update(value=unknown, expires_at=now_ts + _CACHE_TTL_SECONDS)
+            return unknown
+
+        successful_at = float(_STATUS_CACHE.get("successful_at", 0.0))
+        if (
+            isinstance(cached, ServiceStatusResponse)
+            and now_ts - successful_at <= _STALE_MAX_SECONDS
+        ):
+            stale = cached.model_copy(update={"stale": True})
+            _STATUS_CACHE.update(value=stale, expires_at=now_ts + _CACHE_TTL_SECONDS)
+            return stale
         unknown = _unknown_response()
         _STATUS_CACHE.update(value=unknown, expires_at=now_ts + _CACHE_TTL_SECONDS)
         return unknown
-
-    successful_at = float(_STATUS_CACHE.get("successful_at", 0.0))
-    if isinstance(cached, ServiceStatusResponse) and now_ts - successful_at <= _STALE_MAX_SECONDS:
-        stale = cached.model_copy(update={"stale": True})
-        _STATUS_CACHE.update(value=stale, expires_at=now_ts + _CACHE_TTL_SECONDS)
-        return stale
-    unknown = _unknown_response()
-    _STATUS_CACHE.update(value=unknown, expires_at=now_ts + _CACHE_TTL_SECONDS)
-    return unknown
