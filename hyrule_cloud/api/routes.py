@@ -1601,14 +1601,38 @@ async def create_crypto_intent(
     if existing_intent is not None:
         return _intent_to_response(existing_intent, request)
 
+    # Native BTC/XMR checkout is bound to the same durable quote as EVM. The
+    # quote's stored spec and USD amount are authoritative; recomputing from the
+    # posted body would let the deposit amount drift from the review page.
+    quote_row: VMQuoteRow | None = None
+    order = body.order_payload
+    if order.quote_id:
+        quote_row = await get_quote(orch.db, order.quote_id)
+        if quote_row is None:
+            raise HTTPException(404, "Quote not found")
+        if QuoteStatus(quote_row.status) == QuoteStatus.CONSUMED:
+            raise HTTPException(409, "Quote has already been consumed")
+        if is_expired(quote_row):
+            raise HTTPException(409, "Quote expired; create a new one")
+        if QuoteStatus(quote_row.status) != QuoteStatus.CREATED:
+            raise HTTPException(409, "Quote is not payable")
+        if order.model_dump(mode="json", exclude={"quote_id"}) != quote_row.order_payload:
+            raise HTTPException(422, "Order body does not match the quote")
+        order = VMCreateRequest(**quote_row.order_payload).model_copy(
+            update={"quote_id": quote_row.quote_id}
+        )
+
     # Same validation as the x402 create path — including the real-mode OS
     # support check, so an unsupported order is rejected BEFORE a deposit
     # address is handed out, not after the customer's crypto settles.
-    _validate_vm_order(body.order_payload, cfg)
+    _validate_vm_order(order, cfg)
 
     await _enforce_paid_vm_cap(orch, cfg)
     await _enforce_prefix_capacity(orch, cfg)
-    total, _ = await _compute_vm_price(orch, cfg, body.order_payload)
+    if quote_row is not None:
+        total = quote_row.amount_usd
+    else:
+        total, _ = await _compute_vm_price(orch, cfg, order)
 
     app_state: AppState = get_app_state(request)
     provider = getattr(app_state, "native_crypto", None)
@@ -1622,7 +1646,7 @@ async def create_crypto_intent(
             provider=provider,
             rates=rates,
             asset=asset,
-            order_payload=body.order_payload,
+            order_payload=order,
             amount_usd=total,
             client_order_id=body.client_order_id,
             owner_account_id=(account.account_id if account is not None else None),

@@ -31,6 +31,7 @@ from hyrule_cloud.models import (
 )
 from hyrule_cloud.providers.native_crypto import AddressScanResult, NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.services.quotes import claim_quote, link_quote_vm
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -348,6 +349,16 @@ async def _trigger_provisioning(
     vm_row = None
     try:
         order = VMCreateRequest.model_validate(row.order_payload)
+        quote_id = order.quote_id
+        if quote_id is not None and not await claim_quote(session_factory, quote_id):
+            # Another EVM/native payment already consumed this quote. Funds are
+            # settled, so fail closed to an explicit refund instead of creating
+            # a second VM from the same locked order.
+            await orch.record_native_intent_refund(
+                intent_id,
+                reason="quote_already_consumed",
+            )
+            return
         # Create the VM row but DON'T start provisioning yet: link the intent to
         # the vm_id first, so a fast provisioning failure (immediate XO/API
         # error) can always find the paying intent and record its refund.
@@ -357,6 +368,10 @@ async def _trigger_provisioning(
             owner_account_id=row.owner_account_id,
             start_provisioning=False,
         )
+        if quote_id is not None:
+            if row.amount_usd is not None:
+                await orch.persist_charged_amount(vm_row.vm_id, row.amount_usd)
+            await link_quote_vm(session_factory, quote_id, vm_row.vm_id)
         async with session_factory() as db:
             r = await db.get(CryptoIntentRow, intent_id)
             if r is None:
