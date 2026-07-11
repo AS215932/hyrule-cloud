@@ -290,6 +290,17 @@ async def test_old_or_missing_snapshot_becomes_unknown(status_state, client):
 
 
 @pytest.mark.asyncio
+async def test_empty_prometheus_url_returns_unknown(status_state, client):
+    app.state._typed_state.config.prometheus_url = ""
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert body["stale"] is True
+    assert {component["status"] for component in body["components"]} == {"unknown"}
+
+
+@pytest.mark.asyncio
 @respx.mock
 async def test_prometheus_failure_is_cached_briefly(status_state, client):
     _mock_loaded_rules()
