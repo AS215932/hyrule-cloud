@@ -862,6 +862,39 @@ async def test_quote_bound_native_intent_expires_with_quote(intent_state, client
 
 
 @pytest.mark.asyncio
+async def test_awaiting_native_replay_refuses_consumed_quote(intent_state, client):
+    quote = await _seed_quote(intent_state, quote_id="q_native_consumed_replay")
+    order = _vm_create_request().model_copy(update={"quote_id": quote.quote_id})
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=quote.amount_usd,
+        client_order_id="consumed-quote-replay",
+        owner_account_id=None,
+    )
+    async with intent_state.orchestrator.db() as db:
+        stored_quote = await db.get(VMQuoteRow, quote.quote_id)
+        stored_quote.status = QuoteStatus.CONSUMED
+        await db.commit()
+
+    response = await client.post(
+        "/v1/intent/create",
+        json={
+            "asset": "BTC",
+            "client_order_id": "consumed-quote-replay",
+            "order_payload": order.model_dump(mode="json"),
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Quote has already been consumed"
+    assert intent.address not in response.text
+
+
+@pytest.mark.asyncio
 async def test_quote_bound_native_intent_consumes_and_links_quote(intent_state):
     quote = await _seed_quote(
         intent_state,
@@ -947,6 +980,89 @@ async def test_paid_native_intent_refunds_when_quote_expired_before_settlement(
     assert stored_quote.status == QuoteStatus.CREATED
     assert intent_state.orchestrator.created_vms == []
     assert intent_state.orchestrator.native_refunds == [intent.intent_id]
+
+
+@pytest.mark.asyncio
+async def test_first_scan_after_expiry_detects_deposit_and_records_refund(
+    intent_state,
+):
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_paid_near_expiry",
+        amount_usd=Decimal("3.75"),
+    )
+    order = _vm_create_request().model_copy(update={"quote_id": quote.quote_id})
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=quote.amount_usd,
+        client_order_id=None,
+        owner_account_id=None,
+        expires_at=quote.expires_at,
+    )
+    async with intent_state.orchestrator.db() as db:
+        stored_intent = await db.get(CryptoIntentRow, intent.intent_id)
+        stored_quote = await db.get(VMQuoteRow, quote.quote_id)
+        expired_at = _now() - timedelta(seconds=1)
+        stored_intent.expires_at = expired_at
+        stored_intent.rate_valid_until = expired_at
+        stored_quote.expires_at = expired_at
+        await db.commit()
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+
+    await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    async with intent_state.orchestrator.db() as db:
+        settled_intent = await db.get(CryptoIntentRow, intent.intent_id)
+    assert settled_intent.status == CryptoIntentStatus.REFUND_MANUAL
+    assert settled_intent.amount_received_crypto == intent.amount_crypto
+    assert intent_state.orchestrator.created_vms == []
+    assert intent_state.orchestrator.native_refunds == [intent.intent_id]
+
+
+@pytest.mark.asyncio
+async def test_first_scan_after_expiry_without_payment_marks_intent_expired(
+    intent_state,
+):
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=_vm_create_request(),
+        amount_usd=Decimal("0.05"),
+        client_order_id=None,
+        owner_account_id=None,
+    )
+    async with intent_state.orchestrator.db() as db:
+        stored_intent = await db.get(CryptoIntentRow, intent.intent_id)
+        stored_intent.expires_at = _now() - timedelta(seconds=1)
+        await db.commit()
+
+    updated = await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    assert updated.status == CryptoIntentStatus.EXPIRED
+    assert updated.amount_received_crypto == 0
+    assert intent_state.orchestrator.created_vms == []
 
 
 @pytest.mark.parametrize("mismatch", ["owner", "payload", "amount"])

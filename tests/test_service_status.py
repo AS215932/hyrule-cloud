@@ -317,6 +317,30 @@ async def test_rules_endpoint_failure_returns_unknown(status_state, client):
     assert alerts_route.called is False
 
 
+@pytest.mark.parametrize("malformed_endpoint", ["rules", "alerts"])
+@pytest.mark.asyncio
+@respx.mock
+async def test_non_object_prometheus_response_returns_unknown(
+    status_state,
+    client,
+    malformed_endpoint,
+):
+    rules_response = [] if malformed_endpoint == "rules" else _prometheus_rules()
+    alerts_response = [] if malformed_endpoint == "alerts" else _prometheus([])
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(200, json=rules_response)
+    )
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=alerts_response)
+    )
+
+    response = await client.get("/v1/status")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "unknown"
+    assert response.json()["stale"] is True
+
+
 @pytest.mark.asyncio
 @respx.mock
 async def test_prometheus_failure_is_cached_briefly(status_state, client):

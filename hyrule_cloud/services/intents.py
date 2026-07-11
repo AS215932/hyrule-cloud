@@ -215,15 +215,6 @@ async def poll_one_intent(
         ):
             return row
 
-        now = _now()
-        # Expiry check first — no payment ever arrived.
-        if row.expires_at and row.expires_at.replace(tzinfo=row.expires_at.tzinfo or UTC) < now:
-            # Only expire if nothing has been received yet
-            if not row.amount_received_crypto or row.amount_received_crypto == 0:
-                row.status = CryptoIntentStatus.EXPIRED
-                await db.commit()
-                return row
-
     # Scan on-chain. Held outside the DB session because Esplora/RPC can take a while.
     try:
         if row.asset == "BTC":
@@ -241,11 +232,34 @@ async def poll_one_intent(
         row = await db.get(CryptoIntentRow, intent_id)
         if row is None:
             return None
+        # A concurrent poll may have completed while this network scan was in
+        # flight. Never overwrite its terminal transition.
+        if row.status in (
+            CryptoIntentStatus.PROVISIONED,
+            CryptoIntentStatus.PROVISIONING,
+            CryptoIntentStatus.REFUND_MANUAL,
+            CryptoIntentStatus.FAILED,
+            CryptoIntentStatus.EXPIRED,
+        ):
+            return row
         row.last_scanned_at = _now()
         row.confirmations = scan.confirmations
         row.amount_received_crypto = scan.received_total
         if scan.tx_hash and not row.tx_hash:
             row.tx_hash = scan.tx_hash
+
+        # Expiry means "no payment was observed before the address window
+        # closed", so it must be decided from the fresh chain scan. Checking
+        # the stale DB amount first can permanently discard a deposit that was
+        # sent near expiry and still needs provisioning or an explicit refund.
+        expires_at = row.expires_at
+        if expires_at is not None:
+            expires_at = expires_at.replace(tzinfo=expires_at.tzinfo or UTC)
+        if expires_at is not None and expires_at < _now() and scan.received_total == 0:
+            row.status = CryptoIntentStatus.EXPIRED
+            await db.commit()
+            await db.refresh(row)
+            return row
 
         new_status = _decide_status(
             row=row,

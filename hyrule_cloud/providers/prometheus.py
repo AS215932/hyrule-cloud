@@ -56,7 +56,7 @@ class PrometheusClient:
             log.warning("prometheus_query_failed", error=repr(exc), query=promql)
             return None
 
-        if body.get("status") != "success":
+        if not isinstance(body, dict) or body.get("status") != "success":
             return None
         data = body.get("data", {})
         result = data.get("result", []) if isinstance(data, dict) else []
@@ -88,7 +88,7 @@ class PrometheusClient:
             body = resp.json()
         except (httpx.HTTPError, ValueError):
             return None
-        if body.get("status") != "success":
+        if not isinstance(body, dict) or body.get("status") != "success":
             return None
         return body.get("data")
 
@@ -109,7 +109,7 @@ class PrometheusClient:
             log.warning("prometheus_alerts_failed", error=repr(exc))
             return None
 
-        if body.get("status") != "success":
+        if not isinstance(body, dict) or body.get("status") != "success":
             return None
         data = body.get("data")
         alerts = data.get("alerts") if isinstance(data, dict) else None
@@ -138,7 +138,7 @@ class PrometheusClient:
             log.warning("prometheus_rules_failed", error=repr(exc))
             return None
 
-        if body.get("status") != "success":
+        if not isinstance(body, dict) or body.get("status") != "success":
             return None
         data = body.get("data")
         groups = data.get("groups") if isinstance(data, dict) else None
@@ -161,8 +161,4 @@ class PrometheusClient:
         rules = await self.alerting_rules()
         if rules is None:
             return None
-        return {
-            name
-            for rule in rules
-            if isinstance((name := rule.get("name")), str)
-        }
+        return {name for rule in rules if isinstance((name := rule.get("name")), str)}

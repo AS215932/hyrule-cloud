@@ -1598,6 +1598,38 @@ def _intent_to_response(
     )
 
 
+async def _load_payable_native_quote(
+    *,
+    orch,
+    order: VMCreateRequest,
+    account: Any,
+) -> tuple[VMQuoteRow | None, VMCreateRequest]:
+    """Load and revalidate the durable quote bound to a native intent order."""
+    if not order.quote_id:
+        return None, order
+
+    quote_row = await get_quote(orch.db, order.quote_id)
+    if quote_row is None:
+        raise HTTPException(404, "Quote not found")
+    _require_resource_owner(
+        quote_row.owner_account_id,
+        account,
+        not_found="Quote not found",
+    )
+    if QuoteStatus(quote_row.status) == QuoteStatus.CONSUMED:
+        raise HTTPException(409, "Quote has already been consumed")
+    if is_expired(quote_row):
+        raise HTTPException(409, "Quote expired; create a new one")
+    if QuoteStatus(quote_row.status) != QuoteStatus.CREATED:
+        raise HTTPException(409, "Quote is not payable")
+    if order.model_dump(mode="json", exclude={"quote_id"}) != quote_row.order_payload:
+        raise HTTPException(422, "Order body does not match the quote")
+    locked_order = VMCreateRequest(**quote_row.order_payload).model_copy(
+        update={"quote_id": quote_row.quote_id}
+    )
+    return quote_row, locked_order
+
+
 @router.post("/intent/create", response_model=CryptoIntentResponse)
 async def create_crypto_intent(
     body: CryptoIntentRequest,
@@ -1642,33 +1674,32 @@ async def create_crypto_intent(
     _require_vm_service_open(gate)
 
     if existing_intent is not None:
+        # An awaiting replay can safely be refused because no funds have been
+        # observed. Revalidate its stored quote before re-serving the address:
+        # another checkout may have consumed or expired that quote meanwhile.
+        try:
+            existing_order = VMCreateRequest.model_validate(existing_intent.order_payload)
+        except ValueError:
+            raise HTTPException(409, "Intent order is no longer payable")
+        existing_quote, existing_order = await _load_payable_native_quote(
+            orch=orch,
+            order=existing_order,
+            account=account,
+        )
+        if existing_quote is not None:
+            _validate_vm_order(existing_order, cfg)
+            await _compute_vm_price(orch, cfg, existing_order)
         return _intent_to_response(existing_intent, request)
 
     # Native BTC/XMR checkout is bound to the same durable quote as EVM. The
     # quote's stored spec and USD amount are authoritative; recomputing from the
     # posted body would let the deposit amount drift from the review page.
-    quote_row: VMQuoteRow | None = None
     order = body.order_payload
-    if order.quote_id:
-        quote_row = await get_quote(orch.db, order.quote_id)
-        if quote_row is None:
-            raise HTTPException(404, "Quote not found")
-        _require_resource_owner(
-            quote_row.owner_account_id,
-            account,
-            not_found="Quote not found",
-        )
-        if QuoteStatus(quote_row.status) == QuoteStatus.CONSUMED:
-            raise HTTPException(409, "Quote has already been consumed")
-        if is_expired(quote_row):
-            raise HTTPException(409, "Quote expired; create a new one")
-        if QuoteStatus(quote_row.status) != QuoteStatus.CREATED:
-            raise HTTPException(409, "Quote is not payable")
-        if order.model_dump(mode="json", exclude={"quote_id"}) != quote_row.order_payload:
-            raise HTTPException(422, "Order body does not match the quote")
-        order = VMCreateRequest(**quote_row.order_payload).model_copy(
-            update={"quote_id": quote_row.quote_id}
-        )
+    quote_row, order = await _load_payable_native_quote(
+        orch=orch,
+        order=order,
+        account=account,
+    )
 
     # Same validation as the x402 create path — including the real-mode OS
     # support check, so an unsupported order is rejected BEFORE a deposit
