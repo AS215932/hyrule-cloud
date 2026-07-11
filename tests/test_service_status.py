@@ -96,7 +96,7 @@ def _alert(
     *,
     name: str = "HyrulePublicApiUnavailable",
     state: str = "outage",
-    components: str = "api_checkout,intelligence",
+    components: str = "api_checkout,intelligence,domains_dns,network_proxy",
     firing: str = "firing",
     public: str = "true",
 ) -> dict:
@@ -195,7 +195,12 @@ async def test_only_explicit_firing_public_alerts_cross_boundary(status_state, c
     assert len(body["incidents"]) == 1
     incident = body["incidents"][0]
     assert incident["id"].startswith("inc_")
-    assert incident["component_ids"] == ["api_checkout", "intelligence"]
+    assert incident["component_ids"] == [
+        "api_checkout",
+        "intelligence",
+        "domains_dns",
+        "network_proxy",
+    ]
     assert incident["title"] == "Cloud API unavailable"
     serialized = response.text
     assert "2a0c:b641" not in serialized
@@ -212,8 +217,12 @@ async def test_only_explicit_firing_public_alerts_cross_boundary(status_state, c
 async def test_highest_incident_state_wins_per_component(status_state, client):
     _mock_loaded_rules()
     alerts = [
-        _alert(name="Routing", state="degraded", components="compute,network_proxy"),
-        _alert(name="Proxy", state="outage", components="network_proxy"),
+        _alert(
+            name="HyrulePublicRoutingDegraded",
+            state="degraded",
+            components="compute,domains_dns,network_proxy",
+        ),
+        _alert(),
     ]
     respx.get("http://prom.test:9090/api/v1/alerts").mock(
         return_value=Response(200, json=_prometheus(alerts))
@@ -235,7 +244,18 @@ async def test_recent_success_is_returned_stale_on_prometheus_failure(status_sta
     _mock_loaded_rules()
     route = respx.get("http://prom.test:9090/api/v1/alerts")
     route.side_effect = [
-        Response(200, json=_prometheus([_alert(state="degraded")])),
+        Response(
+            200,
+            json=_prometheus(
+                [
+                    _alert(
+                        name="HyrulePublicPaymentFailureRatio",
+                        state="degraded",
+                        components="api_checkout",
+                    )
+                ]
+            ),
+        ),
         Response(503, text="unavailable"),
     ]
     first = await client.get("/v1/status")
@@ -318,6 +338,61 @@ async def test_missing_public_rule_group_never_reports_operational(status_state,
     assert body["stale"] is True
     assert body["checked_at"] != previous.checked_at.isoformat().replace("+00:00", "Z")
     assert alerts_route.called is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_uncurated_public_alert_cannot_cross_boundary(status_state, client):
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(
+            200,
+            json=_prometheus(
+                [
+                    _alert(
+                        name="ExperimentalPublicAlert",
+                        state="outage",
+                        components="api_checkout",
+                    )
+                ]
+            ),
+        )
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "operational"
+    assert body["incidents"] == []
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_per_target_alerts_collapse_to_one_public_incident(status_state, client):
+    _mock_loaded_rules()
+    first = _alert(
+        name="HyrulePublicComputeHostDegraded",
+        state="degraded",
+        components="compute",
+    )
+    second = _alert(
+        name="HyrulePublicComputeHostDegraded",
+        state="degraded",
+        components="compute",
+    )
+    first["activeAt"] = "2026-07-11T12:05:00Z"
+    second["activeAt"] = "2026-07-11T12:00:00Z"
+    second["labels"]["instance"] = "another-private-target"
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([first, second]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "degraded"
+    assert len(body["incidents"]) == 1
+    assert body["incidents"][0]["component_ids"] == ["compute"]
+    assert body["incidents"][0]["started_at"] == "2026-07-11T12:00:00Z"
+    assert "another-private-target" not in str(body)
 
 
 @pytest.mark.asyncio

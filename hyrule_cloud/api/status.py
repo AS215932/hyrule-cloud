@@ -156,22 +156,32 @@ def _incident_from_alert(alert: dict[str, Any]) -> ServiceIncident | None:
     if not isinstance(labels, dict) or labels.get("public_status") != "true":
         return None
 
-    raw_state = labels.get("public_state")
-    if raw_state not in {ServiceState.DEGRADED.value, ServiceState.OUTAGE.value}:
+    raw_alert_name = labels.get("alertname")
+    if not isinstance(raw_alert_name, str):
         return None
-    state = ServiceState(raw_state)
+    expected_metadata = _REQUIRED_PUBLIC_RULES.get(raw_alert_name)
+    if expected_metadata is None:
+        return None
+    expected_state, expected_components = expected_metadata
+
+    raw_state = labels.get("public_state")
+    if raw_state != expected_state.value:
+        return None
+    state = expected_state
 
     raw_components = labels.get("public_components")
     if not isinstance(raw_components, str):
         return None
-    component_ids = [
+    parsed_components = frozenset(
         component_id
         for component_id in (item.strip() for item in raw_components.split(","))
-        if component_id in _COMPONENTS
-    ]
-    component_ids = list(dict.fromkeys(component_ids))
-    if not component_ids:
+        if component_id
+    )
+    if parsed_components != expected_components:
         return None
+    component_ids = [
+        component_id for component_id in _COMPONENTS if component_id in expected_components
+    ]
 
     annotations = alert.get("annotations")
     safe_annotations = annotations if isinstance(annotations, dict) else {}
@@ -182,11 +192,7 @@ def _incident_from_alert(alert: dict[str, Any]) -> ServiceIncident | None:
         500,
     )
     started_at = _started_at(alert.get("activeAt"))
-    raw_alert_name = labels.get("alertname")
-    alert_name = raw_alert_name if isinstance(raw_alert_name, str) else "alert"
-    identity = "|".join(
-        [alert_name, started_at.isoformat() if started_at else "", *component_ids]
-    )
+    identity = "|".join([raw_alert_name, *component_ids])
     incident_id = "inc_" + hashlib.sha256(identity.encode()).hexdigest()[:16]
     return ServiceIncident(
         id=incident_id,
@@ -239,7 +245,20 @@ def _public_rules_ready(rules: list[dict[str, Any]]) -> bool:
 
 
 def _build_response(alerts: list[dict[str, Any]]) -> ServiceStatusResponse:
-    incidents = [incident for alert in alerts if (incident := _incident_from_alert(alert))]
+    incidents_by_id: dict[str, ServiceIncident] = {}
+    for alert in alerts:
+        incident = _incident_from_alert(alert)
+        if incident is None:
+            continue
+        existing = incidents_by_id.get(incident.id)
+        if existing is None:
+            incidents_by_id[incident.id] = incident
+        elif incident.started_at is not None and (
+            existing.started_at is None or incident.started_at < existing.started_at
+        ):
+            existing.started_at = incident.started_at
+
+    incidents = list(incidents_by_id.values())
     incidents.sort(
         key=lambda incident: (
             -_RANK[incident.status],
