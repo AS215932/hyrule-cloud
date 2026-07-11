@@ -1677,10 +1677,10 @@ async def create_crypto_intent(
 
     await _enforce_paid_vm_cap(orch, cfg)
     await _enforce_prefix_capacity(orch, cfg)
-    if quote_row is not None:
-        total = quote_row.amount_usd
-    else:
-        total, _ = await _compute_vm_price(orch, cfg, order)
+    # Re-run validation that depends on mutable external state (notably custom
+    # domain availability), while retaining the durable quote's locked amount.
+    computed, _ = await _compute_vm_price(orch, cfg, order)
+    total = quote_row.amount_usd if quote_row is not None else computed
 
     app_state: AppState = get_app_state(request)
     provider = getattr(app_state, "native_crypto", None)
@@ -1698,9 +1698,15 @@ async def create_crypto_intent(
             amount_usd=total,
             client_order_id=body.client_order_id,
             owner_account_id=(account.account_id if account is not None else None),
+            expires_at=(quote_row.expires_at if quote_row is not None else None),
         )
     except IntentExistsError as exc:
         # Idempotent replay: return the existing intent verbatim
+        _require_resource_owner(
+            exc.existing.owner_account_id,
+            account,
+            not_found="Intent not found",
+        )
         return _intent_to_response(exc.existing, request)
     except RuntimeError as exc:
         log.error("intent_create_failed", error=str(exc))

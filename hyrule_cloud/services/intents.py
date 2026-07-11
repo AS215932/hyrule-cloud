@@ -96,6 +96,7 @@ async def create_intent(
     amount_usd: Decimal,
     client_order_id: str | None,
     owner_account_id: str | None,
+    expires_at: datetime | None = None,
 ) -> CryptoIntentRow:
     """Insert a fresh CryptoIntentRow and derive a receive address for it.
 
@@ -119,6 +120,14 @@ async def create_intent(
     rate = await rates.get_usd_per(asset)
     amount_crypto = (amount_usd / rate).quantize(Decimal("0.000000000001"))
     now = _now()
+    intent_expires_at = now + INTENT_TTL
+    if expires_at is not None:
+        quote_expires_at = expires_at
+        if quote_expires_at.tzinfo is None:
+            quote_expires_at = quote_expires_at.replace(tzinfo=UTC)
+        else:
+            quote_expires_at = quote_expires_at.astimezone(UTC)
+        intent_expires_at = min(intent_expires_at, quote_expires_at)
     intent_id = str(uuid.uuid4())
 
     async with session_factory() as db:
@@ -141,11 +150,11 @@ async def create_intent(
             amount_usd=amount_usd,
             amount_crypto=amount_crypto,
             rate_snapshot=rate,
-            rate_valid_until=now + RATE_VALID_TTL,
+            rate_valid_until=min(now + RATE_VALID_TTL, intent_expires_at),
             address=address,
             bip32_index=bip32_index,
             xmr_subaddr_index=xmr_subaddr_index,
-            expires_at=now + INTENT_TTL,
+            expires_at=intent_expires_at,
             status=CryptoIntentStatus.CREATED,
             client_order_id=client_order_id,
             order_payload=order_payload.model_dump(mode="json"),
@@ -375,6 +384,25 @@ async def _trigger_provisioning(
                 await orch.record_native_intent_refund(
                     intent_id,
                     reason="quote_expired_at_settlement",
+                )
+                return
+            # Route checks protect new HTTP-created intents, but settlement is
+            # the irreversible trust boundary. Revalidate the complete durable
+            # quote binding for legacy rows and internal create_intent callers
+            # before consuming somebody else's quote or a changed price/spec.
+            expected_payload = order.model_dump(mode="json", exclude={"quote_id"})
+            if (
+                (
+                    quote.owner_account_id is not None
+                    and quote.owner_account_id != row.owner_account_id
+                )
+                or quote.order_payload != expected_payload
+                or row.amount_usd is None
+                or row.amount_usd != quote.amount_usd
+            ):
+                await orch.record_native_intent_refund(
+                    intent_id,
+                    reason="quote_binding_mismatch_at_settlement",
                 )
                 return
             if not await claim_quote(session_factory, quote_id):
