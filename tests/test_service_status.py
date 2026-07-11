@@ -257,6 +257,10 @@ async def test_status_cache_avoids_repeated_prometheus_requests(status_state, cl
 @pytest.mark.asyncio
 @respx.mock
 async def test_missing_public_rule_group_never_reports_operational(status_state, client):
+    from hyrule_cloud.api.status import _STATUS_CACHE, _build_response
+
+    previous = _build_response([])
+    _STATUS_CACHE.update(value=previous, expires_at=0.0, successful_at=10**12)
     respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
         return_value=Response(200, json=_prometheus_rules(("SomeInternalRule",)))
     )
@@ -268,4 +272,5 @@ async def test_missing_public_rule_group_never_reports_operational(status_state,
 
     assert body["status"] == "unknown"
     assert body["stale"] is True
+    assert body["checked_at"] != previous.checked_at.isoformat().replace("+00:00", "Z")
     assert alerts_route.called is False

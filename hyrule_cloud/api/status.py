@@ -212,11 +212,14 @@ async def get_service_status(request: Request) -> ServiceStatusResponse:
     config = getattr(app_state, "config", None)
     prometheus_url = getattr(config, "prometheus_url", "") or ""
     alerts: list[dict[str, Any]] | None = None
+    rules_mismatch = False
     if prometheus_url:
         client = PrometheusClient(prometheus_url)
         try:
             loaded_rules = await client.alerting_rule_names()
-            if loaded_rules is not None and _REQUIRED_PUBLIC_RULES <= loaded_rules:
+            if loaded_rules is not None and not _REQUIRED_PUBLIC_RULES <= loaded_rules:
+                rules_mismatch = True
+            elif loaded_rules is not None:
                 alerts = await client.active_alerts()
         finally:
             await client.aclose()
@@ -229,6 +232,11 @@ async def get_service_status(request: Request) -> ServiceStatusResponse:
             successful_at=now_ts,
         )
         return response
+
+    if rules_mismatch:
+        unknown = _unknown_response()
+        _STATUS_CACHE.update(value=unknown, expires_at=now_ts + _CACHE_TTL_SECONDS)
+        return unknown
 
     successful_at = float(_STATUS_CACHE.get("successful_at", 0.0))
     if isinstance(cached, ServiceStatusResponse) and now_ts - successful_at <= _STALE_MAX_SECONDS:
