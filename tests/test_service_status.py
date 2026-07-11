@@ -25,17 +25,61 @@ _PUBLIC_RULES = (
     "HyrulePublicRoutingDegraded",
     "HyrulePublicDNSDegraded",
     "HyrulePublicDNSOutage",
+    "HyruleVMProvisionFailureRatio",
+    "HyruleNetworkProxyDown",
 )
 
 
-def _prometheus_rules(names: tuple[str, ...] = _PUBLIC_RULES) -> dict:
+_PUBLIC_RULE_METADATA = {
+    "HyrulePublicApiUnavailable": (
+        "outage",
+        "api_checkout,intelligence,domains_dns,network_proxy",
+    ),
+    "HyrulePublicComputeControlPlaneUnavailable": ("degraded", "compute"),
+    "HyrulePublicPaymentFailureRatio": ("degraded", "api_checkout"),
+    "HyrulePublicComputeHostDegraded": ("degraded", "compute"),
+    "HyrulePublicRoutingDegraded": (
+        "degraded",
+        "compute,domains_dns,network_proxy",
+    ),
+    "HyrulePublicDNSDegraded": ("degraded", "domains_dns"),
+    "HyrulePublicDNSOutage": ("outage", "domains_dns"),
+    "HyruleVMProvisionFailureRatio": ("degraded", "compute"),
+    "HyruleNetworkProxyDown": ("degraded", "network_proxy"),
+}
+
+
+def _prometheus_rules(
+    names: tuple[str, ...] = _PUBLIC_RULES,
+    overrides: dict[str, dict] | None = None,
+) -> dict:
+    rules = []
+    for name in names:
+        state, components = _PUBLIC_RULE_METADATA.get(name, ("degraded", "compute"))
+        rule = {
+            "type": "alerting",
+            "name": name,
+            "health": "ok",
+            "labels": {
+                "public_status": "true",
+                "public_state": state,
+                "public_components": components,
+            },
+            "annotations": {
+                "public_title": f"{name} title",
+                "public_message": f"{name} customer-safe message",
+            },
+        }
+        if overrides and name in overrides:
+            rule.update(overrides[name])
+        rules.append(rule)
     return {
         "status": "success",
         "data": {
             "groups": [
                 {
                     "name": "hyrule-public-status",
-                    "rules": [{"type": "alerting", "name": name} for name in names],
+                    "rules": rules,
                 }
             ]
         },
@@ -273,4 +317,56 @@ async def test_missing_public_rule_group_never_reports_operational(status_state,
     assert body["status"] == "unknown"
     assert body["stale"] is True
     assert body["checked_at"] != previous.checked_at.isoformat().replace("+00:00", "Z")
+    assert alerts_route.called is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unhealthy_public_rule_never_reports_operational(status_state, client):
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(
+            200,
+            json=_prometheus_rules(
+                overrides={"HyrulePublicDNSOutage": {"health": "err"}}
+            ),
+        )
+    )
+    alerts_route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert body["stale"] is True
+    assert alerts_route.called is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_invalid_public_rule_metadata_never_reports_operational(status_state, client):
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(
+            200,
+            json=_prometheus_rules(
+                overrides={
+                    "HyruleNetworkProxyDown": {
+                        "labels": {
+                            "public_status": "true",
+                            "public_state": "degraded",
+                            "public_components": "compute",
+                        }
+                    }
+                }
+            ),
+        )
+    )
+    alerts_route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert body["stale"] is True
     assert alerts_route.called is False

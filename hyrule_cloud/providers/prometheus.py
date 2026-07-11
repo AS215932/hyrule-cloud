@@ -117,12 +117,13 @@ class PrometheusClient:
             return None
         return [alert for alert in alerts if isinstance(alert, dict)]
 
-    async def alerting_rule_names(self) -> set[str] | None:
-        """Return the alerting-rule names currently loaded by Prometheus.
+    async def alerting_rules(self) -> list[dict[str, Any]] | None:
+        """Return alerting-rule definitions currently loaded by Prometheus.
 
         A zero-alert response is only evidence of healthy services when the
-        customer-status rules are actually loaded. Callers use this method as
-        a readiness gate so a failed rule deployment cannot look green.
+        customer-status rules are loaded, healthy, and carry the expected
+        public metadata. Callers use the full rule objects as a readiness gate
+        so a failed evaluation or partial deployment cannot look green.
         """
         try:
             resp = await self._http().get(
@@ -144,7 +145,7 @@ class PrometheusClient:
         if not isinstance(groups, list):
             return None
 
-        names: set[str] = set()
+        alerting_rules: list[dict[str, Any]] = []
         for group in groups:
             rules = group.get("rules") if isinstance(group, dict) else None
             if not isinstance(rules, list):
@@ -152,7 +153,16 @@ class PrometheusClient:
             for rule in rules:
                 if not isinstance(rule, dict) or rule.get("type") != "alerting":
                     continue
-                name = rule.get("name")
-                if isinstance(name, str):
-                    names.add(name)
-        return names
+                alerting_rules.append(rule)
+        return alerting_rules
+
+    async def alerting_rule_names(self) -> set[str] | None:
+        """Return loaded alerting-rule names for non-readiness callers."""
+        rules = await self.alerting_rules()
+        if rules is None:
+            return None
+        return {
+            name
+            for rule in rules
+            if isinstance((name := rule.get("name")), str)
+        }

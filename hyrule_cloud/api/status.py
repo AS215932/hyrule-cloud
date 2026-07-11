@@ -62,14 +62,43 @@ _RANK = {
 }
 _CACHE_TTL_SECONDS = 15
 _STALE_MAX_SECONDS = 120
-_REQUIRED_PUBLIC_RULES = {
-    "HyrulePublicApiUnavailable",
-    "HyrulePublicComputeControlPlaneUnavailable",
-    "HyrulePublicPaymentFailureRatio",
-    "HyrulePublicComputeHostDegraded",
-    "HyrulePublicRoutingDegraded",
-    "HyrulePublicDNSDegraded",
-    "HyrulePublicDNSOutage",
+_REQUIRED_PUBLIC_RULES: dict[str, tuple[ServiceState, frozenset[str]]] = {
+    "HyrulePublicApiUnavailable": (
+        ServiceState.OUTAGE,
+        frozenset({"api_checkout", "intelligence", "domains_dns", "network_proxy"}),
+    ),
+    "HyrulePublicComputeControlPlaneUnavailable": (
+        ServiceState.DEGRADED,
+        frozenset({"compute"}),
+    ),
+    "HyrulePublicPaymentFailureRatio": (
+        ServiceState.DEGRADED,
+        frozenset({"api_checkout"}),
+    ),
+    "HyrulePublicComputeHostDegraded": (
+        ServiceState.DEGRADED,
+        frozenset({"compute"}),
+    ),
+    "HyrulePublicRoutingDegraded": (
+        ServiceState.DEGRADED,
+        frozenset({"compute", "domains_dns", "network_proxy"}),
+    ),
+    "HyrulePublicDNSDegraded": (
+        ServiceState.DEGRADED,
+        frozenset({"domains_dns"}),
+    ),
+    "HyrulePublicDNSOutage": (
+        ServiceState.OUTAGE,
+        frozenset({"domains_dns"}),
+    ),
+    "HyruleVMProvisionFailureRatio": (
+        ServiceState.DEGRADED,
+        frozenset({"compute"}),
+    ),
+    "HyruleNetworkProxyDown": (
+        ServiceState.DEGRADED,
+        frozenset({"network_proxy"}),
+    ),
 }
 _STATUS_CACHE: dict[str, Any] = {
     "value": None,
@@ -169,6 +198,46 @@ def _incident_from_alert(alert: dict[str, Any]) -> ServiceIncident | None:
     )
 
 
+def _public_rules_ready(rules: list[dict[str, Any]]) -> bool:
+    """Require one healthy, correctly-labelled definition for every public rule."""
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for rule in rules:
+        name = rule.get("name")
+        if isinstance(name, str) and name in _REQUIRED_PUBLIC_RULES:
+            by_name.setdefault(name, []).append(rule)
+
+    for name, (expected_state, expected_components) in _REQUIRED_PUBLIC_RULES.items():
+        matches = by_name.get(name, [])
+        if len(matches) != 1:
+            return False
+        rule = matches[0]
+        if rule.get("health") != "ok":
+            return False
+
+        labels = rule.get("labels")
+        if not isinstance(labels, dict) or labels.get("public_status") != "true":
+            return False
+        if labels.get("public_state") != expected_state.value:
+            return False
+        raw_components = labels.get("public_components")
+        if not isinstance(raw_components, str):
+            return False
+        components = frozenset(
+            component.strip() for component in raw_components.split(",") if component.strip()
+        )
+        if components != expected_components:
+            return False
+
+        annotations = rule.get("annotations")
+        if not isinstance(annotations, dict):
+            return False
+        for field in ("public_title", "public_message"):
+            value = annotations.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return False
+    return True
+
+
 def _build_response(alerts: list[dict[str, Any]]) -> ServiceStatusResponse:
     incidents = [incident for alert in alerts if (incident := _incident_from_alert(alert))]
     incidents.sort(
@@ -212,13 +281,13 @@ async def get_service_status(request: Request) -> ServiceStatusResponse:
     config = getattr(app_state, "config", None)
     prometheus_url = getattr(config, "prometheus_url", "") or ""
     alerts: list[dict[str, Any]] | None = None
-    rules_mismatch = False
+    rules_unready = False
     if prometheus_url:
         client = PrometheusClient(prometheus_url)
         try:
-            loaded_rules = await client.alerting_rule_names()
-            if loaded_rules is not None and not _REQUIRED_PUBLIC_RULES <= loaded_rules:
-                rules_mismatch = True
+            loaded_rules = await client.alerting_rules()
+            if loaded_rules is not None and not _public_rules_ready(loaded_rules):
+                rules_unready = True
             elif loaded_rules is not None:
                 alerts = await client.active_alerts()
         finally:
@@ -233,7 +302,7 @@ async def get_service_status(request: Request) -> ServiceStatusResponse:
         )
         return response
 
-    if rules_mismatch:
+    if rules_unready:
         unknown = _unknown_response()
         _STATUS_CACHE.update(value=unknown, expires_at=now_ts + _CACHE_TTL_SECONDS)
         return unknown
