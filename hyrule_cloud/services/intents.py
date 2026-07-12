@@ -15,6 +15,7 @@ decides to provision.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -27,10 +28,17 @@ from sqlalchemy.exc import IntegrityError
 from hyrule_cloud.db import CryptoIntentRow
 from hyrule_cloud.models import (
     CryptoIntentStatus,
+    QuoteStatus,
     VMCreateRequest,
 )
 from hyrule_cloud.providers.native_crypto import AddressScanResult, NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.services.quotes import (
+    claim_quote,
+    get_quote,
+    is_expired,
+    link_quote_vm,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -88,6 +96,7 @@ async def create_intent(
     amount_usd: Decimal,
     client_order_id: str | None,
     owner_account_id: str | None,
+    expires_at: datetime | None = None,
 ) -> CryptoIntentRow:
     """Insert a fresh CryptoIntentRow and derive a receive address for it.
 
@@ -111,6 +120,14 @@ async def create_intent(
     rate = await rates.get_usd_per(asset)
     amount_crypto = (amount_usd / rate).quantize(Decimal("0.000000000001"))
     now = _now()
+    intent_expires_at = now + INTENT_TTL
+    if expires_at is not None:
+        quote_expires_at = expires_at
+        if quote_expires_at.tzinfo is None:
+            quote_expires_at = quote_expires_at.replace(tzinfo=UTC)
+        else:
+            quote_expires_at = quote_expires_at.astimezone(UTC)
+        intent_expires_at = min(intent_expires_at, quote_expires_at)
     intent_id = str(uuid.uuid4())
 
     async with session_factory() as db:
@@ -133,11 +150,11 @@ async def create_intent(
             amount_usd=amount_usd,
             amount_crypto=amount_crypto,
             rate_snapshot=rate,
-            rate_valid_until=now + RATE_VALID_TTL,
+            rate_valid_until=min(now + RATE_VALID_TTL, intent_expires_at),
             address=address,
             bip32_index=bip32_index,
             xmr_subaddr_index=xmr_subaddr_index,
-            expires_at=now + INTENT_TTL,
+            expires_at=intent_expires_at,
             status=CryptoIntentStatus.CREATED,
             client_order_id=client_order_id,
             order_payload=order_payload.model_dump(mode="json"),
@@ -198,15 +215,6 @@ async def poll_one_intent(
         ):
             return row
 
-        now = _now()
-        # Expiry check first — no payment ever arrived.
-        if row.expires_at and row.expires_at.replace(tzinfo=row.expires_at.tzinfo or UTC) < now:
-            # Only expire if nothing has been received yet
-            if not row.amount_received_crypto or row.amount_received_crypto == 0:
-                row.status = CryptoIntentStatus.EXPIRED
-                await db.commit()
-                return row
-
     # Scan on-chain. Held outside the DB session because Esplora/RPC can take a while.
     try:
         if row.asset == "BTC":
@@ -224,11 +232,34 @@ async def poll_one_intent(
         row = await db.get(CryptoIntentRow, intent_id)
         if row is None:
             return None
+        # A concurrent poll may have completed while this network scan was in
+        # flight. Never overwrite its terminal transition.
+        if row.status in (
+            CryptoIntentStatus.PROVISIONED,
+            CryptoIntentStatus.PROVISIONING,
+            CryptoIntentStatus.REFUND_MANUAL,
+            CryptoIntentStatus.FAILED,
+            CryptoIntentStatus.EXPIRED,
+        ):
+            return row
         row.last_scanned_at = _now()
         row.confirmations = scan.confirmations
         row.amount_received_crypto = scan.received_total
         if scan.tx_hash and not row.tx_hash:
             row.tx_hash = scan.tx_hash
+
+        # Expiry means "no payment was observed before the address window
+        # closed", so it must be decided from the fresh chain scan. Checking
+        # the stale DB amount first can permanently discard a deposit that was
+        # sent near expiry and still needs provisioning or an explicit refund.
+        expires_at = row.expires_at
+        if expires_at is not None:
+            expires_at = expires_at.replace(tzinfo=expires_at.tzinfo or UTC)
+        if expires_at is not None and expires_at < _now() and scan.received_total == 0:
+            row.status = CryptoIntentStatus.EXPIRED
+            await db.commit()
+            await db.refresh(row)
+            return row
 
         new_status = _decide_status(
             row=row,
@@ -244,9 +275,7 @@ async def poll_one_intent(
 
     # SETTLED → trigger atomic provisioning. Exactly-once via UPDATE...RETURNING.
     if row.status == CryptoIntentStatus.SETTLED:
-        await _trigger_provisioning(
-            intent_id=intent_id, session_factory=session_factory, orch=orch
-        )
+        await _trigger_provisioning(intent_id=intent_id, session_factory=session_factory, orch=orch)
         # Re-fetch terminal state after provisioning
         async with session_factory() as db:
             row = await db.get(CryptoIntentRow, intent_id) or row
@@ -275,14 +304,14 @@ def _decide_status(
 ) -> CryptoIntentStatus:
     """LENIENT policy decision table:
 
-      no payment yet                           → WAITING_PAYMENT
-      paid but below min confs                 → keep current (WAITING_PAYMENT)
-      paid >= quote (within slip) + confirmed  → SETTLED (advances)
-      paid > quote (overpay) + confirmed       → SETTLED (overpay → still provisions)
-      paid < quote (underpay) + confirmed      → REFUND_MANUAL (manual)
-      paid after rate snapshot expired:
-        - amount matches fresh quote ±1%       → SETTLED (auto re-quote)
-        - amount drifted > 1%                  → REFUND_MANUAL
+    no payment yet                           → WAITING_PAYMENT
+    paid but below min confs                 → keep current (WAITING_PAYMENT)
+    paid >= quote (within slip) + confirmed  → SETTLED (advances)
+    paid > quote (overpay) + confirmed       → SETTLED (overpay → still provisions)
+    paid < quote (underpay) + confirmed      → REFUND_MANUAL (manual)
+    paid after rate snapshot expired:
+      - amount matches fresh quote ±1%       → SETTLED (auto re-quote)
+      - amount drifted > 1%                  → REFUND_MANUAL
     """
     received = scan.received_total
     if received == 0:
@@ -348,6 +377,57 @@ async def _trigger_provisioning(
     vm_row = None
     try:
         order = VMCreateRequest.model_validate(row.order_payload)
+        quote_id = order.quote_id
+        if quote_id is not None:
+            quote = await get_quote(session_factory, quote_id)
+            if quote is None:
+                await orch.record_native_intent_refund(
+                    intent_id,
+                    reason="quote_missing_at_settlement",
+                )
+                return
+            if QuoteStatus(quote.status) == QuoteStatus.CONSUMED:
+                await orch.record_native_intent_refund(
+                    intent_id,
+                    reason="quote_already_consumed",
+                )
+                return
+            if is_expired(quote):
+                # A native deposit can confirm long after its address was
+                # issued. Never consume a stale locked price at settlement.
+                await orch.record_native_intent_refund(
+                    intent_id,
+                    reason="quote_expired_at_settlement",
+                )
+                return
+            # Route checks protect new HTTP-created intents, but settlement is
+            # the irreversible trust boundary. Revalidate the complete durable
+            # quote binding for legacy rows and internal create_intent callers
+            # before consuming somebody else's quote or a changed price/spec.
+            expected_payload = order.model_dump(mode="json", exclude={"quote_id"})
+            if (
+                (
+                    quote.owner_account_id is not None
+                    and quote.owner_account_id != row.owner_account_id
+                )
+                or quote.order_payload != expected_payload
+                or row.amount_usd is None
+                or row.amount_usd != quote.amount_usd
+            ):
+                await orch.record_native_intent_refund(
+                    intent_id,
+                    reason="quote_binding_mismatch_at_settlement",
+                )
+                return
+            if not await claim_quote(session_factory, quote_id):
+                # Another EVM/native payment won after the read above. Funds are
+                # settled, so fail closed to an explicit refund instead of
+                # creating a second VM from the same locked order.
+                await orch.record_native_intent_refund(
+                    intent_id,
+                    reason="quote_already_consumed",
+                )
+                return
         # Create the VM row but DON'T start provisioning yet: link the intent to
         # the vm_id first, so a fast provisioning failure (immediate XO/API
         # error) can always find the paying intent and record its refund.
@@ -357,6 +437,60 @@ async def _trigger_provisioning(
             owner_account_id=row.owner_account_id,
             start_provisioning=False,
         )
+        if quote_id is not None:
+            if row.amount_usd is not None:
+                amount_persisted = False
+                for attempt in range(3):
+                    try:
+                        await orch.persist_charged_amount(vm_row.vm_id, row.amount_usd)
+                        amount_persisted = True
+                        break
+                    except Exception:
+                        log.warning(
+                            "native_charged_amount_attempt_failed",
+                            intent_id=intent_id,
+                            vm_id=vm_row.vm_id,
+                            attempt=attempt,
+                            exc_info=True,
+                        )
+                        if attempt < 2:
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                if not amount_persisted:
+                    # The intent itself retains the settled USD/crypto amounts,
+                    # so a later native refund remains accurate. Do not fail a
+                    # paid, provisionable VM over this denormalized copy.
+                    log.error(
+                        "native_charged_amount_failed_post_settlement",
+                        intent_id=intent_id,
+                        vm_id=vm_row.vm_id,
+                    )
+            linked = False
+            for attempt in range(3):
+                try:
+                    await link_quote_vm(session_factory, quote_id, vm_row.vm_id)
+                    linked = True
+                    break
+                except Exception:
+                    log.warning(
+                        "native_quote_link_attempt_failed",
+                        intent_id=intent_id,
+                        vm_id=vm_row.vm_id,
+                        quote_id=quote_id,
+                        attempt=attempt,
+                        exc_info=True,
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+            if not linked:
+                # The intent-to-VM link below remains the authoritative native
+                # recovery path, so provisioning is safer than refunding a
+                # working paid VM solely because quote bookkeeping is down.
+                log.error(
+                    "native_quote_link_failed_post_settlement",
+                    intent_id=intent_id,
+                    vm_id=vm_row.vm_id,
+                    quote_id=quote_id,
+                )
         async with session_factory() as db:
             r = await db.get(CryptoIntentRow, intent_id)
             if r is None:
@@ -393,9 +527,7 @@ async def _trigger_provisioning(
             # background provisioner was scheduled; fail it terminally so it
             # doesn't sit in PROVISIONING (owner_wallet=intent_id) pinning a /64
             # the sweeper (unpaid rows only) won't reclaim.
-            await orch.mark_vm_failed(
-                vm_row.vm_id, "native provisioning failed post-settlement"
-            )
+            await orch.mark_vm_failed(vm_row.vm_id, "native provisioning failed post-settlement")
 
 
 async def scan_pending_intents(

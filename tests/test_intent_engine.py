@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -23,9 +24,11 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.app import app
-from hyrule_cloud.db import Base, CryptoIntentRow, VMRow
+from hyrule_cloud.db import AccountRow, Base, CryptoIntentRow, VMQuoteRow, VMRow
+from hyrule_cloud.middleware.auth import current_account
 from hyrule_cloud.models import (
     CryptoIntentStatus,
+    QuoteStatus,
     VMSize,
     VMStatus,
 )
@@ -82,7 +85,8 @@ class _StubNativeProvider:
 
     async def scan_btc_address(self, address: str) -> AddressScanResult:
         return self.scan_results.get(
-            address, AddressScanResult(address=address, received_total=Decimal("0"), confirmations=0)
+            address,
+            AddressScanResult(address=address, received_total=Decimal("0"), confirmations=0),
         )
 
     async def scan_xmr_subaddress(self, subaddr_index: int) -> AddressScanResult:
@@ -125,6 +129,13 @@ class _StubOrchestrator:
                 await db.commit()
         return True
 
+    async def persist_charged_amount(self, vm_id: str, amount: Decimal) -> None:
+        async with self.db() as db:
+            row = await db.get(VMRow, vm_id)
+            if row is not None:
+                row.cost_total = amount
+                await db.commit()
+
     async def create_vm(
         self,
         request,
@@ -137,6 +148,7 @@ class _StubOrchestrator:
             generate_anon_management_token,
             generate_vm_id,
         )
+
         vm_id = generate_vm_id()
         anon_token = generate_anon_management_token()
         anon_hash = hash_anon_token(anon_token)
@@ -166,6 +178,7 @@ class _StubOrchestrator:
 
 def _vm_create_request():
     from hyrule_cloud.models import DomainMode, VMCreateRequest, VMSize
+
     return VMCreateRequest(
         duration_days=1,
         size=VMSize.XS,
@@ -176,6 +189,39 @@ def _vm_create_request():
         open_ports=[80, 443],
         setup_script=None,
     )
+
+
+async def _seed_quote(
+    state,
+    *,
+    quote_id: str,
+    amount_usd: Decimal = Decimal("4.25"),
+    owner_account_id: str | None = None,
+    order=None,
+) -> VMQuoteRow:
+    order = order or _vm_create_request()
+    row = VMQuoteRow(
+        quote_id=quote_id,
+        order_payload=order.model_dump(mode="json", exclude={"quote_id"}),
+        amount_usd=amount_usd,
+        status=QuoteStatus.CREATED,
+        client_order_id=None,
+        owner_account_id=owner_account_id,
+        expires_at=_now() + timedelta(minutes=15),
+    )
+    async with state.orchestrator.db() as db:
+        if owner_account_id is not None and await db.get(AccountRow, owner_account_id) is None:
+            db.add(
+                AccountRow(
+                    account_id=owner_account_id,
+                    password_hash="test-only",
+                    recovery_code_hash=None,
+                )
+            )
+        db.add(row)
+        await db.commit()
+        await db.refresh(row)
+    return row
 
 
 @pytest_asyncio.fixture
@@ -198,11 +244,17 @@ async def intent_state(tmp_path):
     provider = _StubNativeProvider()
 
     state = AppState(
-        config=type("Cfg", (), {
-            "payment": type("Pay", (), {"price_vm_xs": Decimal("0.05"), "dev_bypass_secret": ""})(),
-            "deploy_domain": "deploy.hyrule.host",
-            "blocked_ports": [25],
-        })(),
+        config=type(
+            "Cfg",
+            (),
+            {
+                "payment": type(
+                    "Pay", (), {"price_vm_xs": Decimal("0.05"), "dev_bypass_secret": ""}
+                )(),
+                "deploy_domain": "deploy.hyrule.host",
+                "blocked_ports": [25],
+            },
+        )(),
         orchestrator=orch,
         payment_gate=AsyncMock(),
         network_provider=None,
@@ -309,7 +361,10 @@ async def test_create_intent_xmr_allocates_subaddress(intent_state):
 
 
 async def _seed_intent(
-    state, asset: str = "BTC", amount_crypto: Decimal | None = None, amount_usd: Decimal | None = None,
+    state,
+    asset: str = "BTC",
+    amount_crypto: Decimal | None = None,
+    amount_usd: Decimal | None = None,
     rate_valid_until: datetime | None = None,
 ):
     intent_state_provider = state.native_crypto
@@ -460,7 +515,9 @@ async def test_poll_seen_but_unconfirmed_stays_waiting(intent_state):
 async def test_poll_late_paid_within_slippage_re_quotes_and_settles(intent_state):
     """LENIENT: paid after rate snapshot expired → re-quote; within 1% → SETTLED."""
     expired = _now() - timedelta(minutes=1)
-    row = await _seed_intent(intent_state, asset="BTC", amount_usd=Decimal("1.00"), rate_valid_until=expired)
+    row = await _seed_intent(
+        intent_state, asset="BTC", amount_usd=Decimal("1.00"), rate_valid_until=expired
+    )
     # Rate moved by < 1% so the same crypto amount still matches a fresh quote
     intent_state.rate_provider.usd_per["BTC"] = Decimal("65500.00")
     # Customer sent the amount that matches the NEW rate (1.00 / 65500)
@@ -483,7 +540,9 @@ async def test_poll_late_paid_within_slippage_re_quotes_and_settles(intent_state
 @pytest.mark.asyncio
 async def test_poll_late_paid_outside_slippage_refund_manual(intent_state):
     expired = _now() - timedelta(minutes=1)
-    row = await _seed_intent(intent_state, asset="BTC", amount_usd=Decimal("1.00"), rate_valid_until=expired)
+    row = await _seed_intent(
+        intent_state, asset="BTC", amount_usd=Decimal("1.00"), rate_valid_until=expired
+    )
     # Rate moved by 10% — customer sent the OLD amount but USD value drifted
     intent_state.rate_provider.usd_per["BTC"] = Decimal("72000.00")
     intent_state.native_crypto.scan_results[row.address] = AddressScanResult(
@@ -536,6 +595,7 @@ async def test_provisioning_fires_exactly_once_even_with_concurrent_polls(intent
     )
     # Two concurrent polls; only one should provision
     import asyncio as _aio
+
     r1, r2 = await _aio.gather(
         poll_one_intent(
             intent_id=row.intent_id,
@@ -642,6 +702,530 @@ async def test_intent_create_endpoint_returns_qr_uri(intent_state, client):
 
 
 @pytest.mark.asyncio
+async def test_intent_create_uses_durable_quote_spec_and_locked_amount(intent_state, client):
+    quote = await _seed_quote(intent_state, quote_id="q_native_locked")
+    order_payload = dict(quote.order_payload)
+    order_payload["quote_id"] = quote.quote_id
+    response = await client.post(
+        "/v1/intent/create",
+        json={"asset": "BTC", "order_payload": order_payload},
+    )
+
+    assert response.status_code == 200, response.text
+    assert Decimal(response.json()["amount_usd"]) == quote.amount_usd
+    async with intent_state.orchestrator.db() as db:
+        intent = await db.get(CryptoIntentRow, response.json()["intent_id"])
+    assert intent is not None
+    assert intent.order_payload["quote_id"] == quote.quote_id
+    assert intent.amount_usd == quote.amount_usd
+
+
+@pytest.mark.asyncio
+async def test_native_intent_rejects_cross_account_quote(intent_state, client):
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_owned",
+        owner_account_id="HOWNER00001",
+    )
+    order_payload = dict(quote.order_payload)
+    order_payload["quote_id"] = quote.quote_id
+    app.dependency_overrides[current_account] = lambda: SimpleNamespace(
+        account_id="HOTHER00001",
+        is_admin=False,
+    )
+    try:
+        response = await client.post(
+            "/v1/intent/create",
+            json={"asset": "BTC", "order_payload": order_payload},
+        )
+    finally:
+        app.dependency_overrides.pop(current_account, None)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Quote not found"
+
+
+@pytest.mark.asyncio
+async def test_native_intent_race_replay_rechecks_owner(
+    intent_state,
+    client,
+    monkeypatch,
+):
+    owner_id = "HOWNER00001"
+    other_id = "HOTHER00001"
+    async with intent_state.orchestrator.db() as db:
+        db.add_all(
+            [
+                AccountRow(
+                    account_id=owner_id,
+                    password_hash="test-only",
+                    recovery_code_hash=None,
+                ),
+                AccountRow(
+                    account_id=other_id,
+                    password_hash="test-only",
+                    recovery_code_hash=None,
+                ),
+            ]
+        )
+        await db.commit()
+    existing = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=_vm_create_request(),
+        amount_usd=Decimal("0.05"),
+        client_order_id="raced-owner-key",
+        owner_account_id=owner_id,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.api.routes.get_intent_by_client_order_id",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.api.routes.create_intent",
+        AsyncMock(side_effect=IntentExistsError(existing)),
+    )
+    app.dependency_overrides[current_account] = lambda: SimpleNamespace(
+        account_id=other_id,
+        is_admin=False,
+    )
+    try:
+        response = await client.post(
+            "/v1/intent/create",
+            json={
+                "asset": "BTC",
+                "client_order_id": "raced-owner-key",
+                "order_payload": _vm_create_request().model_dump(mode="json"),
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(current_account, None)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Intent not found"
+
+
+@pytest.mark.asyncio
+async def test_quote_bound_native_intent_rechecks_custom_domain_availability(
+    intent_state,
+    client,
+):
+    from hyrule_cloud.models import DomainMode
+
+    order = _vm_create_request().model_copy(
+        update={"domain_mode": DomainMode.CUSTOM, "domain": "taken.test"}
+    )
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_taken_domain",
+        order=order,
+    )
+    check_domain = AsyncMock(return_value={"status": "taken"})
+    intent_state.orchestrator.openprovider = SimpleNamespace(check_domain=check_domain)
+    posted = dict(quote.order_payload)
+    posted["quote_id"] = quote.quote_id
+
+    response = await client.post(
+        "/v1/intent/create",
+        json={"asset": "BTC", "order_payload": posted},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Domain taken.test is not available"
+    check_domain.assert_awaited_once_with("taken", "test")
+
+
+@pytest.mark.asyncio
+async def test_quote_bound_native_intent_expires_with_quote(intent_state, client):
+    quote = await _seed_quote(intent_state, quote_id="q_native_bounded_expiry")
+    async with intent_state.orchestrator.db() as db:
+        stored_quote = await db.get(VMQuoteRow, quote.quote_id)
+        stored_quote.expires_at = _now() + timedelta(minutes=2)
+        await db.commit()
+        await db.refresh(stored_quote)
+        quote_expires_at = stored_quote.expires_at
+    posted = dict(quote.order_payload)
+    posted["quote_id"] = quote.quote_id
+
+    response = await client.post(
+        "/v1/intent/create",
+        json={"asset": "BTC", "order_payload": posted},
+    )
+
+    assert response.status_code == 200, response.text
+    async with intent_state.orchestrator.db() as db:
+        intent = await db.get(CryptoIntentRow, response.json()["intent_id"])
+    assert intent.expires_at == quote_expires_at
+    assert intent.rate_valid_until <= intent.expires_at
+
+
+@pytest.mark.asyncio
+async def test_awaiting_native_replay_refuses_consumed_quote(intent_state, client):
+    quote = await _seed_quote(intent_state, quote_id="q_native_consumed_replay")
+    order = _vm_create_request().model_copy(update={"quote_id": quote.quote_id})
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=quote.amount_usd,
+        client_order_id="consumed-quote-replay",
+        owner_account_id=None,
+    )
+    async with intent_state.orchestrator.db() as db:
+        stored_quote = await db.get(VMQuoteRow, quote.quote_id)
+        stored_quote.status = QuoteStatus.CONSUMED
+        await db.commit()
+
+    response = await client.post(
+        "/v1/intent/create",
+        json={
+            "asset": "BTC",
+            "client_order_id": "consumed-quote-replay",
+            "order_payload": order.model_dump(mode="json"),
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Quote has already been consumed"
+    assert intent.address not in response.text
+
+
+@pytest.mark.asyncio
+async def test_quote_bound_native_intent_consumes_and_links_quote(intent_state):
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_settled",
+        amount_usd=Decimal("3.75"),
+    )
+    order = _vm_create_request().model_copy(update={"quote_id": quote.quote_id})
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=quote.amount_usd,
+        client_order_id=None,
+        owner_account_id=None,
+    )
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+
+    await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    async with intent_state.orchestrator.db() as db:
+        linked_quote = await db.get(VMQuoteRow, quote.quote_id)
+        settled_intent = await db.get(CryptoIntentRow, intent.intent_id)
+        vm = await db.get(VMRow, settled_intent.vm_id)
+    assert linked_quote.status == QuoteStatus.CONSUMED
+    assert linked_quote.vm_id == settled_intent.vm_id
+    assert vm.cost_total == quote.amount_usd
+
+
+@pytest.mark.asyncio
+async def test_paid_native_intent_refunds_when_quote_expired_before_settlement(
+    intent_state,
+):
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_expired_at_settlement",
+        amount_usd=Decimal("3.75"),
+    )
+    order = _vm_create_request().model_copy(update={"quote_id": quote.quote_id})
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=quote.amount_usd,
+        client_order_id=None,
+        owner_account_id=None,
+    )
+    async with intent_state.orchestrator.db() as db:
+        stored_quote = await db.get(VMQuoteRow, quote.quote_id)
+        stored_quote.expires_at = _now() - timedelta(seconds=1)
+        await db.commit()
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+
+    await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    async with intent_state.orchestrator.db() as db:
+        settled_intent = await db.get(CryptoIntentRow, intent.intent_id)
+        stored_quote = await db.get(VMQuoteRow, quote.quote_id)
+    assert settled_intent.status == CryptoIntentStatus.REFUND_MANUAL
+    assert stored_quote.status == QuoteStatus.CREATED
+    assert intent_state.orchestrator.created_vms == []
+    assert intent_state.orchestrator.native_refunds == [intent.intent_id]
+
+
+@pytest.mark.asyncio
+async def test_first_scan_after_expiry_detects_deposit_and_records_refund(
+    intent_state,
+):
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_paid_near_expiry",
+        amount_usd=Decimal("3.75"),
+    )
+    order = _vm_create_request().model_copy(update={"quote_id": quote.quote_id})
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=quote.amount_usd,
+        client_order_id=None,
+        owner_account_id=None,
+        expires_at=quote.expires_at,
+    )
+    async with intent_state.orchestrator.db() as db:
+        stored_intent = await db.get(CryptoIntentRow, intent.intent_id)
+        stored_quote = await db.get(VMQuoteRow, quote.quote_id)
+        expired_at = _now() - timedelta(seconds=1)
+        stored_intent.expires_at = expired_at
+        stored_intent.rate_valid_until = expired_at
+        stored_quote.expires_at = expired_at
+        await db.commit()
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+
+    await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    async with intent_state.orchestrator.db() as db:
+        settled_intent = await db.get(CryptoIntentRow, intent.intent_id)
+    assert settled_intent.status == CryptoIntentStatus.REFUND_MANUAL
+    assert settled_intent.amount_received_crypto == intent.amount_crypto
+    assert intent_state.orchestrator.created_vms == []
+    assert intent_state.orchestrator.native_refunds == [intent.intent_id]
+
+
+@pytest.mark.asyncio
+async def test_first_scan_after_expiry_without_payment_marks_intent_expired(
+    intent_state,
+):
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=_vm_create_request(),
+        amount_usd=Decimal("0.05"),
+        client_order_id=None,
+        owner_account_id=None,
+    )
+    async with intent_state.orchestrator.db() as db:
+        stored_intent = await db.get(CryptoIntentRow, intent.intent_id)
+        stored_intent.expires_at = _now() - timedelta(seconds=1)
+        await db.commit()
+
+    updated = await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    assert updated.status == CryptoIntentStatus.EXPIRED
+    assert updated.amount_received_crypto == 0
+    assert intent_state.orchestrator.created_vms == []
+
+
+@pytest.mark.parametrize("mismatch", ["owner", "payload", "amount"])
+@pytest.mark.asyncio
+async def test_paid_native_intent_refunds_on_quote_binding_mismatch(
+    intent_state,
+    mismatch,
+):
+    owner_id = "HOWNER00001" if mismatch == "owner" else None
+    quote = await _seed_quote(
+        intent_state,
+        quote_id=f"q_native_binding_{mismatch}",
+        amount_usd=Decimal("3.75"),
+        owner_account_id=owner_id,
+    )
+    order = _vm_create_request().model_copy(update={"quote_id": quote.quote_id})
+    intent_owner = None
+    amount_usd = quote.amount_usd
+    if mismatch == "owner":
+        intent_owner = "HOTHER00001"
+        async with intent_state.orchestrator.db() as db:
+            db.add(
+                AccountRow(
+                    account_id=intent_owner,
+                    password_hash="test-only",
+                    recovery_code_hash=None,
+                )
+            )
+            await db.commit()
+    elif mismatch == "payload":
+        order = order.model_copy(update={"duration_days": 2})
+    else:
+        amount_usd = Decimal("1.00")
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=amount_usd,
+        client_order_id=None,
+        owner_account_id=intent_owner,
+    )
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+
+    await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    async with intent_state.orchestrator.db() as db:
+        settled_intent = await db.get(CryptoIntentRow, intent.intent_id)
+        stored_quote = await db.get(VMQuoteRow, quote.quote_id)
+    assert settled_intent.status == CryptoIntentStatus.REFUND_MANUAL
+    assert stored_quote.status == QuoteStatus.CREATED
+    assert intent_state.orchestrator.created_vms == []
+    assert intent_state.orchestrator.native_refunds == [intent.intent_id]
+
+
+@pytest.mark.asyncio
+async def test_native_quote_bookkeeping_failure_still_provisions_paid_vm(
+    intent_state,
+    monkeypatch,
+):
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_bookkeeping_failure",
+        amount_usd=Decimal("3.75"),
+    )
+    order = _vm_create_request().model_copy(update={"quote_id": quote.quote_id})
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=quote.amount_usd,
+        client_order_id=None,
+        owner_account_id=None,
+    )
+    persist = AsyncMock(side_effect=RuntimeError("charged amount write unavailable"))
+    link = AsyncMock(side_effect=RuntimeError("quote link unavailable"))
+    monkeypatch.setattr(intent_state.orchestrator, "persist_charged_amount", persist)
+    monkeypatch.setattr("hyrule_cloud.services.intents.link_quote_vm", link)
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+
+    await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    async with intent_state.orchestrator.db() as db:
+        settled_intent = await db.get(CryptoIntentRow, intent.intent_id)
+        stored_quote = await db.get(VMQuoteRow, quote.quote_id)
+    assert persist.await_count == 3
+    assert link.await_count == 3
+    assert settled_intent.status == CryptoIntentStatus.PROVISIONED
+    assert settled_intent.vm_id in intent_state.orchestrator.provisioning_started
+    assert stored_quote.status == QuoteStatus.CONSUMED
+    assert stored_quote.vm_id is None
+    assert intent_state.orchestrator.native_refunds == []
+
+
+@pytest.mark.asyncio
+async def test_second_paid_native_intent_for_quote_is_refunded(intent_state):
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_single_use",
+        amount_usd=Decimal("2.50"),
+    )
+    order = _vm_create_request().model_copy(update={"quote_id": quote.quote_id})
+    intents = []
+    for client_order_id in ("native-first", "native-second"):
+        intent = await create_intent(
+            session_factory=intent_state.orchestrator.db,
+            provider=intent_state.native_crypto,
+            rates=intent_state.rate_provider,
+            asset="BTC",
+            order_payload=order,
+            amount_usd=quote.amount_usd,
+            client_order_id=client_order_id,
+            owner_account_id=None,
+        )
+        intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+            address=intent.address,
+            received_total=intent.amount_crypto,
+            confirmations=2,
+        )
+        intents.append(intent)
+
+    for intent in intents:
+        await poll_one_intent(
+            intent_id=intent.intent_id,
+            session_factory=intent_state.orchestrator.db,
+            provider=intent_state.native_crypto,
+            rates=intent_state.rate_provider,
+            orch=intent_state.orchestrator,
+        )
+
+    async with intent_state.orchestrator.db() as db:
+        first = await db.get(CryptoIntentRow, intents[0].intent_id)
+        second = await db.get(CryptoIntentRow, intents[1].intent_id)
+    assert first.status == CryptoIntentStatus.PROVISIONED
+    assert second.status == CryptoIntentStatus.REFUND_MANUAL
+    assert intent_state.orchestrator.native_refunds == [second.intent_id]
+    assert len(intent_state.orchestrator.created_vms) == 1
+
+
+@pytest.mark.asyncio
 async def test_intent_create_replay_returns_same_intent_id(intent_state, client):
     intent_state.native_crypto.next_btc_addr_per_index = {1: "bc1qreplay"}
     payload = {
@@ -717,7 +1301,10 @@ async def test_esplora_falls_back_to_blockstream_on_mempool_failure(monkeypatch)
             if url.endswith("/address/bc1qtest"):
                 return _FakeResp(
                     200,
-                    {"chain_stats": {"funded_txo_sum": 100000}, "mempool_stats": {"funded_txo_sum": 0}},
+                    {
+                        "chain_stats": {"funded_txo_sum": 100000},
+                        "mempool_stats": {"funded_txo_sum": 0},
+                    },
                 )
             if url.endswith("/address/bc1qtest/txs"):
                 return _FakeResp(
@@ -730,6 +1317,7 @@ async def test_esplora_falls_back_to_blockstream_on_mempool_failure(monkeypatch)
 
     # Patch the http client into a NativeCryptoProvider instance
     from hyrule_cloud.config import PaymentConfig
+
     p = NativeCryptoProvider(PaymentConfig())
     p._http = _FakeClient()  # type: ignore[assignment]
     result = await p.scan_btc_address("bc1qtest")

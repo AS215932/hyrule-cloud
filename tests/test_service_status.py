@@ -1,0 +1,530 @@
+"""Public /v1/status contract and monitoring-data disclosure boundary."""
+
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+import pytest_asyncio
+import respx
+from httpx import ASGITransport, AsyncClient, Response
+
+from hyrule_cloud.app import app
+from hyrule_cloud.providers.prometheus import PrometheusClient
+from hyrule_cloud.state import AppState
+
+
+def _prometheus(alerts: list[dict]) -> dict:
+    return {"status": "success", "data": {"alerts": alerts}}
+
+
+_PUBLIC_RULES = (
+    "HyrulePublicApiUnavailable",
+    "HyrulePublicComputeControlPlaneUnavailable",
+    "HyrulePublicPaymentFailureRatio",
+    "HyrulePublicComputeHostDegraded",
+    "HyrulePublicRoutingDegraded",
+    "HyrulePublicDNSDegraded",
+    "HyrulePublicDNSOutage",
+    "HyruleVMProvisionFailureRatio",
+    "HyruleNetworkProxyDown",
+)
+
+
+_PUBLIC_RULE_METADATA = {
+    "HyrulePublicApiUnavailable": (
+        "outage",
+        "api_checkout,intelligence,domains_dns,network_proxy",
+    ),
+    "HyrulePublicComputeControlPlaneUnavailable": ("degraded", "compute"),
+    "HyrulePublicPaymentFailureRatio": ("degraded", "api_checkout"),
+    "HyrulePublicComputeHostDegraded": ("degraded", "compute"),
+    "HyrulePublicRoutingDegraded": (
+        "degraded",
+        "compute,domains_dns,network_proxy",
+    ),
+    "HyrulePublicDNSDegraded": ("degraded", "domains_dns"),
+    "HyrulePublicDNSOutage": ("outage", "domains_dns"),
+    "HyruleVMProvisionFailureRatio": ("degraded", "compute"),
+    "HyruleNetworkProxyDown": ("degraded", "network_proxy"),
+}
+
+
+def _prometheus_rules(
+    names: tuple[str, ...] = _PUBLIC_RULES,
+    overrides: dict[str, dict] | None = None,
+) -> dict:
+    rules = []
+    for name in names:
+        state, components = _PUBLIC_RULE_METADATA.get(name, ("degraded", "compute"))
+        rule = {
+            "type": "alerting",
+            "name": name,
+            "health": "ok",
+            "labels": {
+                "public_status": "true",
+                "public_state": state,
+                "public_components": components,
+            },
+            "annotations": {
+                "public_title": f"{name} title",
+                "public_message": f"{name} customer-safe message",
+            },
+        }
+        if overrides and name in overrides:
+            rule.update(overrides[name])
+        rules.append(rule)
+    return {
+        "status": "success",
+        "data": {
+            "groups": [
+                {
+                    "name": "hyrule-public-status",
+                    "rules": rules,
+                }
+            ]
+        },
+    }
+
+
+def _mock_loaded_rules() -> respx.Route:
+    return respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(200, json=_prometheus_rules())
+    )
+
+
+def _alert(
+    *,
+    name: str = "HyrulePublicApiUnavailable",
+    state: str = "outage",
+    components: str = "api_checkout,intelligence,domains_dns,network_proxy",
+    firing: str = "firing",
+    public: str = "true",
+) -> dict:
+    return {
+        "labels": {
+            "alertname": name,
+            "instance": "[2a0c:b641:b50:2::20]:8402",
+            "public_status": public,
+            "public_state": state,
+            "public_components": components,
+        },
+        "annotations": {
+            "summary": "internal summary naming api-01.servify.network",
+            "description": "internal runbook and secret topology details",
+            "public_title": "Cloud API unavailable",
+            "public_message": "Purchasing and API-backed services are currently unavailable.",
+        },
+        "state": firing,
+        "activeAt": "2026-07-11T12:00:00Z",
+        "value": "1e+00",
+    }
+
+
+@pytest_asyncio.fixture
+async def status_state():
+    from hyrule_cloud.api.status import _STATUS_CACHE
+
+    _STATUS_CACHE.update(value=None, expires_at=0.0, successful_at=0.0)
+    previous = getattr(app.state, "_typed_state", None)
+    app.state._typed_state = AppState(
+        config=SimpleNamespace(prometheus_url="http://prom.test:9090"),
+        orchestrator=None,
+        payment_gate=None,
+        network_provider=None,
+    )
+    try:
+        yield
+    finally:
+        _STATUS_CACHE.update(value=None, expires_at=0.0, successful_at=0.0)
+        if previous is None:
+            delattr(app.state, "_typed_state")
+        else:
+            app.state._typed_state = previous
+
+
+@pytest_asyncio.fixture
+async def client():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost") as value:
+        yield value
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_no_public_alerts_is_operational(status_state, client):
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    response = await client.get("/v1/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "operational"
+    assert body["stale"] is False
+    assert [component["id"] for component in body["components"]] == [
+        "api_checkout",
+        "compute",
+        "intelligence",
+        "domains_dns",
+        "network_proxy",
+    ]
+    assert {component["status"] for component in body["components"]} == {"operational"}
+    assert body["incidents"] == []
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_only_explicit_firing_public_alerts_cross_boundary(status_state, client):
+    _mock_loaded_rules()
+    alerts = [
+        _alert(),
+        _alert(name="Pending", firing="pending"),
+        _alert(name="Internal", public="false"),
+        _alert(name="BadState", state="critical"),
+        _alert(name="UnknownComponent", components="private_database"),
+    ]
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus(alerts))
+    )
+
+    response = await client.get("/v1/status")
+
+    body = response.json()
+    assert body["status"] == "outage"
+    assert len(body["incidents"]) == 1
+    incident = body["incidents"][0]
+    assert incident["id"].startswith("inc_")
+    assert incident["component_ids"] == [
+        "api_checkout",
+        "intelligence",
+        "domains_dns",
+        "network_proxy",
+    ]
+    assert incident["title"] == "Cloud API unavailable"
+    serialized = response.text
+    assert "2a0c:b641" not in serialized
+    assert "servify.network" not in serialized
+    assert "runbook" not in serialized
+    statuses = {component["id"]: component["status"] for component in body["components"]}
+    assert statuses["api_checkout"] == "outage"
+    assert statuses["intelligence"] == "outage"
+    assert statuses["compute"] == "operational"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_highest_incident_state_wins_per_component(status_state, client):
+    _mock_loaded_rules()
+    alerts = [
+        _alert(
+            name="HyrulePublicRoutingDegraded",
+            state="degraded",
+            components="compute,domains_dns,network_proxy",
+        ),
+        _alert(),
+    ]
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus(alerts))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert body["status"] == "outage"
+    assert components["compute"]["status"] == "degraded"
+    assert components["network_proxy"]["status"] == "outage"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_recent_success_is_returned_stale_on_prometheus_failure(status_state, client):
+    from hyrule_cloud.api.status import _STATUS_CACHE
+
+    _mock_loaded_rules()
+    route = respx.get("http://prom.test:9090/api/v1/alerts")
+    route.side_effect = [
+        Response(
+            200,
+            json=_prometheus(
+                [
+                    _alert(
+                        name="HyrulePublicPaymentFailureRatio",
+                        state="degraded",
+                        components="api_checkout",
+                    )
+                ]
+            ),
+        ),
+        Response(503, text="unavailable"),
+    ]
+    first = await client.get("/v1/status")
+    _STATUS_CACHE["expires_at"] = 0.0
+
+    second = await client.get("/v1/status")
+
+    assert second.status_code == 200
+    assert second.json()["status"] == "degraded"
+    assert second.json()["stale"] is True
+    assert second.json()["checked_at"] == first.json()["checked_at"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_old_or_missing_snapshot_becomes_unknown(status_state, client):
+    from hyrule_cloud.api.status import _STATUS_CACHE
+
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(503, text="unavailable")
+    )
+    _STATUS_CACHE["successful_at"] = 1.0
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert body["stale"] is True
+    assert {component["status"] for component in body["components"]} == {"unknown"}
+
+
+@pytest.mark.asyncio
+async def test_empty_prometheus_url_returns_unknown(status_state, client):
+    app.state._typed_state.config.prometheus_url = ""
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert body["stale"] is True
+    assert {component["status"] for component in body["components"]} == {"unknown"}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_rules_endpoint_failure_returns_unknown(status_state, client):
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(503, text="unavailable")
+    )
+    alerts_route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert body["stale"] is True
+    assert alerts_route.called is False
+
+
+@pytest.mark.parametrize("malformed_endpoint", ["rules", "alerts"])
+@pytest.mark.asyncio
+@respx.mock
+async def test_non_object_prometheus_response_returns_unknown(
+    status_state,
+    client,
+    malformed_endpoint,
+):
+    rules_response = [] if malformed_endpoint == "rules" else _prometheus_rules()
+    alerts_response = [] if malformed_endpoint == "alerts" else _prometheus([])
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(200, json=rules_response)
+    )
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=alerts_response)
+    )
+
+    response = await client.get("/v1/status")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "unknown"
+    assert response.json()["stale"] is True
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_prometheus_failure_is_cached_briefly(status_state, client):
+    _mock_loaded_rules()
+    route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(503, text="unavailable")
+    )
+
+    first = await client.get("/v1/status")
+    second = await client.get("/v1/status")
+
+    assert first.json()["status"] == "unknown"
+    assert second.json()["status"] == "unknown"
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_status_cache_avoids_repeated_prometheus_requests(status_state, client):
+    rules_route = _mock_loaded_rules()
+    route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    await client.get("/v1/status")
+    await client.get("/v1/status")
+
+    assert route.call_count == 1
+    assert rules_route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cache_misses_share_one_prometheus_refresh(
+    status_state, client, monkeypatch
+):
+    rule_calls = 0
+    alert_calls = 0
+    rules = _prometheus_rules()["data"]["groups"][0]["rules"]
+
+    async def alerting_rules(_client):
+        nonlocal rule_calls
+        rule_calls += 1
+        await asyncio.sleep(0.01)
+        return rules
+
+    async def active_alerts(_client):
+        nonlocal alert_calls
+        alert_calls += 1
+        await asyncio.sleep(0.01)
+        return []
+
+    monkeypatch.setattr(PrometheusClient, "alerting_rules", alerting_rules)
+    monkeypatch.setattr(PrometheusClient, "active_alerts", active_alerts)
+
+    responses = await asyncio.gather(*(client.get("/v1/status") for _ in range(5)))
+
+    assert {response.status_code for response in responses} == {200}
+    assert {response.json()["status"] for response in responses} == {"operational"}
+    assert rule_calls == 1
+    assert alert_calls == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_missing_public_rule_group_never_reports_operational(status_state, client):
+    from hyrule_cloud.api.status import _STATUS_CACHE, _build_response
+
+    previous = _build_response([])
+    _STATUS_CACHE.update(value=previous, expires_at=0.0, successful_at=10**12)
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(200, json=_prometheus_rules(("SomeInternalRule",)))
+    )
+    alerts_route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert body["stale"] is True
+    assert body["checked_at"] != previous.checked_at.isoformat().replace("+00:00", "Z")
+    assert alerts_route.called is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_uncurated_public_alert_cannot_cross_boundary(status_state, client):
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(
+            200,
+            json=_prometheus(
+                [
+                    _alert(
+                        name="ExperimentalPublicAlert",
+                        state="outage",
+                        components="api_checkout",
+                    )
+                ]
+            ),
+        )
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "operational"
+    assert body["incidents"] == []
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_per_target_alerts_collapse_to_one_public_incident(status_state, client):
+    _mock_loaded_rules()
+    first = _alert(
+        name="HyrulePublicComputeHostDegraded",
+        state="degraded",
+        components="compute",
+    )
+    second = _alert(
+        name="HyrulePublicComputeHostDegraded",
+        state="degraded",
+        components="compute",
+    )
+    first["activeAt"] = "2026-07-11T12:05:00Z"
+    second["activeAt"] = "2026-07-11T12:00:00Z"
+    second["labels"]["instance"] = "another-private-target"
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([first, second]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "degraded"
+    assert len(body["incidents"]) == 1
+    assert body["incidents"][0]["component_ids"] == ["compute"]
+    assert body["incidents"][0]["started_at"] == "2026-07-11T12:00:00Z"
+    assert "another-private-target" not in str(body)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unhealthy_public_rule_never_reports_operational(status_state, client):
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(
+            200,
+            json=_prometheus_rules(overrides={"HyrulePublicDNSOutage": {"health": "err"}}),
+        )
+    )
+    alerts_route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert body["stale"] is True
+    assert alerts_route.called is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_invalid_public_rule_metadata_never_reports_operational(status_state, client):
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(
+            200,
+            json=_prometheus_rules(
+                overrides={
+                    "HyruleNetworkProxyDown": {
+                        "labels": {
+                            "public_status": "true",
+                            "public_state": "degraded",
+                            "public_components": "compute",
+                        }
+                    }
+                }
+            ),
+        )
+    )
+    alerts_route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert body["stale"] is True
+    assert alerts_route.called is False

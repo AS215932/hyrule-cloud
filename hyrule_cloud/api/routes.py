@@ -138,11 +138,14 @@ async def _proxy_authorization_guard(request: Request):
 def get_orch(app_state: AppState = Depends(get_app_state)):
     return app_state.orchestrator
 
+
 def get_cfg(app_state: AppState = Depends(get_app_state)):
     return app_state.config
 
+
 def get_gate(app_state: AppState = Depends(get_app_state)):
     return app_state.payment_gate
+
 
 def get_network(app_state: AppState = Depends(get_app_state)):
     return app_state.network_provider
@@ -262,6 +265,20 @@ def _quote_to_response(row: VMQuoteRow, cfg, app_state: AppState) -> VMQuoteResp
     )
 
 
+def _require_resource_owner(
+    owner_account_id: str | None,
+    account: Any,
+    *,
+    not_found: str,
+) -> None:
+    """Hide account-owned resources from anonymous and cross-account callers."""
+    if owner_account_id is not None and (
+        account is None
+        or (account.account_id != owner_account_id and not getattr(account, "is_admin", False))
+    ):
+        raise HTTPException(404, not_found)
+
+
 def _vm_create_response(
     row: VMRow, request: Request, management_token: str | None
 ) -> VMCreateResponse:
@@ -273,9 +290,7 @@ def _vm_create_response(
         estimated_ready_seconds=60,
         management_token=management_token,
         management_url=(
-            f"{base_url}/v1/vm/{row.vm_id}?token={management_token}"
-            if management_token
-            else None
+            f"{base_url}/v1/vm/{row.vm_id}?token={management_token}" if management_token else None
         ),
     )
 
@@ -342,9 +357,7 @@ async def _enforce_prefix_capacity(orch, cfg) -> None:
     usable = customer_prefix_count(supernet) - len(RESERVED_PREFIX_INDEXES)
     async with orch.db() as session:
         result = await session.execute(
-            select(func.count())
-            .select_from(VMRow)
-            .where(VMRow.ipv6_prefix_index.isnot(None))
+            select(func.count()).select_from(VMRow).where(VMRow.ipv6_prefix_index.isnot(None))
         )
     if int(result.scalar() or 0) >= usable:
         raise HTTPException(503, "No customer IPv6 capacity available right now")
@@ -364,7 +377,7 @@ _RUNTIME_CACHE: _TTLCache = _TTLCache(maxsize=2, ttl=20)
 @router.get("/stats/runtime")
 async def get_runtime_stats(
     request: Request,
-    orch = Depends(get_orch),
+    orch=Depends(get_orch),
 ) -> dict:
     """Per-process live runtime metrics.
 
@@ -409,9 +422,7 @@ async def get_runtime_stats(
     avg_provision_seconds = None
     try:
         async with orch.db() as db:
-            counts = await db.execute(
-                select(VMRow.status, sa_func.count()).group_by(VMRow.status)
-            )
+            counts = await db.execute(select(VMRow.status, sa_func.count()).group_by(VMRow.status))
             for status, c in counts.all():
                 # `live_vms` counts everything that's not destroyed/failed —
                 # both READY and still-PROVISIONING contribute (a VM in the
@@ -506,12 +517,12 @@ async def get_network_stats(request: Request):
         # rather than raising; the endpoint then keeps the static fallback for
         # that one field while still labelling _source live for the rest.
         try:
-            bgp = await client.query_scalar('count(bgp_peer_state == 1)')
+            bgp = await client.query_scalar("count(bgp_peer_state == 1)")
             if bgp is None:
                 # FRR exporter alternative metric name
                 bgp = await client.query_scalar('count(frr_bgp_peer_state{state="Established"})')
-            prefixes = await client.query_scalar('count(count by (prefix) (bgp_prefix_received))')
-            nat64 = await client.query_scalar('sum(nat64_sessions_active)')
+            prefixes = await client.query_scalar("count(count by (prefix) (bgp_prefix_received))")
+            nat64 = await client.query_scalar("sum(nat64_sessions_active)")
         finally:
             await client.aclose()
 
@@ -539,7 +550,7 @@ async def get_network_stats(request: Request):
 
 @router.get("/payments/networks")
 async def get_payment_networks(
-    cfg = Depends(get_cfg),
+    cfg=Depends(get_cfg),
     app_state: AppState = Depends(get_app_state),
 ) -> dict:
     """Block C (Wave 3): the canonical list of supported payment chains.
@@ -582,7 +593,7 @@ async def get_payment_networks(
 
 
 @router.get("/pricing", response_model=PricingResponse)
-async def get_pricing(cfg = Depends(get_cfg)) -> PricingResponse:
+async def get_pricing(cfg=Depends(get_cfg)) -> PricingResponse:
     return PricingResponse(
         vm_prices={
             "xs (1vCPU/1GB/10GB)": f"${cfg.payment.price_vm_xs}/day",
@@ -596,7 +607,10 @@ async def get_pricing(cfg = Depends(get_cfg)) -> PricingResponse:
             "tor": f"${cfg.payment.price_proxy_tor}/request",
             "i2p": f"${cfg.payment.price_proxy_i2p}/request",
             "yggdrasil": f"${cfg.payment.price_proxy_yggdrasil}/request",
-        } if hasattr(PricingResponse, '__annotations__') and 'proxy_prices' in PricingResponse.__annotations__ else {}
+        }
+        if hasattr(PricingResponse, "__annotations__")
+        and "proxy_prices" in PricingResponse.__annotations__
+        else {},
     )
 
 
@@ -629,7 +643,7 @@ async def get_vm_products(request: Request, cfg=Depends(get_cfg)) -> VMProductsR
 
 
 @router.get("/os/list", response_model=OSListResponse)
-async def list_os_templates(cfg = Depends(get_cfg)) -> OSListResponse:
+async def list_os_templates(cfg=Depends(get_cfg)) -> OSListResponse:
     names = list(cfg.xcpng.templates)
     if not names:
         names = ["debian-13", "alpine-3.21", "freebsd-14"]
@@ -662,8 +676,8 @@ async def list_os_templates(cfg = Depends(get_cfg)) -> OSListResponse:
 async def _vm_for_management(
     vm_id: str,
     request: Request,
-    orch = Depends(get_orch),
-    account = Depends(current_account),
+    orch=Depends(get_orch),
+    account=Depends(current_account),
 ):
     row = await orch.get_vm(vm_id)
     if not row:
@@ -690,7 +704,8 @@ async def _vm_for_management(
 # to `/status`.
 @router.get("/vm/{vm_id}/status", response_model=VMPublicStatusResponse)
 async def get_vm_public_status(
-    vm_id: str, orch = Depends(get_orch),
+    vm_id: str,
+    orch=Depends(get_orch),
 ) -> VMPublicStatusResponse:
     row = await orch.get_vm(vm_id)
     if not row:
@@ -721,7 +736,7 @@ async def get_vm_public_status(
 # management token.
 @router.get("/vm/{vm_id}", response_model=VMStatusResponse)
 async def get_vm_status(
-    row = Depends(_vm_for_management),
+    row=Depends(_vm_for_management),
 ) -> VMStatusResponse:
     firewall = None
     if row.open_ports:
@@ -744,7 +759,7 @@ async def get_vm_status(
 
 @router.get("/vm/{vm_id}/logs", response_model=VMLogsResponse)
 async def get_vm_logs(
-    row = Depends(_vm_for_management),
+    row=Depends(_vm_for_management),
 ) -> VMLogsResponse:
     return VMLogsResponse(
         vm_id=row.vm_id,
@@ -763,14 +778,14 @@ async def get_vm_logs(
 async def create_vm(
     body: VMCreateRequest,
     request: Request,
-    orch = Depends(get_orch),
-    cfg = Depends(get_cfg),
-    gate = Depends(get_gate),
+    orch=Depends(get_orch),
+    cfg=Depends(get_cfg),
+    gate=Depends(get_gate),
     # Block A1 (Wave 2): if the caller has a session cookie, the new VM is
     # attached to their account so it shows up on /dashboard immediately
     # without a separate claim step. Anon callers (account=None) get the
     # A0 management-token flow unchanged.
-    account = Depends(current_account),
+    account=Depends(current_account),
 ):
     # Issue #14: when a durable quote_id is supplied, the stored spec is
     # authoritative and the price is locked to the quote. Otherwise this is the
@@ -781,6 +796,11 @@ async def create_vm(
         quote_row = await get_quote(orch.db, body.quote_id)
         if quote_row is None:
             raise HTTPException(404, "Quote not found")
+        _require_resource_owner(
+            quote_row.owner_account_id,
+            account,
+            not_found="Quote not found",
+        )
         if QuoteStatus(quote_row.status) == QuoteStatus.CONSUMED:
             # Idempotent replay: a VM was already provisioned from this quote —
             # return it rather than charging/provisioning again. The one-shot
@@ -897,14 +917,16 @@ async def create_vm(
                 # Reservation vanished (e.g. sweeper raced an extremely slow
                 # payment) — fall back to allocate-after-payment.
                 row, management_token = await orch.create_vm(
-                    order, owner_wallet=wallet,
+                    order,
+                    owner_wallet=wallet,
                     owner_account_id=account.account_id if account else None,
                     start_provisioning=False,
                 )
                 row.payment_tx = getattr(request.state, "payment_tx", None)
         else:
             row, management_token = await orch.create_vm(
-                order, owner_wallet=wallet,
+                order,
+                owner_wallet=wallet,
                 owner_account_id=account.account_id if account else None,
                 start_provisioning=False,
             )
@@ -1054,11 +1076,11 @@ async def get_vm_quote(
         raise HTTPException(404, "Quote not found")
     # Account-owned quotes are only visible to the owner (or admin) — 404 (not
     # 403) to avoid leaking existence, mirroring the intent GET guard.
-    if row.owner_account_id is not None and (
-        account is None
-        or (account.account_id != row.owner_account_id and not account.is_admin)
-    ):
-        raise HTTPException(404, "Quote not found")
+    _require_resource_owner(
+        row.owner_account_id,
+        account,
+        not_found="Quote not found",
+    )
     return _quote_to_response(row, cfg, get_app_state(request))
 
 
@@ -1067,10 +1089,10 @@ async def extend_vm(
     vm_id: str,
     body: VMExtendRequest,
     request: Request,
-    row = Depends(_vm_for_management),
-    orch = Depends(get_orch),
-    cfg = Depends(get_cfg),
-    gate = Depends(get_gate),
+    row=Depends(_vm_for_management),
+    orch=Depends(get_orch),
+    cfg=Depends(get_cfg),
+    gate=Depends(get_gate),
 ):
     # Block A0: row already loaded + management-gated by the dep above.
     # vm_id (path param) is used downstream in the payment description /
@@ -1116,8 +1138,8 @@ async def extend_vm(
 @router.post("/vm/{vm_id}/reboot", response_model=GenericActionResponse)
 async def reboot_vm(
     vm_id: str,
-    row = Depends(_vm_for_management),
-    orch = Depends(get_orch),
+    row=Depends(_vm_for_management),
+    orch=Depends(get_orch),
 ) -> GenericActionResponse:
     # Block A0: management dep ensures caller has the token.
     if not await orch.reboot_vm(vm_id):
@@ -1128,8 +1150,8 @@ async def reboot_vm(
 @router.delete("/vm/{vm_id}", response_model=GenericActionResponse)
 async def destroy_vm(
     vm_id: str,
-    row = Depends(_vm_for_management),
-    orch = Depends(get_orch),
+    row=Depends(_vm_for_management),
+    orch=Depends(get_orch),
 ) -> GenericActionResponse:
     # Block A0: management dep ensures caller has the token.
     if not await orch.destroy_vm(vm_id):
@@ -1255,7 +1277,9 @@ async def register_domain(
                 raise HTTPException(409, f"Domain {fqdn} is already managed") from exc
 
         try:
-            op_result = await orch.openprovider.register_domain(name, extension, period=body.duration_years)
+            op_result = await orch.openprovider.register_domain(
+                name, extension, period=body.duration_years
+            )
             try:
                 await orch.openprovider.create_zone(fqdn)
             except Exception:
@@ -1369,7 +1393,9 @@ async def create_zone_record(
         raise HTTPException(500, f"Failed to create record: {e}")
 
     fqdn = f"{body.name}.{zone}" if body.name else zone
-    return GenericActionResponse(status="ok", message=f"Record {body.type.value} created for {fqdn}")
+    return GenericActionResponse(
+        status="ok", message=f"Record {body.type.value} created for {fqdn}"
+    )
 
 
 @router.delete("/zone/record", response_model=GenericActionResponse)
@@ -1401,8 +1427,15 @@ async def delete_zone_record(
     fqdn = f"{name}.{zone}" if name else zone
     return GenericActionResponse(status="ok", message=f"Record {rtype.value} deleted for {fqdn}")
 
+
 @router.post("/network/request", response_model=NetworkResponse)
-async def proxy_network_request(body: NetworkRequest, request: Request, cfg = Depends(get_cfg), gate = Depends(get_gate), provider = Depends(get_network)):
+async def proxy_network_request(
+    body: NetworkRequest,
+    request: Request,
+    cfg=Depends(get_cfg),
+    gate=Depends(get_gate),
+    provider=Depends(get_network),
+):
     price_map = {
         ProxyMode.DIRECT: cfg.payment.price_proxy_direct,
         ProxyMode.TOR: cfg.payment.price_proxy_tor,
@@ -1478,6 +1511,8 @@ async def proxy_network_request(body: NetworkRequest, request: Request, cfg = De
         if not await gate.settle_verified(request, verified):
             raise HTTPException(402, "payment settlement failed")
         return resp
+
+
 from hyrule_cloud.db import CryptoIntentRow
 from hyrule_cloud.models import CryptoIntentRequest, CryptoIntentResponse, CryptoIntentStatus
 from hyrule_cloud.services.intents import (
@@ -1524,7 +1559,9 @@ def _intent_awaiting_payment(row: CryptoIntentRow) -> bool:
     return not getattr(row, "tx_hash", None)
 
 
-def _intent_to_response(row: CryptoIntentRow, request: Request | None = None) -> CryptoIntentResponse:
+def _intent_to_response(
+    row: CryptoIntentRow, request: Request | None = None
+) -> CryptoIntentResponse:
     """Render a CryptoIntentRow as the public response. Builds management_url
     from request.base_url when the one-shot cleartext is present."""
     from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
@@ -1561,6 +1598,38 @@ def _intent_to_response(row: CryptoIntentRow, request: Request | None = None) ->
     )
 
 
+async def _load_payable_native_quote(
+    *,
+    orch,
+    order: VMCreateRequest,
+    account: Any,
+) -> tuple[VMQuoteRow | None, VMCreateRequest]:
+    """Load and revalidate the durable quote bound to a native intent order."""
+    if not order.quote_id:
+        return None, order
+
+    quote_row = await get_quote(orch.db, order.quote_id)
+    if quote_row is None:
+        raise HTTPException(404, "Quote not found")
+    _require_resource_owner(
+        quote_row.owner_account_id,
+        account,
+        not_found="Quote not found",
+    )
+    if QuoteStatus(quote_row.status) == QuoteStatus.CONSUMED:
+        raise HTTPException(409, "Quote has already been consumed")
+    if is_expired(quote_row):
+        raise HTTPException(409, "Quote expired; create a new one")
+    if QuoteStatus(quote_row.status) != QuoteStatus.CREATED:
+        raise HTTPException(409, "Quote is not payable")
+    if order.model_dump(mode="json", exclude={"quote_id"}) != quote_row.order_payload:
+        raise HTTPException(422, "Order body does not match the quote")
+    locked_order = VMCreateRequest(**quote_row.order_payload).model_copy(
+        update={"quote_id": quote_row.quote_id}
+    )
+    return quote_row, locked_order
+
+
 @router.post("/intent/create", response_model=CryptoIntentResponse)
 async def create_crypto_intent(
     body: CryptoIntentRequest,
@@ -1587,6 +1656,12 @@ async def create_crypto_intent(
         if body.client_order_id
         else None
     )
+    if existing_intent is not None:
+        _require_resource_owner(
+            existing_intent.owner_account_id,
+            account,
+            not_found="Intent not found",
+        )
     # A committed intent (funds received / provisioning / terminal recovery)
     # always resolves so a deposit is never orphaned — even after the VM service
     # closes. One still awaiting payment falls through to the guard below so a
@@ -1599,16 +1674,44 @@ async def create_crypto_intent(
     _require_vm_service_open(gate)
 
     if existing_intent is not None:
+        # An awaiting replay can safely be refused because no funds have been
+        # observed. Revalidate its stored quote before re-serving the address:
+        # another checkout may have consumed or expired that quote meanwhile.
+        try:
+            existing_order = VMCreateRequest.model_validate(existing_intent.order_payload)
+        except ValueError:
+            raise HTTPException(409, "Intent order is no longer payable")
+        existing_quote, existing_order = await _load_payable_native_quote(
+            orch=orch,
+            order=existing_order,
+            account=account,
+        )
+        if existing_quote is not None:
+            _validate_vm_order(existing_order, cfg)
+            await _compute_vm_price(orch, cfg, existing_order)
         return _intent_to_response(existing_intent, request)
+
+    # Native BTC/XMR checkout is bound to the same durable quote as EVM. The
+    # quote's stored spec and USD amount are authoritative; recomputing from the
+    # posted body would let the deposit amount drift from the review page.
+    order = body.order_payload
+    quote_row, order = await _load_payable_native_quote(
+        orch=orch,
+        order=order,
+        account=account,
+    )
 
     # Same validation as the x402 create path — including the real-mode OS
     # support check, so an unsupported order is rejected BEFORE a deposit
     # address is handed out, not after the customer's crypto settles.
-    _validate_vm_order(body.order_payload, cfg)
+    _validate_vm_order(order, cfg)
 
     await _enforce_paid_vm_cap(orch, cfg)
     await _enforce_prefix_capacity(orch, cfg)
-    total, _ = await _compute_vm_price(orch, cfg, body.order_payload)
+    # Re-run validation that depends on mutable external state (notably custom
+    # domain availability), while retaining the durable quote's locked amount.
+    computed, _ = await _compute_vm_price(orch, cfg, order)
+    total = quote_row.amount_usd if quote_row is not None else computed
 
     app_state: AppState = get_app_state(request)
     provider = getattr(app_state, "native_crypto", None)
@@ -1622,13 +1725,19 @@ async def create_crypto_intent(
             provider=provider,
             rates=rates,
             asset=asset,
-            order_payload=body.order_payload,
+            order_payload=order,
             amount_usd=total,
             client_order_id=body.client_order_id,
             owner_account_id=(account.account_id if account is not None else None),
+            expires_at=(quote_row.expires_at if quote_row is not None else None),
         )
     except IntentExistsError as exc:
         # Idempotent replay: return the existing intent verbatim
+        _require_resource_owner(
+            exc.existing.owner_account_id,
+            account,
+            not_found="Intent not found",
+        )
         return _intent_to_response(exc.existing, request)
     except RuntimeError as exc:
         log.error("intent_create_failed", error=str(exc))
@@ -1653,11 +1762,11 @@ async def get_crypto_intent_status(
             raise HTTPException(404, "Intent not found")
         # Account-owned intents are only visible to the owner (or admin) —
         # 404 (not 403) to avoid leaking existence.
-        if row.owner_account_id is not None:
-            if account is None or (
-                account.account_id != row.owner_account_id and not account.is_admin
-            ):
-                raise HTTPException(404, "Intent not found")
+        _require_resource_owner(
+            row.owner_account_id,
+            account,
+            not_found="Intent not found",
+        )
         # One-shot reveal: atomically clear the token under a NOT NULL guard so
         # two concurrent GETs can't both reveal it. Only the caller whose UPDATE
         # actually matches a row (rowcount == 1) returns the cleartext we read
