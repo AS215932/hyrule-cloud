@@ -109,6 +109,11 @@ def test_every_catalog_operation_has_complete_x402_openapi_metadata(
             for content in success_content
             for media in content.values()
         ), operation.key
+        assert all(
+            media.get("example") == operation.output_example
+            for content in success_content
+            for media in content.values()
+        ), operation.key
 
 
 def test_manifest_openapi_and_bazaar_share_the_same_enabled_catalog(
@@ -175,6 +180,64 @@ async def test_unpaid_catalog_probes_reach_valid_402_before_validation(
             app.state._typed_state = old_state
         elif hasattr(app.state, "_typed_state"):
             delattr(app.state, "_typed_state")
+
+
+@pytest.mark.asyncio
+async def test_valid_dynamic_input_reaches_handler_for_exact_first_challenge() -> None:
+    config = HyruleConfig()
+    gate = _gate(_FakeServer(), public_base_url="https://cloud.hyrule.host")
+    old_state = getattr(app.state, "_typed_state", None)
+    app.state._typed_state = SimpleNamespace(config=config, payment_gate=gate)
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/v1/bgp/jobs",
+                json={
+                    "subject": {
+                        "type": "prefix",
+                        "value": "2a0c:b641:b50::/44",
+                    },
+                    "record_type": "ribs",
+                },
+            )
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+        elif hasattr(app.state, "_typed_state"):
+            delattr(app.state, "_typed_state")
+
+    assert response.status_code == 402
+    assert response.json()["amount"] == str(config.payment.price_bgpstream_rib)
+
+
+@pytest.mark.asyncio
+async def test_trailing_slash_probe_still_reaches_prevalidation_challenge() -> None:
+    gate = _gate(_FakeServer())
+    old_state = getattr(app.state, "_typed_state", None)
+    app.state._typed_state = SimpleNamespace(config=HyruleConfig(), payment_gate=gate)
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/v1/ip/lookup/",
+                content=b"{",
+                headers={"Content-Type": "application/json"},
+            )
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+        elif hasattr(app.state, "_typed_state"):
+            delattr(app.state, "_typed_state")
+
+    assert response.status_code == 402
+    assert PAYMENT_REQUIRED_HEADER in response.headers
 
 
 @pytest.mark.asyncio

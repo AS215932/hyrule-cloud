@@ -236,8 +236,9 @@ async def challenge_curated_x402_requests(request: Request, call_next) -> Respon
     """Return the advertised 402 before FastAPI validates an unpaid request.
 
     x402scan probes from OpenAPI and must be able to reach the payment challenge
-    with an empty body or a literal path parameter. Paid retries still pass to
-    the route handler, which computes and verifies the exact request price.
+    with an empty body or a literal path parameter. Valid dynamic-price inputs
+    continue to the route handler so its first challenge carries the exact
+    body-dependent amount; paid retries always continue to that handler too.
     """
 
     state = getattr(request.app.state, "_typed_state", None)
@@ -250,6 +251,20 @@ async def challenge_curated_x402_requests(request: Request, call_next) -> Respon
     operation = match_enabled_operation(request.method, request.url.path)
     if operation is None:
         return await call_next(request)
+
+    # Dynamic prices depend on validated request data (VM size/duration, proxy
+    # mode, BGP dataset/job type). Let a valid body reach the handler so a normal
+    # x402 client can pay its first challenge successfully. Empty, malformed, or
+    # schema-invalid scanner probes still receive the advertised minimum before
+    # FastAPI can reject them.
+    if operation.price.mode == "dynamic":
+        try:
+            payload = await request.json()
+        except (UnicodeDecodeError, ValueError):
+            pass
+        else:
+            if operation.accepts_input(payload):
+                return await call_next(request)
 
     return await gate.challenge_payment(
         request,
@@ -307,7 +322,12 @@ def curated_openapi() -> dict:
     from hyrule_cloud.services.discovery import build_curated_openapi
 
     state = getattr(app.state, "_typed_state", None)
-    config = getattr(state, "config", None) or HyruleConfig()
+    # Production HTTP requests run inside lifespan and therefore always use the
+    # exact live AppState config. The BaseSettings fallback intentionally keeps
+    # import-time schema tooling and tests usable without starting databases or
+    # providers; it still reads the deployment environment rather than using a
+    # separate hard-coded price table.
+    config = state.config if state is not None else HyruleConfig()
     return build_curated_openapi(app, config)
 
 

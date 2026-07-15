@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi.openapi.utils import get_openapi
 from fastapi.routing import APIRoute
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from starlette.routing import compile_path
 from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 
@@ -82,6 +82,7 @@ class PaidOperation:
     description: str
     price: PriceSpec
     declaration: dict[str, Any]
+    request_model: type[BaseModel] | None
     input_example: dict[str, Any] | None
     output_example: Any
     path_examples: dict[str, Any]
@@ -90,6 +91,17 @@ class PaidOperation:
     @property
     def key(self) -> tuple[str, str]:
         return self.method, self.path
+
+    def accepts_input(self, value: Any) -> bool:
+        """Whether a parsed body can safely reach its exact-price handler."""
+
+        if self.request_model is None:
+            return False
+        try:
+            self.request_model.model_validate(value)
+        except ValidationError:
+            return False
+        return True
 
 
 def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
@@ -165,6 +177,7 @@ def _body_operation(
             output_model,
             output_example,
         ),
+        request_model=request_model,
         input_example=input_example,
         output_example=output_example,
         path_examples={},
@@ -201,6 +214,7 @@ def _download_operation(
         description=description,
         price=price,
         declaration=declaration,
+        request_model=None,
         input_example=None,
         output_example=output_example,
         path_examples=path_examples,
@@ -685,10 +699,11 @@ def match_enabled_operation(method: str, concrete_path: str) -> PaidOperation | 
     """Match a request URL to an enabled catalog path template."""
 
     wanted_method = method.upper()
+    normalized_path = concrete_path.rstrip("/") or "/"
     for operation, path_regex in _PATH_MATCHERS:
         if operation.method != wanted_method or not _gate_enabled(operation.gate):
             continue
-        if path_regex.fullmatch(concrete_path):
+        if path_regex.fullmatch(normalized_path):
             return operation
     return None
 
@@ -793,10 +808,9 @@ def _annotate_operation(
         content = response.get("content")
         if not isinstance(content, dict) or not content:
             continue
-        media = content.get("application/json") or next(iter(content.values()))
-        if isinstance(media, dict):
-            media.setdefault("example", operation.output_example)
-        break
+        for media in content.values():
+            if isinstance(media, dict):
+                media.setdefault("example", operation.output_example)
 
 
 def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[str, Any]:
@@ -825,7 +839,9 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
         terms_of_service=application.terms_of_service,
         contact=application.contact,
         license_info=application.license_info,
-        separate_input_output_schemas=application.separate_input_output_schemas,
+        separate_input_output_schemas=bool(
+            getattr(application, "separate_input_output_schemas", True)
+        ),
         external_docs=application.openapi_external_docs,
     )
     schema["info"]["x-guidance"] = (
