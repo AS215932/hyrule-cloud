@@ -285,7 +285,20 @@ async def download_bgp_job(request: Request, job_id: str, token: str | None = No
     return FileResponse(path, media_type="application/gzip", filename=path.name)
 
 
-@router.get("/snapshots/router/{snapshot_id}/download", response_model=None)
+@router.get(
+    "/snapshots/router/{snapshot_id}/download",
+    response_model=None,
+    responses={
+        200: {
+            "description": "Gzip-compressed normalized router-table snapshot",
+            "content": {
+                "application/gzip": {
+                    "schema": {"type": "string", "format": "binary"}
+                }
+            },
+        }
+    },
+)
 async def download_bgp_router_snapshot(request: Request, snapshot_id: str, format: str = "normalized_jsonl") -> Response:
     result = await require_payment(
         request,

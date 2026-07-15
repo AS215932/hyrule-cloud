@@ -37,7 +37,11 @@ PAYER = "0xFBD95291e4b9C901E084a8856eA184d3F7A232ed"
 ASSET = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 
 
-def _request(headers: dict[str, str] | None = None) -> Request:
+def _request(
+    headers: dict[str, str] | None = None,
+    *,
+    path: str = "/v1/vm/create",
+) -> Request:
     raw_headers = [
         (k.lower().encode(), v.encode()) for k, v in (headers or {}).items()
     ]
@@ -46,7 +50,7 @@ def _request(headers: dict[str, str] | None = None) -> Request:
             "type": "http",
             "method": "POST",
             "scheme": "http",
-            "path": "/v1/vm/create",
+            "path": path,
             "query_string": b"",
             "headers": [(b"host", b"testserver"), *raw_headers],
             "server": ("testserver", 80),
@@ -262,7 +266,11 @@ async def test_no_payment_returns_standard_and_legacy_payment_required_headers()
     server = _FakeServer()
     gate = _gate(server)
 
-    result = await gate.check_payment(_request(), Decimal("0.05"), "VM creation")
+    result = await gate.check_payment(
+        _request(path="/v1/ip/lookup"),
+        Decimal("0.003"),
+        "IP lookup",
+    )
 
     assert isinstance(result, Response)
     assert result.status_code == 402
@@ -405,7 +413,11 @@ async def test_402_carries_bazaar_discovery_extension_for_declared_route() -> No
     server = _FakeServer()
     gate = _gate(server)
 
-    result = await gate.check_payment(_request(), Decimal("0.05"), "VM creation")
+    result = await gate.check_payment(
+        _request(path="/v1/ip/lookup"),
+        Decimal("0.003"),
+        "IP lookup",
+    )
 
     assert isinstance(result, Response)
     assert result.status_code == 402
@@ -414,7 +426,7 @@ async def test_402_carries_bazaar_discovery_extension_for_declared_route() -> No
     # The server extension must have enriched the declaration with the method.
     assert bazaar["info"]["input"]["method"] == "POST"
     assert bazaar["info"]["input"]["bodyType"] == "json"
-    assert "duration_days" in bazaar["info"]["input"]["body"]
+    assert "address" in bazaar["info"]["input"]["body"]
 
 
 @pytest.mark.asyncio

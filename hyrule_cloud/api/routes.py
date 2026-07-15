@@ -774,7 +774,7 @@ async def get_vm_logs(
 # --- x402-gated endpoints ---
 
 
-@router.post("/vm/create")
+@router.post("/vm/create", response_model=VMCreateResponse)
 async def create_vm(
     body: VMCreateRequest,
     request: Request,

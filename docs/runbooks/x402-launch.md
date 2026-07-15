@@ -201,10 +201,11 @@ the receiver wallet the same day. The Grafana provisioning panel and the
 
 ## Phase 4 — Bazaar indexing
 
-1. After the CDP switch + PR #38 deploy: run one paid canary per flagship
-   endpoint (`/v1/vm/create` via quote flow, `/v1/domain/register`,
-   `/v1/network/request`, `/v1/dns/lookup`, `/v1/web/check`, `/v1/mx/check`)
-   so CDP indexes them at settlement.
+1. After the CDP switch + PR #38 deploy: run one paid canary per advertised
+   flagship endpoint (`/v1/vm/create` via quote flow, `/v1/network/request`,
+   `/v1/dns/lookup`, `/v1/web/check`, `/v1/mx/check`) so CDP indexes them at
+   settlement. Domain registration stays outside discovery until its separate
+   readiness PR has passed a live provider canary.
 2. Verify after ~6h (ranking recomputes on that cadence):
    ```
    curl -s -H "Authorization: Bearer <cdp-jwt>" \
@@ -217,8 +218,12 @@ the receiver wallet the same day. The Grafana provisioning panel and the
 
 ## Phase 5 — Announce (only after 3d passed)
 
-1. **x402scan**: submit `https://cloud.hyrule.host/.well-known/x402.json` at
-   <https://www.x402scan.com/resources/register>; verify the listing.
+1. **x402scan**: submit `https://cloud.hyrule.host` at
+   <https://www.x402scan.com/resources/register>. Current x402scan normalizes
+   every submitted URL to its origin and reads `/openapi.json`; it does not use
+   `/.well-known/x402.json` for route discovery. Verify that every advertised
+   operation registers and that no health, auth, management, internal, stub, or
+   Domain route appears.
 2. **x402-list.com** submit flow; then Agentic.Market and
    app.ampersend.ai/discover.
 3. **ClawHub skills**: follow `skills/README.md` (13 publishable slugs in

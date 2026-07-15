@@ -2,7 +2,8 @@
 
 Full-stack network infrastructure for AI agents on Hyrule Networks (AS215932), paid per request via x402.
 
-Agents discover the service via the x402 Bazaar or `/.well-known/x402.json` and pay with USDC on Base. Four service groups:
+Agents discover the curated paid surface via `/openapi.json`, the x402 Bazaar,
+or `/.well-known/x402.json` and pay with USDC on Base. Four service groups:
 
 - **Compute** — bare IPv6-native VMs with SSH, automatic HTTPS subdomains, and optional custom domains.
 - **Domains & DNS** — domain registration and DNS management.
@@ -14,7 +15,7 @@ Agents discover the service via the x402 Bazaar or `/.well-known/x402.json` and 
 ```
 Agent (OpenClaw, Claude MCP, x402-aware client)
   |
-  |-- discovers via /.well-known/x402.json or Bazaar
+  |-- discovers via /openapi.json, /.well-known/x402.json, or Bazaar
   |
   |-- POST /v1/vm/create  (no payment) --> 402 + pricing + specs
   |-- pays via x402 facilitator (USDC on Base)

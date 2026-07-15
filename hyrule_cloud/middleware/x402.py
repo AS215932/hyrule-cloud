@@ -228,12 +228,17 @@ class PaymentGate:
             requirements.extend(self.server.build_payment_requirements(resource_cfg))
         return requirements
 
-    def _discovery_extensions(self, request: Request) -> dict[str, Any] | None:
+    def _discovery_extensions(
+        self,
+        request: Request,
+        *,
+        route_path: str | None = None,
+    ) -> dict[str, Any] | None:
         """Look up and enrich the Bazaar discovery declaration for this route."""
         from hyrule_cloud.services.discovery import discovery_for
 
         route = request.scope.get("route")
-        path = getattr(route, "path", None) or request.url.path
+        path = route_path or getattr(route, "path", None) or request.url.path
         declared = discovery_for(request.method, path)
         if not declared:
             return None
@@ -267,21 +272,20 @@ class PaymentGate:
             payment_required = await payment_required
         encoded = encode_payment_required_header(payment_required)
 
+        # Header and body must describe the same challenge. Serializing the SDK
+        # model preserves resource metadata and extensions (especially Bazaar),
+        # which the previous hand-built body accidentally dropped.
         body: dict[str, Any] = dict(extra_body or {})
+        body.update(payment_required.model_dump(by_alias=True, exclude_none=True))
         body.update(
             {
-                "x402Version": 2,
-                "accepts": [
-                    req.model_dump(by_alias=True, exclude_none=True) for req in requirements
-                ],
+                # Hyrule compatibility fields retained alongside canonical v2.
                 "payment_required": True,
                 "amount": str(amount),
                 "description": description,
                 "networks": self.config.networks,
             }
         )
-        if error:
-            body["error"] = error
 
         return self._json_response(
             402,
@@ -381,6 +385,33 @@ class PaymentGate:
             return str(request.url)
         query = f"?{request.url.query}" if request.url.query else ""
         return f"{self.public_base_url}{request.url.path}{query}"
+
+    async def challenge_payment(
+        self,
+        request: Request,
+        amount: Decimal,
+        description: str,
+        *,
+        route_path: str | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> Response:
+        """Issue an unpaid challenge before FastAPI request validation.
+
+        ``route_path`` is the catalog template matched by the outer middleware;
+        routing has not populated ``request.scope['route']`` at that point.
+        This method never verifies or settles a payment.
+        """
+
+        response = await self.build_402_response(
+            amount,
+            description,
+            extra_body,
+            request_url=self._canonical_url(request),
+            extensions=self._discovery_extensions(request, route_path=route_path),
+        )
+        if response.status_code == 402:
+            await self._record("required_402", request, amount)
+        return response
 
     async def check_payment(
         self,

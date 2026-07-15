@@ -15,48 +15,49 @@ def test_bgp_prefix_lookup_contract_does_not_require_asn():
     assert req.assertions.expected_origin_asns == []
 
 
-def test_openapi_exposes_network_intelligence_contracts():
+def test_openapi_exposes_only_enabled_paid_launch_contracts():
+    from hyrule_cloud.services.discovery import enabled_paid_operations
+
     paths = app.openapi()["paths"]
-    for path in [
-        "/v1/bgp/status",
+    actual = {
+        (method.upper(), path)
+        for path, path_item in paths.items()
+        for method in path_item
+        if method.lower() in {"get", "post", "put", "delete", "patch"}
+    }
+    expected = {operation.key for operation in enabled_paid_operations()}
+
+    assert actual == expected
+    for required in {
         "/v1/bgp/lookup",
         "/v1/ip/lookup",
         "/v1/dns/lookup",
-        "/v1/dns/resolve",
         "/v1/dns/propagation",
         "/v1/dns/recommend-records",
-        "/v1/dns/authority-vs-recursive",
-        "/v1/dns/resolver-detect",
-        "/v1/dns/dnssec/report",
         "/v1/rdap/lookup",
         "/v1/whois/lookup",
         "/v1/web/check",
-        "/v1/web/reports",
         "/v1/web/tls/deep",
         "/v1/mx/check",
         "/v1/mx/bounce/parse",
         "/v1/mx/recommend-records",
-        "/v1/mx/reports/mail-delivery",
-        "/v1/mx/jobs",
-        "/v1/path/report",
-        "/v1/path/ping",
-        "/v1/path/jobs",
         "/v1/ports/check",
-        "/v1/nat/ip",
         "/v1/nat/lookup",
-        "/v1/nat/port-forward/check",
-        "/v1/threat/lookup",
-        "/v1/threat/domain/{domain}",
-        "/v1/threat/rbl",
         "/v1/voip/check",
-        "/v1/voip/number/lookup",
-        "/v1/voip/jobs",
-        "/v1/speedtest",
-        "/v1/speedtest/jobs",
+    }:
+        assert required in paths
+
+    for hidden in {
+        "/health",
+        "/.well-known/x402.json",
+        "/v1/domain/register",
+        "/v1/auth/login",
+        "/v1/internal/bgp/jobs/claim",
+        "/v1/me",
         "/v1/mail/accounts",
-        "/v1/mail/messages/send",
-    ]:
-        assert path in paths
+        "/v1/speedtest",
+    }:
+        assert hidden not in paths
 
 
 @pytest.mark.asyncio
