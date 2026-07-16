@@ -72,6 +72,10 @@ _REQUIRED_PUBLIC_RULES: dict[str, tuple[ServiceState, frozenset[str]]] = {
         ServiceState.DEGRADED,
         frozenset({"compute"}),
     ),
+    "HyrulePublicApiAddressFamilyDegraded": (
+        ServiceState.DEGRADED,
+        frozenset({"api_checkout", "compute", "intelligence", "domains_dns", "network_proxy"}),
+    ),
     "HyrulePublicPaymentFailureRatio": (
         ServiceState.DEGRADED,
         frozenset({"api_checkout"}),
