@@ -13,6 +13,8 @@ slot, mirroring the pattern in tests/test_api.py.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -49,33 +51,18 @@ def real_payment_state():
 
 
 @pytest.mark.asyncio
-async def test_payments_networks_returns_base_by_default(real_payment_state) -> None:
-    """Default config: only Base mainnet is enabled out of the box because
-    that's what the default public facilitator verifies against.
-    Polygon and Arbitrum are coded but disabled; operators flip them on in
-    Vault once they're pointed at Coinbase CDP."""
+async def test_payments_networks_returns_all_mainnet_chains_by_default(
+    real_payment_state,
+) -> None:
+    """Default config: Base, Polygon and Arbitrum are all enabled — every
+    default chain must have passed a live paid canary against the production
+    facilitator per [[feedback_verified_payment_chains]]. Order matches
+    _DEFAULT_NETWORKS so the frontend's chain selector is stable."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         res = await c.get("/v1/payments/networks")
     assert res.status_code == 200
     keys = [n["key"] for n in res.json()["networks"]]
-    assert keys == ["base"]
-
-
-@pytest.mark.asyncio
-async def test_payments_networks_omits_disabled_chains_by_default(
-    real_payment_state,
-) -> None:
-    """Polygon and Arbitrum are present in PaymentConfig but enabled=False —
-    the endpoint MUST NOT advertise them. Per [[feedback_verified_payment_chains]],
-    advertising a chain implies the verify_facilitator gate passed for it."""
-    cfg = PaymentConfig()
-    polygon = next(n for n in cfg.payment_networks if n.key == "polygon")
-    assert polygon.enabled is False
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-        body = (await c.get("/v1/payments/networks")).json()
-    keys_on_wire = {n["key"] for n in body["networks"]}
-    assert "polygon" not in keys_on_wire
-    assert "arbitrum" not in keys_on_wire
+    assert keys == ["base", "polygon", "arbitrum"]
 
 
 @pytest.mark.asyncio
@@ -131,6 +118,28 @@ async def test_payments_networks_native_lists_btc_xmr_when_rail_wired(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         body = (await c.get("/v1/payments/networks")).json()
     assert body["native"] == ["BTC", "XMR"]
+
+
+@pytest.mark.asyncio
+async def test_payments_networks_omits_explicitly_disabled_chains(
+    real_payment_state,
+) -> None:
+    """A chain flipped to enabled=False (operator kill-switch via
+    PAYMENT_PAYMENT_NETWORKS in Vault) MUST drop off the endpoint. Per
+    [[feedback_verified_payment_chains]], advertising a chain implies the
+    verify_facilitator gate passed for it."""
+    networks = [
+        dataclasses.replace(n, enabled=(n.key == "base"))
+        for n in real_payment_state.config.payment.payment_networks
+    ]
+    real_payment_state.config.payment = PaymentConfig(
+        facilitator_url="https://facilitator.payai.network",
+        payment_networks=networks,
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        body = (await c.get("/v1/payments/networks")).json()
+    keys_on_wire = {n["key"] for n in body["networks"]}
+    assert keys_on_wire == {"base"}
 
 
 def test_disabled_chain_drops_off_the_wire() -> None:

@@ -61,20 +61,23 @@ jobs:
           ~/.local/bin/uv run pytest -q
 
       # verify_facilitator.py is the CI gate per feedback_verified_payment_chains.md.
-      # Triggers only when PaymentConfig itself changes (not unrelated feature
-      # flags or other config edits) to avoid burning facilitator-side quota
-      # on every PR. Failure here blocks merge.
-      - name: Verify payment facilitator (when PaymentConfig changes)
+      # Triggers only when the payment stack itself changes (PaymentConfig or
+      # the facilitator middleware — not unrelated feature flags or other
+      # config edits) to avoid burning facilitator-side quota on every PR.
+      # Probes the DEFAULT facilitator only: CDP's /supported requires auth
+      # (401 unauthenticated), so CI cannot probe it without credentials.
+      # Failure here blocks merge.
+      - name: Verify payment facilitator (when the payment stack changes)
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE="${{ github.event.pull_request.base.sha }}"
           else
             BASE="${{ github.event.before }}"
           fi
-          DIFF=$(git diff "$BASE"...HEAD -- hyrule_cloud/config.py || true)
-          if echo "$DIFF" | grep -qE '^[+-].*(class PaymentConfig|facilitator_url|networks[[:space:]]*[:=]|"network":|receiver_address)'; then
-            echo "PaymentConfig changed — running facilitator smoke test."
+          DIFF=$(git diff "$BASE"...HEAD -- hyrule_cloud/config.py hyrule_cloud/middleware/x402.py || true)
+          if echo "$DIFF" | grep -qE '^[+-].*(class PaymentConfig|facilitator_url|networks[[:space:]]*[:=]|"network":|receiver_address|enabled[[:space:]]*=|_ALLOWED_FACILITATOR_HOSTS|class CdpFacilitatorAuthProvider|def _jwt_for|def _facilitator_config)'; then
+            echo "Payment stack changed — running facilitator smoke test."
             PYTHONPATH=. ~/.local/bin/uv run python scripts/verify_facilitator.py
           else
-            echo "PaymentConfig unchanged — skipping facilitator smoke."
+            echo "Payment stack unchanged — skipping facilitator smoke."
           fi

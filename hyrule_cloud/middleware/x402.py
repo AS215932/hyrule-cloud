@@ -81,12 +81,15 @@ class CdpFacilitatorAuthProvider:
         now = int(time.time())
         path = f"{self.base_path}/{suffix.lstrip('/')}"
         uri = f"{method.upper()} {self.host}{path}"
+        # Claim shape must match coinbase/cdp-sdk generate_jwt: `iss` is the
+        # literal "cdp" (the key id goes in sub/kid only) and the endpoint
+        # scope is a `uris` list. CDP rejects iss=<key id> with a plain 401.
         payload = {
-            "iss": self.api_key_id,
+            "iss": "cdp",
             "sub": self.api_key_id,
             "nbf": now,
             "exp": now + 120,
-            "uri": uri,
+            "uris": [uri],
         }
         headers = {"kid": self.api_key_id, "nonce": secrets.token_hex(16)}
         return jwt.encode(payload, self.api_key_secret, algorithm="ES256", headers=headers)
@@ -128,12 +131,18 @@ def _facilitator_config(config: PaymentConfig) -> FacilitatorConfig:
     if facilitator_host == _CDP_FACILITATOR_HOST:
         api_key_id = _env_or_dotenv("CDP_API_KEY_ID")
         api_key_secret = _env_or_dotenv("CDP_API_KEY_SECRET")
-        if api_key_id and api_key_secret:
-            auth_provider = CdpFacilitatorAuthProvider(
-                api_key_id,
-                api_key_secret,
-                config.facilitator_url,
+        if not (api_key_id and api_key_secret):
+            # CDP requires auth on every endpoint (401 otherwise), and the
+            # vault render hook does not treat these keys as required — fail
+            # at boot rather than 401 on every paid request.
+            raise ValueError(
+                "CDP facilitator configured but CDP_API_KEY_ID/CDP_API_KEY_SECRET are unset"
             )
+        auth_provider = CdpFacilitatorAuthProvider(
+            api_key_id,
+            api_key_secret,
+            config.facilitator_url,
+        )
     return FacilitatorConfig(url=config.facilitator_url, auth_provider=auth_provider)
 
 
