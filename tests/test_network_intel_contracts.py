@@ -175,6 +175,25 @@ async def test_unbuilt_paid_endpoints_return_501_before_charging():
                 ),
                 "/v1/path/ping": await client.post("/v1/path/ping", json={"target": "example.com"}),
                 "/v1/path/report": await client.post("/v1/path/report", json={"target": "example.com"}),
+                # BGPStream jobs are queue-only until a worker is deployed —
+                # charging would sell a job that never completes.
+                "/v1/bgp/jobs": await client.post(
+                    "/v1/bgp/jobs",
+                    json={
+                        "subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"},
+                        "record_type": "updates",
+                    },
+                ),
+                # IP geo/reputation views have no data provider: a paid request
+                # would only ever receive a not_configured placeholder.
+                "/v1/ip/lookup (geo view)": await client.post(
+                    "/v1/ip/lookup", json={"address": "192.0.2.10", "views": ["geo"]}
+                ),
+                "/v1/ip/lookup (reputation view)": await client.post(
+                    "/v1/ip/lookup", json={"address": "192.0.2.10", "views": ["reputation"]}
+                ),
+                "/v1/ip/{address}/geo": await client.get("/v1/ip/192.0.2.10/geo"),
+                "/v1/ip/{address}/reputation": await client.get("/v1/ip/192.0.2.10/reputation"),
             }
     finally:
         if old_state is not None:
@@ -250,6 +269,8 @@ async def test_x402_manifest_lists_network_intel_resources():
     assert "/v1/voip/number/lookup" not in paths
     assert "/v1/path/ping" not in paths
     assert "/v1/path/report" not in paths
+    # Queue-only until a BGPStream worker is deployed.
+    assert "/v1/bgp/jobs" not in paths
     assert "/v1/mail/messages/send" not in paths
     assert "/v1/web/reports" not in paths
     assert "/v1/path/jobs" not in paths
@@ -276,21 +297,30 @@ async def test_quotes_for_unbuilt_endpoints_return_501():
         web_report_quote = await client.post(
             "/v1/web/reports/quote", json={"target": "https://example.com"}
         )
-    for res in (mail_quote, speedtest_quote, web_report_quote):
+        ip_geo_quote = await client.post(
+            "/v1/ip/lookup/quote", json={"address": "192.0.2.10", "views": ["geo"]}
+        )
+    for res in (mail_quote, speedtest_quote, web_report_quote, ip_geo_quote):
         assert res.status_code == 501
         assert res.json()["error"] == "not_implemented"
 
 
-def test_diagnostic_enablement_predicates_default_off():
+def test_diagnostic_enablement_predicates_default_off(monkeypatch):
     """With no external data source configured, the pluggable diagnostics report
     disabled — this is what makes their routes 501 before charging."""
+    from hyrule_cloud.services.bgp.stream import bgpstream_worker_enabled
+    from hyrule_cloud.services.intel.ip import geo_intel_enabled, reputation_intel_enabled
     from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
     from hyrule_cloud.services.threat.lookup import threat_intel_enabled
     from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
 
+    monkeypatch.delenv("HYRULE_BGPSTREAM_WORKER_ENABLED", raising=False)
     assert threat_intel_enabled() is False
     assert number_intel_enabled() is False
     assert path_active_probe_enabled() is False
+    assert bgpstream_worker_enabled() is False
+    assert geo_intel_enabled() is False
+    assert reputation_intel_enabled() is False
 
 
 @pytest.mark.asyncio
@@ -326,6 +356,38 @@ async def test_threat_lookup_readvertises_and_charges_once_source_configured(mon
     assert lookup.status_code == 402
     paths = {resource["path"] for resource in manifest.json()["resources"]}
     assert "/v1/threat/lookup" in paths
+
+
+@pytest.mark.asyncio
+async def test_bgp_jobs_readvertises_and_charges_once_worker_deployed(monkeypatch):
+    """Deploying the BGPStream worker (env flag flipped alongside it) must turn
+    /v1/bgp/jobs from 501-before-charge back into a normal paid endpoint and
+    re-list it in the manifest — the gate is deployment-driven, not a
+    permanent removal."""
+    monkeypatch.setenv("HYRULE_BGPSTREAM_WORKER_ENABLED", "1")
+    old_state = getattr(app.state, "_typed_state", None)
+    if hasattr(app.state, "_typed_state"):
+        delattr(app.state, "_typed_state")
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            create = await client.post(
+                "/v1/bgp/jobs",
+                json={
+                    "subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"},
+                    "record_type": "updates",
+                },
+            )
+        app.state._typed_state = SimpleNamespace(config=HyruleConfig())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            manifest = await client.get("/.well-known/x402.json")
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+        elif hasattr(app.state, "_typed_state"):
+            delattr(app.state, "_typed_state")
+    assert create.status_code == 402
+    paths = {resource["path"] for resource in manifest.json()["resources"]}
+    assert "/v1/bgp/jobs" in paths
 
 
 @pytest.mark.asyncio
@@ -486,6 +548,8 @@ async def test_capabilities_hide_gated_paid_endpoints():
         threat = (await client.get("/v1/threat/capabilities")).json()
         voip = (await client.get("/v1/voip/capabilities")).json()
         path = (await client.get("/v1/path/capabilities")).json()
+        bgp = (await client.get("/v1/bgp/capabilities")).json()
+        ip = (await client.get("/v1/ip/capabilities")).json()
 
     assert {e["path"] for e in threat["paid_endpoints"]} == set()
     voip_paid = {e["path"] for e in voip["paid_endpoints"]}
@@ -494,6 +558,13 @@ async def test_capabilities_hide_gated_paid_endpoints():
     assert {e["path"] for e in path["paid_endpoints"]} == set()
     # The gated quote also disappears from the free list.
     assert not any(e["path"] == "/v1/path/report/quote" for e in path["free_endpoints"])
+    bgp_paid = {e["path"] for e in bgp["paid_endpoints"]}
+    assert "/v1/bgp/lookup" in bgp_paid  # real lookup stays advertised
+    assert "/v1/bgp/jobs" not in bgp_paid  # gated until a worker is deployed
+    ip_paid = {e["path"] for e in ip["paid_endpoints"]}
+    assert "/v1/ip/{address}/asn" in ip_paid  # real views stay advertised
+    assert "/v1/ip/{address}/geo" not in ip_paid  # gated: no provider
+    assert "/v1/ip/{address}/reputation" not in ip_paid  # gated: no provider
 
 
 def test_bazaar_discovery_hides_gated_diagnostics_by_default():
@@ -507,6 +578,7 @@ def test_bazaar_discovery_hides_gated_diagnostics_by_default():
     assert discovery_for("POST", "/v1/path/ping") is None
     assert discovery_for("POST", "/v1/threat/lookup") is None
     assert discovery_for("POST", "/v1/voip/number/lookup") is None
+    assert discovery_for("POST", "/v1/bgp/jobs") is None
     # An ungated diagnostic is still advertised.
     assert discovery_for("POST", "/v1/dns/lookup") is not None
     assert discovery_for("POST", "/v1/mx/check") is not None

@@ -41,6 +41,10 @@ def _enable_all_catalog_gates(monkeypatch: pytest.MonkeyPatch) -> None:
         "hyrule_cloud.services.voip.diagnostics.number_intel_enabled",
         lambda: True,
     )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.bgp.stream.bgpstream_worker_enabled",
+        lambda: True,
+    )
 
 
 def _schema_operations(schema: dict) -> set[tuple[str, str]]:
@@ -183,7 +187,15 @@ async def test_unpaid_catalog_probes_reach_valid_402_before_validation(
 
 
 @pytest.mark.asyncio
-async def test_valid_dynamic_input_reaches_handler_for_exact_first_challenge() -> None:
+async def test_valid_dynamic_input_reaches_handler_for_exact_first_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # /v1/bgp/jobs is worker-gated; enable both the catalog gate and the
+    # route-level guard binding so the dynamic-price path stays covered.
+    monkeypatch.setattr(
+        "hyrule_cloud.services.bgp.stream.bgpstream_worker_enabled", lambda: True
+    )
+    monkeypatch.setattr("hyrule_cloud.api.bgp.bgpstream_worker_enabled", lambda: True)
     config = HyruleConfig()
     gate = _gate(_FakeServer(), public_base_url="https://cloud.hyrule.host")
     old_state = getattr(app.state, "_typed_state", None)
@@ -212,6 +224,38 @@ async def test_valid_dynamic_input_reaches_handler_for_exact_first_challenge() -
 
     assert response.status_code == 402
     assert response.json()["amount"] == str(config.payment.price_bgpstream_rib)
+
+
+@pytest.mark.asyncio
+async def test_gated_bgp_jobs_post_returns_501_without_payment_challenge() -> None:
+    """With no BGPStream worker deployed (default), a valid /v1/bgp/jobs body
+    must be refused with 501 and never see a payment challenge, even with the
+    payment gate fully wired."""
+    gate = _gate(_FakeServer(), public_base_url="https://cloud.hyrule.host")
+    old_state = getattr(app.state, "_typed_state", None)
+    app.state._typed_state = SimpleNamespace(config=HyruleConfig(), payment_gate=gate)
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/v1/bgp/jobs",
+                json={
+                    "subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"},
+                    "record_type": "updates",
+                },
+            )
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+        elif hasattr(app.state, "_typed_state"):
+            delattr(app.state, "_typed_state")
+
+    assert response.status_code == 501
+    assert response.json()["error"] == "not_implemented"
+    assert PAYMENT_REQUIRED_HEADER not in response.headers
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import select
 
 from hyrule_cloud.api._contract import (
+    not_implemented,
     now_utc,
     payment_price,
     quote,
@@ -37,6 +38,7 @@ from hyrule_cloud.models import (
     SourceHealth,
 )
 from hyrule_cloud.services.bgp.lookup import as215932_status, lookup_bgp
+from hyrule_cloud.services.bgp.stream import bgpstream_worker_enabled
 
 router = APIRouter(prefix="/v1/bgp", tags=["BGP intelligence"])
 
@@ -96,7 +98,14 @@ async def get_bgp_capabilities() -> ProductCapabilityResponse:
         ],
         paid_endpoints=[
             CapabilityEndpoint(path="/v1/bgp/lookup", method="POST", paid=True, description="Lookup by prefix, IP, or ASN; prefix/IP do not require ASN input"),
-            CapabilityEndpoint(path="/v1/bgp/jobs", method="POST", paid=True, description="Create historical BGPStream job"),
+            # Don't advertise BGPStream jobs while no processing worker is
+            # deployed — creation 501s before charging. Mirrors the threat/voip
+            # gated-capabilities pattern.
+            *(
+                [CapabilityEndpoint(path="/v1/bgp/jobs", method="POST", paid=True, description="Create historical BGPStream job")]
+                if bgpstream_worker_enabled()
+                else []
+            ),
             CapabilityEndpoint(path="/v1/bgp/snapshots/router/{snapshot_id}/download", method="GET", paid=True, description="Download paid router table snapshot"),
         ],
     )
@@ -207,6 +216,14 @@ async def bgp_asn(request: Request, asn: str) -> BGPLookupResponse | Response:
 
 @router.post("/jobs", response_model=BGPJobResponse)
 async def create_bgpstream_job(request: Request, body: BGPStreamJobRequest) -> BGPJobResponse | Response:
+    # Queued jobs are only fulfilled by an external BGPStream worker. Until one
+    # is deployed, refuse before charging rather than bill for a job that would
+    # sit queued forever. Existing job status/download routes stay reachable.
+    if not bgpstream_worker_enabled():
+        return not_implemented(
+            "bgp.jobs.create",
+            "Historical BGPStream jobs are temporarily unavailable; no processing worker is deployed.",
+        )
     attr = "price_bgpstream_rib" if body.record_type.value == "ribs" else "price_bgpstream_hour"
     default = "0.10" if attr == "price_bgpstream_rib" else "0.05"
     amount = payment_price(request, attr, default)
