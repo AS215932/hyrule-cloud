@@ -10,7 +10,7 @@ import string
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Block A0: widen vm_id from 48-bit hex (vm_<12 hex>) to ~131-bit base62
 # (vm_<22 base62>). The legacy 48-bit space was borderline guessable; with
@@ -855,7 +855,32 @@ class ThreatSubject(BaseModel):
     value: str
 
 
-class ThreatLookupRequest(BaseModel):
+class _FlatSubjectRequest(BaseModel):
+    """Accept the canonical scalar discovery form as well as nested subject.
+
+    Bazaar consumers that fully implement JSON Schema can call these APIs with
+    ``{"subject": {"type": ..., "value": ...}}``.  Some discovery surfaces
+    currently flatten only scalar example fields and render an object example
+    as ``object / null``.  ``subject_type`` + ``subject_value`` is therefore
+    the advertised form, while the original nested form remains compatible.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _expand_flat_subject(cls, value: object) -> object:
+        if not isinstance(value, dict) or "subject" in value:
+            return value
+        if "subject_type" not in value and "subject_value" not in value:
+            return value
+        normalized = dict(value)
+        normalized["subject"] = {
+            "type": normalized.pop("subject_type", None),
+            "value": normalized.pop("subject_value", None),
+        }
+        return normalized
+
+
+class ThreatLookupRequest(_FlatSubjectRequest):
     subject: ThreatSubject
     views: list[ThreatView] = Field(default_factory=lambda: [ThreatView.RBL, ThreatView.CT, ThreatView.RDAP, ThreatView.WHOIS, ThreatView.DNS, ThreatView.REPUTATION])
     include_raw: bool = False
@@ -959,7 +984,7 @@ class BGPAssertions(BaseModel):
     expected_rpki: str | None = Field(default=None, description="valid, invalid, not_found, or unknown")
 
 
-class BGPLookupRequest(BaseModel):
+class BGPLookupRequest(_FlatSubjectRequest):
     subject: BGPSubject
     datasets: list[BGPDataset] = Field(
         default_factory=lambda: [BGPDataset.PUBLIC_ROUTING, BGPDataset.RPKI]
@@ -1039,7 +1064,7 @@ class BGPStreamRecordType(enum.StrEnum):
     RIBS = "ribs"
 
 
-class BGPStreamJobRequest(BaseModel):
+class BGPStreamJobRequest(_FlatSubjectRequest):
     subject: BGPSubject
     projects: list[str] = Field(default_factory=lambda: ["routeviews", "ris"])
     record_type: BGPStreamRecordType = BGPStreamRecordType.UPDATES
@@ -1234,7 +1259,7 @@ class RegistrySubject(BaseModel):
     value: str | int
 
 
-class RDAPLookupRequest(BaseModel):
+class RDAPLookupRequest(_FlatSubjectRequest):
     subject: RegistrySubject
     include_raw: bool = False
     max_age_seconds: int = Field(default=86400, ge=0, le=2592000)
@@ -1250,7 +1275,7 @@ class RDAPLookupResponse(BaseModel):
     generated_at: datetime
 
 
-class WhoisLookupRequest(BaseModel):
+class WhoisLookupRequest(_FlatSubjectRequest):
     subject: RegistrySubject
     include_raw: bool = False
     max_age_seconds: int = Field(default=86400, ge=0, le=2592000)
