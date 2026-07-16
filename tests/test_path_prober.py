@@ -281,6 +281,57 @@ async def test_path_report_degraded_classification():
     assert resp.status == DiagnosticStatus.WARNING
 
 
+@pytest.mark.asyncio
+async def test_path_report_without_traceroute_evidence_does_not_settle():
+    # Ping succeeds but every traceroute failed: the ping+traceroute pack was not
+    # delivered, so it must raise (deliver-then-settle → no charge) rather than
+    # settle a report that contains no path evidence.
+    prober = _FakeProber(
+        outcomes={
+            "ping": [_ping_result("as215932", 0.0)],
+            "traceroute": [VantageOutcome(vantage="as215932", ok=False, error="traceroute failed")],
+        }
+    )
+    body = PathReportRequest(target="example.com", vantages=[DiagnosticVantage.AS215932])
+    with pytest.raises(ProbeUnavailableError):
+        await pd.path_report(body, prober)
+
+
+@pytest.mark.asyncio
+async def test_path_report_without_ping_evidence_does_not_settle():
+    prober = _FakeProber(
+        outcomes={
+            "ping": [VantageOutcome(vantage="as215932", ok=False, error="ping failed")],
+            "traceroute": [_trace_result("as215932", reached=True)],
+        }
+    )
+    body = PathReportRequest(target="example.com", vantages=[DiagnosticVantage.AS215932])
+    with pytest.raises(ProbeUnavailableError):
+        await pd.path_report(body, prober)
+
+
+@pytest.mark.asyncio
+async def test_path_report_marks_partial_when_a_vantage_is_unavailable():
+    # Two prober vantages requested, only one healthy: the report still delivers
+    # (both required kinds present from the healthy vantage) but must flag the
+    # degraded coverage so callers don't read it as full-fleet evidence.
+    prober = _FakeProber(
+        healthy=("as215932",),
+        outcomes={
+            "ping": [_ping_result("as215932", 0.0)],
+            "traceroute": [_trace_result("as215932", reached=True)],
+        },
+    )
+    body = PathReportRequest(
+        target="example.com",
+        vantages=[DiagnosticVantage.EXTMON, DiagnosticVantage.AS215932],
+    )
+    resp = await pd.path_report(body, prober)
+    assert resp.partial is True
+    assert resp.sources["as215932"].status.value == "ok"
+    assert resp.sources["extmon"].status.value != "ok"
+
+
 # --- route deliver-then-settle ----------------------------------------------
 
 

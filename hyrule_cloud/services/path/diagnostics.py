@@ -339,18 +339,41 @@ async def path_report(body: PathReportRequest, provider: ProberProvider | None) 
     )
 
     findings: list[DiagnosticFinding] = []
-    measured: set[str] = set()
+    ping_vantages: set[str] = set()
+    trace_vantages: set[str] = set()
     for result in ping_outcome.results:
         if _ping_measured(result):
             findings.append(_ping_finding(result))
-            measured.add(result.vantage)
+            ping_vantages.add(result.vantage)
         else:
             findings.append(_unavailable_finding(result))
     for result in trace_outcome.results:
         if _trace_measured(result):
             findings.append(_trace_finding(result))
-            measured.add(result.vantage)
+            trace_vantages.add(result.vantage)
+        else:
+            findings.append(
+                _finding(
+                    DiagnosticStatus.WARNING,
+                    f"traceroute_unavailable_{result.vantage}",
+                    f"{result.vantage}: no traceroute measurement returned "
+                    f"({result.error or 'unknown error'}).",
+                    vantage=result.vantage,
+                    error=result.error,
+                )
+            )
+    measured = ping_vantages | trace_vantages
 
+    # Deliver-then-settle: this pack is sold as ping + traceroute + classification,
+    # so every requested active measurement kind must actually produce evidence
+    # before the payment is captured. A sidecar that returns ping but no
+    # traceroute (a filtered target still yields hops, so an empty set means the
+    # traceroute itself did not run) is an undelivered pack — raise so we never
+    # settle for a partial deliverable, consistent with path_probe.
+    if PathReportCheck.PING.value in checks and not ping_vantages:
+        raise ProbeUnavailableError("prober returned no ping measurement from any vantage")
+    if PathReportCheck.TRACEROUTE.value in checks and not trace_vantages:
+        raise ProbeUnavailableError("prober returned no traceroute measurement from any vantage")
     if not measured:
         raise ProbeUnavailableError("prober returned no measurement from any vantage")
 
@@ -424,6 +447,10 @@ async def path_report(body: PathReportRequest, provider: ProberProvider | None) 
         target=DiagnosticTarget(input=body.target, normalized=host, type=DiagnosticTargetType.HOST),
         findings=findings,
         sources=_sources_for(body.vantages, ran, measured),
+        # A requested prober vantage that returned no measurement is a degraded
+        # evidence set: flag it so callers relying on the top-level completeness
+        # signal do not treat a single-vantage report as full coverage.
+        partial=len(measured) < len(_requested_prober_vantages(body.vantages)),
         raw=raw,
         generated_at=datetime.now(UTC),
     )
