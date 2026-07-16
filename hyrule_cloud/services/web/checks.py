@@ -154,7 +154,7 @@ async def run_web_tls_deep(body: WebTLSDeepRequest) -> DiagnosticResponse:
     except Exception as exc:
         findings.append(_finding(DiagnosticStatus.CRITICAL, "tls_handshake_failed", f"TLS handshake failed: {exc}"))
 
-    protocols = await asyncio.to_thread(_tls_protocol_probe, body.host, body.port)
+    protocols, ciphers = await asyncio.to_thread(_tls_protocol_probe, body.host, body.port)
     raw["protocols"] = protocols
     if protocols.get("TLSv1") or protocols.get("TLSv1_1"):
         findings.append(_finding(DiagnosticStatus.CRITICAL, "tls_legacy_enabled", "Legacy TLS 1.0/1.1 appears enabled.", "Disable TLS 1.0 and TLS 1.1."))
@@ -168,12 +168,12 @@ async def run_web_tls_deep(body: WebTLSDeepRequest) -> DiagnosticResponse:
     status = _overall(findings)
     raw["score"] = score
     raw["grade"] = grade
-    raw["ciphers"] = []
+    raw["ciphers"] = ciphers
     raw["recommendations"] = [finding.recommendation for finding in findings if finding.recommendation]
 
     return DiagnosticResponse(
         status=status,
-        summary=f"Hyrule-native SSL Labs-style TLS scan for {body.host}:{body.port}: grade {grade}.",
+        summary=f"Deep TLS protocol/certificate/cipher scan for {body.host}:{body.port}: grade {grade}.",
         target=_target(body.host, normalized=f"{body.host}:{body.port}", type_=DiagnosticTargetType.HOST),
         findings=findings,
         sources={"hyrule_tls_scanner": source_ok()},
@@ -255,8 +255,14 @@ def _cdn_findings(headers: httpx.Headers) -> list[DiagnosticFinding]:
     return [_finding(DiagnosticStatus.INFO, "cdn_waf_not_obvious", "No obvious CDN/WAF response-header hints detected.")]
 
 
-def _tls_protocol_probe(host: str, port: int) -> dict[str, bool | str]:
-    protocols: dict[str, bool | str] = {}
+def _tls_protocol_probe(host: str, port: int) -> tuple[dict[str, bool], list[dict[str, object]]]:
+    """Probe each TLS version and record the cipher negotiated on success.
+
+    Ciphers are the per-version negotiated suites (one handshake per version
+    with default client ciphers), not an exhaustive suite enumeration.
+    """
+    protocols: dict[str, bool] = {}
+    ciphers: list[dict[str, object]] = []
     for label, minimum, maximum in [
         ("TLSv1", ssl.TLSVersion.TLSv1, ssl.TLSVersion.TLSv1),
         ("TLSv1_1", ssl.TLSVersion.TLSv1_1, ssl.TLSVersion.TLSv1_1),
@@ -269,11 +275,22 @@ def _tls_protocol_probe(host: str, port: int) -> dict[str, bool | str]:
             context.maximum_version = maximum
             addresses = assert_safe_active_probe_target(host, port=port)
             with socket.create_connection((addresses[0], port), timeout=8) as sock:
-                with context.wrap_socket(sock, server_hostname=host):
+                with context.wrap_socket(sock, server_hostname=host) as tls:
                     protocols[label] = True
+                    negotiated = tls.cipher()
+                    if negotiated:
+                        name, tls_version, bits = negotiated
+                        ciphers.append(
+                            {
+                                "protocol": label,
+                                "cipher": name,
+                                "tls_version": tls_version,
+                                "bits": bits,
+                            }
+                        )
         except Exception:
             protocols[label] = False
-    return protocols
+    return protocols, ciphers
 
 
 def _tls_score(findings: list[DiagnosticFinding]) -> int:

@@ -12,8 +12,7 @@ from hyrule_cloud.models import (
     MailBounceParseRequest,
     MailBounceParseResponse,
     MailRecordRecommendation,
-    MailRecordRecommendationRequest,
-    MailRecordRecommendationResponse,
+    MXCheckResponse,
 )
 
 _SMTP_RE = re.compile(r"\b([245][0-9]{2})(?:[ .-]([245]\.[0-9]\.[0-9]{1,3}))?\b")
@@ -81,87 +80,37 @@ def parse_bounce(body: MailBounceParseRequest) -> MailBounceParseResponse:
     )
 
 
-def recommend_records(body: MailRecordRecommendationRequest) -> MailRecordRecommendationResponse:
-    domain = body.domain.rstrip(".").lower()
-    warnings: list[str] = []
-    mechanisms: list[str] = []
-    for ip in body.sending_ips:
-        if ":" in ip:
-            mechanisms.append(f"ip6:{ip}")
-        else:
-            mechanisms.append(f"ip4:{ip}")
-    for host in body.sending_hosts:
-        mechanisms.append(f"a:{host.rstrip('.')}")
-    provider = body.provider.lower()
-    if provider in {"google_workspace", "google"}:
-        mechanisms.append("include:_spf.google.com")
-    elif provider in {"m365", "office365", "microsoft365"}:
-        mechanisms.append("include:spf.protection.outlook.com")
-    elif provider == "hyrule":
-        mechanisms.append("include:_spf.hyrule.host")
-    if not mechanisms:
-        mechanisms.append("mx")
-        warnings.append("No explicit sending IPs/hosts were supplied; SPF recommendation falls back to mx.")
+def derive_recommendations(domain: str, results: list[MXCheckResponse]) -> list[MailRecordRecommendation]:
+    """Concrete DNS records derived from the report's own observed lookups.
 
-    records = [
-        MailRecordRecommendation(
-            type=DNSLookupRecordType.TXT,
-            name=domain,
-            value=f"v=spf1 {' '.join(mechanisms)} -all",
-            purpose="SPF sender authorization",
-            notes="Keep total SPF DNS lookups at or below 10.",
-        ),
-        MailRecordRecommendation(
-            type=DNSLookupRecordType.TXT,
-            name=f"_dmarc.{domain}",
-            value=f"v=DMARC1; p={body.policy.dmarc}; rua=mailto:dmarc@{domain}; ruf=mailto:dmarc@{domain}; adkim=s; aspf=s",
-            purpose="DMARC alignment and reporting",
-            notes="Start with p=none if you are not ready to enforce.",
-        ),
-        MailRecordRecommendation(
-            type=DNSLookupRecordType.TXT,
-            name=f"default._domainkey.{domain}",
-            value="v=DKIM1; k=rsa; p=<publish-provider-public-key-here>",
-            purpose="DKIM public key placeholder",
-            notes="Replace with the exact selector and key from the sending platform.",
-        ),
-    ]
-    if body.policy.tls_reporting:
+    Only records whose full value is determined by what was actually observed
+    are emitted (missing DMARC/TLS-RPT policies at their well-known names).
+    Anything needing data we cannot observe (DKIM keys, SPF sending sources,
+    MTA-STS policy hosting) stays a per-finding recommendation instead.
+    """
+    domain = domain.rstrip(".").lower()
+    codes = {finding.code for result in results for finding in result.findings}
+    records: list[MailRecordRecommendation] = []
+    if "dmarc_missing" in codes:
+        records.append(
+            MailRecordRecommendation(
+                type=DNSLookupRecordType.TXT,
+                name=f"_dmarc.{domain}",
+                value=f"v=DMARC1; p=none; rua=mailto:dmarc@{domain}",
+                purpose="DMARC monitoring policy (no record was observed)",
+                notes="Start at p=none to collect reports; move to quarantine/reject once aligned mail is confirmed.",
+            )
+        )
+    if "tlsrpt_missing" in codes:
         records.append(
             MailRecordRecommendation(
                 type=DNSLookupRecordType.TXT,
                 name=f"_smtp._tls.{domain}",
                 value=f"v=TLSRPTv1; rua=mailto:tlsrpt@{domain}",
-                purpose="SMTP TLS reporting",
+                purpose="SMTP TLS failure reporting (no record was observed)",
             )
         )
-    if body.policy.mta_sts:
-        records.append(
-            MailRecordRecommendation(
-                type=DNSLookupRecordType.TXT,
-                name=f"_mta-sts.{domain}",
-                value="v=STSv1; id=2026061301",
-                purpose="MTA-STS policy discovery",
-                notes=f"Also serve https://mta-sts.{domain}/.well-known/mta-sts.txt.",
-            )
-        )
-    if body.policy.bimi:
-        records.append(
-            MailRecordRecommendation(
-                type=DNSLookupRecordType.TXT,
-                name=f"default._bimi.{domain}",
-                value="v=BIMI1; l=https://example.com/bimi.svg; a=https://example.com/vmc.pem",
-                purpose="BIMI logo assertion",
-                notes="Requires DMARC enforcement and provider-specific VMC support.",
-            )
-        )
-    return MailRecordRecommendationResponse(
-        domain=domain,
-        provider=body.provider,
-        records=records,
-        warnings=warnings,
-        generated_at=datetime.now(UTC),
-    )
+    return records
 
 
 def _smtp_status(text: str) -> str | None:

@@ -33,7 +33,6 @@ class _Payment:
     price_vm_sm = Decimal("0.10")
     price_vm_md = Decimal("0.20")
     price_vm_lg = Decimal("0.40")
-    price_vpn = Decimal("0.02")
     price_domain_markup = Decimal("1.00")
     price_proxy_direct = Decimal("0.01")
     price_proxy_tor = Decimal("0.05")

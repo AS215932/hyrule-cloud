@@ -35,7 +35,7 @@ router = APIRouter(prefix="/v1/threat", tags=["Threat and reputation"])
 async def get_threat_capabilities() -> ProductCapabilityResponse:
     # Don't advertise paid endpoints (or their quote) while no reputation
     # source is configured — they all 501 before charging. Mirrors the manifest
-    # gate and the mail/speedtest capabilities pattern.
+    # gate and the shared gated-capabilities pattern.
     enabled = threat_intel_enabled()
     free_endpoints = [
         CapabilityEndpoint(path="/v1/threat/capabilities", method="GET", description="Threat diagnostic capabilities"),

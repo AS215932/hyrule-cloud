@@ -10,7 +10,7 @@ RDAP, WHOIS, registrar/delegation, or record-publication guidance.
 
 ## API boundary
 
-- `/v1/dns` is read-only DNS diagnostics and recommendations.
+- `/v1/dns` is read-only DNS diagnostics.
 - `/v1/rdap` is structured registry lookup.
 - `/v1/whois` is legacy WHOIS lookup.
 - `/v1/domains` provides account-owned registration, renewal, and managed DNS.
@@ -45,15 +45,6 @@ curl -X POST 'https://cloud.hyrule.host/v1/dns/dnssec/report?name=example.com' \
   -H 'X-PAYMENT: <x402-payment>'
 ```
 
-### Record recommendations
-
-```bash
-curl -X POST https://cloud.hyrule.host/v1/dns/recommend-records \
-  -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
-  -d '{"domain":"example.com","use_case":"sip","sip_target":"sip.example.com."}'
-```
-
 ### Registry context
 
 ```bash
@@ -72,7 +63,6 @@ curl -X POST https://cloud.hyrule.host/v1/whois/lookup \
 
 Use DNS propagation when a customer says a recent change is visible in one
 place but not another. Use RDAP/WHOIS when registrar, registry, expiration,
-allocation, abuse contact, or nameserver delegation ownership matters. Use
-record recommendations to explain what the customer should publish, but do not
+allocation, abuse contact, or nameserver delegation ownership matters. Do not
 publish records unless the agent intentionally calls the revision-checked
 `/v1/domains/{domain}/dns/changesets` endpoint with the customer's authorization.

@@ -143,7 +143,7 @@ revenue.)
 One paid call each; response must contain substantive real data:
 `/v1/dns/lookup`, `/v1/ip/lookup`, `/v1/bgp/lookup`, `/v1/rdap/lookup`,
 `/v1/whois/lookup`, `/v1/web/check`, `/v1/web/tls/deep`, `/v1/mx/check`,
-`/v1/path/ping`, `/v1/path/report`, `/v1/ports/check`, `/v1/nat/lookup`,
+`/v1/path/ping`, `/v1/path/report`, `/v1/ports/check`, `/v1/nat/port-forward/check`,
 `/v1/voip/check`, **`/v1/threat/lookup`** (inspect quality — its service
 makes no external calls; if stub-grade, pull it from the manifest +
 discovery.py and skip its skill).
@@ -231,7 +231,8 @@ the receiver wallet the same day. The Grafana provisioning panel and the
 2. **x402-list.com** submit flow; then Agentic.Market and
    app.ampersend.ai/discover.
 3. **ClawHub skills**: follow `skills/README.md` (13 publishable slugs in
-   order; `hyrule-mail` + `hyrule-speedtest` withheld; dry-run first).
+   order; the former `hyrule-mail`/`hyrule-speedtest` skills were removed with
+   their dead routers; dry-run first).
 4. **GitHub org README** (github.com/AS215932 profile — the manifest
    `contact` target): add service list, manifest URL, golden-path curl,
    ClawHub links, pricing table.

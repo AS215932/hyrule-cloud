@@ -14,9 +14,6 @@ from hyrule_cloud.models import (
     DNSLookupRecordType,
     DNSLookupRequest,
     DNSPropagationRequest,
-    DNSRecordAnswer,
-    DNSRecordRecommendationRequest,
-    DNSRecordRecommendationUseCase,
 )
 from hyrule_cloud.services.diagnostics.sources import source_ok
 from hyrule_cloud.services.dns.lookup import lookup
@@ -119,41 +116,3 @@ def resolver_detect(headers: dict[str, str | None] | None = None) -> DNSDiagnost
     )
 
 
-def recommend_records(body: DNSRecordRecommendationRequest) -> DNSDiagnosticResponse:
-    records: list[DNSRecordAnswer] = []
-    domain = body.domain.rstrip(".").lower()
-    if body.use_case == DNSRecordRecommendationUseCase.WEB:
-        host = body.hostname or "@"
-        if body.ipv4:
-            records.append(DNSRecordAnswer(name=host, type="A", ttl=3600, value=body.ipv4))
-        if body.ipv6:
-            records.append(DNSRecordAnswer(name=host, type="AAAA", ttl=3600, value=body.ipv6))
-        if not records:
-            records.append(DNSRecordAnswer(name="www", type="CNAME", ttl=3600, value=domain))
-    elif body.use_case == DNSRecordRecommendationUseCase.MAIL:
-        provider = body.mail_provider or "custom"
-        records.extend([
-            DNSRecordAnswer(name=domain, type="MX", ttl=3600, value=f"10 mail.{domain}."),
-            DNSRecordAnswer(name=domain, type="TXT", ttl=3600, value=f"v=spf1 mx include:_spf.{provider}.example -all"),
-            DNSRecordAnswer(name=f"_dmarc.{domain}", type="TXT", ttl=3600, value="v=DMARC1; p=quarantine; rua=mailto:dmarc@" + domain),
-        ])
-    elif body.use_case == DNSRecordRecommendationUseCase.SIP:
-        target = body.sip_target or f"sip.{domain}."
-        records.extend([
-            DNSRecordAnswer(name=f"_sip._udp.{domain}", type="SRV", ttl=3600, value=f"10 10 5060 {target}"),
-            DNSRecordAnswer(name=f"_sips._tcp.{domain}", type="SRV", ttl=3600, value=f"10 10 5061 {target}"),
-        ])
-    elif body.use_case == DNSRecordRecommendationUseCase.VERIFY:
-        records.append(DNSRecordAnswer(name=body.verification_name or domain, type="TXT", ttl=3600, value=body.verification_value or "<provider-verification-token>"))
-    elif body.use_case == DNSRecordRecommendationUseCase.REVERSE_DNS:
-        records.append(DNSRecordAnswer(name="<reverse-zone>", type="PTR", ttl=3600, value=f"host.{domain}."))
-
-    return DNSDiagnosticResponse(
-        status=DiagnosticStatus.INFO,
-        summary=f"Recommended {len(records)} DNS record(s) for {body.use_case.value} on {domain}.",
-        target=DiagnosticTarget(input=domain, normalized=domain, type=DiagnosticTargetType.DOMAIN),
-        findings=[_finding(DiagnosticStatus.INFO, "dns_record_recommendations", "Publish these records with your authoritative DNS provider.", records=[record.model_dump(mode="json") for record in records])],
-        sources={"hyrule_recommendation_engine": source_ok()},
-        raw={"records": [record.model_dump(mode="json") for record in records]},
-        generated_at=datetime.now(UTC),
-    )

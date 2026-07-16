@@ -138,7 +138,7 @@ def assert_safe_active_probe_target(
     """Validate a public active-probe target and return resolved addresses.
 
     This is the shared abuse-control gate for web, path, port, NAT callback,
-    SIP/VoIP, and speedtest diagnostics. Private/reserved/loopback/link-local
+    and SIP/VoIP diagnostics. Private/reserved/loopback/link-local
     destinations are always blocked in the public API, including when a domain
     resolves to one of those addresses.
     """

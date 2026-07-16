@@ -6,6 +6,7 @@ import asyncio
 from datetime import UTC, datetime
 
 import dns.exception
+import dns.flags
 import dns.resolver
 import dns.reversename
 
@@ -80,11 +81,26 @@ def _resolve_sync(req: DNSLookupRequest) -> DNSLookupResponse:
         authority.append(DNSRecordAnswer(name=name, type="ERROR", value=str(exc)))
 
     if req.dnssec:
+        # validated = the AD (authenticated data) flag as reported by the
+        # selected recursive resolver; only meaningful when that resolver
+        # itself validates DNSSEC (1.1.1.1 / 8.8.8.8 / 9.9.9.9 all do).
         dnssec = DNSSECResult(
             validated=None,
             chain_status="unknown",
-            detail="DNSSEC validation is reported by resolver support in a later implementation step.",
+            detail="validated reflects the AD flag reported by the selected recursive resolver.",
         )
+        try:
+            ad_resolver = dns.resolver.Resolver(configure=req.resolver == "system")
+            if req.resolver not in {"system", "default"}:
+                ad_resolver.nameservers = [req.resolver]
+            ad_resolver.lifetime = resolver.lifetime
+            ad_resolver.timeout = resolver.timeout
+            ad_resolver.use_edns(0, dns.flags.DO, 1232)
+            ad_resolver.flags = dns.flags.RD | dns.flags.AD
+            ad_answer = ad_resolver.resolve(name, req.type.value, raise_on_no_answer=False)
+            dnssec.validated = bool(ad_answer.response.flags & dns.flags.AD)
+        except Exception:
+            pass
         try:
             ds_answer = resolver.resolve(name, "DS", raise_on_no_answer=False)
             if ds_answer.rrset is not None:
