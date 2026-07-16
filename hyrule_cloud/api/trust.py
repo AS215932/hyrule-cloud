@@ -94,7 +94,11 @@ async def jwks(request: Request) -> JSONResponse:
     if trust is None:
         return JSONResponse(content={"keys": []})
     return JSONResponse(
-        content=build_jwks(trust.receipts.keys, trust.receipts.config)
+        content=build_jwks(
+            trust.receipts.keys,
+            trust.receipts.config,
+            measurement_signer=getattr(trust, "measurements", None),
+        )
     )
 
 

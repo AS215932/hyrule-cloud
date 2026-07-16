@@ -20,6 +20,7 @@ provisioning, or management behavior.
 | x401 policy + shadow log | `hyrule_cloud/trust/x401.py` | `TRUST_X401_MODE=shadow` | built (M5) |
 | x401 step-up enforcement (`/v1/vm/create`) | same + `POST /v1/x401/proof` | `TRUST_X401_MODE=enforce` | scaffolding built (M6), **ships off**; needs a real credential verifier before any flip |
 | Caller-agent binding (RFC 9421 → did:web) | `hyrule_cloud/trust/principal.py` | `TRUST_PRINCIPAL_MODE=observe` | built (M7), observe-only |
+| Signed measurements (ed25519 response-body signature) | `hyrule_cloud/trust/measurements.py` + `hyrule_cloud/middleware/signing.py` | `TRUST_MEASUREMENT_SIGNING_ENABLED` | built; key in the shared JWKS |
 
 Storage: `fulfillment_receipts` (migration 015, + `ix_payment_events_tx_hash`
 duplicate-settle detection), `x401_proof_log` + `x401_proof_tokens`

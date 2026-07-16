@@ -294,6 +294,21 @@ class TrustConfig(BaseSettings):
     # receipts; it never blocks or authorizes anything.
     principal_mode: str = "off"
 
+    # --- Signed measurements (ed25519 response-body signatures) ---
+    # Receipts attest the transaction; this attests the measurement DATA. When
+    # enabled, every paid 2xx JSON response carries a detached ed25519 signature
+    # over its exact body (Hyrule-Signature header), verifiable against the
+    # OKP/Ed25519 key published in the same /.well-known/jwks.json. Off by
+    # default; the manifest stays byte-identical while off.
+    measurement_signing_enabled: bool = False
+    # base64-encoded 32-byte ed25519 seed.
+    measurement_signing_key: str = ""
+    # kid override; default = "hyr-meas-" + sha256(pubkey)[:16].
+    measurement_signing_key_id: str = ""
+    # Retired public JWKs (JSON list or {"keys": [...]}) kept in the JWKS so
+    # measurements signed before a rotation stay verifiable.
+    measurement_retired_jwks_json: str = ""
+
     # --- Circle Gateway additive payment kind (roadmap M8; reserved) ---
     gateway_enabled: bool = False
     gateway_max_amount_usd: Decimal = Decimal("0.05")

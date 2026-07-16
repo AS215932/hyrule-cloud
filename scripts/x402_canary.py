@@ -177,6 +177,43 @@ async def _receipt_check(resp: httpx.Response) -> bool:
         return False
 
 
+async def _measurement_signature_check(resp: httpx.Response) -> bool:
+    """Verify the ed25519 measurement signature on a paid response, if any.
+
+    Advisory when signing is disabled (no Hyrule-Signature header → note and
+    pass). When present, the detached signature over the exact body must verify
+    against an OKP/Ed25519 key served in /.well-known/jwks.json — a served-but-
+    unverifiable signature is a trust-layer regression and fails the canary.
+    """
+    header = resp.headers.get("hyrule-signature")
+    if not header:
+        print("    signature: none (measurement signing disabled on server)")
+        return True
+    if not header.startswith("ed25519="):
+        print(f"    !! signature: unexpected header format: {header[:40]}")
+        return False
+    try:
+        import base64
+
+        from hyrule_cloud.trust.measurements import verify_measurement_signature
+
+        async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
+            jwks = (await http.get("/.well-known/jwks.json")).raise_for_status().json()
+        signature = header.split("=", 1)[1]
+        for key in jwks.get("keys", []):
+            if key.get("kty") == "OKP" and key.get("crv") == "Ed25519":
+                raw = key["x"] + "=" * (-len(key["x"]) % 4)
+                pub_b64 = base64.b64encode(base64.urlsafe_b64decode(raw)).decode()
+                if verify_measurement_signature(pub_b64, resp.content, signature):
+                    print(f"    signature: verified ed25519 (kid={resp.headers.get('hyrule-signature-key', '?')})")
+                    return True
+        print("    !! signature: did NOT verify against any served OKP/Ed25519 key")
+        return False
+    except Exception as e:
+        print(f"    !! signature: verification errored: {e!r}")
+        return False
+
+
 async def _domain_check_price(name: str, extension: str) -> Decimal | None:
     """GET /v1/domain/check (free) for the REAL registration price, so the
     payment cap tracks the actual quote instead of a generous static guess.
@@ -271,6 +308,8 @@ async def _run_one(name: str, *, destroy: bool, domain_name: str | None, use_quo
         print("    !! paid 2xx with no successful settlement — route not charged; FAILING.")
         return False
     if not await _receipt_check(r):
+        return False
+    if not await _measurement_signature_check(r):
         return False
 
     if name == "vm":

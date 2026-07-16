@@ -84,6 +84,9 @@ async def lifespan(app: FastAPI):
     # Same philosophy for receipts: advertising receipts without working
     # signing keys would break the trust contract silently.
     enforce_trust_key_guard(config)
+    # Same for signed measurements: advertise signing only if we can sign.
+    from hyrule_cloud.trust.measurements import enforce_measurement_key_guard
+    enforce_measurement_key_guard(config)
 
     # Database
     engine = create_db_engine(config.database_url)
@@ -300,6 +303,13 @@ app.include_router(trust_router)
 # `/v1/stats/runtime`. Cheap (one perf_counter per request + O(1) deque
 # append) and bounded in memory.
 install_metrics(app)
+
+# Trust layer: sign paid 2xx JSON responses (ed25519). Added last so it is the
+# outermost middleware and signs the exact bytes the buyer receives. No-ops
+# unless measurement signing is configured (read from AppState.trust).
+from hyrule_cloud.middleware.signing import ResponseSigningMiddleware
+
+app.add_middleware(ResponseSigningMiddleware)
 
 
 @app.get("/health")

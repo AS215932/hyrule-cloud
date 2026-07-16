@@ -10,6 +10,7 @@ human decisions (see docs/trust-layer.md invariants).
 |---|---|---|---|
 | ES256 P-256 receipt key | JWS signature on every receipt | Vault kv/hyrule-cloud → `TRUST_RECEIPT_SIGNING_KEY_PEM` | reuse elsewhere |
 | secp256k1 receipt signer | EIP-712 receipt signature | Vault → `TRUST_RECEIPT_EVM_SIGNING_KEY` | fund it, or use as registry owner |
+| ed25519 measurement key | detached signature over each paid 2xx JSON body | Vault → `TRUST_MEASUREMENT_SIGNING_KEY` | reuse a receipt/registry key |
 | ERC-8004 registry owner | owns the agent NFT (register/setAgentURI) | org-controlled cold key / multisig; only ever exported into `ERC8004_OWNER_KEY` for the ceremony shell | store on the API host |
 
 Generate:
@@ -53,6 +54,50 @@ silently.
    before swapping `TRUST_RECEIPT_EVM_SIGNING_KEY`; old receipts name their
    signer in `evm_signer`, so verifiers compare against the receipt, and
    the registration document should keep listing historical signers.
+
+## Signed measurements (ed25519)
+
+Receipts attest the *transaction*; signed measurements attest the *data*.
+When `TRUST_MEASUREMENT_SIGNING_ENABLED=true`, an ed25519 detached signature
+over the exact response-body bytes rides on every paid 2xx JSON response as
+`Hyrule-Signature: ed25519=<b64>` + `Hyrule-Signature-Key: <kid>`. It is
+independent of receipts: enable either, both, or neither.
+
+The public key is published in the SAME `/.well-known/jwks.json` as an
+OKP/Ed25519 entry (`build_jwks` appends it), and advertised in the
+agent-registration document under `signedMeasurements` — never in the x402
+manifest, so `/.well-known/x402.json` stays byte-identical with the flag off.
+
+Like receipts, this fails closed: with the flag on the app **refuses to boot**
+unless the seed loads (`enforce_measurement_key_guard`). A signing outage can
+never silently drop signatures from an advertised surface.
+
+Generate + enable:
+
+```bash
+# 32-byte ed25519 seed, base64 (this is the whole private key):
+python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+```
+
+1. Staging: set `TRUST_MEASUREMENT_SIGNING_KEY=<seed-b64>` +
+   `TRUST_MEASUREMENT_SIGNING_ENABLED=true`. Leave `TRUST_MEASUREMENT_SIGNING_KEY_ID`
+   blank to let the kid derive as `hyr-meas-<sha256(pubkey)[:16]>` (stable per
+   key); set it only to pin a human-chosen id.
+2. Verify: `python scripts/x402_canary.py <suite> --verify-signature` — it
+   re-derives the Ed25519 pubkey from `/.well-known/jwks.json` by `kid` and
+   checks the detached signature over the received bytes; a paid 2xx that
+   advertises a signature which doesn't verify fails the run.
+3. Prod flip is a normal Vault change + deploy.
+
+### Measurement key rotation (old signatures stay verifiable)
+
+1. Generate the new seed; note its derived (or chosen) `kid`.
+2. Move the OLD public JWK into `TRUST_MEASUREMENT_RETIRED_JWKS_JSON` (JSON
+   list; append, never remove — mirrors the receipt-key discipline). Copy the
+   OKP entry the running JWKS currently serves for the active key.
+3. Swap `TRUST_MEASUREMENT_SIGNING_KEY` (and `_KEY_ID` if pinned) to the new
+   seed and deploy. JWKS now serves new-active + old-retired; signatures made
+   before the swap still verify by their `kid`.
 
 ## ERC-8004 registration ceremony
 

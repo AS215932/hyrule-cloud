@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 if TYPE_CHECKING:
     from hyrule_cloud.config import TrustConfig
+    from hyrule_cloud.trust.measurements import MeasurementSigner
     from hyrule_cloud.trust.receipts import ReceiptSigningKeys
 
 log = structlog.get_logger()
@@ -61,13 +62,23 @@ def _retired_jwks(retired_json: str) -> list[dict[str, Any]]:
     return [entry for entry in entries if isinstance(entry, dict)]
 
 
-def build_jwks(keys: ReceiptSigningKeys | None, config: TrustConfig) -> dict[str, Any]:
-    """Active signing key first, then retired keys (old receipts stay
-    verifiable after rotation)."""
+def build_jwks(
+    keys: ReceiptSigningKeys | None,
+    config: TrustConfig,
+    measurement_signer: MeasurementSigner | None = None,
+) -> dict[str, Any]:
+    """Receipt keys first (active then retired), then measurement keys (active
+    then retired). One JWKS verifies both receipt JWS (ES256) and measurement
+    signatures (EdDSA); old keys stay so pre-rotation artifacts verify."""
+    from hyrule_cloud.trust.measurements import measurement_jwks_entries
+
     entries: list[dict[str, Any]] = []
     if keys is not None:
         entries.append(es256_public_jwk(keys.es256_pem, keys.kid))
     entries.extend(_retired_jwks(config.receipt_retired_jwks_json))
+    entries.extend(
+        measurement_jwks_entries(measurement_signer, config.measurement_retired_jwks_json)
+    )
     return {"keys": entries}
 
 
@@ -137,5 +148,14 @@ def build_agent_registration(
             "profile": "x402-compute-fulfillment-receipt/0.1",
             "jwks": f"{base}/.well-known/jwks.json",
             "receiptSigners": [keys.evm_signer] if keys is not None else [],
+        }
+    if config.measurement_signing_enabled:
+        # Signed measurements attest the DATA (receipts attest the transaction):
+        # an ed25519 detached signature over each paid 2xx JSON body.
+        document["signedMeasurements"] = {
+            "algorithm": "ed25519",
+            "signatureHeader": "Hyrule-Signature",
+            "keyIdHeader": "Hyrule-Signature-Key",
+            "jwks": f"{base}/.well-known/jwks.json",
         }
     return document

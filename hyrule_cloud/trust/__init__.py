@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from hyrule_cloud.trust.measurements import MeasurementSigner, load_measurement_signer
 from hyrule_cloud.trust.principal import AgentPrincipalResolver
 from hyrule_cloud.trust.receipts import ReceiptService, load_signing_keys
 from hyrule_cloud.trust.x401 import X401Service
@@ -31,6 +32,8 @@ class TrustServices:
     x401: X401Service | None = None
     # RFC 9421 → did:web caller binding; present only in observe mode.
     principal: AgentPrincipalResolver | None = None
+    # ed25519 response-body signer; present only when measurement signing is on.
+    measurements: MeasurementSigner | None = None
 
 
 def _api_version() -> str:
@@ -73,4 +76,7 @@ def build_trust_services(
         principal = AgentPrincipalResolver(
             config.trust, public_base_url=config.public_base_url
         )
-    return TrustServices(receipts=receipts, x401=x401, principal=principal)
+    measurements = load_measurement_signer(config.trust)
+    return TrustServices(
+        receipts=receipts, x401=x401, principal=principal, measurements=measurements
+    )
