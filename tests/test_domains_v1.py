@@ -613,6 +613,87 @@ async def test_ambiguous_registration_is_reconciled_without_refund(domain_servic
 
 
 @pytest.mark.asyncio
+async def test_failed_unregistered_domain_row_is_rebound_to_later_order(domain_service):
+    service, provider, sessions = domain_service
+    first_quote = await service.create_quote(
+        "retry-registration.dev",
+        DomainAction.REGISTER,
+        "H1234567890",
+    )
+    first_order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=first_quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="retry-registration-first",
+    )
+    await service.mark_x402_paid(
+        first_order.order_id,
+        payer="0x" + "1" * 40,
+        tx_hash="0xretry-first",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+    async with sessions() as session:
+        stored_order = await session.get(DomainOrderRow, first_order.order_id)
+        stored_quote = await session.get(DomainQuoteRow, first_quote.quote_id)
+    assert stored_order is not None and stored_quote is not None
+    reserved = await service._reserve_registration_domain(
+        stored_order,
+        stored_quote,
+        "retry-registration",
+        "dev",
+    )
+    assert reserved is not None
+    await service._fail_paid_order(
+        first_order.order_id,
+        "price_increased",
+        "The registrar price increased after payment.",
+    )
+
+    second_quote = await service.create_quote(
+        "retry-registration.dev",
+        DomainAction.REGISTER,
+        "H1234567890",
+    )
+    second_order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=second_quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="retry-registration-second",
+    )
+    await service.mark_x402_paid(
+        second_order.order_id,
+        payer="0x" + "2" * 40,
+        tx_hash="0xretry-second",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+
+    await service._fulfill_registration(second_order.order_id)
+
+    async with sessions() as session:
+        domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "retry-registration.dev")
+            )
+        ).scalar_one()
+        first = await session.get(DomainOrderRow, first_order.order_id)
+        second = await session.get(DomainOrderRow, second_order.order_id)
+    assert domain.client_order_id == second_order.order_id
+    assert domain.openprovider_id == 1234
+    assert str(domain.status) == "active"
+    assert first is not None and first.status == "refund_due"
+    assert second is not None and second.status == "active"
+    assert provider.registrations == ["retry-registration.dev"]
+
+
+@pytest.mark.asyncio
 async def test_terminal_fulfillment_failure_updates_order_operation(domain_service):
     service, _provider, sessions = domain_service
     quote = await service.create_quote("renew-failure.dev", DomainAction.REGISTER, "H1234567890")
@@ -1222,6 +1303,9 @@ async def test_partial_bundle_refund_commits_atomically_with_terminal_job(
         payment_asset="USDC",
     )
     async with sessions() as session:
+        stored_order = await session.get(DomainOrderRow, order.order_id)
+        assert stored_order is not None
+        stored_order.vm_id = "vm_orphaned_bundle_claim"
         session.add(
             DomainRow(
                 name="partial-refund",
@@ -1235,6 +1319,7 @@ async def test_partial_bundle_refund_commits_atomically_with_terminal_job(
                 nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
                 dnssec_mode="managed",
                 dnssec_status="active",
+                vm_id="vm_orphaned_bundle_claim",
             )
         )
         job = (
@@ -1260,6 +1345,9 @@ async def test_partial_bundle_refund_commits_atomically_with_terminal_job(
     async with sessions() as session:
         rolled_back_job = await session.get(DomainJobRow, job_id)
         rolled_back_order = await session.get(DomainOrderRow, order.order_id)
+        rolled_back_domain = (
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
+        ).scalar_one()
         refund_events = list(
             await session.scalars(
                 select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
@@ -1267,6 +1355,7 @@ async def test_partial_bundle_refund_commits_atomically_with_terminal_job(
         )
     assert rolled_back_job is not None and rolled_back_job.status == "running"
     assert rolled_back_order is not None and rolled_back_order.status == "queued"
+    assert rolled_back_domain.vm_id == "vm_orphaned_bundle_claim"
     assert refund_events == []
 
     monkeypatch.setattr(refunds, "build_owed_event", original_builder)
@@ -1274,6 +1363,9 @@ async def test_partial_bundle_refund_commits_atomically_with_terminal_job(
     async with sessions() as session:
         failed_job = await session.get(DomainJobRow, job_id)
         active_order = await session.get(DomainOrderRow, order.order_id)
+        active_domain = (
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
+        ).scalar_one()
         refund_event = (
             await session.execute(
                 select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
@@ -1281,6 +1373,7 @@ async def test_partial_bundle_refund_commits_atomically_with_terminal_job(
         ).scalar_one()
     assert failed_job is not None and failed_job.status == "failed"
     assert active_order is not None and active_order.status == "active"
+    assert active_domain.vm_id is None
     assert refund_event.amount_usd == Decimal("5")
     assert refund_event.extra["order_id"] == order.order_id
 

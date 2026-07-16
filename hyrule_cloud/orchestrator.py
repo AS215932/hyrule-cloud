@@ -20,7 +20,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import CryptoIntentRow, DomainRow, PaymentEventRow, VMQuoteRow, VMRow
+from hyrule_cloud.db import (
+    CryptoIntentRow,
+    DomainOrderRow,
+    DomainRow,
+    PaymentEventRow,
+    VMQuoteRow,
+    VMRow,
+)
 from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
@@ -839,7 +846,26 @@ class Orchestrator:
                     .limit(1)
                 )
             ).scalar_one_or_none() is not None
+            order_changed = False
+            if intent.resource_type == "domain_order" and intent.resource_id:
+                order = await session.get(DomainOrderRow, intent.resource_id)
+                if order is not None and order.status == "awaiting_payment":
+                    # Keep the customer-facing resource consistent with the
+                    # intent and refund obligation in this same transaction. A
+                    # failed settlement handoff must not leave an unpayable
+                    # order appearing to wait forever for payment.
+                    order.status = "refund_due"
+                    order.paid_at = intent.paid_at or _now()
+                    order.payer = intent.intent_id
+                    order.payment_tx = intent.tx_hash
+                    order.payment_network = "native"
+                    order.payment_asset = intent.asset
+                    order.error_code = reason[:64]
+                    order.error_detail = "Native payment settled, but fulfillment handoff failed."
+                    order_changed = True
             if intent.status == CryptoIntentStatus.REFUND_MANUAL and already_owed:
+                if order_changed:
+                    await session.commit()
                 return False  # fully recorded — don't double-owe
             # payer is the intent_id (a bounded reference the operator resolves to
             # the REFUND_MANUAL intent) — NOT the deposit address, which for XMR

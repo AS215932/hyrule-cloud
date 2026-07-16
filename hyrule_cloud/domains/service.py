@@ -1824,6 +1824,42 @@ class DomainService:
                     select(DomainRow).where(DomainRow.fqdn == order.fqdn).with_for_update()
                 )
             ).scalar_one_or_none()
+            if (
+                domain is not None
+                and domain.openprovider_id is None
+                and str(domain.status) == DomainStatus.FAILED.value
+            ):
+                # A registrar submission never succeeded, so the failed row is
+                # only a stale local reservation. Rebind it to this paid order
+                # instead of making the name permanently unpurchasable.
+                domain.name = name
+                domain.extension = extension
+                domain.owner_wallet = order.payer or order.order_id
+                domain.owner_account_id = order.owner_account_id
+                domain.status = DomainStatus.REGISTERING
+                domain.client_order_id = order.order_id
+                domain.registrar_price = quote.provider_cost
+                domain.markup = quote.hyrule_fee_usd
+                domain.total_price = quote.total_usd
+                domain.currency = "USD"
+                domain.error = None
+                domain.provider_status = None
+                domain.provider_operation_id = None
+                domain.payment_tx = order.payment_tx
+                domain.expires_at = None
+                domain.vm_id = None
+                domain.vm_ipv6 = None
+                domain.nameserver_mode = NameserverMode.MANAGED.value
+                domain.nameservers = self.domain_config.managed_nameservers
+                domain.dnssec_mode = DNSSECMode.MANAGED.value
+                domain.dnssec_status = "pending"
+                domain.ds_records = []
+                domain.zone_revision = 1
+                domain.can_renew = False
+                domain.transferred_at = None
+                domain.registered_at = _now()
+                await session.commit()
+                await session.refresh(domain)
             if domain is None:
                 domain = DomainRow(
                     name=name,
@@ -2654,6 +2690,26 @@ class DomainService:
                         order.status = DomainOrderStatus.ACTIVE.value
                         order.error_code = "bundle_vm_failed"
                         order.error_detail = str(exc)[:1000]
+                        if (
+                            order.vm_id
+                            and domain.vm_id == order.vm_id
+                            and domain.vm_ipv6 is None
+                        ):
+                            bundle_vm = await session.get(VMRow, order.vm_id)
+                            if bundle_vm is None or str(bundle_vm.status) in {
+                                VMStatus.PROVISIONING.value,
+                                VMStatus.FAILED.value,
+                            }:
+                                # No provisioned VM owns this attachment. Clear
+                                # the planned claim atomically with the terminal
+                                # partial-refund state so later custom checkouts
+                                # can use the delivered domain.
+                                domain.vm_id = None
+                                if bundle_vm is not None:
+                                    bundle_vm.status = VMStatus.FAILED
+                                    bundle_vm.error = str(exc)[:1000]
+                                    bundle_vm.ipv6_prefix_index = None
+                                    bundle_vm.ipv6_prefix = None
                         if Decimal(order.vm_amount_usd) > 0:
                             # The terminal job/order state and the partial refund
                             # obligation are one atomic commit. If ledger event
