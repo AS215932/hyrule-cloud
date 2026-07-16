@@ -376,6 +376,89 @@ async def test_paid_order_is_idempotent_and_fulfills_through_outbox(domain_servi
 
 
 @pytest.mark.asyncio
+async def test_pending_registration_schedules_prompt_reconciliation(domain_service):
+    service, provider, sessions = domain_service
+    provider.register_domain = AsyncMock(
+        return_value={
+            "id": 1234,
+            "status": "PEN",
+            "expiration_date": "2027-07-15T00:00:00Z",
+        }
+    )
+    provider.get_domain = AsyncMock(
+        side_effect=[
+            {
+                "id": 1234,
+                "status": "PEN",
+                "expiration_date": "2027-07-15T00:00:00Z",
+            },
+            {
+                "id": 1234,
+                "status": "ACT",
+                "expiration_date": "2027-07-15T00:00:00Z",
+            },
+        ]
+    )
+    quote = await service.create_quote(
+        "pending-registration.dev", DomainAction.REGISTER, "H1234567890"
+    )
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="pending-registration",
+    )
+    await service.mark_x402_paid(
+        order.order_id,
+        payer="0x" + "1" * 40,
+        tx_hash="0xpending-registration",
+    )
+
+    assert await service.process_jobs(worker_id="test") == 1
+    async with sessions() as session:
+        pending_order = await session.get(DomainOrderRow, order.order_id)
+        reconcile = (
+            await session.execute(
+                select(DomainJobRow).where(
+                    DomainJobRow.dedupe_key == f"provider-pending:{order.order_id}"
+                )
+            )
+        ).scalar_one()
+    assert pending_order is not None and pending_order.status == "provider_pending"
+    assert reconcile.status == "queued"
+    assert reconcile.available_at.replace(tzinfo=UTC) > datetime.now(UTC)
+
+    async with sessions() as session:
+        reconcile = await session.get(DomainJobRow, reconcile.job_id)
+        assert reconcile is not None
+        reconcile.available_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+    async with sessions() as session:
+        retry = await session.get(DomainJobRow, reconcile.job_id)
+    assert retry is not None and retry.status == "queued" and retry.attempts == 1
+
+    async with sessions() as session:
+        retry = await session.get(DomainJobRow, reconcile.job_id)
+        assert retry is not None
+        retry.available_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+    async with sessions() as session:
+        active_order = await session.get(DomainOrderRow, order.order_id)
+        active_domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "pending-registration.dev")
+            )
+        ).scalar_one()
+    assert active_order is not None and active_order.status == "active"
+    assert str(active_domain.status) == "active"
+
+
+@pytest.mark.asyncio
 async def test_domain_quote_is_reserved_before_payment(domain_service):
     service, _provider, sessions = domain_service
     quote = await service.create_quote("single-order.dev", DomainAction.REGISTER, "H1234567890")
@@ -492,6 +575,26 @@ async def test_openprovider_renew_payload_includes_domain_identity() -> None:
 async def test_renewal_service_passes_domain_identity_to_registrar(domain_service):
     service, provider, sessions = domain_service
     now = datetime.now(UTC)
+    old_expiry = now + timedelta(days=20)
+    renewed_expiry = now + timedelta(days=385)
+    provider.get_domain = AsyncMock(
+        side_effect=[
+            {"id": 123456, "status": "ACT", "expiration_date": old_expiry.isoformat()},
+            {"id": 123456, "status": "PEN", "expiration_date": old_expiry.isoformat()},
+            {
+                "id": 123456,
+                "status": "ACT",
+                "expiration_date": renewed_expiry.isoformat(),
+            },
+        ]
+    )
+    provider.renew_domain = AsyncMock(
+        return_value={
+            "id": 123456,
+            "status": "PEN",
+            "expiration_date": old_expiry.isoformat(),
+        }
+    )
     async with sessions() as session:
         session.add_all(
             [
@@ -525,7 +628,7 @@ async def test_renewal_service_passes_domain_identity_to_registrar(domain_servic
                     nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
                     dnssec_mode="managed",
                     dnssec_status="active",
-                    expires_at=now + timedelta(days=20),
+                    expires_at=old_expiry,
                     can_renew=True,
                 ),
                 DomainOrderRow(
@@ -550,7 +653,54 @@ async def test_renewal_service_passes_domain_identity_to_registrar(domain_servic
 
     await service._fulfill_renewal("do_renew_payload")
 
-    assert provider.renewals == [(123456, "renew-payload", "dev", 1)]
+    provider.renew_domain.assert_awaited_once_with(
+        123456,
+        name="renew-payload",
+        extension="dev",
+        period=1,
+    )
+    async with sessions() as session:
+        pending_order = await session.get(DomainOrderRow, "do_renew_payload")
+        reconcile = (
+            await session.execute(
+                select(DomainJobRow).where(
+                    DomainJobRow.dedupe_key == "provider-pending:do_renew_payload"
+                )
+            )
+        ).scalar_one()
+    assert pending_order is not None and pending_order.status == "provider_pending"
+    assert reconcile.status == "queued"
+    assert reconcile.available_at.replace(tzinfo=UTC) > datetime.now(UTC)
+
+    async with sessions() as session:
+        reconcile = await session.get(DomainJobRow, reconcile.job_id)
+        assert reconcile is not None
+        reconcile.available_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+    async with sessions() as session:
+        retry = await session.get(DomainJobRow, reconcile.job_id)
+        order_after_pending_poll = await session.get(DomainOrderRow, "do_renew_payload")
+    assert retry is not None and retry.status == "queued" and retry.attempts == 1
+    assert order_after_pending_poll is not None
+    assert order_after_pending_poll.provider_response is not None
+    assert "_hyrule_renewal_baseline" in order_after_pending_poll.provider_response
+
+    async with sessions() as session:
+        retry = await session.get(DomainJobRow, reconcile.job_id)
+        assert retry is not None
+        retry.available_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+    async with sessions() as session:
+        active_order = await session.get(DomainOrderRow, "do_renew_payload")
+        renewed_domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "renew-payload.dev")
+            )
+        ).scalar_one()
+    assert active_order is not None and active_order.status == "active"
+    assert renewed_domain.expires_at.replace(tzinfo=UTC) == renewed_expiry
 
 
 @pytest.mark.asyncio

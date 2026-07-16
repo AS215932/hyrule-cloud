@@ -1604,7 +1604,7 @@ class DomainService:
         elif job.kind == "transfer_out":
             await self._transfer_out(job.resource_id)
         elif job.kind == "reconcile_domain":
-            await self._reconcile_domain(job.resource_id)
+            await self._reconcile_domain(job.resource_id, retry_pending=True)
         elif job.kind == "attach_vm":
             payload = job.payload or {}
             await self.attach_vm(
@@ -1785,6 +1785,18 @@ class DomainService:
                     DomainOrderStatus.SUBMITTING.value
                     if active
                     else DomainOrderStatus.PROVIDER_PENDING.value
+                )
+            if not active:
+                self._add_job(
+                    session,
+                    kind="reconcile_domain",
+                    resource_id=fqdn,
+                    dedupe_key=f"provider-pending:{order_id}",
+                    payload={"order_id": order_id},
+                    available_at=_now()
+                    + timedelta(
+                        seconds=self.domain_config.provider_reconcile_delay_seconds
+                    ),
                 )
             operation = await session.get(DomainOperationRow, order.operation_id)
             if operation is not None:
@@ -2022,6 +2034,18 @@ class DomainService:
                     DomainOrderStatus.ACTIVE.value
                     if active
                     else DomainOrderStatus.PROVIDER_PENDING.value
+                )
+            if not active:
+                self._add_job(
+                    session,
+                    kind="reconcile_domain",
+                    resource_id=domain.fqdn,
+                    dedupe_key=f"provider-pending:{order_id}",
+                    payload={"order_id": order_id},
+                    available_at=_now()
+                    + timedelta(
+                        seconds=self.domain_config.provider_reconcile_delay_seconds
+                    ),
                 )
             if operation is not None:
                 operation.status = (
@@ -2262,7 +2286,7 @@ class DomainService:
                 op.result_payload = {"unlocked": True, "authcode_available": True}
             await session.commit()
 
-    async def _reconcile_domain(self, fqdn: str) -> None:
+    async def _reconcile_domain(self, fqdn: str, *, retry_pending: bool = False) -> None:
         async with self.db() as session:
             domain = (
                 await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
@@ -2338,14 +2362,35 @@ class DomainService:
             if order is not None:
                 order.provider_domain_id = provider_id
                 order.provider_status = status
-                order.provider_response = jsonable_encoder(result)
+                response_payload = jsonable_encoder(result)
+                if order.action == DomainAction.RENEW.value and isinstance(
+                    response_payload, dict
+                ):
+                    baseline = (order.provider_response or {}).get(
+                        "_hyrule_renewal_baseline"
+                    )
+                    if baseline is not None:
+                        response_payload["_hyrule_renewal_baseline"] = baseline
+                order.provider_response = response_payload
                 if not active:
                     order.status = DomainOrderStatus.PROVIDER_PENDING.value
-                    operation = await session.get(DomainOperationRow, order.operation_id)
+                    operation = (
+                        await session.get(DomainOperationRow, order.operation_id)
+                        if order.operation_id
+                        else None
+                    )
                     if operation is not None:
                         operation.status = DomainOperationStatus.WAITING_PROVIDER.value
             await session.commit()
-        if transferred or expired or not active:
+        if transferred or expired:
+            return
+        if not active:
+            if retry_pending and order is not None:
+                raise OpenproviderUnavailableError(
+                    "domain_reconciliation_pending",
+                    "The registrar still reports the domain operation as pending",
+                    retryable=True,
+                )
             return
         if str(domain.status) == DomainStatus.TRANSFER_PENDING.value:
             return
@@ -2355,6 +2400,12 @@ class DomainService:
             )
             result_expiry = _provider_expiry(result)
             if baseline is not None and (result_expiry is None or result_expiry <= baseline):
+                if retry_pending:
+                    raise OpenproviderUnavailableError(
+                        "renewal_reconciliation_pending",
+                        "The registrar has not exposed the renewed expiry yet",
+                        retryable=True,
+                    )
                 return
         if domain.nameserver_mode == NameserverMode.MANAGED.value:
             await self._ensure_managed_zone(fqdn, provider_id)
@@ -2765,6 +2816,7 @@ class DomainService:
         resource_id: str,
         dedupe_key: str,
         payload: dict[str, Any],
+        available_at: datetime | None = None,
     ) -> None:
         session.add(
             DomainJobRow(
@@ -2774,7 +2826,7 @@ class DomainService:
                 dedupe_key=dedupe_key[:160],
                 payload=payload,
                 status="queued",
-                available_at=_now(),
+                available_at=available_at or _now(),
             )
         )
 
