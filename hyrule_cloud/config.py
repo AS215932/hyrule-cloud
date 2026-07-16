@@ -203,6 +203,18 @@ class DomainConfig(BaseSettings):
     transfer_authcode_ttl_seconds: int = Field(default=900, ge=60, le=3600)
 
 
+class GlobalpingConfig(BaseSettings):
+    """Distributed HTTP-probe provider used by the web diagnostics product."""
+
+    model_config = SettingsConfigDict(env_prefix="GLOBALPING_", env_file=".env", extra="ignore")
+
+    enabled: bool = True
+    api_url: str = "https://api.globalping.io"
+    token: str = ""
+    poll_interval_seconds: float = Field(default=0.5, ge=0.5, le=2.0)
+    request_timeout_seconds: float = Field(default=15.0, ge=3.0, le=60.0)
+
+
 class PaymentConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PAYMENT_", env_file=".env", extra="ignore")
 
@@ -245,7 +257,7 @@ class PaymentConfig(BaseSettings):
     price_vm_md: Decimal = Decimal("0.20")
     price_vm_lg: Decimal = Decimal("0.40")
     price_domain_markup: Decimal = Decimal("1.00")
-    
+
     price_proxy_direct: Decimal = Decimal("0.01")
     price_proxy_tor: Decimal = Decimal("0.05")
     price_proxy_i2p: Decimal = Decimal("0.05")
@@ -334,9 +346,7 @@ class HyruleConfig(BaseSettings):
     max_paid_active_vms: int = 0
     max_duration_days: int = 365
     max_ports: int = 10
-    blocked_ports: list[int] = Field(
-        default_factory=lambda: [25, 465, 587]
-    )
+    blocked_ports: list[int] = Field(default_factory=lambda: [25, 465, 587])
 
     # Cloud-init template directory
     templates_dir: Path = Path("templates")
@@ -375,4 +385,5 @@ class HyruleConfig(BaseSettings):
     xcpng: XCPNGConfig = Field(default_factory=XCPNGConfig)
     openprovider: OpenproviderConfig = Field(default_factory=OpenproviderConfig)
     domain: DomainConfig = Field(default_factory=DomainConfig)
+    globalping: GlobalpingConfig = Field(default_factory=GlobalpingConfig)
     payment: PaymentConfig = Field(default_factory=PaymentConfig)

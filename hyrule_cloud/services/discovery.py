@@ -45,8 +45,7 @@ class PriceSpec:
 
     def values(self, payment: PaymentConfig) -> tuple[Decimal, ...]:
         return tuple(
-            Decimal(str(getattr(payment, field, default)))
-            for field, default in self.fields
+            Decimal(str(getattr(payment, field, default))) for field, default in self.fields
         )
 
     def minimum(self, payment: PaymentConfig) -> Decimal:
@@ -359,13 +358,70 @@ def _diagnostic_output(
             "normalized": target,
             "type": target_type,
         },
-        "findings": [
-            {"severity": "ok", "code": "example", "message": "No issue found"}
-        ],
+        "findings": [{"severity": "ok", "code": "example", "message": "No issue found"}],
         "sources": {},
         "partial": False,
         "generated_at": _GENERATED_AT,
     }
+
+
+_WEB_CHECK_OUTPUT = {
+    **_diagnostic_output(
+        "https://example.com",
+        "url",
+        "example.com is up across 4 observed vantages",
+    ),
+    "availability": {
+        "status": "up",
+        "is_down": False,
+        "total_vantages": 4,
+        "responding_vantages": 4,
+        "degraded_vantages": 0,
+        "failed_vantages": 0,
+        "down_ratio": 0.0,
+    },
+    "vantage_results": [
+        {
+            "vantage": "globalping:US:New York:AS64500",
+            "provider": "globalping",
+            "location": {
+                "city": "New York",
+                "country": "US",
+                "continent": "NA",
+                "asn": 64500,
+                "network": "Example Network",
+            },
+            "status": "up",
+            "status_code": 200,
+            "resolved_address": "93.184.216.34",
+            "latency_ms": 87,
+            "timings_ms": {
+                "dns": 12,
+                "tcp": 20,
+                "tls": 25,
+                "firstByte": 29,
+                "total": 87,
+            },
+            "final_url": "https://example.com",
+            "headers": {"server": "example", "content-type": "text/html"},
+            "tls": {
+                "authorized": True,
+                "protocol": "TLSv1.3",
+                "cipher": "TLS_AES_256_GCM_SHA384",
+                "subject": {"CN": "example.com"},
+                "issuer": {"O": "Example CA"},
+            },
+        }
+    ],
+    "root_cause": {
+        "code": "healthy",
+        "scope": "none",
+        "confidence": "high",
+        "summary": "The site responded successfully from every conclusive vantage.",
+        "evidence": ["4 up, 0 degraded, 0 down across 4 conclusive vantage(s)"],
+        "recommendations": [],
+    },
+}
 
 
 _BGP_LOOKUP_OUTPUT = {
@@ -636,18 +692,16 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
     ),
     _body_operation(
         "/v1/web/check",
-        "Paid web reachability, HTTP/HTTPS, TLS certificate, security headers, and CDN/WAF diagnostic check",
+        "Paid multi-point site availability check with latency, redirect chain, TLS certificate, server headers, and deterministic outage root-cause analysis",
         _fixed("price_web_check", "0.005"),
         models.WebCheckRequest,
         {
             "target": "https://example.com",
-            "checks": ["dns", "http", "tls", "cert", "headers", "cdn_waf"],
-            "vantages": ["extmon"],
-            "timeout_ms": 10000,
-            "include_raw": False,
+            "vantages": ["extmon", "globalping"],
+            "locations": ["Western Europe", "Northern America", "Eastern Asia"],
         },
-        models.DiagnosticResponse,
-        _diagnostic_output("https://example.com", "url", "Web diagnostic completed"),
+        models.WebCheckResponse,
+        _WEB_CHECK_OUTPUT,
     ),
     _body_operation(
         "/v1/web/tls/deep",
@@ -1058,9 +1112,7 @@ def _annotate_operation(
             }
         },
         "content": {
-            "application/json": {
-                "schema": {"$ref": "#/components/schemas/X402PaymentRequired"}
-            }
+            "application/json": {"schema": {"$ref": "#/components/schemas/X402PaymentRequired"}}
         },
     }
 
@@ -1113,9 +1165,9 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
         "payment signature. Routes omitted from this document are not part of "
         "the agent launch catalog."
     )
-    schema.setdefault("components", {}).setdefault("schemas", {})[
-        "X402PaymentRequired"
-    ] = _PAYMENT_REQUIRED_SCHEMA
+    schema.setdefault("components", {}).setdefault("schemas", {})["X402PaymentRequired"] = (
+        _PAYMENT_REQUIRED_SCHEMA
+    )
 
     for operation in enabled:
         _annotate_operation(schema, operation, config.payment)
@@ -1123,7 +1175,16 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
     # Be exact even if a future APIRoute gains more than one method.
     for path, path_item in list(schema.get("paths", {}).items()):
         for method in list(path_item):
-            if method.upper() in {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"}:
+            if method.upper() in {
+                "GET",
+                "POST",
+                "PUT",
+                "DELETE",
+                "PATCH",
+                "HEAD",
+                "OPTIONS",
+                "TRACE",
+            }:
                 if (method.upper(), path) not in enabled_keys:
                     del path_item[method]
         if not any((method.upper(), path) in enabled_keys for method in path_item):

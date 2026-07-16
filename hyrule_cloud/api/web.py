@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request, Response
 
 from hyrule_cloud.api._contract import (
+    config_from_request,
     diagnostic_quote,
     not_implemented,
     payment_price,
@@ -18,6 +19,7 @@ from hyrule_cloud.models import (
     ProductCapabilityResponse,
     WebCheck,
     WebCheckRequest,
+    WebCheckResponse,
     WebPricingResponse,
     WebReportRequest,
     WebTLSDeepRequest,
@@ -31,24 +33,72 @@ router = APIRouter(prefix="/v1/web", tags=["Web reachability"])
 async def get_web_capabilities() -> ProductCapabilityResponse:
     return ProductCapabilityResponse(
         service="web",
-        purpose="Paid web reachability, HTTP/HTTPS, TLS certificate, security header, CDN/WAF, and site-down evidence packs for AI-agent support workflows.",
+        purpose="Paid multi-point web reachability, latency, redirects, TLS certificate, server-header, CDN/WAF, and deterministic outage root-cause evidence for AI-agent support workflows.",
         separation_of_concerns="/v1/web diagnoses public web endpoints; /v1/dns diagnoses DNS records; /v1/ports performs single declared service reachability checks.",
         free_endpoints=[
-            CapabilityEndpoint(path="/v1/web/capabilities", method="GET", description="Web diagnostic capabilities"),
-            CapabilityEndpoint(path="/v1/web/pricing", method="GET", description="Web diagnostic pricing"),
-            CapabilityEndpoint(path="/v1/web/check/quote", method="POST", description="Quote a web diagnostic check"),
-            CapabilityEndpoint(path="/v1/web/tls/deep/quote", method="POST", description="Quote a deep TLS protocol/certificate/cipher scan"),
+            CapabilityEndpoint(
+                path="/v1/web/capabilities", method="GET", description="Web diagnostic capabilities"
+            ),
+            CapabilityEndpoint(
+                path="/v1/web/pricing", method="GET", description="Web diagnostic pricing"
+            ),
+            CapabilityEndpoint(
+                path="/v1/web/check/quote",
+                method="POST",
+                description="Quote a web diagnostic check",
+            ),
+            CapabilityEndpoint(
+                path="/v1/web/tls/deep/quote",
+                method="POST",
+                description="Quote a deep TLS protocol/certificate/cipher scan",
+            ),
         ],
         paid_endpoints=[
-            CapabilityEndpoint(path="/v1/web/check", method="POST", paid=True, description="Run a synchronous web diagnostic check"),
-            CapabilityEndpoint(path="/v1/web/http", method="GET", paid=True, description="HTTP reachability check"),
-            CapabilityEndpoint(path="/v1/web/https", method="GET", paid=True, description="HTTPS/TLS reachability check"),
-            CapabilityEndpoint(path="/v1/web/tls", method="GET", paid=True, description="TLS handshake and certificate check"),
-            CapabilityEndpoint(path="/v1/web/cert", method="GET", paid=True, description="Certificate-focused check"),
-            CapabilityEndpoint(path="/v1/web/headers", method="GET", paid=True, description="Security header check"),
-            CapabilityEndpoint(path="/v1/web/cdn", method="GET", paid=True, description="CDN/WAF response hint check"),
-            CapabilityEndpoint(path="/v1/web/down", method="GET", paid=True, description="Site-down evidence check"),
-            CapabilityEndpoint(path="/v1/web/tls/deep", method="POST", paid=True, description="Run Hyrule-native deep TLS scan (synchronous)"),
+            CapabilityEndpoint(
+                path="/v1/web/check",
+                method="POST",
+                paid=True,
+                description="Run a synchronous local-plus-global web diagnostic and root-cause analysis",
+            ),
+            CapabilityEndpoint(
+                path="/v1/web/http", method="GET", paid=True, description="HTTP reachability check"
+            ),
+            CapabilityEndpoint(
+                path="/v1/web/https",
+                method="GET",
+                paid=True,
+                description="HTTPS/TLS reachability check",
+            ),
+            CapabilityEndpoint(
+                path="/v1/web/tls",
+                method="GET",
+                paid=True,
+                description="TLS handshake and certificate check",
+            ),
+            CapabilityEndpoint(
+                path="/v1/web/cert",
+                method="GET",
+                paid=True,
+                description="Certificate-focused check",
+            ),
+            CapabilityEndpoint(
+                path="/v1/web/headers", method="GET", paid=True, description="Security header check"
+            ),
+            CapabilityEndpoint(
+                path="/v1/web/cdn",
+                method="GET",
+                paid=True,
+                description="CDN/WAF response hint check",
+            ),
+            CapabilityEndpoint(
+                path="/v1/web/down", method="GET", paid=True, description="Site-down evidence check"
+            ),
+            CapabilityEndpoint(
+                path="/v1/web/tls/deep",
+                method="POST",
+                paid=True,
+                description="Run Hyrule-native deep TLS scan (synchronous)",
+            ),
         ],
     )
 
@@ -63,7 +113,13 @@ async def get_web_pricing(request: Request) -> WebPricingResponse:
 
 @router.post("/check/quote", response_model=PaidEndpointQuote)
 async def quote_web_check(request: Request, body: WebCheckRequest) -> PaidEndpointQuote:
-    return diagnostic_quote(request, price_attr="price_web_check", default="0.005", name="web_check", paid_endpoint="/v1/web/check")
+    return diagnostic_quote(
+        request,
+        price_attr="price_web_check",
+        default="0.005",
+        name="web_check",
+        paid_endpoint="/v1/web/check",
+    )
 
 
 @router.post("/reports/quote", response_model=PaidEndpointQuote)
@@ -75,60 +131,113 @@ async def quote_web_report(request: Request, body: WebReportRequest) -> Response
 
 @router.post("/tls/deep/quote", response_model=PaidEndpointQuote)
 async def quote_web_tls_deep(request: Request, body: WebTLSDeepRequest) -> PaidEndpointQuote:
-    return diagnostic_quote(request, price_attr="price_web_tls_deep", default="0.10", name="web_tls_deep", paid_endpoint="/v1/web/tls/deep")
+    return diagnostic_quote(
+        request,
+        price_attr="price_web_tls_deep",
+        default="0.10",
+        name="web_tls_deep",
+        paid_endpoint="/v1/web/tls/deep",
+    )
 
 
-@router.post("/check", response_model=DiagnosticResponse)
-async def web_check(request: Request, body: WebCheckRequest) -> DiagnosticResponse | Response:
-    if payment := await require_paid_diagnostic(request, price_attr="price_web_check", default="0.005", description="Hyrule web reachability diagnostic check"):
+@router.post("/check", response_model=WebCheckResponse)
+async def web_check(request: Request, body: WebCheckRequest) -> WebCheckResponse | Response:
+    if payment := await require_paid_diagnostic(
+        request,
+        price_attr="price_web_check",
+        default="0.005",
+        description="Hyrule web reachability diagnostic check",
+    ):
         return payment
-    return await run_web_check(body)
+    return await run_web_check(
+        body,
+        globalping_config=config_from_request(request).globalping,
+    )
 
 
-@router.get("/http", response_model=DiagnosticResponse)
-async def web_http(request: Request, url: str) -> DiagnosticResponse | Response:
-    return await web_check(request, WebCheckRequest(target=url, checks=[WebCheck.DNS, WebCheck.HTTP, WebCheck.HEADERS, WebCheck.CDN_WAF]))
+@router.get("/http", response_model=WebCheckResponse)
+async def web_http(request: Request, url: str) -> WebCheckResponse | Response:
+    return await web_check(
+        request,
+        WebCheckRequest(
+            target=url, checks=[WebCheck.DNS, WebCheck.HTTP, WebCheck.HEADERS, WebCheck.CDN_WAF]
+        ),
+    )
 
 
-@router.get("/https", response_model=DiagnosticResponse)
-async def web_https(request: Request, url: str) -> DiagnosticResponse | Response:
-    return await web_check(request, WebCheckRequest(target=url, checks=[WebCheck.DNS, WebCheck.HTTPS, WebCheck.TLS, WebCheck.CERT, WebCheck.HEADERS, WebCheck.CDN_WAF]))
+@router.get("/https", response_model=WebCheckResponse)
+async def web_https(request: Request, url: str) -> WebCheckResponse | Response:
+    return await web_check(
+        request,
+        WebCheckRequest(
+            target=url,
+            checks=[
+                WebCheck.DNS,
+                WebCheck.HTTPS,
+                WebCheck.TLS,
+                WebCheck.CERT,
+                WebCheck.HEADERS,
+                WebCheck.CDN_WAF,
+            ],
+        ),
+    )
 
 
-@router.get("/tls", response_model=DiagnosticResponse)
-async def web_tls(request: Request, host: str, port: int = 443) -> DiagnosticResponse | Response:
-    return await web_check(request, WebCheckRequest(target=f"https://{host}:{port}", checks=[WebCheck.TLS, WebCheck.CERT]))
+@router.get("/tls", response_model=WebCheckResponse)
+async def web_tls(request: Request, host: str, port: int = 443) -> WebCheckResponse | Response:
+    return await web_check(
+        request,
+        WebCheckRequest(target=f"https://{host}:{port}", checks=[WebCheck.TLS, WebCheck.CERT]),
+    )
 
 
-@router.get("/cert", response_model=DiagnosticResponse)
-async def web_cert(request: Request, host: str, port: int = 443) -> DiagnosticResponse | Response:
+@router.get("/cert", response_model=WebCheckResponse)
+async def web_cert(request: Request, host: str, port: int = 443) -> WebCheckResponse | Response:
     return await web_tls(request, host, port)
 
 
-@router.get("/headers", response_model=DiagnosticResponse)
-async def web_headers(request: Request, url: str) -> DiagnosticResponse | Response:
-    return await web_check(request, WebCheckRequest(target=url, checks=[WebCheck.HTTP, WebCheck.HEADERS]))
+@router.get("/headers", response_model=WebCheckResponse)
+async def web_headers(request: Request, url: str) -> WebCheckResponse | Response:
+    return await web_check(
+        request, WebCheckRequest(target=url, checks=[WebCheck.HTTP, WebCheck.HEADERS])
+    )
 
 
-@router.get("/cdn", response_model=DiagnosticResponse)
-async def web_cdn(request: Request, host: str) -> DiagnosticResponse | Response:
-    return await web_check(request, WebCheckRequest(target=f"https://{host}", checks=[WebCheck.HTTP, WebCheck.CDN_WAF]))
+@router.get("/cdn", response_model=WebCheckResponse)
+async def web_cdn(request: Request, host: str) -> WebCheckResponse | Response:
+    return await web_check(
+        request, WebCheckRequest(target=f"https://{host}", checks=[WebCheck.HTTP, WebCheck.CDN_WAF])
+    )
 
 
-@router.get("/down", response_model=DiagnosticResponse)
-async def web_down(request: Request, url: str) -> DiagnosticResponse | Response:
-    return await web_check(request, WebCheckRequest(target=url, checks=[WebCheck.DNS, WebCheck.HTTP, WebCheck.HTTPS, WebCheck.DOWN]))
+@router.get("/down", response_model=WebCheckResponse)
+async def web_down(request: Request, url: str) -> WebCheckResponse | Response:
+    return await web_check(
+        request,
+        WebCheckRequest(
+            target=url, checks=[WebCheck.DNS, WebCheck.HTTP, WebCheck.HTTPS, WebCheck.DOWN]
+        ),
+    )
 
 
 @router.post("/reports", response_model=DiagnosticJobResponse)
-async def create_web_report(request: Request, body: WebReportRequest) -> DiagnosticJobResponse | Response:
+async def create_web_report(
+    request: Request, body: WebReportRequest
+) -> DiagnosticJobResponse | Response:
     # Async report jobs have no retrieval backend yet: refuse before charging.
     return not_implemented("web.reports.create")
 
 
 @router.post("/tls/deep", response_model=DiagnosticResponse)
-async def create_web_tls_deep(request: Request, body: WebTLSDeepRequest) -> DiagnosticResponse | Response:
-    if payment := await require_paid_diagnostic(request, price_attr="price_web_tls_deep", default="0.10", description="Hyrule deep TLS protocol/certificate/cipher scan"):
+async def create_web_tls_deep(
+    request: Request, body: WebTLSDeepRequest
+) -> DiagnosticResponse | Response:
+    if payment := await require_paid_diagnostic(
+        request,
+        price_attr="price_web_tls_deep",
+        default="0.10",
+        description="Hyrule deep TLS protocol/certificate/cipher scan",
+    ):
         return payment
     return await run_web_tls_deep(body)
 

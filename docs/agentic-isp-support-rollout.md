@@ -9,7 +9,8 @@ Hyrule exposes low-overhead x402-paid diagnostics for AI agents and ISP support
 workflows. Product namespaces wrap existing primitives rather than replacing
 UNIX-style API boundaries:
 
-- `/v1/web` wraps DNS/HTTP/TLS/header/CDN checks.
+- `/v1/web` combines the external monitor with Globalping HTTP probes and
+  returns DNS/HTTP/TLS/header/CDN, latency, redirect, and outage-cause evidence.
 - `/v1/mx` remains canonical for mail deliverability diagnostics.
 - `/v1/dns`, `/v1/rdap`, `/v1/whois` remain registry/DNS primitives.
 - `/v1/path` combines active path, BGP/RPKI, AS215932, and optional multi-vantage evidence.
@@ -24,8 +25,10 @@ UNIX-style API boundaries:
 1. Apply migrations through `011_diagnostic_job_primitives.py`.
 2. Ensure runtime env contains the new `PAYMENT_PRICE_*` knobs or relies on defaults.
 3. Keep `EXTMON` operationally independent and outside AS215932.
-4. Configure provider tokens only when provider terms permit commercial/API use.
-5. Do not enable private-target scanning in the public API.
+4. Leave `GLOBALPING_ENABLED=true` and configure `GLOBALPING_TOKEN` from the
+   deployment secret store when authenticated capacity is required.
+5. Configure provider tokens only when provider terms permit commercial/API use.
+6. Do not enable private-target scanning in the public API.
 
 ## Abuse controls
 
@@ -54,6 +57,7 @@ Watch during rollout:
 - request latency by route
 - source status fields in responses
 - extmon agent health
+- Globalping quota/availability and the ratio of partial web checks
 - BGP/RPKI source freshness
 - abuse-control rejects from active probes
 

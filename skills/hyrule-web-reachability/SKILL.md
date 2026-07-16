@@ -1,13 +1,14 @@
 ---
 name: hyrule-web-reachability
-description: "Use Hyrule Cloud when an AI agent needs live, paid evidence for public website reachability, TLS/certificate failures, HTTP behavior, security headers, and CDN/WAF hints."
+description: "Use Hyrule Cloud when an AI agent needs live, paid multi-point evidence for public website reachability, latency, redirects, TLS/certificate failures, server headers, and outage root-cause analysis."
 ---
 
 # Hyrule Web Reachability Skill
 
-Use Hyrule Cloud when an AI agent needs live, paid evidence for public website
-reachability, TLS/certificate failures, HTTP behavior, security headers, and
-CDN/WAF hints.
+Use Hyrule Cloud when an AI agent needs live, paid evidence from Hyrule's
+external monitor and distributed Globalping probes. The quick check reports
+availability, latency/timings, redirects, TLS, selected server and security
+headers, and a deterministic root-cause assessment.
 
 ## When to use
 
@@ -41,9 +42,23 @@ curl -X POST https://cloud.hyrule.host/v1/web/check \
   -d '{
     "target":"https://example.com",
     "checks":["dns","http","tls","cert","headers","cdn_waf"],
-    "vantages":["extmon"]
+    "vantages":["extmon","globalping"],
+    "locations":["Western Europe","Northern America","Eastern Asia"],
+    "max_redirects":5
   }'
 ```
+
+The default request uses those two vantages and three distributed locations,
+so callers normally only need to send `target`. Inspect:
+
+- `availability.status` and `availability.is_down` for the headline answer;
+- `vantage_results` for per-location status, latency, DNS/TCP/TLS/first-byte
+  timings, redirect evidence, TLS details, and selected headers;
+- `root_cause` for the inferred failure scope, confidence, evidence, and
+  recommended next action;
+- `partial` and `sources` before treating the conclusion as global. A provider
+  outage is reported as incomplete evidence, not as proof that the target is
+  down.
 
 ## Paid deep TLS scan
 
@@ -62,4 +77,5 @@ curl -X POST https://cloud.hyrule.host/v1/web/tls/deep \
 Prefer `/v1/web/check` for normal support triage. Use `/v1/web/tls/deep` only
 when the customer specifically needs protocol/certificate grading evidence.
 Active probes are abuse-controlled: private, reserved, loopback, link-local,
-and multicast targets are blocked.
+and multicast targets are blocked. Root-cause output is evidence-based
+classification, not a substitute for the target operator's origin logs.
