@@ -36,6 +36,7 @@ def _now() -> datetime:
 class _StubNetwork:
     key = "base"
     caip2 = "eip155:8453"
+    family = "evm"
     asset = "USDC"
     chain_id = 8453
 
@@ -131,6 +132,7 @@ async def quote_state():
     factory = async_sessionmaker(engine, expire_on_commit=False)
     orch = _StubOrchestrator(factory)
     gate = AsyncMock()
+    gate.supported_network_keys.return_value = {"base"}
 
     state = AppState(
         config=_StubCfg(),
@@ -177,6 +179,13 @@ async def test_create_quote_returns_quote(quote_state, client):
     assert body["quote_id"].startswith("q_")
     assert body["status"] == "created"
     assert body["amount_usd"] == "0.050000"  # Numeric(12,6) round-trip
+    assert body["accepted_payment_methods"]["x402"][0] == {
+        "key": "base",
+        "caip2": "eip155:8453",
+        "family": "evm",
+        "asset": "USDC",
+        "chain_id": 8453,
+    }
     assert body["accepted_payment_methods"]["evm"][0]["caip2"] == "eip155:8453"
     assert body["accepted_payment_methods"]["native"] == []  # no native rail wired
     assert body["order_payload"]["size"] == "xs"
@@ -193,17 +202,13 @@ async def test_create_quote_price_matches_compute_price(quote_state, client):
 
 @pytest.mark.asyncio
 async def test_create_quote_custom_domain_requires_domain(quote_state, client):
-    res = await client.post(
-        "/v1/vm/quote", json={"order_payload": _order(domain_mode="custom")}
-    )
+    res = await client.post("/v1/vm/quote", json={"order_payload": _order(domain_mode="custom")})
     assert res.status_code == 400
 
 
 @pytest.mark.asyncio
 async def test_create_quote_blocked_port_rejected(quote_state, client):
-    res = await client.post(
-        "/v1/vm/quote", json={"order_payload": _order(open_ports=[25])}
-    )
+    res = await client.post("/v1/vm/quote", json={"order_payload": _order(open_ports=[25])})
     assert res.status_code == 400
 
 
@@ -213,9 +218,7 @@ async def test_real_mode_quote_rejects_unsupported_os(quote_state, client, monke
 
     monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", True)
 
-    res = await client.post(
-        "/v1/vm/quote", json={"order_payload": _order(os="openbsd-7.8")}
-    )
+    res = await client.post("/v1/vm/quote", json={"order_payload": _order(os="openbsd-7.8")})
     assert res.status_code == 400
     assert "not supported" in res.text
 
@@ -235,9 +238,7 @@ async def test_quote_idempotent_same_key_same_spec_returns_existing(quote_state,
 
 @pytest.mark.asyncio
 async def test_quote_idempotent_conflict_same_key_different_spec(quote_state, client):
-    await client.post(
-        "/v1/vm/quote", json={"order_payload": _order(), "client_order_id": "cli-2"}
-    )
+    await client.post("/v1/vm/quote", json={"order_payload": _order(), "client_order_id": "cli-2"})
     conflict = await client.post(
         "/v1/vm/quote",
         json={"order_payload": _order(duration_days=30), "client_order_id": "cli-2"},

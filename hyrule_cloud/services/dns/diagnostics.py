@@ -115,4 +115,3 @@ def resolver_detect(headers: dict[str, str | None] | None = None) -> DNSDiagnost
         generated_at=datetime.now(UTC),
     )
 
-

@@ -19,6 +19,7 @@ from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
 from hyrule_cloud.services.intents import scan_pending_intents
+from hyrule_cloud.services.worker_health import record_payment_worker_heartbeat
 
 structlog.configure(
     processors=[
@@ -84,6 +85,8 @@ async def run_worker() -> None:
         while not stop.is_set():
             now = datetime.now(UTC)
             if now >= next_intents:
+                scan_succeeded = True
+                scan_error = None
                 try:
                     await scan_pending_intents(
                         session_factory=sessions,
@@ -91,8 +94,26 @@ async def run_worker() -> None:
                         rates=rates,
                         orch=orchestrator,
                     )
-                except Exception:
+                    ready_assets = set(await native.healthy_assets())
+                    missing_assets = set(config.payment.native_assets_enabled) - ready_assets
+                    if missing_assets:
+                        raise RuntimeError(
+                            "native provider readiness failed: "
+                            + ", ".join(sorted(missing_assets))
+                        )
+                except Exception as exc:
+                    scan_succeeded = False
+                    scan_error = str(exc)[:500]
                     log.exception("intent_scan_failed")
+                try:
+                    await record_payment_worker_heartbeat(
+                        sessions,
+                        worker_id=worker_id,
+                        scan_succeeded=scan_succeeded,
+                        error=scan_error,
+                    )
+                except Exception:
+                    log.exception("payment_worker_heartbeat_failed")
                 next_intents = now + timedelta(seconds=15)
             if now >= next_payment_handoffs:
                 try:

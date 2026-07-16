@@ -111,10 +111,14 @@ async def lifespan(app: FastAPI):
     await rate_provider.start()
     native_crypto = NativeCryptoProvider(config.payment)
     await native_crypto.start()
-    native_payment_assets = await native_crypto.ready_assets()
-    if config.payment.require_native and set(native_payment_assets) != {"BTC", "XMR"}:
+    ready_native_assets = await native_crypto.ready_assets()
+    enabled_native_assets = set(config.payment.native_assets_enabled)
+    native_payment_assets = [
+        asset for asset in ready_native_assets if asset in enabled_native_assets
+    ]
+    if config.payment.require_native and set(native_payment_assets) != enabled_native_assets:
         raise RuntimeError(
-            "PAYMENT_REQUIRE_NATIVE=true but BTC/XMR are not both ready "
+            "PAYMENT_REQUIRE_NATIVE=true but enabled native assets are not ready "
             f"(ready={','.join(native_payment_assets) or 'none'})"
         )
 

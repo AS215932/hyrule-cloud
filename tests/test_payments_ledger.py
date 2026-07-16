@@ -7,6 +7,8 @@ its bearer token.
 
 from __future__ import annotations
 
+import re
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -19,9 +21,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from x402.http import PAYMENT_SIGNATURE_HEADER
 
 from hyrule_cloud.app import app
-from hyrule_cloud.db import Base, PaymentEventRow, VMRow
+from hyrule_cloud.db import (
+    Base,
+    CryptoIntentRow,
+    PaymentEventRow,
+    ServiceHeartbeatRow,
+    VMRow,
+)
 from hyrule_cloud.middleware.x402 import PaymentGate
-from hyrule_cloud.models import VMSize, VMStatus
+from hyrule_cloud.models import CryptoIntentStatus, VMSize, VMStatus
 from hyrule_cloud.services.payments_ledger import PaymentLedger, service_group_for_path
 from tests.test_payment_gate_x402 import (
     PAYER,
@@ -254,6 +262,52 @@ async def test_metrics_renders_ledger_and_fleet_counters(metrics_app_state) -> N
     assert 'hyrule_vms_active{status="ready"} 1' in body
     assert 'hyrule_vm_provision_total{result="ready"} 0' in body
     assert 'hyrule_vm_provision_total{result="failed"} 0' in body
+
+
+@pytest.mark.asyncio
+async def test_metrics_exposes_worker_readiness_and_native_intent_scan_lag(
+    metrics_app_state,
+) -> None:
+    session_factory = metrics_app_state
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(
+            ServiceHeartbeatRow(
+                service_name="hyrule-cloud-worker",
+                worker_id="test-worker",
+                last_seen_at=now,
+                last_success_at=now,
+                last_error=None,
+            )
+        )
+        session.add(
+            CryptoIntentRow(
+                intent_id="intent_metrics_btc",
+                asset="BTC",
+                amount_crypto=Decimal("0.00001000"),
+                amount_usd=Decimal("1.00"),
+                address="bc1qmetrics",
+                status=CryptoIntentStatus.WAITING_PAYMENT,
+                created_at=now - timedelta(minutes=3),
+                expires_at=now + timedelta(minutes=12),
+                last_scanned_at=now - timedelta(seconds=75),
+            )
+        )
+        await session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.get("/metrics", headers={"Authorization": "Bearer scrape-token"})
+
+    assert res.status_code == 200
+    assert "hyrule_payment_worker_ready 1" in res.text
+    assert 'hyrule_native_payment_intents_pending{asset="BTC"} 1' in res.text
+    assert 'hyrule_native_payment_intents_pending{asset="XMR"} 0' in res.text
+    match = re.search(
+        r'hyrule_native_payment_intent_scan_lag_seconds\{asset="BTC"\} ([0-9.]+)',
+        res.text,
+    )
+    assert match is not None
+    assert float(match.group(1)) >= 74
 
 
 @pytest.mark.asyncio

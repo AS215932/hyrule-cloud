@@ -48,16 +48,17 @@ async def test_list_payment_networks_lists_evm_and_svm(monkeypatch):
                         "key": "base", "display_name": "Base", "family": "evm",
                         "caip2": "eip155:8453",
                         "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                        "pay_to": "0xabc",
                         "token_decimals": 6,
                     },
                     {
                         "key": "solana", "display_name": "Solana", "family": "svm",
                         "caip2": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
                         "token_address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                        "pay_to": "SolanaReceiver111111111111111111111111111",
                         "token_decimals": 6,
                     },
                 ],
-                "receiver_address": "0xabc",
                 "facilitator_url": "https://x402.org/facilitator",
             }
 
@@ -69,7 +70,8 @@ async def test_list_payment_networks_lists_evm_and_svm(monkeypatch):
     assert "(evm)" in out and "(svm)" in out
     assert "eip155:8453" in out
     assert "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp" in out
-    assert "0xabc" in out  # receiver shown
+    assert "receiver=0xabc" in out
+    assert "receiver=SolanaReceiver" in out
 
 
 @pytest.mark.asyncio

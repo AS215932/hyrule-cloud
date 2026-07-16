@@ -41,6 +41,7 @@ from hyrule_cloud.models import (
     ProxyMode,
     QuoteEvmMethod,
     QuoteStatus,
+    QuoteX402Method,
     VMCreateRequest,
     VMCreateResponse,
     VMExtendRequest,
@@ -123,20 +124,59 @@ async def get_network(app_state: AppState = Depends(get_app_state)):
 _NATIVE_ASSETS = ("BTC", "XMR")
 
 
-def _native_payment_assets(app_state: AppState) -> list[str]:
+async def _payment_worker_health(app_state: AppState):
+    if app_state.session_factory is None:
+        return None
+    from hyrule_cloud.services.worker_health import payment_worker_health
+
+    try:
+        return await payment_worker_health(
+            app_state.session_factory,
+            max_age_seconds=app_state.config.payment.worker_heartbeat_max_age_seconds,
+        )
+    except Exception:
+        log.warning("payment_worker_health_check_failed", exc_info=True)
+        return None
+
+
+async def _native_payment_assets(app_state: AppState) -> list[str]:
     configured = [asset.upper() for asset in getattr(app_state, "native_payment_assets", [])]
-    return [asset for asset in _NATIVE_ASSETS if asset in configured]
+    assets = [asset for asset in _NATIVE_ASSETS if asset in configured]
+    if not assets:
+        return []
+    # Unit fixtures and embedders without a shared DB retain the old explicit
+    # state contract. Production lifespan always supplies session_factory.
+    if app_state.session_factory is None:
+        return assets
+    health = await _payment_worker_health(app_state)
+    return assets if health is not None and health.ready else []
 
 
-def _accepted_payment_methods(cfg, app_state: AppState) -> AcceptedPaymentMethods:
-    """Single source of truth for what a quote can be paid with: enabled EVM
-    chains from config + native (BTC/XMR) iff the intent rail is wired."""
+async def _accepted_payment_methods(cfg, app_state: AppState) -> AcceptedPaymentMethods:
+    """Single source of truth for x402 and native quote payment methods."""
+    enabled = cfg.payment.enabled_networks()
+    gate = getattr(app_state, "payment_gate", None)
+    supported_keys = None
+    if gate is not None and hasattr(gate, "supported_network_keys"):
+        supported_keys = await gate.supported_network_keys()
+        enabled = [network for network in enabled if network.key in supported_keys]
+    x402 = [
+        QuoteX402Method(
+            key=n.key,
+            caip2=n.caip2,
+            family=n.family,
+            asset=n.asset,
+            chain_id=n.chain_id,
+        )
+        for n in enabled
+    ]
     evm = [
         QuoteEvmMethod(key=n.key, caip2=n.caip2, asset=n.asset, chain_id=n.chain_id)
-        for n in cfg.payment.enabled_networks()
+        for n in enabled
+        if n.family == "evm"
     ]
-    native = _native_payment_assets(app_state)
-    return AcceptedPaymentMethods(evm=evm, native=native)
+    native = await _native_payment_assets(app_state)
+    return AcceptedPaymentMethods(x402=x402, evm=evm, native=native)
 
 
 async def _compute_vm_price(orch, cfg, order: VMCreateRequest) -> tuple[Decimal, Any]:
@@ -161,7 +201,7 @@ async def _enforce_paid_vm_cap(orch, cfg) -> None:
         raise HTTPException(503, "Soft-launch VM capacity reached")
 
 
-def _quote_to_response(row: VMQuoteRow, cfg, app_state: AppState) -> VMQuoteResponse:
+async def _quote_to_response(row: VMQuoteRow, cfg, app_state: AppState) -> VMQuoteResponse:
     status = QuoteStatus(row.status)
     if status == QuoteStatus.CREATED and is_expired(row):
         status = QuoteStatus.EXPIRED
@@ -170,7 +210,7 @@ def _quote_to_response(row: VMQuoteRow, cfg, app_state: AppState) -> VMQuoteResp
         status=status,
         order_payload=VMCreateRequest(**row.order_payload),
         amount_usd=str(row.amount_usd),
-        accepted_payment_methods=_accepted_payment_methods(cfg, app_state),
+        accepted_payment_methods=await _accepted_payment_methods(cfg, app_state),
         created_at=row.created_at,
         expires_at=row.expires_at,
     )
@@ -338,7 +378,7 @@ async def get_runtime_stats(
     from sqlalchemy import func as sa_func
     from sqlalchemy import select
 
-    from hyrule_cloud.db import VMRow
+    from hyrule_cloud.db import ServiceHeartbeatRow, VMRow
     from hyrule_cloud.models import VMStatus
 
     cached = _RUNTIME_CACHE.get("runtime")
@@ -352,6 +392,10 @@ async def get_runtime_stats(
     live_vms = 0
     build_queue = 0
     avg_provision_seconds = None
+    payment_worker_ready = False
+    payment_worker_last_seen_at = None
+    payment_worker_last_success_at = None
+    payment_worker_error = None
     try:
         async with orch.db() as db:
             counts = await db.execute(select(VMRow.status, sa_func.count()).group_by(VMRow.status))
@@ -384,6 +428,28 @@ async def get_runtime_stats(
             ]
             if durations:
                 avg_provision_seconds = round(median(durations), 1)
+            heartbeat = await db.get(ServiceHeartbeatRow, "hyrule-cloud-worker")
+            if heartbeat is not None:
+                last_seen = heartbeat.last_seen_at
+                last_success = heartbeat.last_success_at
+                if last_seen is not None and last_seen.tzinfo is None:
+                    last_seen = last_seen.replace(tzinfo=UTC)
+                if last_success is not None and last_success.tzinfo is None:
+                    last_success = last_success.replace(tzinfo=UTC)
+                payment_worker_last_seen_at = last_seen.isoformat() if last_seen else None
+                payment_worker_last_success_at = last_success.isoformat() if last_success else None
+                payment_worker_error = heartbeat.last_error
+                max_age = (
+                    request.app.state._typed_state.config.payment.worker_heartbeat_max_age_seconds
+                )
+                cutoff = datetime.now(UTC).timestamp() - max_age
+                payment_worker_ready = bool(
+                    last_seen
+                    and last_success
+                    and last_seen.timestamp() >= cutoff
+                    and last_success.timestamp() >= cutoff
+                    and not heartbeat.last_error
+                )
     except Exception as exc:
         log.warning("runtime_stats_db_failed", error=str(exc))
 
@@ -394,6 +460,10 @@ async def get_runtime_stats(
         "live_vms": live_vms,
         "build_queue": build_queue,
         "avg_provision_seconds": avg_provision_seconds,
+        "payment_worker_ready": payment_worker_ready,
+        "payment_worker_last_seen_at": payment_worker_last_seen_at,
+        "payment_worker_last_success_at": payment_worker_last_success_at,
+        "payment_worker_error": payment_worker_error,
         "updated_at": datetime.now(UTC).isoformat(),
     }
     _RUNTIME_CACHE["runtime"] = payload
@@ -495,10 +565,16 @@ async def get_payment_networks(
 
     Shape: `{ networks: [...], native: [...], receiver_address, facilitator_url }`. Each
     network dict carries the CAIP-2 identifier (canonical for x402 v2), the
-    EIP-712 domain shape (so the wallet adapter doesn't have to bake one
-    in), and the explorer URL for the post-pay receipt link.
+    family-specific wallet metadata, its per-network receiver, and the
+    explorer URL for the post-pay receipt link.
     """
-    native = _native_payment_assets(app_state)
+    native = await _native_payment_assets(app_state)
+    worker_health = await _payment_worker_health(app_state)
+    enabled = cfg.payment.enabled_networks()
+    gate = getattr(app_state, "payment_gate", None)
+    if gate is not None and hasattr(gate, "supported_network_keys"):
+        supported_keys = await gate.supported_network_keys()
+        enabled = [network for network in enabled if network.key in supported_keys]
     return {
         "networks": [
             {
@@ -514,11 +590,27 @@ async def get_payment_networks(
                 "native_currency": n.native_currency,
                 "rpc_url": n.rpc_url,
                 "block_explorer_url": n.block_explorer_url,
+                "wallet_chain": n.wallet_chain or None,
+                "pay_to": cfg.payment.receiver_for(n),
                 "testnet": n.testnet,
             }
-            for n in cfg.payment.enabled_networks()
+            for n in enabled
         ],
         "native": native,
+        "native_worker": {
+            "ready": bool(worker_health and worker_health.ready),
+            "last_seen_at": (
+                worker_health.last_seen_at.isoformat()
+                if worker_health and worker_health.last_seen_at
+                else None
+            ),
+            "last_success_at": (
+                worker_health.last_success_at.isoformat()
+                if worker_health and worker_health.last_success_at
+                else None
+            ),
+            "last_error": worker_health.last_error if worker_health else None,
+        },
         "receiver_address": cfg.payment.receiver_address,
         "facilitator_url": cfg.payment.facilitator_url,
     }
@@ -1002,7 +1094,7 @@ async def create_vm_quote(
     except QuoteExistsError as exc:
         # Idempotent replay — return the existing quote with 200, not 201.
         return JSONResponse(
-            _quote_to_response(exc.existing, cfg, app_state).model_dump(mode="json"),
+            (await _quote_to_response(exc.existing, cfg, app_state)).model_dump(mode="json"),
             status_code=200,
         )
     except QuoteConflictError as exc:
@@ -1011,7 +1103,7 @@ async def create_vm_quote(
             f"client_order_id already used for a different order (quote {exc.existing.quote_id})",
         )
     return JSONResponse(
-        _quote_to_response(row, cfg, app_state).model_dump(mode="json"),
+        (await _quote_to_response(row, cfg, app_state)).model_dump(mode="json"),
         status_code=201,
     )
 
@@ -1036,7 +1128,7 @@ async def get_vm_quote(
         account,
         not_found="Quote not found",
     )
-    return _quote_to_response(row, cfg, await get_app_state(request))
+    return await _quote_to_response(row, cfg, await get_app_state(request))
 
 
 @router.post("/vm/{vm_id}/extend")
@@ -1403,7 +1495,7 @@ async def create_crypto_intent(
     app_state: AppState = await get_app_state(request)
     provider = getattr(app_state, "native_crypto", None)
     rates = getattr(app_state, "rate_provider", None)
-    if provider is None or rates is None or asset not in _native_payment_assets(app_state):
+    if provider is None or rates is None or asset not in await _native_payment_assets(app_state):
         raise HTTPException(503, f"{asset} payments are not configured")
 
     try:

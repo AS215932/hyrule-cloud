@@ -240,7 +240,7 @@ async def poll_one_intent(
             min_confs = XMR_MIN_CONFIRMATIONS
     except Exception:
         log.exception("intent_scan_failed", intent_id=intent_id, asset=row.asset)
-        return row
+        raise
 
     # Apply LENIENT policy and persist.
     async with session_factory() as db:
@@ -701,6 +701,7 @@ async def scan_pending_intents(
         )
 
     touched = 0
+    failures = 0
     for iid in domain_handoffs:
         if await _resume_domain_handoff(
             intent_id=iid,
@@ -719,7 +720,10 @@ async def scan_pending_intents(
             )
             touched += 1
         except Exception:
+            failures += 1
             log.exception("poll_one_intent_failed", intent_id=iid)
+    if failures:
+        raise RuntimeError(f"{failures} native payment intent scan(s) failed")
     return touched
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ from x402.http import (
     encode_payment_signature_header,
 )
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
+from x402.mechanisms.svm.exact import ExactSvmServerScheme
 from x402.schemas import (
     PaymentPayload,
     PaymentRequired,
@@ -24,7 +26,7 @@ from x402.schemas import (
     VerifyResponse,
 )
 
-from hyrule_cloud.config import PaymentConfig
+from hyrule_cloud.config import PaymentConfig, PaymentNetwork
 from hyrule_cloud.middleware.x402 import (
     LEGACY_PAYMENT_REQUIRED_HEADER,
     CdpFacilitatorAuthProvider,
@@ -35,6 +37,9 @@ from hyrule_cloud.middleware.x402 import (
 RECEIVER = "0xFf4555af30A1066A889324a3Fe88c76796159f15"
 PAYER = "0xFBD95291e4b9C901E084a8856eA184d3F7A232ed"
 ASSET = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+SOLANA_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+SOLANA_RECEIVER = "9xQeWvG816bUx9EPfEZRzHLrqvRQmkmSBmGE4kc9x9C"
 
 
 def _request(
@@ -42,9 +47,7 @@ def _request(
     *,
     path: str = "/v1/vm/create",
 ) -> Request:
-    raw_headers = [
-        (k.lower().encode(), v.encode()) for k, v in (headers or {}).items()
-    ]
+    raw_headers = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     return Request(
         {
             "type": "http",
@@ -206,6 +209,63 @@ def test_sdk_accepts_dollar_prefixed_money_price() -> None:
     assert parsed.asset == ASSET
 
 
+def _solana_config() -> PaymentConfig:
+    return PaymentConfig(
+        facilitator_url="https://facilitator.payai.network",
+        receiver_addresses={"solana": SOLANA_RECEIVER},
+        payment_networks=[
+            PaymentNetwork(
+                key="solana",
+                display_name="Solana",
+                caip2=SOLANA_NETWORK,
+                family="svm",
+                chain_id=None,
+                asset="USDC",
+                token_address=SOLANA_MINT,
+                token_decimals=6,
+                wallet_chain="solana:mainnet",
+            )
+        ],
+    )
+
+
+def test_solana_network_registers_the_official_svm_server_scheme() -> None:
+    gate = PaymentGate(_solana_config())
+
+    registered = gate.server._schemes[SOLANA_NETWORK]["exact"]
+    assert isinstance(registered, ExactSvmServerScheme)
+
+
+@pytest.mark.asyncio
+async def test_solana_is_advertised_only_with_facilitator_fee_payer_support() -> None:
+    gate = PaymentGate(_solana_config())
+
+    class SupportedServer:
+        def initialize(self) -> None:
+            pass
+
+        def get_supported_kind(self, version: int, network: str, scheme: str):
+            assert (version, network, scheme) == (2, SOLANA_NETWORK, "exact")
+            return SimpleNamespace(extra={"feePayer": SOLANA_RECEIVER})
+
+    gate.server = SupportedServer()  # type: ignore[assignment]
+
+    assert await gate.supported_network_keys() == {"solana"}
+    config = gate._resource_configs(Decimal("0.05"))[0]
+    assert config.network == SOLANA_NETWORK
+    assert config.pay_to == SOLANA_RECEIVER
+
+    gate.server.get_supported_kind = lambda *_: SimpleNamespace(extra={})  # type: ignore[attr-defined,method-assign]
+    assert gate._supported_networks() == []
+
+
+def test_enabled_solana_requires_an_explicit_network_receiver() -> None:
+    network = _solana_config().payment_networks[0]
+
+    with pytest.raises(ValueError, match="requires an explicit receiver"):
+        PaymentConfig(payment_networks=[network])
+
+
 def test_unknown_facilitator_host_is_rejected() -> None:
     with pytest.raises(ValueError, match="Unsupported x402 facilitator host"):
         _facilitator_config(
@@ -223,7 +283,9 @@ def test_unknown_facilitator_host_is_rejected() -> None:
         "https://pay.openfacilitator.io",
     ],
 )
-def test_non_cdp_facilitator_does_not_attach_cdp_auth(monkeypatch: pytest.MonkeyPatch, facilitator_url: str) -> None:
+def test_non_cdp_facilitator_does_not_attach_cdp_auth(
+    monkeypatch: pytest.MonkeyPatch, facilitator_url: str
+) -> None:
     monkeypatch.setenv("CDP_API_KEY_ID", "organizations/test/apiKeys/key-id")
     monkeypatch.setenv("CDP_API_KEY_SECRET", "not-used-for-public-facilitator")
 
@@ -498,7 +560,14 @@ def test_discovery_registry_only_declares_real_endpoints() -> None:
     from hyrule_cloud.services.discovery import DISCOVERY
 
     declared_paths = {path for _, path in DISCOVERY}
-    for dead in ("/v1/mail/accounts", "/v1/mail/messages/send", "/v1/speedtest", "/v1/web/reports", "/v1/voip/report", "/v1/path/jobs"):
+    for dead in (
+        "/v1/mail/accounts",
+        "/v1/mail/messages/send",
+        "/v1/speedtest",
+        "/v1/web/reports",
+        "/v1/voip/report",
+        "/v1/path/jobs",
+    ):
         assert dead not in declared_paths
 
 
