@@ -38,6 +38,7 @@ from hyrule_cloud.models import (
     SourceHealth,
 )
 from hyrule_cloud.services.bgp.lookup import as215932_status, lookup_bgp
+from hyrule_cloud.services.bgp.snapshots import router_snapshot_download_enabled
 from hyrule_cloud.services.bgp.stream import bgpstream_worker_enabled
 
 router = APIRouter(prefix="/v1/bgp", tags=["BGP intelligence"])
@@ -106,7 +107,18 @@ async def get_bgp_capabilities() -> ProductCapabilityResponse:
                 if bgpstream_worker_enabled()
                 else []
             ),
-            CapabilityEndpoint(path="/v1/bgp/snapshots/router/{snapshot_id}/download", method="GET", paid=True, description="Download paid router table snapshot"),
+            *(
+                [
+                    CapabilityEndpoint(
+                        path="/v1/bgp/snapshots/router/{snapshot_id}/download",
+                        method="GET",
+                        paid=True,
+                        description="Download paid router table snapshot",
+                    )
+                ]
+                if router_snapshot_download_enabled()
+                else []
+            ),
         ],
     )
 
@@ -316,6 +328,11 @@ async def download_bgp_job(request: Request, job_id: str, token: str | None = No
     },
 )
 async def download_bgp_router_snapshot(request: Request, snapshot_id: str, format: str = "normalized_jsonl") -> Response:
+    if not router_snapshot_download_enabled():
+        return not_implemented(
+            "bgp.snapshots.router.download",
+            "Router snapshot downloads are temporarily unavailable; artifacts are not stored on the API host.",
+        )
     result = await require_payment(
         request,
         payment_price(request, "price_bgp_router_table", "0.10"),

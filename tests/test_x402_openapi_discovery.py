@@ -45,6 +45,14 @@ def _enable_all_catalog_gates(monkeypatch: pytest.MonkeyPatch) -> None:
         "hyrule_cloud.services.bgp.stream.bgpstream_worker_enabled",
         lambda: True,
     )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.bgp.snapshots.router_snapshot_download_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.api.bgp.router_snapshot_download_enabled",
+        lambda: True,
+    )
 
 
 def _schema_operations(schema: dict) -> set[tuple[str, str]]:
@@ -269,6 +277,75 @@ async def test_gated_bgp_jobs_post_returns_501_without_payment_challenge() -> No
     assert response.status_code == 501
     assert response.json()["error"] == "not_implemented"
     assert PAYMENT_REQUIRED_HEADER not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_gated_router_snapshot_download_returns_501_without_payment_challenge() -> None:
+    """Metadata-only snapshots on noc cannot be downloaded from api.
+
+    The route must refuse before charging and remain outside the default
+    catalog until artifact transfer/shared storage is explicitly enabled.
+    """
+    gate = _gate(_FakeServer(), public_base_url="https://cloud.hyrule.host")
+    old_state = getattr(app.state, "_typed_state", None)
+    app.state._typed_state = SimpleNamespace(config=HyruleConfig(), payment_gate=gate)
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/v1/bgp/snapshots/router/bgps_probe/download",
+            )
+            manifest = await client.get("/.well-known/x402.json")
+            capabilities = await client.get("/v1/bgp/capabilities")
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+        elif hasattr(app.state, "_typed_state"):
+            delattr(app.state, "_typed_state")
+
+    assert response.status_code == 501
+    assert response.json()["error"] == "not_implemented"
+    assert PAYMENT_REQUIRED_HEADER not in response.headers
+    manifest_paths = {resource["path"] for resource in manifest.json()["resources"]}
+    assert "/v1/bgp/snapshots/router/{snapshot_id}/download" not in manifest_paths
+    paid_paths = {endpoint["path"] for endpoint in capabilities.json()["paid_endpoints"]}
+    assert "/v1/bgp/snapshots/router/{snapshot_id}/download" not in paid_paths
+
+
+@pytest.mark.asyncio
+async def test_router_snapshot_download_readvertises_when_artifacts_are_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HYRULE_BGP_ROUTER_SNAPSHOT_DOWNLOAD_ENABLED", "1")
+    gate = _gate(_FakeServer(), public_base_url="https://cloud.hyrule.host")
+    old_state = getattr(app.state, "_typed_state", None)
+    app.state._typed_state = SimpleNamespace(config=HyruleConfig(), payment_gate=gate)
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/v1/bgp/snapshots/router/bgps_probe/download",
+            )
+            manifest = await client.get("/.well-known/x402.json")
+            capabilities = await client.get("/v1/bgp/capabilities")
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+        elif hasattr(app.state, "_typed_state"):
+            delattr(app.state, "_typed_state")
+
+    assert response.status_code == 402
+    assert PAYMENT_REQUIRED_HEADER in response.headers
+    manifest_paths = {resource["path"] for resource in manifest.json()["resources"]}
+    assert "/v1/bgp/snapshots/router/{snapshot_id}/download" in manifest_paths
+    paid_paths = {endpoint["path"] for endpoint in capabilities.json()["paid_endpoints"]}
+    assert "/v1/bgp/snapshots/router/{snapshot_id}/download" in paid_paths
 
 
 @pytest.mark.asyncio

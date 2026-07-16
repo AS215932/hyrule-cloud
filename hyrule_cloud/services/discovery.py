@@ -217,6 +217,8 @@ def _download_operation(
     path: str,
     description: str,
     price: PriceSpec,
+    *,
+    gate: str = "always",
 ) -> PaidOperation:
     path_examples = {"snapshot_id": "bgpsnap_a1b2c3d4"}
     output_example = "<gzip-compressed normalized JSONL>"
@@ -246,6 +248,7 @@ def _download_operation(
         input_example=None,
         output_example=output_example,
         path_examples=path_examples,
+        gate=gate,
         tags=_default_tags(path),
     )
 
@@ -457,6 +460,7 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "/v1/bgp/snapshots/router/{snapshot_id}/download",
         "Paid AS215932 active router table snapshot download",
         _fixed("price_bgp_router_table", "0.10"),
+        gate="bgp_router_snapshot_download",
     ),
     _body_operation(
         "/v1/ip/lookup",
@@ -679,6 +683,10 @@ def _gate_enabled(gate: str) -> bool:
         from hyrule_cloud.services.bgp.stream import bgpstream_worker_enabled
 
         return bgpstream_worker_enabled()
+    if gate == "bgp_router_snapshot_download":
+        from hyrule_cloud.services.bgp.snapshots import router_snapshot_download_enabled
+
+        return router_snapshot_download_enabled()
     raise ValueError(f"Unknown paid-operation gate: {gate}")
 
 
