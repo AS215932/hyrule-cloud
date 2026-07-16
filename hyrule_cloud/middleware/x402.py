@@ -442,7 +442,12 @@ class PaymentGate:
                 request.state.payment_network = "dev-bypass"
                 request.state.payment_asset = "USDC"
                 await self._record(
-                    "dev_bypass", request, amount, payer="0xDEV_TEST_WALLET", tx_hash="dev_bypass_0x0"
+                    "dev_bypass",
+                    request,
+                    amount,
+                    payer="0xDEV_TEST_WALLET",
+                    tx_hash="dev_bypass_0x0",
+                    extra=extra_body,
                 )
                 return "0xDEV_TEST_WALLET"
 
@@ -597,6 +602,7 @@ class PaymentGate:
                 asset=matching_requirements.asset,
                 payer=wallet,
                 tx_hash=tx_hash,
+                extra=extra_body,
             )
 
             request.state.payment_tx = tx_hash

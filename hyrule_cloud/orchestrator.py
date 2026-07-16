@@ -20,7 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import CryptoIntentRow, PaymentEventRow, VMQuoteRow, VMRow
+from hyrule_cloud.db import CryptoIntentRow, DomainRow, PaymentEventRow, VMQuoteRow, VMRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
@@ -388,6 +388,13 @@ class Orchestrator:
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if row is not None and not row.owner_wallet and row.status == VMStatus.PROVISIONING:
+                domain = (
+                    await session.execute(
+                        select(DomainRow).where(DomainRow.vm_id == vm_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if domain is not None and domain.vm_ipv6 is None:
+                    domain.vm_id = None
                 await session.delete(row)
                 await session.commit()
 
@@ -553,6 +560,20 @@ class Orchestrator:
                         vm_id=vm_id,
                         domain=custom_domain,
                     )
+                    try:
+                        assert custom_account_id is not None and self.domains is not None
+                        await self.domains.enqueue_vm_attachment(
+                            custom_account_id,
+                            custom_domain,
+                            vm_id,
+                            ipv6,
+                        )
+                    except Exception:
+                        log.exception(
+                            "custom_domain_attachment_retry_enqueue_failed",
+                            vm_id=vm_id,
+                            domain=custom_domain,
+                        )
 
             log.info("provision_complete", vm_id=vm_id, ipv6=ipv6)
 
@@ -582,6 +603,11 @@ class Orchestrator:
                         )
                     ).scalar_one_or_none()
                 await session.commit()
+            if self.domains is not None:
+                try:
+                    await self.domains.release_vm_attachment_claim(vm_id)
+                except Exception:
+                    log.exception("custom_domain_claim_release_failed", vm_id=vm_id)
             await self._record_vm_refund(
                 vm_id, owner_wallet, amount, payment_tx, settled, reason=str(e)
             )
@@ -677,6 +703,13 @@ class Orchestrator:
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if row is not None and row.status not in (VMStatus.DESTROYED, VMStatus.FAILED):
+                domain = (
+                    await session.execute(
+                        select(DomainRow).where(DomainRow.vm_id == vm_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if domain is not None and domain.vm_ipv6 is None:
+                    domain.vm_id = None
                 row.status = VMStatus.FAILED
                 row.error = error
                 # Free the customer /64: _allocate_customer_prefix counts any
@@ -1056,6 +1089,7 @@ class Orchestrator:
                 cleanup_ok = False
 
         if domain_mode == DomainMode.CUSTOM and domain:
+            other_cleanup_ok = cleanup_ok
             try:
                 if self.domains is None or owner_account_id is None:
                     raise RuntimeError("managed-domain cleanup is unavailable for this VM")
@@ -1068,6 +1102,20 @@ class Orchestrator:
                     exc_info=True,
                 )
                 cleanup_ok = False
+                if self.domains is not None and owner_account_id is not None:
+                    try:
+                        await self.domains.enqueue_vm_detachment(
+                            owner_account_id,
+                            domain,
+                            vm_id,
+                            release_prefix=other_cleanup_ok,
+                        )
+                    except Exception:
+                        log.exception(
+                            "custom_domain_cleanup_retry_enqueue_failed",
+                            vm_id=vm_id,
+                            domain=domain,
+                        )
 
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
@@ -1092,6 +1140,19 @@ class Orchestrator:
         log.info("vm_destroyed", vm_id=vm_id)
         return True
 
+    async def release_destroyed_prefix(self, vm_id: str) -> None:
+        """Release a quarantined /64 after its deferred cleanup converges."""
+        async with self.db() as session:
+            row = (
+                await session.execute(
+                    select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is not None and str(row.status) == VMStatus.DESTROYED.value:
+                row.ipv6_prefix_index = None
+                row.ipv6_prefix = None
+                await session.commit()
+
     # --- Expiry Management ---
 
     async def check_expiries(self) -> None:
@@ -1103,13 +1164,31 @@ class Orchestrator:
         # reserve_vm and settlement leaves an unpaid placeholder pinning a
         # /64). Live reservations are seconds old; 15 minutes is generous.
         async with self.db() as session:
-            await session.execute(
-                sql_delete(VMRow).where(
-                    VMRow.owner_wallet == "",
-                    VMRow.status == VMStatus.PROVISIONING,
-                    VMRow.created_at < now - timedelta(minutes=15),
+            stale_reservations = list(
+                await session.scalars(
+                    select(VMRow.vm_id).where(
+                        VMRow.owner_wallet == "",
+                        VMRow.status == VMStatus.PROVISIONING,
+                        VMRow.created_at < now - timedelta(minutes=15),
+                    )
                 )
             )
+            if stale_reservations:
+                await session.execute(
+                    update(DomainRow)
+                    .where(
+                        DomainRow.vm_id.in_(stale_reservations),
+                        DomainRow.vm_ipv6.is_(None),
+                    )
+                    .values(vm_id=None)
+                )
+                await session.execute(
+                    sql_delete(VMRow).where(
+                        VMRow.vm_id.in_(stale_reservations),
+                        VMRow.owner_wallet == "",
+                        VMRow.status == VMStatus.PROVISIONING,
+                    )
+                )
             await session.commit()
 
         async with self.db() as session:

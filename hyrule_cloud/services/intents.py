@@ -101,6 +101,7 @@ async def create_intent(
     resource_type: str = "vm",
     resource_id: str | None = None,
     refund_address: str | None = None,
+    planned_vm_id: str | None = None,
 ) -> CryptoIntentRow:
     """Insert a fresh CryptoIntentRow and derive a receive address for it.
 
@@ -170,6 +171,7 @@ async def create_intent(
             resource_type=resource_type,
             resource_id=resource_id,
             refund_address=refund_address,
+            vm_id=planned_vm_id,
         )
         db.add(row)
         try:

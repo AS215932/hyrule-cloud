@@ -31,6 +31,7 @@ from hyrule_cloud.db import (
     DomainQuoteRow,
     DomainRow,
     OpenproviderWebhookRow,
+    PaymentEventRow,
     VMQuoteRow,
     VMRow,
 )
@@ -76,6 +77,7 @@ from hyrule_cloud.domains.validation import (
 )
 from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
+    CryptoIntentStatus,
     DomainMode,
     DomainStatus,
     QuoteStatus,
@@ -614,6 +616,13 @@ class DomainService:
             }:
                 return order
             if order.status == DomainOrderStatus.AWAITING_PAYMENT.value:
+                # Persist settlement attribution before any quote validation so
+                # an invalidated quote still produces a usable refund record.
+                order.paid_at = _now()
+                order.payer = payer[:128]
+                order.payment_tx = tx_hash
+                order.payment_network = payment_network
+                order.payment_asset = payment_asset
                 quote = await session.get(DomainQuoteRow, order.quote_id)
                 native_settlement = payment_network == "native"
                 if quote is None or (
@@ -622,8 +631,8 @@ class DomainService:
                 ):
                     order.status = DomainOrderStatus.REFUND_DUE.value
                     order.error_code = "quote_already_consumed"
+                    session.add(self._build_refund_event(order, "quote_already_consumed"))
                     await session.commit()
-                    await self._record_refund(order, "quote_already_consumed")
                     return order
                 quote.status = "consumed"
                 quote.consumed_at = _now()
@@ -632,16 +641,13 @@ class DomainService:
                     if vm_quote is None or vm_quote.status != QuoteStatus.CREATED:
                         order.status = DomainOrderStatus.REFUND_DUE.value
                         order.error_code = "vm_quote_already_consumed"
+                        session.add(
+                            self._build_refund_event(order, "vm_quote_already_consumed")
+                        )
                         await session.commit()
-                        await self._record_refund(order, "vm_quote_already_consumed")
                         return order
                     vm_quote.status = QuoteStatus.CONSUMED
                 order.status = DomainOrderStatus.QUEUED.value
-                order.paid_at = _now()
-                order.payer = payer[:128]
-                order.payment_tx = tx_hash
-                order.payment_network = payment_network
-                order.payment_asset = payment_asset
                 operation = DomainOperationRow(
                     operation_id=generate_domain_operation_id(),
                     fqdn=order.fqdn,
@@ -673,6 +679,14 @@ class DomainService:
                 if row.native_intent_id
                 else None
             )
+            if (
+                intent is not None
+                and str(intent.status) == CryptoIntentStatus.EXPIRED.value
+                and row.status == DomainOrderStatus.AWAITING_PAYMENT.value
+            ):
+                row.status = DomainOrderStatus.EXPIRED.value
+                await session.commit()
+                await session.refresh(row)
         return self._order_response(row, intent)
 
     async def order_response(self, row: DomainOrderRow) -> DomainOrderResponse:
@@ -682,6 +696,14 @@ class DomainService:
                 if row.native_intent_id
                 else None
             )
+            if (
+                intent is not None
+                and str(intent.status) == CryptoIntentStatus.EXPIRED.value
+                and row.status == DomainOrderStatus.AWAITING_PAYMENT.value
+            ):
+                row.status = DomainOrderStatus.EXPIRED.value
+                await session.commit()
+                await session.refresh(row)
         return self._order_response(row, intent)
 
     async def list_domains(self, owner_account_id: str) -> DomainListResponse:
@@ -1069,6 +1091,46 @@ class DomainService:
             self.orchestrator.start_provisioning(vm_id)
         return len(vm_ids)
 
+    async def recover_x402_handoffs(self, *, limit: int = 200) -> int:
+        """Replay settled domain payments whose order transition was lost."""
+        async with self.db() as session:
+            events = list(
+                await session.scalars(
+                    select(PaymentEventRow)
+                    .where(
+                        PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
+                        PaymentEventRow.resource_path == "/v1/domains/orders",
+                    )
+                    .order_by(PaymentEventRow.created_at.desc())
+                    .limit(limit)
+                )
+            )
+        recovered = 0
+        seen: set[str] = set()
+        for event in events:
+            extra = event.extra if isinstance(event.extra, dict) else {}
+            order_id = str(extra.get("order_id") or "")
+            if not order_id or order_id in seen:
+                continue
+            seen.add(order_id)
+            async with self.db() as session:
+                order = await session.get(DomainOrderRow, order_id)
+                awaiting = bool(
+                    order is not None
+                    and order.status == DomainOrderStatus.AWAITING_PAYMENT.value
+                )
+            if not awaiting:
+                continue
+            await self._mark_paid(
+                order_id,
+                payer=event.payer_wallet or "unknown",
+                tx_hash=event.tx_hash,
+                payment_network=event.network,
+                payment_asset=event.asset,
+            )
+            recovered += 1
+        return recovered
+
     async def expire_quotes(self) -> int:
         async with self.db() as session:
             result = await session.execute(
@@ -1181,6 +1243,134 @@ class DomainService:
                 )
             await session.commit()
 
+    async def claim_vm_attachment(
+        self, owner_account_id: str, value: str, vm_id: str
+    ) -> None:
+        """Atomically reserve a managed domain before payment settles."""
+        _, _, fqdn = normalize_registrable_domain(value)
+        async with self.db() as session:
+            domain = (
+                await session.execute(
+                    select(DomainRow)
+                    .where(
+                        DomainRow.fqdn == fqdn,
+                        DomainRow.owner_account_id == owner_account_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if domain is None:
+                raise DomainProblem(404, "domain_not_found", "Domain not found.")
+            if str(domain.status) not in {
+                DomainStatus.ACTIVE.value,
+                DomainStatus.RENEWAL_DUE.value,
+            }:
+                raise DomainProblem(409, "domain_not_active", "The managed domain is not active.")
+            if domain.nameserver_mode != NameserverMode.MANAGED.value:
+                raise DomainProblem(
+                    409,
+                    "external_nameservers",
+                    "The domain must use Hyrule managed nameservers.",
+                )
+            if domain.vm_id and domain.vm_id != vm_id:
+                raise DomainProblem(
+                    409,
+                    "domain_already_attached",
+                    "The managed domain is already attached to a VM.",
+                )
+            if domain.vm_id is None:
+                apex = (
+                    await session.execute(
+                        select(DomainDNSRecordRow).where(
+                            DomainDNSRecordRow.fqdn == fqdn,
+                            DomainDNSRecordRow.name == "@",
+                            DomainDNSRecordRow.type == ManagedRecordType.AAAA.value,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if apex is not None:
+                    raise DomainProblem(
+                        409,
+                        "apex_aaaa_in_use",
+                        "The apex AAAA record is customer-managed and cannot be attached.",
+                    )
+                domain.vm_id = vm_id
+                domain.vm_ipv6 = None
+                await session.commit()
+
+    async def release_vm_attachment_claim(self, vm_id: str) -> None:
+        """Release an unpaid or failed pre-attachment reservation."""
+        async with self.db() as session:
+            domain = (
+                await session.execute(
+                    select(DomainRow).where(DomainRow.vm_id == vm_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if domain is not None and domain.vm_ipv6 is None:
+                domain.vm_id = None
+                await session.commit()
+
+    async def enqueue_vm_attachment(
+        self,
+        owner_account_id: str,
+        fqdn: str,
+        vm_id: str,
+        ipv6: str,
+    ) -> None:
+        await self._enqueue_vm_job(
+            kind="attach_vm",
+            vm_id=vm_id,
+            payload={
+                "owner_account_id": owner_account_id,
+                "fqdn": fqdn,
+                "vm_id": vm_id,
+                "ipv6": ipv6,
+            },
+        )
+
+    async def enqueue_vm_detachment(
+        self,
+        owner_account_id: str,
+        fqdn: str,
+        vm_id: str,
+        *,
+        release_prefix: bool = False,
+    ) -> None:
+        await self._enqueue_vm_job(
+            kind="detach_vm",
+            vm_id=vm_id,
+            payload={
+                "owner_account_id": owner_account_id,
+                "fqdn": fqdn,
+                "vm_id": vm_id,
+                "release_prefix": release_prefix,
+            },
+        )
+
+    async def _enqueue_vm_job(
+        self, *, kind: str, vm_id: str, payload: dict[str, Any]
+    ) -> None:
+        dedupe_key = f"{kind}:{vm_id}"
+        async with self.db() as session:
+            existing = (
+                await session.execute(
+                    select(DomainJobRow).where(DomainJobRow.dedupe_key == dedupe_key)
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return
+            self._add_job(
+                session,
+                kind=kind,
+                resource_id=vm_id,
+                dedupe_key=dedupe_key,
+                payload=payload,
+            )
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+
     async def attach_vm(self, owner_account_id: str, fqdn: str, vm_id: str, ipv6: str) -> None:
         domain = await self._owned_domain(owner_account_id, fqdn)
         if str(domain.status) not in {DomainStatus.ACTIVE.value, DomainStatus.RENEWAL_DUE.value}:
@@ -1194,56 +1384,12 @@ class DomainService:
             if current is None:
                 raise RuntimeError("managed domain disappeared")
             previous_vm_id = current.vm_id
+            previous_ipv6 = current.vm_ipv6
             if previous_vm_id and previous_vm_id != vm_id:
                 raise RuntimeError("managed domain is already attached to another VM")
+            if current.nameserver_mode != NameserverMode.MANAGED.value:
+                raise RuntimeError("managed domain is using external nameservers")
             current.vm_id = vm_id
-            if current.nameserver_mode == NameserverMode.MANAGED.value:
-                record = (
-                    await session.execute(
-                        select(DomainDNSRecordRow).where(
-                            DomainDNSRecordRow.fqdn == fqdn,
-                            DomainDNSRecordRow.name == "@",
-                            DomainDNSRecordRow.type == ManagedRecordType.AAAA.value,
-                        )
-                    )
-                ).scalar_one_or_none()
-                if record is None:
-                    record = DomainDNSRecordRow(
-                        fqdn=fqdn,
-                        name="@",
-                        type=ManagedRecordType.AAAA.value,
-                        ttl=300,
-                        values=[ipv6],
-                    )
-                    session.add(record)
-                else:
-                    if previous_vm_id is None:
-                        raise RuntimeError("the apex AAAA RRset is already customer-managed")
-                    record.ttl = 300
-                    record.values = [ipv6]
-                records = list(
-                    await session.scalars(
-                        select(DomainDNSRecordRow).where(DomainDNSRecordRow.fqdn == fqdn)
-                    )
-                )
-                if record not in records:
-                    records.append(record)
-                revision = current.zone_revision + 1
-                await self.dns.apply_zone(
-                    fqdn,
-                    revision=revision,
-                    records=[self._record_payload(item) for item in records],
-                )
-                current.zone_revision = revision
-            await session.commit()
-
-    async def detach_vm(self, owner_account_id: str, fqdn: str, vm_id: str) -> None:
-        domain = await self._owned_domain(owner_account_id, fqdn)
-        async with self.db() as session:
-            current = await session.get(DomainRow, domain.id)
-            if current is None or current.vm_id != vm_id:
-                return
-            current.vm_id = None
             record = (
                 await session.execute(
                     select(DomainDNSRecordRow).where(
@@ -1253,7 +1399,67 @@ class DomainService:
                     )
                 )
             ).scalar_one_or_none()
-            if record is not None and current.nameserver_mode == NameserverMode.MANAGED.value:
+            if record is None:
+                record = DomainDNSRecordRow(
+                    fqdn=fqdn,
+                    name="@",
+                    type=ManagedRecordType.AAAA.value,
+                    ttl=300,
+                    values=[ipv6],
+                )
+                session.add(record)
+            else:
+                if previous_ipv6 is None:
+                    raise RuntimeError("the apex AAAA RRset is already customer-managed")
+                if record.ttl != 300 or list(record.values) not in ([previous_ipv6], [ipv6]):
+                    raise RuntimeError("the apex AAAA RRset was changed by the customer")
+                record.ttl = 300
+                record.values = [ipv6]
+            records = list(
+                await session.scalars(
+                    select(DomainDNSRecordRow).where(DomainDNSRecordRow.fqdn == fqdn)
+                )
+            )
+            if record not in records:
+                records.append(record)
+            revision = current.zone_revision + 1
+            await self.dns.apply_zone(
+                fqdn,
+                revision=revision,
+                records=[self._record_payload(item) for item in records],
+            )
+            current.zone_revision = revision
+            current.vm_ipv6 = ipv6
+            await session.commit()
+
+    async def detach_vm(self, owner_account_id: str, fqdn: str, vm_id: str) -> None:
+        domain = await self._owned_domain(owner_account_id, fqdn)
+        async with self.db() as session:
+            current = (
+                await session.execute(
+                    select(DomainRow).where(DomainRow.id == domain.id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if current is None or current.vm_id != vm_id:
+                return
+            attached_ipv6 = current.vm_ipv6
+            record = (
+                await session.execute(
+                    select(DomainDNSRecordRow).where(
+                        DomainDNSRecordRow.fqdn == fqdn,
+                        DomainDNSRecordRow.name == "@",
+                        DomainDNSRecordRow.type == ManagedRecordType.AAAA.value,
+                    )
+                )
+            ).scalar_one_or_none()
+            managed_record = bool(
+                record is not None
+                and attached_ipv6 is not None
+                and record.ttl == 300
+                and list(record.values) == [attached_ipv6]
+            )
+            if managed_record and current.nameserver_mode == NameserverMode.MANAGED.value:
+                assert record is not None
                 await session.delete(record)
                 records = list(
                     await session.scalars(
@@ -1270,6 +1476,8 @@ class DomainService:
                     records=[self._record_payload(item) for item in records],
                 )
                 current.zone_revision = revision
+            current.vm_id = None
+            current.vm_ipv6 = None
             await session.commit()
 
     async def _dispatch_job(self, job: DomainJobRow) -> None:
@@ -1283,6 +1491,23 @@ class DomainService:
             await self._transfer_out(job.resource_id)
         elif job.kind == "reconcile_domain":
             await self._reconcile_domain(job.resource_id)
+        elif job.kind == "attach_vm":
+            payload = job.payload or {}
+            await self.attach_vm(
+                str(payload["owner_account_id"]),
+                str(payload["fqdn"]),
+                str(payload["vm_id"]),
+                str(payload["ipv6"]),
+            )
+        elif job.kind == "detach_vm":
+            payload = job.payload or {}
+            await self.detach_vm(
+                str(payload["owner_account_id"]),
+                str(payload["fqdn"]),
+                str(payload["vm_id"]),
+            )
+            if payload.get("release_prefix"):
+                await self.orchestrator.release_destroyed_prefix(str(payload["vm_id"]))
         else:
             raise RuntimeError(f"unknown domain job: {job.kind}")
 
@@ -1699,14 +1924,32 @@ class DomainService:
     async def _fail_paid_order(self, order_id: str, code: str, detail: str) -> None:
         async with self.db() as session:
             order = await session.get(DomainOrderRow, order_id)
-            if order is None:
+        if order is None:
+            return
+        vm_kept = False
+        if order.vm_quote_id and order.on_domain_failure == DomainFailurePolicy.KEEP_VM.value:
+            try:
+                await self._provision_bundle(order_id, fallback_auto_domain=True)
+                vm_kept = True
+            except Exception:
+                log.exception("domain_bundle_keep_vm_failed", order_id=order_id)
+        refund_amount = Decimal(order.domain_amount_usd) if vm_kept else Decimal(order.amount_usd)
+        async with self.db() as session:
+            current = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if current is None:
                 return
-            order.status = DomainOrderStatus.REFUND_DUE.value
-            order.error_code = code
-            order.error_detail = detail[:1000]
+            current.status = DomainOrderStatus.REFUND_DUE.value
+            current.error_code = code
+            current.error_detail = detail[:1000]
             operation = (
-                await session.get(DomainOperationRow, order.operation_id)
-                if order.operation_id
+                await session.get(DomainOperationRow, current.operation_id)
+                if current.operation_id
                 else None
             )
             if operation is not None:
@@ -1721,16 +1964,36 @@ class DomainService:
             if domain is not None and domain.openprovider_id is None:
                 domain.status = DomainStatus.FAILED
                 domain.error = detail[:1000]
+            session.add(self._build_refund_event(current, code, amount=refund_amount))
             await session.commit()
-        vm_kept = False
-        if order.vm_quote_id and order.on_domain_failure == DomainFailurePolicy.KEEP_VM.value:
-            try:
-                await self._provision_bundle(order_id, fallback_auto_domain=True)
-                vm_kept = True
-            except Exception:
-                log.exception("domain_bundle_keep_vm_failed", order_id=order_id)
-        refund_amount = Decimal(order.domain_amount_usd) if vm_kept else Decimal(order.amount_usd)
-        await self._record_refund(order, code, amount=refund_amount)
+
+    def _build_refund_event(
+        self, order: DomainOrderRow, reason: str, *, amount: Decimal | None = None
+    ) -> PaymentEventRow:
+        builder = getattr(self.orchestrator.refunds, "build_owed_event", None)
+        if builder is None:
+            raise RuntimeError("atomic refund ledger is unavailable")
+        native = order.payment_method in {
+            DomainPaymentMethod.BTC.value,
+            DomainPaymentMethod.XMR.value,
+        }
+        event: PaymentEventRow | None = builder(
+            resource_path="/v1/domains/orders",
+            payer=order.order_id if native else order.payer,
+            amount=amount if amount is not None else Decimal(order.amount_usd),
+            original_tx=order.payment_tx,
+            reason=reason,
+            network="native" if native else order.payment_network,
+            asset=order.payment_method.upper() if native else order.payment_asset,
+            extra={
+                "order_id": order.order_id,
+                "domain": order.fqdn,
+                "refund_address": order.refund_address,
+            },
+        )
+        if event is None:
+            raise RuntimeError("paid domain order has no recordable refund target")
+        return event
 
     async def _record_refund(
         self, order: DomainOrderRow, reason: str, *, amount: Decimal | None = None
@@ -1963,7 +2226,9 @@ class DomainService:
         async with self.db() as session:
             domain = (
                 await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
-            ).scalar_one()
+            ).scalar_one_or_none()
+            if domain is None:
+                raise RuntimeError("managed domain disappeared before zone initialization")
             records = list(
                 await session.scalars(
                     select(DomainDNSRecordRow).where(DomainDNSRecordRow.fqdn == fqdn)
@@ -1989,6 +2254,12 @@ class DomainService:
     async def _resolve_matching_dnskeys(
         self, fqdn: str, submitted: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not submitted:
+            raise DomainProblem(
+                422,
+                "dnssec_records_required",
+                "At least one DS record is required for external DNSSEC.",
+            )
         resolver = dns.asyncresolver.Resolver()
         try:
             answer = await resolver.resolve(fqdn, dns.rdatatype.DNSKEY, lifetime=8.0)
@@ -2221,9 +2492,11 @@ class DomainService:
                 await session.commit()
                 return
             job.status = "failed"
-            operation = await session.get(DomainOperationRow, job.resource_id)
+            operation: DomainOperationRow | None = None
             if job.kind == "fulfill_order":
                 order = await session.get(DomainOrderRow, job.resource_id)
+                if order is not None and order.operation_id:
+                    operation = await session.get(DomainOperationRow, order.operation_id)
                 domain = (
                     (
                         await session.execute(select(DomainRow).where(DomainRow.fqdn == order.fqdn))
@@ -2291,6 +2564,8 @@ class DomainService:
                         failure_action = "none"
                 else:
                     failure_action = "full_refund"
+            elif job.kind in {"nameservers", "dnssec", "transfer_out"}:
+                operation = await session.get(DomainOperationRow, job.resource_id)
             if operation is not None and job.kind != "fulfill_order":
                 operation.status = DomainOperationStatus.FAILED.value
                 operation.error_code = getattr(exc, "code", "operation_failed")
@@ -2377,7 +2652,19 @@ class DomainService:
         self, row: DomainOrderRow, intent: CryptoIntentRow | None
     ) -> DomainOrderResponse:
         payment: NativePaymentInstructions | None = None
-        if intent is not None:
+        payable_intent = bool(
+            intent is not None
+            and row.status == DomainOrderStatus.AWAITING_PAYMENT.value
+            and str(intent.status)
+            in {
+                CryptoIntentStatus.CREATED.value,
+                CryptoIntentStatus.WAITING_PAYMENT.value,
+                CryptoIntentStatus.PENDING.value,
+            }
+            and _aware(intent.expires_at) > _now()
+        )
+        if payable_intent:
+            assert intent is not None
             if intent.asset not in {"BTC", "XMR"}:
                 raise RuntimeError("native domain intent has an unsupported asset")
             asset = cast(Asset, intent.asset)

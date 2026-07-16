@@ -153,6 +153,9 @@ class DomainRow(Base):
     extension: Mapped[str] = mapped_column(String(32))
     fqdn: Mapped[str] = mapped_column(String(256), unique=True, index=True)
     vm_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    # Address written by the VM attachment flow. Keeping it separately lets
+    # detach distinguish Hyrule's managed apex AAAA from a customer edit.
+    vm_ipv6: Mapped[str | None] = mapped_column(String(64))
     owner_wallet: Mapped[str] = mapped_column(String(64), index=True)
     owner_account_id: Mapped[str | None] = mapped_column(
         String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True

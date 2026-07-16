@@ -389,11 +389,21 @@ def _extract_product_price(result: dict[str, Any]) -> tuple[Decimal | None, str 
         except Exception:
             return None, str(result.get("currency") or "").upper() or None
     price = price or {}
+    # OpenProvider's customer charge is the reseller price. ``product`` is the
+    # wholesale component and must not be surfaced as our firm sell price.
+    reseller = price.get("reseller") or {}
     product = price.get("product") or {}
-    raw = product.get("price")
-    currency = product.get("currency")
+    if isinstance(reseller, dict):
+        raw = reseller.get("price")
+        currency = reseller.get("currency")
+    else:
+        raw = reseller
+        currency = None
+    if raw is None and isinstance(product, dict):
+        raw = product.get("price")
+        currency = currency or product.get("currency")
     if raw is None:
-        raw = price.get("reseller") or price.get("price")
+        raw = price.get("price")
         currency = currency or price.get("currency")
     if raw is None:
         return None, str(currency).upper() if currency else None

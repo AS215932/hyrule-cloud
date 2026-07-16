@@ -20,6 +20,7 @@ from sqlalchemy import func, select
 from sqlalchemy import update as _sql_update
 
 from hyrule_cloud.db import VMQuoteRow, VMRow
+from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.middleware.anon_token import (
     anon_management_token,
     can_manage_vm,
@@ -788,6 +789,24 @@ async def create_vm(
             )
         except RuntimeError:
             raise HTTPException(503, "No customer IPv6 capacity available right now")
+        if order.domain_mode == DomainMode.CUSTOM and order.domain:
+            domains = getattr(await get_app_state(request), "domains", None)
+            try:
+                if domains is None or account is None:
+                    raise DomainProblem(
+                        503,
+                        "domain_service_unavailable",
+                        "Managed domains are unavailable.",
+                    )
+                await domains.claim_vm_attachment(
+                    account.account_id, order.domain, reservation_row.vm_id
+                )
+            except DomainProblem as exc:
+                await orch.release_vm_reservation(reservation_row.vm_id)
+                raise HTTPException(exc.status, exc.detail) from exc
+            except Exception as exc:
+                await orch.release_vm_reservation(reservation_row.vm_id)
+                raise HTTPException(503, "Managed domains are temporarily unavailable") from exc
 
     result = await gate.check_payment(
         request,
@@ -848,6 +867,8 @@ async def create_vm(
             else:
                 # Reservation vanished (e.g. sweeper raced an extremely slow
                 # payment) — fall back to allocate-after-payment.
+                if order.domain_mode == DomainMode.CUSTOM:
+                    raise RuntimeError("the managed-domain reservation expired during payment")
                 row, management_token = await orch.create_vm(
                     order,
                     owner_wallet=wallet,
@@ -906,7 +927,9 @@ async def create_vm(
     except Exception as exc:
         # Post-charge, pre-provision failure: no background task exists to record
         # the refund, so record it here before surfacing the error.
-        failed_vm_id = getattr(row, "vm_id", None)
+        failed_vm_id = getattr(row, "vm_id", None) or (
+            reservation_row.vm_id if reservation_row is not None else None
+        )
         log.error(
             "vm_create_post_charge_failed",
             vm_id=failed_vm_id,

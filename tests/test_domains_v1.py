@@ -14,10 +14,14 @@ from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
     AccountRow,
     Base,
+    CryptoIntentRow,
+    DomainDNSRecordRow,
     DomainJobRow,
+    DomainOperationRow,
     DomainOrderRow,
     DomainRow,
     DomainTLDRow,
+    PaymentEventRow,
     VMRow,
     create_db_engine,
     create_session_factory,
@@ -46,9 +50,14 @@ from hyrule_cloud.domains.wallet_auth import (
     WalletChallengeRequest,
     WalletVerifyRequest,
 )
-from hyrule_cloud.models import VMSize, VMStatus
-from hyrule_cloud.providers.openprovider import OpenproviderUnavailableError
+from hyrule_cloud.models import CryptoIntentStatus, VMSize, VMStatus
+from hyrule_cloud.providers.openprovider import (
+    OpenproviderUnavailableError,
+    _extract_product_price,
+)
 from hyrule_cloud.services.passwords import hash_password
+from hyrule_cloud.services.payments_ledger import PaymentLedger
+from hyrule_cloud.services.refunds import RefundService
 
 
 class _Provider:
@@ -132,15 +141,9 @@ class _DNS:
         return None
 
 
-class _Refunds:
-    async def record_owed(self, **kwargs):
-        return True
-
-
 class _Orchestrator:
-    refunds = _Refunds()
-
-    def __init__(self) -> None:
+    def __init__(self, sessions) -> None:
+        self.refunds = RefundService(PaymentLedger(sessions))
         self.started_vms: list[str] = []
 
     def start_provisioning(self, vm_id: str) -> None:
@@ -170,7 +173,7 @@ async def domain_service(tmp_path):
         provider,
         _Rates(),
         SimpleNamespace(),
-        _Orchestrator(),
+        _Orchestrator(sessions),
     )
     await service.dns.close()
     service.dns = _DNS()
@@ -352,6 +355,60 @@ async def test_ambiguous_registration_is_reconciled_without_refund(domain_servic
 
 
 @pytest.mark.asyncio
+async def test_terminal_fulfillment_failure_updates_order_operation(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote("renew-failure.dev", DomainAction.REGISTER, "H1234567890")
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="renew-failure",
+    )
+    await service.mark_x402_paid(order.order_id, payer="0x" + "1" * 40, tx_hash="0xrenew")
+    async with sessions() as session:
+        current = await session.get(DomainOrderRow, order.order_id)
+        assert current is not None and current.operation_id is not None
+        current.action = DomainAction.RENEW.value
+        session.add(
+            DomainRow(
+                name="renew-failure",
+                extension="dev",
+                fqdn="renew-failure.dev",
+                owner_wallet=current.payer or current.order_id,
+                owner_account_id="H1234567890",
+                status="active",
+                openprovider_id=777,
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+            )
+        )
+        job = (
+            await session.execute(
+                select(DomainJobRow).where(DomainJobRow.resource_id == order.order_id)
+            )
+        ).scalar_one()
+        job.attempts = 10
+        operation_id = current.operation_id
+        await session.commit()
+
+    await service._retry_or_fail_job(
+        job.job_id,
+        DomainProblem(422, "renewal_rejected", "Registrar rejected renewal."),
+    )
+
+    async with sessions() as session:
+        operation = await session.get(DomainOperationRow, operation_id)
+        current = await session.get(DomainOrderRow, order.order_id)
+    assert operation is not None and operation.status == "failed"
+    assert current is not None and current.status == "provider_pending"
+
+
+@pytest.mark.asyncio
 async def test_dns_changeset_uses_optimistic_revision(domain_service):
     service, _provider, sessions = domain_service
     async with sessions() as session:
@@ -412,6 +469,177 @@ async def test_dns_changeset_uses_optimistic_revision(domain_service):
 
 
 @pytest.mark.asyncio
+async def test_vm_attachment_claim_is_atomic_and_detach_preserves_customer_edit(
+    domain_service,
+):
+    service, _provider, sessions = domain_service
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="attached",
+                extension="dev",
+                fqdn="attached.dev",
+                owner_wallet="0x" + "1" * 40,
+                owner_account_id="H1234567890",
+                status="active",
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+            )
+        )
+        await session.commit()
+
+    await service.claim_vm_attachment("H1234567890", "attached.dev", "vm_claim_one")
+    with pytest.raises(DomainProblem) as conflict:
+        await service.claim_vm_attachment("H1234567890", "attached.dev", "vm_claim_two")
+    assert conflict.value.code == "domain_already_attached"
+
+    await service.attach_vm(
+        "H1234567890", "attached.dev", "vm_claim_one", "2001:db8::20"
+    )
+    async with sessions() as session:
+        domain = (
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == "attached.dev"))
+        ).scalar_one()
+        record = (
+            await session.execute(
+                select(DomainDNSRecordRow).where(
+                    DomainDNSRecordRow.fqdn == "attached.dev",
+                    DomainDNSRecordRow.name == "@",
+                    DomainDNSRecordRow.type == "AAAA",
+                )
+            )
+        ).scalar_one()
+        assert domain.vm_ipv6 == "2001:db8::20"
+        # A customer edit changes ownership of this RRset. Detach must unlink
+        # the VM without deleting the customer's new value.
+        record.ttl = 600
+        record.values = ["2001:db8::99"]
+        await session.commit()
+
+    await service.detach_vm("H1234567890", "attached.dev", "vm_claim_one")
+    async with sessions() as session:
+        domain = (
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == "attached.dev"))
+        ).scalar_one()
+        record = (
+            await session.execute(
+                select(DomainDNSRecordRow).where(
+                    DomainDNSRecordRow.fqdn == "attached.dev",
+                    DomainDNSRecordRow.name == "@",
+                    DomainDNSRecordRow.type == "AAAA",
+                )
+            )
+        ).scalar_one()
+    assert domain.vm_id is None
+    assert domain.vm_ipv6 is None
+    assert record.values == ["2001:db8::99"]
+
+
+@pytest.mark.asyncio
+async def test_expired_native_intent_is_not_rendered_as_payable(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote("expired-native.dev", DomainAction.REGISTER, "H1234567890")
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="expired-native",
+    )
+    intent = CryptoIntentRow(
+        intent_id="intent-expired-domain",
+        asset="BTC",
+        amount_crypto=Decimal("0.001"),
+        amount_usd=Decimal("13"),
+        address="bc1qexpired",
+        status=CryptoIntentStatus.EXPIRED,
+        expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        resource_type="domain_order",
+        resource_id=order.order_id,
+    )
+    async with sessions() as session:
+        current = await session.get(DomainOrderRow, order.order_id)
+        assert current is not None
+        current.payment_method = DomainPaymentMethod.BTC.value
+        current.native_intent_id = intent.intent_id
+        session.add(intent)
+        await session.commit()
+
+    response = await service.get_order("H1234567890", order.order_id)
+
+    assert response.status.value == "expired"
+    assert response.payment is None
+
+
+@pytest.mark.asyncio
+async def test_settlement_ledger_recovers_lost_x402_order_handoff(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote("recover-payment.dev", DomainAction.REGISTER, "H1234567890")
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="recover-payment",
+    )
+    ledger = PaymentLedger(sessions)
+    event = ledger.build_event(
+        event_type="settled",
+        resource_path="/v1/domains/orders",
+        method="POST",
+        amount=Decimal("13"),
+        network="eip155:8453",
+        asset="USDC",
+        payer="0x" + "2" * 40,
+        tx_hash="0xrecover",
+        extra={"order_id": order.order_id, "domain": "recover-payment.dev"},
+    )
+    async with sessions() as session:
+        session.add(event)
+        await session.commit()
+
+    assert await service.recover_x402_handoffs() == 1
+    assert await service.recover_x402_handoffs() == 0
+    async with sessions() as session:
+        current = await session.get(DomainOrderRow, order.order_id)
+        jobs = list(
+            await session.scalars(
+                select(DomainJobRow).where(DomainJobRow.resource_id == order.order_id)
+            )
+        )
+    assert current is not None and current.status == "queued"
+    assert current.payment_tx == "0xrecover"
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_dnssec_validation_rejects_empty_ds_before_resolver(domain_service):
+    service, _provider, _sessions = domain_service
+    with pytest.raises(DomainProblem) as problem:
+        await service._resolve_matching_dnskeys("example.dev", [])
+    assert problem.value.code == "dnssec_records_required"
+
+
+def test_openprovider_sell_price_prefers_reseller_component() -> None:
+    amount, currency = _extract_product_price(
+        {
+            "price": {
+                "product": {"price": "5.00", "currency": "EUR"},
+                "reseller": {"price": "7.25", "currency": "USD"},
+            }
+        }
+    )
+    assert amount == Decimal("7.25")
+    assert currency == "USD"
+
+
+@pytest.mark.asyncio
 async def test_two_paid_orders_cannot_reassign_the_same_registrar_domain(domain_service):
     service, provider, sessions = domain_service
     first_quote = await service.create_quote("contended.dev", DomainAction.REGISTER, "H1234567890")
@@ -445,10 +673,16 @@ async def test_two_paid_orders_cannot_reassign_the_same_registrar_domain(domain_
         managed = (
             await session.execute(select(DomainRow).where(DomainRow.fqdn == "contended.dev"))
         ).scalar_one()
+        refunds = list(
+            await session.scalars(
+                select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
+            )
+        )
     assert first_stored.status == "active"
     assert second_stored.status == "refund_due"
     assert managed.client_order_id == first.order_id
     assert provider.registrations == ["contended.dev"]
+    assert [event.extra["order_id"] for event in refunds] == [second.order_id]
 
 
 @pytest.mark.asyncio

@@ -506,8 +506,21 @@ class _StubDNSDelete:
 
 
 class _FailingDomains:
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[str, str, str, bool]] = []
+
     async def detach_vm(self, account_id: str, domain: str, vm_id: str) -> None:
         raise RuntimeError("managed DNS control down")
+
+    async def enqueue_vm_detachment(
+        self,
+        account_id: str,
+        domain: str,
+        vm_id: str,
+        *,
+        release_prefix: bool = False,
+    ) -> None:
+        self.enqueued.append((account_id, domain, vm_id, release_prefix))
 
 
 class _OkDomains:
@@ -548,7 +561,8 @@ async def test_destroy_quarantines_prefix_when_custom_dns_cleanup_fails(session_
     orch = Orchestrator(cfg, session_factory)
     orch.xcpng = _StubXCPNGDestroy()
     orch.dns = _StubDNSDelete()
-    orch.domains = _FailingDomains()
+    domains = _FailingDomains()
+    orch.domains = domains
 
     async with session_factory() as session:
         session.add(
@@ -563,6 +577,7 @@ async def test_destroy_quarantines_prefix_when_custom_dns_cleanup_fails(session_
         await session.commit()
 
     assert await orch.destroy_vm("vm_cd") is True
+    assert domains.enqueued == [("H1234567890", "cust.dev", "vm_cd", True)]
 
     async with session_factory() as session:
         row = await session.get(VMRow, "vm_cd")

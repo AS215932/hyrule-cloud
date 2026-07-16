@@ -66,6 +66,7 @@ async def run_worker() -> None:
 
     now = datetime.now(UTC)
     next_intents = now
+    next_payment_handoffs = now
     next_jobs = now
     next_expiry = now
     next_quotes = now
@@ -92,6 +93,12 @@ async def run_worker() -> None:
                 except Exception:
                     log.exception("intent_scan_failed")
                 next_intents = now + timedelta(seconds=15)
+            if now >= next_payment_handoffs:
+                try:
+                    await domains.recover_x402_handoffs()
+                except Exception:
+                    log.exception("domain_payment_handoff_recovery_failed")
+                next_payment_handoffs = now + timedelta(seconds=15)
             if now >= next_jobs:
                 try:
                     await domains.process_jobs(worker_id=worker_id, limit=20)

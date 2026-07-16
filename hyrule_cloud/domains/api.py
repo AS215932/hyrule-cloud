@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import re
 from typing import Annotated, Any
 
+import structlog
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
@@ -47,6 +49,7 @@ from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.state import AppState, get_app_state
 
 router = APIRouter(prefix="/v1/domains", tags=["domains"])
+log = structlog.get_logger()
 
 
 async def get_domains(state: AppState = Depends(get_app_state)) -> DomainService:
@@ -185,13 +188,37 @@ async def create_order(
         )
         if isinstance(paid, Response):
             return paid
-        order = await service.mark_x402_paid(
-            order.order_id,
-            payer=paid,
-            tx_hash=getattr(request.state, "payment_tx", None),
-            payment_network=getattr(request.state, "payment_network", None),
-            payment_asset=getattr(request.state, "payment_asset", None),
-        )
+        handoff_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                order = await service.mark_x402_paid(
+                    order.order_id,
+                    payer=paid,
+                    tx_hash=getattr(request.state, "payment_tx", None),
+                    payment_network=getattr(request.state, "payment_network", None),
+                    payment_asset=getattr(request.state, "payment_asset", None),
+                )
+                handoff_error = None
+                break
+            except Exception as exc:
+                handoff_error = exc
+                log.warning(
+                    "domain_payment_handoff_attempt_failed",
+                    order_id=order.order_id,
+                    attempt=attempt + 1,
+                    exc_info=True,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.1 * (attempt + 1))
+        if handoff_error is not None:
+            # PaymentGate persisted the order_id in its settled ledger event;
+            # the worker replays that durable handoff. A 503 also makes a
+            # client retry safe because create_order is idempotent.
+            raise DomainProblem(
+                503,
+                "payment_handoff_pending",
+                "Payment settled, but the order handoff is pending recovery.",
+            ) from handoff_error
         response.status_code = 202
     else:
         response.status_code = 200

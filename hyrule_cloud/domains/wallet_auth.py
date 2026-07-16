@@ -311,7 +311,9 @@ class WalletAuthService:
                 raise DomainProblem(401, "invalid_transfer_challenge", "The transfer challenge is invalid.")
             wallet = (
                 await session.execute(
-                    select(AccountWalletRow).where(AccountWalletRow.account_id == account_id)
+                    select(AccountWalletRow)
+                    .where(AccountWalletRow.account_id == account_id)
+                    .with_for_update()
                 )
             ).scalar_one_or_none()
             if wallet is None or challenge.address.lower() != wallet.address.lower():

@@ -38,6 +38,7 @@ def upgrade() -> None:
 
     op.add_column("domains", sa.Column("provider_status", sa.String(32)))
     op.add_column("domains", sa.Column("provider_operation_id", sa.String(128)))
+    op.add_column("domains", sa.Column("vm_ipv6", sa.String(64)))
     op.add_column(
         "domains",
         sa.Column("nameserver_mode", sa.String(16), nullable=False, server_default="managed"),
@@ -341,7 +342,7 @@ def downgrade() -> None:
     for column in (
         "updated_at", "transferred_at", "can_renew", "zone_revision", "ds_records",
         "dnssec_status", "dnssec_mode", "nameservers", "nameserver_mode",
-        "provider_operation_id", "provider_status",
+        "vm_ipv6", "provider_operation_id", "provider_status",
     ):
         op.drop_column("domains", column)
     # PostgreSQL enum values are intentionally retained; removing enum values
