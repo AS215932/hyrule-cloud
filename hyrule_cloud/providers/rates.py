@@ -28,6 +28,13 @@ _COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 _COINGECKO_IDS = {"BTC": "bitcoin", "XMR": "monero"}
 _KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
 _KRAKEN_PAIRS = {"BTC": "XBTUSD", "XMR": "XMRUSD"}
+_KRAKEN_FIAT_PAIRS = {
+    "EUR": "EURUSD",
+    "GBP": "GBPUSD",
+    "CAD": "CADUSD",
+    "CHF": "CHFUSD",
+    "AUD": "AUDUSD",
+}
 
 
 class RateProvider:
@@ -72,6 +79,28 @@ class RateProvider:
             self._cache[key] = rate
             return rate
 
+    async def get_usd_per_fiat(self, currency: str) -> Decimal:
+        """Return conservative USD cost for one unit of registrar currency."""
+        key = currency.upper()
+        if key == "USD":
+            return Decimal("1")
+        cache_key = f"FX:{key}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        pair = _KRAKEN_FIAT_PAIRS.get(key)
+        if pair is None:
+            raise RuntimeError(f"unsupported registrar currency: {key}")
+        lock = self._locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            if cache_key in self._cache:
+                return self._cache[cache_key]
+            rate = await self._fetch_kraken_pair(pair, prefer_ask=True)
+            if rate <= 0:
+                raise RuntimeError(f"invalid FX rate for {key}")
+            self._cache[cache_key] = rate
+            log.info("fiat_rate_fetched", currency=key, usd=str(rate), provider="kraken")
+            return rate
+
     async def _fetch_with_fallback(self, asset: str) -> Decimal:
         for provider_name, fn in (("coingecko", self._fetch_coingecko), ("kraken", self._fetch_kraken)):
             try:
@@ -101,10 +130,13 @@ class RateProvider:
         return Decimal(str(usd))
 
     async def _fetch_kraken(self, asset: str) -> Decimal:
-        assert self._client is not None
         pair = _KRAKEN_PAIRS.get(asset)
         if not pair:
             raise ValueError(f"unsupported asset: {asset}")
+        return await self._fetch_kraken_pair(pair)
+
+    async def _fetch_kraken_pair(self, pair: str, *, prefer_ask: bool = False) -> Decimal:
+        assert self._client is not None
         resp = await self._client.get(_KRAKEN_URL, params={"pair": pair})
         resp.raise_for_status()
         body = resp.json()
@@ -116,7 +148,11 @@ class RateProvider:
         # Kraken returns the pair under a normalized key (e.g. "XXBTZUSD")
         first_pair = next(iter(result.values()))
         # 'c' is "last trade closed": [price, lot_volume]
-        last = first_pair.get("c") or first_pair.get("p") or first_pair.get("a")
+        last = (
+            first_pair.get("a") or first_pair.get("c") or first_pair.get("p")
+            if prefer_ask
+            else first_pair.get("c") or first_pair.get("p") or first_pair.get("a")
+        )
         if not last:
-            raise ValueError(f"kraken returned no price for {asset}")
+            raise ValueError(f"kraken returned no price for {pair}")
         return Decimal(str(last[0]))

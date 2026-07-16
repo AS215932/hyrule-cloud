@@ -165,8 +165,12 @@ evidence before treating 3a as complete.
 
 1. Vault kv: `openprovider_username/password/*_handle` non-empty; Openprovider
    account has balance.
-2. Gate: live paid registration of one cheap real TLD via
-   `POST /v1/domain/register` → `POST /v1/zone/record` (AAAA) → public
+2. Set `HYRULE_API_KEY` to a canary account key with `domain:purchase`,
+   `domain:read`, and `domain:dns` scopes.
+3. Gate: live paid registration of one cheap real TLD via
+   `GET /v1/domains/check` → `POST /v1/domains/quotes` → x402-paid
+   `POST /v1/domains/orders` → poll the durable order → revision-checked
+   `POST /v1/domains/{domain}/dns/changesets` (AAAA) → public
    `dig AAAA <name>` resolves → `payment_events` row + Grafana movement.
 
 ### 3d VM hosting — the big gate

@@ -22,7 +22,8 @@ CDN/WAF hints.
 - `/v1/web` diagnoses public web endpoints.
 - `/v1/dns` diagnoses read-only DNS details.
 - `/v1/ports` checks one declared service port from outside.
-- `/v1/zone` mutates authoritative DNS and is not used by this Skill.
+- `/v1/domains/{domain}/dns/changesets` mutates authoritative DNS and is not
+  used by this Skill.
 
 ## Discovery
 

@@ -6,7 +6,8 @@ Agents discover the curated paid surface via `/openapi.json`, the x402 Bazaar,
 or `/.well-known/x402.json` and pay with USDC on Base. Four service groups:
 
 - **Compute** — bare IPv6-native VMs with SSH, automatic HTTPS subdomains, and optional custom domains.
-- **Domains & DNS** — domain registration and DNS management.
+- **Domains & DNS** — quoted registration and renewal, managed or external
+  nameservers, DNSSEC, transfer-out, and revisioned DNS management.
 - **Network intelligence** — BGP/routing over AS215932's own tables plus RouteViews/RIPE RIS, IP geolocation/ASN/reputation, DNS (lookup, propagation, DNSSEC, record recommendations), RDAP/WHOIS, web reachability and deep TLS grading, MXToolbox-compatible mail deliverability (MX/SPF/DKIM/DMARC/blacklist/bounce), port and NAT/CGNAT reachability, and VoIP/SIP diagnostics.
 - **Network proxy** — outbound requests over Direct, Tor, I2P, or Yggdrasil.
 
@@ -29,8 +30,8 @@ Agent (OpenClaw, Claude MCP, x402-aware client)
 Hyrule Cloud API (FastAPI + x402 SDK)
   |-- XCP-NG XAPI       VM lifecycle (clone, start, stop, destroy)
   |-- cloud-init         SSH key, default UFW rules, optional setup script
-  |-- DNS (RFC 2136)     AAAA records on authoritative NS
-  |-- Openprovider       Domain registration (custom domain mode)
+  |-- DNS control API    Signed customer zones on ns1/ns2.hyrule.host
+  |-- OpenProvider       Registrar-only registration and renewal
   |-- PostgreSQL         Persistent state (VMs, domains, tunnels)
   |-- x402 facilitator   Payment verification and settlement (official SDK)
   |-- network proxy      Internal Go sidecar for paid Direct/Tor/I2P/Yggdrasil requests
@@ -46,8 +47,13 @@ Hyrule Cloud API (FastAPI + x402 SDK)
 | `/v1/vm/{id}/reboot`  | POST   | No   | Hard reboot                  |
 | `/v1/vm/{id}`         | DELETE | No   | Destroy VM                   |
 | `/v1/vm/{id}/logs`    | GET    | No   | Provisioning log             |
-| `/v1/domain/check`    | GET    | No   | Domain availability          |
-| `/v1/domain/register` | POST   | Yes  | Register via Openprovider    |
+| `/v1/domains/tlds`    | GET    | No   | Eligible live TLD catalog    |
+| `/v1/domains/check`   | GET    | No   | Availability and pricing     |
+| `/v1/domains/quotes`  | POST   | No   | Durable 15-minute quote      |
+| `/v1/domains/orders`  | POST   | Yes  | Idempotent buy or renewal    |
+| `/v1/domains`         | GET    | No   | Account domain portfolio     |
+| `/v1/domains/{domain}/dns` | GET/POST | No | Revisioned managed DNS |
+| `/v1/domains/{domain}/dnssec` | PUT | No | Managed/external DNSSEC |
 | `/v1/pricing`         | GET    | No   | Current pricing              |
 | `/v1/os/list`         | GET    | No   | Available OS templates       |
 | `/v1/network/request` | POST   | Yes  | One paid network request     |
@@ -68,11 +74,14 @@ pip install -e .
 # Run migrations
 alembic upgrade head
 
-# Start
+# Start the API and the single durable background worker. Do not run the
+# worker loop inside every API process.
 uvicorn hyrule_cloud.app:app --host :: --port 8402
+hyrule-cloud-worker
 ```
 
-Or with Docker Compose (runs migrations automatically):
+Or with Docker Compose (runs migrations once, then starts both the API and
+the dedicated worker):
 
 ```bash
 docker compose up
@@ -137,7 +146,10 @@ only.
 x402 exact scheme, USDC on Base (eip155:8453). Uses the official Coinbase
 x402 Python SDK for verification and settlement.
 
-VM/domain pricing is per-day or per-operation, paid upfront. Extend via `/v1/vm/{id}/extend`.
+VM runtime is paid per day. Domains use separate 15-minute registration and
+renewal quotes based on live provider USD cost plus the greater of 25% or
+$3.00, rounded up to cents. Renewal is manual and prepaid; registrar auto-renew
+is disabled. Extend VM runtime via `/v1/vm/{id}/extend`.
 VMs are suspended at expiry, destroyed after a 48h grace period.
 
 `POST /v1/network/request` is a per-request x402 resource. The API verifies
@@ -166,6 +178,8 @@ hyrule_cloud/
   models.py              API request/response models
   db.py                  SQLAlchemy ORM models, engine setup
   orchestrator.py        VM lifecycle coordinator
+  worker.py              Single durable jobs/reconciliation worker
+  domains/               Domain API, catalog, pricing, DNS and wallet auth
   api/
     routes.py            All HTTP endpoints
   middleware/

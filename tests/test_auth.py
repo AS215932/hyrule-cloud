@@ -14,10 +14,11 @@ import pytest
 import pytest_asyncio
 from fastapi import Response
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.app import app
-from hyrule_cloud.db import Base, VMRow
+from hyrule_cloud.db import Base, DomainOrderRow, DomainQuoteRow, DomainRow, VMRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token as hash_anon_management_token
 from hyrule_cloud.models import (
     VMSize,
@@ -583,6 +584,108 @@ async def test_account_delete_destroy_actually_destroys(auth_state, client):
     assert res.status_code == 200
     assert res.json()["vm_policy"] == "destroy"
     assert vm_id in auth_state.orchestrator.destroy_called
+
+
+@pytest.mark.asyncio
+async def test_account_delete_with_domain_history_refuses_before_touching_vms(
+    auth_state,
+    client,
+):
+    reg = await client.post("/v1/auth/register", json={"password": "domain owner password 123"})
+    account_id = reg.json()["account_id"]
+    vm_id = await _seed_owned_vm(auth_state, account_id)
+    now = _now()
+    async with auth_state.orchestrator.db() as session:
+        session.add(
+            DomainQuoteRow(
+                quote_id="dq_account_delete_history",
+                fqdn="retained.dev",
+                action="register",
+                owner_account_id=account_id,
+                status="consumed",
+                provider_cost=Decimal("10"),
+                provider_currency="USD",
+                fx_rate=Decimal("1"),
+                provider_cost_usd=Decimal("10"),
+                hyrule_fee_usd=Decimal("3"),
+                tax_usd=Decimal("0"),
+                total_usd=Decimal("13"),
+                available=True,
+                premium=False,
+                terms_version="domain-terms-v1",
+                expires_at=now + timedelta(minutes=15),
+            )
+        )
+        session.add(
+            DomainOrderRow(
+                order_id="do_account_delete_history",
+                quote_id="dq_account_delete_history",
+                fqdn="retained.dev",
+                action="register",
+                owner_account_id=account_id,
+                idempotency_key="account-delete-history",
+                status="active",
+                amount_usd=Decimal("13"),
+                domain_amount_usd=Decimal("13"),
+                vm_amount_usd=Decimal("0"),
+                payment_method="usdc",
+                on_domain_failure="keep_vm",
+                terms_version="domain-terms-v1",
+                terms_accepted_at=now,
+            )
+        )
+        await session.commit()
+
+    response = await client.delete("/v1/me?vm_policy=destroy")
+
+    assert response.status_code == 409
+    assert "assisted deletion" in response.json()["detail"]
+    assert vm_id not in auth_state.orchestrator.destroy_called
+    assert (await client.get("/v1/me")).status_code == 200
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+    assert vm is not None and vm.owner_account_id == account_id
+
+
+@pytest.mark.asyncio
+async def test_account_delete_with_claimed_legacy_domain_requires_assistance(
+    auth_state,
+    client,
+):
+    reg = await client.post("/v1/auth/register", json={"password": "legacy owner password 123"})
+    account_id = reg.json()["account_id"]
+    vm_id = await _seed_owned_vm(auth_state, account_id)
+    async with auth_state.orchestrator.db() as session:
+        session.add(
+            DomainRow(
+                name="legacy-claimed",
+                extension="dev",
+                fqdn="legacy-claimed.dev",
+                owner_wallet="legacy-import",
+                owner_account_id=account_id,
+                anon_management_token_hash=None,
+                status="active",
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+            )
+        )
+        await session.commit()
+
+    response = await client.delete("/v1/me?vm_policy=destroy")
+
+    assert response.status_code == 409
+    assert "assisted deletion" in response.json()["detail"]
+    assert vm_id not in auth_state.orchestrator.destroy_called
+    assert (await client.get("/v1/me")).status_code == 200
+    async with auth_state.orchestrator.db() as session:
+        domain = await session.scalar(
+            select(DomainRow).where(DomainRow.fqdn == "legacy-claimed.dev")
+        )
+    assert domain is not None
+    assert domain.owner_account_id == account_id
+    assert domain.anon_management_token_hash is None
 
 
 @pytest.mark.asyncio

@@ -21,20 +21,49 @@ services:
       - "9050:9050"
     restart: unless-stopped
 
-  api:
-    build: .
-    ports:
-      - "8402:8402"
+  migrate:
+    build:
+      context: .
+      target: api
     depends_on:
       postgres:
         condition: service_healthy
     env_file: .env
     environment:
+      HYRULE_DATABASE_URL: postgresql+asyncpg://hyrule:hyrule@postgres/hyrule
+    command: "alembic upgrade head"
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      target: api
+    ports:
+      - "8402:8402"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
       # Override DB URL to point at compose Postgres
       HYRULE_DATABASE_URL: postgresql+asyncpg://hyrule:hyrule@postgres/hyrule
-    command: >
-      sh -c "alembic upgrade head &&
-             uvicorn hyrule_cloud.app:app --host :: --port 8402"
+    command: "uvicorn hyrule_cloud.app:app --host :: --port 8402"
+
+  worker:
+    build:
+      context: .
+      target: worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      HYRULE_DATABASE_URL: postgresql+asyncpg://hyrule:hyrule@postgres/hyrule
+    restart: unless-stopped
 
 volumes:
   pgdata:

@@ -7,6 +7,8 @@ from fastapi import Request
 
 if TYPE_CHECKING:
     from hyrule_cloud.config import HyruleConfig
+    from hyrule_cloud.domains.service import DomainService
+    from hyrule_cloud.domains.wallet_auth import WalletAuthService
     from hyrule_cloud.middleware.x402 import PaymentGate
     from hyrule_cloud.orchestrator import Orchestrator
     from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
@@ -30,7 +32,9 @@ class AppState:
     # orchestrator. Typed Any so we don't need to import async_sessionmaker
     # at runtime when AppState is constructed in test fixtures.
     session_factory: Any | None = field(default=None)
+    domains: DomainService | None = field(default=None)
+    wallet_auth: WalletAuthService | None = field(default=None)
 
 
-def get_app_state(request: Request) -> AppState:
+async def get_app_state(request: Request) -> AppState:
     return request.app.state._typed_state

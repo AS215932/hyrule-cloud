@@ -6,16 +6,16 @@ Agentic VPS hosting on AS215932 with x402 payments.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import structlog
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from x402.http import PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER
 
 from hyrule_cloud.api.auth import router as auth_router
@@ -38,12 +38,16 @@ from hyrule_cloud.api.voip import router as voip_router
 from hyrule_cloud.api.web import router as web_router
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
+from hyrule_cloud.domains.api import router as domains_router
+from hyrule_cloud.domains.errors import DomainProblem, problem_response
+from hyrule_cloud.domains.service import DomainService
+from hyrule_cloud.domains.wallet_auth import WalletAuthService
+from hyrule_cloud.domains.wallet_auth import router as wallet_auth_router
 from hyrule_cloud.middleware.metrics import install_metrics
 from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
-from hyrule_cloud.services.intents import scan_pending_intents
 
 # Newline-delimited JSON to stdout per AS215932's application logging
 # contract (hyrule-infra/docs/application-logging.md). systemd-journald
@@ -115,6 +119,19 @@ async def lifespan(app: FastAPI):
             f"(ready={','.join(native_payment_assets) or 'none'})"
         )
 
+    # Domain lifecycle is served by the API but all provider mutations are
+    # drained by the dedicated hyrule-cloud-worker process.
+    domains = DomainService(
+        config,
+        session_factory,
+        orchestrator.openprovider,
+        rate_provider,
+        native_crypto,
+        orchestrator,
+    )
+    wallet_auth = WalletAuthService(config, session_factory)
+    orchestrator.domains = domains
+
     # Wire up app state
     app.state._typed_state = AppState(
         config=config,
@@ -125,31 +142,9 @@ async def lifespan(app: FastAPI):
         rate_provider=rate_provider,
         native_payment_assets=native_payment_assets,
         session_factory=session_factory,
+        domains=domains,
+        wallet_auth=wallet_auth,
     )
-
-    # Expiry scheduler
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(orchestrator.check_expiries, "interval", minutes=5)
-    scheduler.start()
-
-    # Block E: background intent poller. Single worker; coordinated via the
-    # exactly-once atomic SQL trigger in services/intents.py.
-    async def _intent_poller_loop() -> None:
-        while True:
-            try:
-                await scan_pending_intents(
-                    session_factory=session_factory,
-                    provider=native_crypto,
-                    rates=rate_provider,
-                    orch=orchestrator,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("intent_poller_iteration_failed")
-            await asyncio.sleep(15)
-
-    poller_task = asyncio.create_task(_intent_poller_loop())
 
     log.info(
         "hyrule_cloud_started",
@@ -159,12 +154,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    scheduler.shutdown()
-    poller_task.cancel()
-    try:
-        await poller_task
-    except asyncio.CancelledError:
-        pass
+    await domains.close()
     await orchestrator.shutdown()
     await network_provider.close()
     await native_crypto.close()
@@ -193,6 +183,52 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(DomainProblem)
+async def handle_domain_problem(request: Request, exc: DomainProblem):
+    return problem_response(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_domain_validation(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith(("/v1/domains", "/v1/auth/wallet")):
+        return problem_response(
+            request,
+            DomainProblem(
+                422,
+                "validation_error",
+                "The request did not match the domain API contract.",
+                extra={"errors": exc.errors()},
+            ),
+        )
+    from fastapi.exception_handlers import request_validation_exception_handler
+
+    return await request_validation_exception_handler(request, exc)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def handle_domain_http_exception(request: Request, exc: StarletteHTTPException):
+    if request.url.path.startswith(("/v1/domains", "/v1/auth/wallet")):
+        code = {
+            401: "authentication_required",
+            403: "not_permitted",
+            404: "not_found",
+            405: "method_not_allowed",
+        }.get(exc.status_code, "request_failed")
+        detail = exc.detail if isinstance(exc.detail, str) else "The request could not be completed."
+        return problem_response(
+            request,
+            DomainProblem(
+                exc.status_code,
+                code,
+                detail,
+                headers=exc.headers,
+            ),
+        )
+    from fastapi.exception_handlers import http_exception_handler
+
+    return await http_exception_handler(request, exc)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -294,6 +330,8 @@ app.include_router(internal_bgp_router)
 app.include_router(status_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
 app.include_router(auth_router)
+app.include_router(wallet_auth_router)
+app.include_router(domains_router)
 # Payments/fleet Prometheus exporter (bearer-token gated, off by default).
 app.include_router(metrics_router)
 

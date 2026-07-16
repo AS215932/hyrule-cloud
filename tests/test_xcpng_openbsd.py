@@ -135,6 +135,26 @@ async def test_debian_create_skips_openbsd_prep():
 
 
 @pytest.mark.asyncio
+async def test_exact_name_lookup_supports_crash_recovery(monkeypatch):
+    provider = XCPNGProvider(XCPNGConfig())
+
+    async def objects(**filters):
+        assert filters == {"type": "VM"}
+        return {
+            "vm-b": {"name_label": "hyrule-vm_target"},
+            "vm-other": {"name_label": "hyrule-vm_other"},
+            "vm-a": {"name_label": "hyrule-vm_target"},
+        }
+
+    monkeypatch.setattr(provider, "_xo_objects", objects)
+
+    assert await provider.find_vm_ids_by_name_label("hyrule-vm_target") == [
+        "vm-a",
+        "vm-b",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_debian_create_passes_network_config_to_xo():
     provider = CreateProvider()
 

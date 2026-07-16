@@ -369,7 +369,7 @@ def _smtp_banner(host: str, port: int) -> str:
         sock.settimeout(10)
         banner = sock.recv(1024).decode("utf-8", errors="replace")
         try:
-            sock.sendall(b"EHLO hyrule.cloud\r\nQUIT\r\n")
+            sock.sendall(b"EHLO hyrule.host\r\nQUIT\r\n")
             banner += sock.recv(2048).decode("utf-8", errors="replace")
         except Exception:
             pass

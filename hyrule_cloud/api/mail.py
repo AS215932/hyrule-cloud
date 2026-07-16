@@ -61,7 +61,7 @@ async def get_mail_capabilities() -> ProductCapabilityResponse:
     return ProductCapabilityResponse(
         service="mail",
         purpose="Email accounts for AI agents with SMTP/IMAP plus first-class API send, fetch, search, webhooks, logs, aliases, identities, and quarantine. Not yet purchasable: the mail backend is under construction.",
-        separation_of_concerns="/v1/mail operates mailboxes; /v1/mx diagnoses mail deliverability; /v1/domain buys domains; /v1/zone manages DNS records.",
+        separation_of_concerns="/v1/mail operates mailboxes; /v1/mx diagnoses mail deliverability; /v1/domains owns registration and authoritative DNS.",
         free_endpoints=[
             CapabilityEndpoint(path="/v1/mail/products", method="GET", description="Agent mailbox product catalog"),
             CapabilityEndpoint(path="/v1/mail/pricing", method="GET", description="Mail product pricing"),

@@ -107,6 +107,21 @@ class XCPNGProvider(Provider):
         objs = await self._xo_objects(id=uuid)
         return next(iter(objs.values()), None)
 
+    async def find_vm_ids_by_name_label(self, name_label: str) -> list[str]:
+        """Return non-template VMs with an exact XO name label.
+
+        Hyrule VM labels contain the durable database VM id. This lookup lets a
+        restarted provisioner remove a clone whose XO create succeeded before
+        its UUID could be committed locally, avoiding a duplicate guest on the
+        same customer prefix.
+        """
+        vms = await self._xo_objects(type="VM")
+        return sorted(
+            uuid
+            for uuid, record in vms.items()
+            if record.get("name_label") == name_label
+        )
+
     async def login(self) -> None:
         await self._xo_connect()
 

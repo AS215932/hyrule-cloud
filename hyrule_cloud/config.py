@@ -145,8 +145,62 @@ class OpenproviderConfig(BaseSettings):
     tech_handle: str = ""
     billing_handle: str = ""
     nameservers: list[str] = Field(
-        default_factory=lambda: ["ns1.servify.network", "ns2.servify.network"]
+        default_factory=lambda: ["ns1.hyrule.host", "ns2.hyrule.host"]
     )
+
+
+class DomainConfig(BaseSettings):
+    """Managed-domain product configuration.
+
+    Read-only discovery is available independently from purchasing.  The
+    three launch switches deliberately fail closed: setting only
+    ``DOMAIN_PURCHASES_ENABLED=true`` is insufficient to accept money before
+    legal and tax review have been recorded by the operator.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="DOMAIN_", env_file=".env", extra="ignore")
+
+    enabled: bool = True
+    purchases_enabled: bool = False
+    legal_approved: bool = False
+    tax_approved: bool = False
+    terms_version: str = "2026-07-15"
+
+    quote_ttl_seconds: int = Field(default=900, ge=60, le=3600)
+    catalog_sync_seconds: int = Field(default=21600, ge=300, le=86400)
+    catalog_max_age_seconds: int = Field(default=86400, ge=600, le=604800)
+    worker_poll_seconds: int = Field(default=5, ge=1, le=60)
+    renewal_window_days: int = Field(default=60, ge=1, le=180)
+    renewal_due_days: int = Field(default=30, ge=1, le=180)
+    job_lock_timeout_seconds: int = Field(default=900, ge=60, le=7200)
+    provider_reconcile_delay_seconds: int = Field(default=60, ge=5, le=3600)
+
+    markup_percent: Decimal = Field(default=Decimal("0.25"), ge=Decimal("0"))
+    markup_min_usd: Decimal = Field(default=Decimal("3.00"), ge=Decimal("0"))
+    tld_allowlist: list[str] = Field(default_factory=list)
+    account_allowlist: list[str] = Field(default_factory=list)
+
+    managed_nameservers: list[str] = Field(
+        default_factory=lambda: ["ns1.hyrule.host", "ns2.hyrule.host"]
+    )
+    soa_mname: str = "ns1.hyrule.host"
+    soa_rname: str = "hostmaster.hyrule.host"
+
+    iana_root_db_url: str = "https://www.iana.org/domains/root/db"
+    dns_control_url: str = ""
+    dns_control_secret: str = ""
+    dns_control_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
+
+    # Fernet key used only for short-lived, one-time transfer auth-code
+    # storage. An empty key disables transfer-out rather than storing a secret
+    # in plaintext.
+    authcode_fernet_key: str = ""
+    openprovider_webhook_secret: str = ""
+
+    max_dns_rrsets: int = Field(default=500, ge=1, le=5000)
+    max_dns_changes: int = Field(default=100, ge=1, le=500)
+    transfer_challenge_ttl_seconds: int = Field(default=300, ge=60, le=900)
+    transfer_authcode_ttl_seconds: int = Field(default=900, ge=60, le=3600)
 
 
 class PaymentConfig(BaseSettings):
@@ -319,4 +373,5 @@ class HyruleConfig(BaseSettings):
     # Sub-configs
     xcpng: XCPNGConfig = Field(default_factory=XCPNGConfig)
     openprovider: OpenproviderConfig = Field(default_factory=OpenproviderConfig)
+    domain: DomainConfig = Field(default_factory=DomainConfig)
     payment: PaymentConfig = Field(default_factory=PaymentConfig)

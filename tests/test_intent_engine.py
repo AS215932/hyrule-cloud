@@ -28,6 +28,7 @@ from hyrule_cloud.db import AccountRow, Base, CryptoIntentRow, VMQuoteRow, VMRow
 from hyrule_cloud.middleware.auth import current_account
 from hyrule_cloud.models import (
     CryptoIntentStatus,
+    DomainMode,
     QuoteStatus,
     VMSize,
     VMStatus,
@@ -104,6 +105,7 @@ class _StubOrchestrator:
         self.created_vms: list[tuple[str, str | None]] = []
         self.provisioning_started: list[str] = []
         self.native_refunds: list[str] = []
+        self.native_refund_reasons: dict[str, str] = {}
 
     def compute_price(self, request):
         # 0.05/day * 1 day = 0.05 for xs
@@ -122,6 +124,7 @@ class _StubOrchestrator:
 
     async def record_native_intent_refund(self, intent_id, *, reason, vm_id=None):
         self.native_refunds.append(intent_id)
+        self.native_refund_reasons[intent_id] = reason
         async with self.db() as db:
             intent = await db.get(CryptoIntentRow, intent_id)
             if intent is not None:
@@ -141,6 +144,7 @@ class _StubOrchestrator:
         request,
         owner_wallet: str,
         owner_account_id: str | None = None,
+        vm_id: str | None = None,
         start_provisioning: bool = True,
     ):
         from hyrule_cloud.middleware.anon_token import hash_anon_token
@@ -149,7 +153,7 @@ class _StubOrchestrator:
             generate_vm_id,
         )
 
-        vm_id = generate_vm_id()
+        vm_id = vm_id or generate_vm_id()
         anon_token = generate_anon_management_token()
         anon_hash = hash_anon_token(anon_token)
         async with self.db() as session:
@@ -808,7 +812,7 @@ async def test_native_intent_race_replay_rechecks_owner(
 
 
 @pytest.mark.asyncio
-async def test_quote_bound_native_intent_rechecks_custom_domain_availability(
+async def test_quote_bound_native_intent_rejects_anonymous_managed_domain_attachment(
     intent_state,
     client,
 ):
@@ -832,9 +836,9 @@ async def test_quote_bound_native_intent_rechecks_custom_domain_availability(
         json={"asset": "BTC", "order_payload": posted},
     )
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "Domain taken.test is not available"
-    check_domain.assert_awaited_once_with("taken", "test")
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Custom domains require an authenticated account"
+    check_domain.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -933,6 +937,128 @@ async def test_quote_bound_native_intent_consumes_and_links_quote(intent_state):
     assert linked_quote.status == QuoteStatus.CONSUMED
     assert linked_quote.vm_id == settled_intent.vm_id
     assert vm.cost_total == quote.amount_usd
+
+
+@pytest.mark.asyncio
+async def test_native_custom_domain_is_claimed_before_vm_creation_at_settlement(
+    intent_state,
+):
+    owner_account_id = "HOWNER00001"
+    order = _vm_create_request().model_copy(
+        update={"domain_mode": DomainMode.CUSTOM, "domain": "managed.dev"}
+    )
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_custom_domain",
+        owner_account_id=owner_account_id,
+        order=order,
+    )
+    order = order.model_copy(update={"quote_id": quote.quote_id})
+    claimed: list[tuple[str, str, str]] = []
+
+    async def claim_domain(account_id: str, domain: str, vm_id: str) -> None:
+        assert intent_state.orchestrator.created_vms == []
+        claimed.append((account_id, domain, vm_id))
+
+    intent_state.orchestrator.domains = SimpleNamespace(
+        claim_vm_attachment=claim_domain,
+        release_vm_attachment_claim=AsyncMock(),
+    )
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=quote.amount_usd,
+        client_order_id=None,
+        owner_account_id=owner_account_id,
+    )
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+
+    await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    async with intent_state.orchestrator.db() as db:
+        settled_intent = await db.get(CryptoIntentRow, intent.intent_id)
+    assert settled_intent.status == CryptoIntentStatus.PROVISIONED
+    assert len(claimed) == 1
+    assert claimed[0][:2] == (owner_account_id, "managed.dev")
+    assert claimed[0][2] == settled_intent.vm_id
+    assert intent_state.orchestrator.created_vms == [
+        (settled_intent.vm_id, owner_account_id)
+    ]
+    assert intent_state.orchestrator.provisioning_started == [settled_intent.vm_id]
+
+
+@pytest.mark.asyncio
+async def test_native_custom_domain_contention_records_refund_without_creating_vm(
+    intent_state,
+):
+    owner_account_id = "HOWNER00002"
+    order = _vm_create_request().model_copy(
+        update={"domain_mode": DomainMode.CUSTOM, "domain": "contended.dev"}
+    )
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_contended_domain",
+        owner_account_id=owner_account_id,
+        order=order,
+    )
+    order = order.model_copy(update={"quote_id": quote.quote_id})
+    claim = AsyncMock(side_effect=RuntimeError("domain already claimed"))
+    release = AsyncMock()
+    intent_state.orchestrator.domains = SimpleNamespace(
+        claim_vm_attachment=claim,
+        release_vm_attachment_claim=release,
+    )
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=quote.amount_usd,
+        client_order_id=None,
+        owner_account_id=owner_account_id,
+    )
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+
+    await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    async with intent_state.orchestrator.db() as db:
+        settled_intent = await db.get(CryptoIntentRow, intent.intent_id)
+        stored_quote = await db.get(VMQuoteRow, quote.quote_id)
+    assert settled_intent.status == CryptoIntentStatus.REFUND_MANUAL
+    assert stored_quote.status == QuoteStatus.CONSUMED
+    assert intent_state.orchestrator.created_vms == []
+    assert intent_state.orchestrator.provisioning_started == []
+    assert intent_state.orchestrator.native_refunds == [intent.intent_id]
+    assert (
+        intent_state.orchestrator.native_refund_reasons[intent.intent_id]
+        == "custom_domain_unavailable_at_settlement"
+    )
+    claim.assert_awaited_once()
+    release.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -22,11 +22,12 @@ Usage:
         avail = await hc.check_domain("example", "com")
 
         # Register a domain
-        reg = await hc.register_domain("mysite", "dev", ipv6="2001:db8::1")
+        reg = await hc.register_domain("mysite", "dev")
 """
 
 from __future__ import annotations
 
+import secrets
 from typing import Any
 
 import httpx
@@ -118,14 +119,32 @@ class HyruleClient:
     async def check_domain(self, name: str, extension: str) -> dict[str, Any]:
         """Check domain availability and price."""
         return await self._request(
-            "GET", "/v1/domain/check", params={"domain": f"{name}.{extension}"}
+            "GET", "/v1/domains/check", params={"domain": f"{name}.{extension}"}
         )
 
     async def check_zone(self, name: str, extension: str) -> dict[str, Any]:
         """Check DNS zone availability and price (same as domain availability)."""
         return await self._request(
-            "GET", "/v1/domain/check", params={"domain": f"{name}.{extension}"}
+            "GET", "/v1/domains/check", params={"domain": f"{name}.{extension}"}
         )
+
+    async def domain_tlds(self) -> dict[str, Any]:
+        """List the current eligible generic TLD catalog."""
+        return await self._request("GET", "/v1/domains/tlds")
+
+    async def quote_domain(self, domain: str, action: str = "register") -> dict[str, Any]:
+        """Create a 15-minute registration or renewal quote."""
+        return await self._request(
+            "POST", "/v1/domains/quotes", json={"domain": domain, "action": action}
+        )
+
+    async def domain_order(self, order_id: str) -> dict[str, Any]:
+        """Fetch a durable domain order and its fulfillment state."""
+        return await self._request("GET", f"/v1/domains/orders/{order_id}")
+
+    async def domains(self) -> dict[str, Any]:
+        """List domains owned by the authenticated account."""
+        return await self._request("GET", "/v1/domains")
 
     # -- Paid endpoints --
 
@@ -179,13 +198,26 @@ class HyruleClient:
         self,
         name: str,
         extension: str,
-        ipv6: str | None = None,
+        *,
+        payment_method: str = "usdc",
+        refund_address: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Register a domain via Openprovider. Paid via x402."""
-        body: dict[str, Any] = {"domain": f"{name}.{extension}"}
-        if ipv6:
-            body["ipv6"] = ipv6
-        return await self._request("POST", "/v1/domain/register", json=body)
+        """Quote and create an account-owned registrar order."""
+        quote = await self.quote_domain(f"{name}.{extension}")
+        body: dict[str, Any] = {
+            "quote_id": quote["quote_id"],
+            "payment_method": payment_method,
+            "terms_version": quote["terms_version"],
+        }
+        if refund_address:
+            body["refund_address"] = refund_address
+        return await self._request(
+            "POST",
+            "/v1/domains/orders",
+            json=body,
+            headers={"Idempotency-Key": idempotency_key or secrets.token_urlsafe(24)},
+        )
 
     async def buy_zone(
         self,
@@ -198,9 +230,7 @@ class HyruleClient:
         The zone will be managed by Hyrule Cloud's authoritative DNS.
         Agents can then create records in the zone via the records API.
         """
-        return await self._request(
-            "POST", "/v1/domain/register", json={"name": name, "extension": extension}
-        )
+        return await self.register_domain(name, extension)
 
     async def create_record(
         self,
@@ -211,10 +241,27 @@ class HyruleClient:
         ttl: int = 300,
     ) -> dict[str, Any]:
         """Create a DNS record in a zone owned by the caller."""
+        current = await self._request("GET", f"/v1/domains/{zone}/dns")
         return await self._request(
             "POST",
-            "/v1/zone/record",
-            json={"zone": zone, "name": name, "type": rtype, "value": value, "ttl": ttl},
+            f"/v1/domains/{zone}/dns/changesets",
+            json={
+                "changes": [
+                    {
+                        "action": "upsert",
+                        "rrset": {
+                            "name": name,
+                            "type": rtype,
+                            "ttl": ttl,
+                            "values": [value],
+                        },
+                    }
+                ]
+            },
+            headers={
+                "If-Match": str(current["revision"]),
+                "Idempotency-Key": secrets.token_urlsafe(24),
+            },
         )
 
     async def delete_record(
@@ -224,10 +271,25 @@ class HyruleClient:
         rtype: str,
     ) -> dict[str, Any]:
         """Delete a DNS record from a zone owned by the caller."""
+        current = await self._request("GET", f"/v1/domains/{zone}/dns")
+        existing = next(
+            (
+                record
+                for record in current.get("records", [])
+                if record.get("name") == name and record.get("type") == rtype.upper()
+            ),
+            None,
+        )
+        if existing is None:
+            return current
         return await self._request(
-            "DELETE",
-            "/v1/zone/record",
-            params={"zone": zone, "name": name, "type": rtype},
+            "POST",
+            f"/v1/domains/{zone}/dns/changesets",
+            json={"changes": [{"action": "delete", "rrset": existing}]},
+            headers={
+                "If-Match": str(current["revision"]),
+                "Idempotency-Key": secrets.token_urlsafe(24),
+            },
         )
 
     # -- Network intelligence / agentic support --

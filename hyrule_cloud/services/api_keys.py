@@ -43,6 +43,14 @@ class ApiKeyScope(StrEnum):
     VM_DESTROY = "vm:destroy"
     INTENT_CREATE = "intent:create"
     INTENT_READ = "intent:read"
+    DOMAIN_READ = "domain:read"
+    DOMAIN_QUOTE = "domain:quote"
+    DOMAIN_PURCHASE = "domain:purchase"
+    DOMAIN_RENEW = "domain:renew"
+    DOMAIN_DNS = "domain:dns"
+    DOMAIN_NAMESERVERS = "domain:nameservers"
+    DOMAIN_TRANSFER = "domain:transfer"
+    # Deprecated compatibility vocabulary. No new route authorizes against it.
     DOMAIN_REGISTER = "domain:register"
     API_KEYS_READ = "api_keys:read"
     API_KEYS_WRITE = "api_keys:write"
@@ -56,6 +64,8 @@ DEFAULT_BOOTSTRAP_SCOPES: tuple[ApiKeyScope, ...] = (
     ApiKeyScope.VM_CREATE,
     ApiKeyScope.INTENT_CREATE,
     ApiKeyScope.INTENT_READ,
+    ApiKeyScope.DOMAIN_READ,
+    ApiKeyScope.DOMAIN_QUOTE,
 )
 
 

@@ -448,8 +448,15 @@ class PaymentGate:
             if bypass == self.config.dev_bypass_secret:
                 log.warning("dev_bypass_payment", amount=str(amount))
                 request.state.payment_tx = "dev_bypass_0x0"
+                request.state.payment_network = "dev-bypass"
+                request.state.payment_asset = "USDC"
                 await self._record(
-                    "dev_bypass", request, amount, payer="0xDEV_TEST_WALLET", tx_hash="dev_bypass_0x0"
+                    "dev_bypass",
+                    request,
+                    amount,
+                    payer="0xDEV_TEST_WALLET",
+                    tx_hash="dev_bypass_0x0",
+                    extra=extra_body,
                 )
                 return "0xDEV_TEST_WALLET"
 
@@ -604,9 +611,12 @@ class PaymentGate:
                 asset=matching_requirements.asset,
                 payer=wallet,
                 tx_hash=tx_hash,
+                extra=extra_body,
             )
 
             request.state.payment_tx = tx_hash
+            request.state.payment_network = matching_requirements.network
+            request.state.payment_asset = matching_requirements.asset
             request.state.payment_response_headers = settlement_headers
             return wallet or "unknown"
 

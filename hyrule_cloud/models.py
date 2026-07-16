@@ -109,7 +109,7 @@ class SSHSmokeStatus(enum.StrEnum):
 
 class DomainMode(enum.StrEnum):
     AUTO = "auto"      # subdomain under the configured deploy domain
-    CUSTOM = "custom"  # register via Openprovider
+    CUSTOM = "custom"  # attach an already-active managed domain
 
 
 class ProxyMode(enum.StrEnum):
@@ -121,7 +121,11 @@ class ProxyMode(enum.StrEnum):
 
 class DomainStatus(enum.StrEnum):
     REGISTERING = "registering"
+    PROVIDER_PENDING = "provider_pending"
     ACTIVE = "active"
+    RENEWAL_DUE = "renewal_due"
+    TRANSFER_PENDING = "transfer_pending"
+    TRANSFERRED = "transferred"
     FAILED = "failed"
     EXPIRED = "expired"
 
@@ -489,6 +493,10 @@ class DNSRecordType(enum.StrEnum):
     MX = "MX"
     NS = "NS"
     SRV = "SRV"
+    CAA = "CAA"
+    TLSA = "TLSA"
+    SVCB = "SVCB"
+    HTTPS = "HTTPS"
 
 class DNSRecord(BaseModel):
     type: DNSRecordType

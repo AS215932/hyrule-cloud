@@ -17,7 +17,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import Base, CryptoIntentRow, PaymentEventRow, VMQuoteRow, VMRow
+from hyrule_cloud.db import (
+    AccountRow,
+    Base,
+    CryptoIntentRow,
+    DomainOrderRow,
+    DomainQuoteRow,
+    PaymentEventRow,
+    VMQuoteRow,
+    VMRow,
+)
 from hyrule_cloud.models import (
     CryptoIntentStatus,
     QuoteStatus,
@@ -596,6 +605,106 @@ async def test_record_native_intent_refund_without_vm(session_factory) -> None:
     assert await orch.record_native_intent_refund("int_novm", reason="again") is False
     owed2 = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
     assert len(owed2) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_domain_refund_atomically_marks_order_refund_due(session_factory) -> None:
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(
+            AccountRow(
+                account_id="HNATIVE0001",
+                password_hash="test-only",
+            )
+        )
+        session.add(
+            DomainQuoteRow(
+                quote_id="dq_native_handoff_failure",
+                fqdn="handoff-failure.dev",
+                action="register",
+                owner_account_id="HNATIVE0001",
+                status="reserved",
+                provider_cost=Decimal("10"),
+                provider_currency="USD",
+                fx_rate=Decimal("1"),
+                provider_cost_usd=Decimal("10"),
+                hyrule_fee_usd=Decimal("3"),
+                tax_usd=Decimal("0"),
+                total_usd=Decimal("13"),
+                available=True,
+                premium=False,
+                terms_version="domain-terms-v1",
+                expires_at=now + timedelta(minutes=15),
+            )
+        )
+        session.add(
+            DomainOrderRow(
+                order_id="do_native_handoff_failure",
+                quote_id="dq_native_handoff_failure",
+                fqdn="handoff-failure.dev",
+                action="register",
+                owner_account_id="HNATIVE0001",
+                idempotency_key="native-handoff-failure",
+                status="awaiting_payment",
+                amount_usd=Decimal("13"),
+                domain_amount_usd=Decimal("13"),
+                vm_amount_usd=Decimal("0"),
+                payment_method="btc",
+                refund_address="bc1qrefund",
+                on_domain_failure="keep_vm",
+                terms_version="domain-terms-v1",
+                terms_accepted_at=now,
+            )
+        )
+        session.add(
+            CryptoIntentRow(
+                intent_id="int_domain_handoff_failure",
+                asset="BTC",
+                amount_crypto=Decimal("0.0002"),
+                amount_usd=Decimal("13"),
+                address="bc1qdeposit",
+                status=CryptoIntentStatus.PROVISIONING,
+                expires_at=now + timedelta(hours=1),
+                paid_at=now,
+                tx_hash="btc-handoff-tx",
+                owner_account_id="HNATIVE0001",
+                resource_type="domain_order",
+                resource_id="do_native_handoff_failure",
+                refund_address="bc1qrefund",
+            )
+        )
+        await session.commit()
+
+    assert await orch.record_native_intent_refund(
+        "int_domain_handoff_failure",
+        reason="domain_fulfillment_handoff_failed",
+    )
+
+    async with session_factory() as session:
+        intent = await session.get(CryptoIntentRow, "int_domain_handoff_failure")
+        order = await session.get(DomainOrderRow, "do_native_handoff_failure")
+    assert intent is not None and intent.status == CryptoIntentStatus.REFUND_MANUAL
+    assert order is not None and order.status == "refund_due"
+    assert order.payer == "int_domain_handoff_failure"
+    assert order.payment_tx == "btc-handoff-tx"
+    assert order.error_code == "domain_fulfillment_handoff_failed"
+
+    # Repair historical drift without recording a second obligation.
+    async with session_factory() as session:
+        order = await session.get(DomainOrderRow, "do_native_handoff_failure")
+        assert order is not None
+        order.status = "awaiting_payment"
+        await session.commit()
+    assert not await orch.record_native_intent_refund(
+        "int_domain_handoff_failure",
+        reason="domain_fulfillment_handoff_failed",
+    )
+    async with session_factory() as session:
+        repaired = await session.get(DomainOrderRow, "do_native_handoff_failure")
+    assert repaired is not None and repaired.status == "refund_due"
+    owed = [event for event in await _events(session_factory) if event.event_type == "refund_owed"]
+    assert len(owed) == 1
 
 
 @pytest.mark.asyncio

@@ -12,10 +12,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.api.routes import _enforce_paid_vm_cap
 from hyrule_cloud.app import app
-from hyrule_cloud.db import Base, CryptoIntentRow, DomainRow, VMQuoteRow, VMRow
+from hyrule_cloud.db import Base, CryptoIntentRow, VMQuoteRow, VMRow
 from hyrule_cloud.models import (
     CryptoIntentStatus,
-    DomainStatus,
     NetworkRequest,
     QuoteStatus,
     VMSize,
@@ -109,13 +108,9 @@ class _Orch:
         from hyrule_cloud.models import CostBreakdown
 
         total = Decimal("0.05") * request.duration_days
-        domain_cost = Decimal("0")
-        if request.domain_mode == "custom" and request.domain:
-            domain_cost = Decimal("1.00")
-        total += domain_cost
         return total, CostBreakdown(
-            vm_cost=f"${total - domain_cost:.2f}",
-            domain_cost=f"${domain_cost:.2f}" if domain_cost else "$0.00",
+            vm_cost=f"${total:.2f}",
+            domain_cost="$0.00",
             total=f"${total:.2f}",
         )
 
@@ -168,106 +163,21 @@ async def test_native_intent_rejected_until_asset_advertised(launch_state):
 
 
 @pytest.mark.asyncio
-async def test_domain_register_persists_ownerless_token_and_gates_records(launch_state):
+async def test_legacy_singular_domain_and_zone_routes_are_removed(launch_state):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         check = await client.get("/v1/domain/check", params={"domain": "example.test"})
-        assert check.status_code == 200
-        assert check.json()["total"] == "9.50"
-
-        unpaid = await client.post("/v1/domain/register", json={"domain": "example.test"})
-        assert unpaid.status_code == 402
-
-        paid = await client.post(
+        register = await client.post(
             "/v1/domain/register",
             json={"domain": "example.test", "client_order_id": "domain-1"},
             headers={"X-Mock-Paid": "1"},
         )
-        assert paid.status_code == 200, paid.text
-        body = paid.json()
-        assert body["status"] == "active"
-        token = body["management_token"]
-        assert token.startswith("hyr_dom_")
-        assert body["management_url"] == "/v1/zone/records?zone=example.test"
+        records = await client.get("/v1/zone/records", params={"zone": "example.test"})
 
-        denied = await client.get("/v1/zone/records", params={"zone": "example.test"})
-        assert denied.status_code == 404
-
-        allowed = await client.get(
-            "/v1/zone/records",
-            params={"zone": "example.test"},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert allowed.status_code == 200
-        assert allowed.json()["records"][0]["type"] == "AAAA"
-
-    async with launch_state.orchestrator.db() as session:
-        row = (await session.get(DomainRow, 1))
-        assert row.fqdn == "example.test"
-        assert row.status == DomainStatus.ACTIVE
-        assert row.owner_wallet == "0xwallet"
+    assert [check.status_code, register.status_code, records.status_code] == [404, 404, 404]
 
 
 @pytest.mark.asyncio
-async def test_domain_register_same_idempotency_key_returns_existing_domain(launch_state):
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        first = await client.post(
-            "/v1/domain/register",
-            json={"domain": "example.test", "client_order_id": "domain-1"},
-            headers={"X-Mock-Paid": "1"},
-        )
-        replay = await client.post(
-            "/v1/domain/register",
-            json={"domain": "example.test", "client_order_id": "domain-1"},
-        )
-
-    assert first.status_code == 200, first.text
-    assert replay.status_code == 200, replay.text
-    assert replay.json()["status"] == "active"
-    assert replay.json()["message"] == "Domain registration already exists"
-    assert launch_state.orchestrator.openprovider.registrations == [("example", "test")]
-
-
-@pytest.mark.asyncio
-async def test_domain_register_reused_idempotency_key_for_different_domain_conflicts(launch_state):
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        first = await client.post(
-            "/v1/domain/register",
-            json={"domain": "example.test", "client_order_id": "domain-1"},
-            headers={"X-Mock-Paid": "1"},
-        )
-        conflict = await client.post(
-            "/v1/domain/register",
-            json={"domain": "other.test", "client_order_id": "domain-1"},
-            headers={"X-Mock-Paid": "1"},
-        )
-
-    assert first.status_code == 200, first.text
-    assert conflict.status_code == 409
-    assert conflict.json()["detail"] == "client_order_id already used for a different domain"
-    assert launch_state.orchestrator.openprovider.registrations == [("example", "test")]
-
-
-@pytest.mark.asyncio
-async def test_domain_register_failure_after_payment_persists_failed_row(launch_state):
-    launch_state.orchestrator.openprovider.fail_register = True
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        paid = await client.post(
-            "/v1/domain/register",
-            json={"domain": "broken.test", "client_order_id": "domain-fail-1"},
-            headers={"X-Mock-Paid": "1"},
-        )
-        assert paid.status_code == 502
-
-    async with launch_state.orchestrator.db() as session:
-        row = (await session.get(DomainRow, 1))
-        assert row.fqdn == "broken.test"
-        assert row.status == DomainStatus.FAILED
-        assert row.payment_tx == "0xpaid"
-        assert "registrar unavailable" in row.error
-
-
-@pytest.mark.asyncio
-async def test_vm_quote_custom_domain_includes_registrar_price_and_markup(launch_state):
+async def test_vm_quote_custom_domain_does_not_bundle_domain_registration(launch_state):
     payload = {
         "order_payload": {
             "duration_days": 1,
@@ -283,7 +193,7 @@ async def test_vm_quote_custom_domain_includes_registrar_price_and_markup(launch
         res = await client.post("/v1/vm/quote", json=payload)
     assert res.status_code == 201, res.text
     body = res.json()
-    assert body["amount_usd"] == "9.550000"
+    assert body["amount_usd"] == "0.050000"
 
 
 @pytest.mark.asyncio
@@ -427,7 +337,10 @@ def _real_gate():
     from hyrule_cloud.middleware.x402 import PaymentGate
 
     return PaymentGate(
-        PaymentConfig(receiver_address="0xFf4555af30A1066A889324a3Fe88c76796159f15")
+        PaymentConfig(
+            receiver_address="0xFf4555af30A1066A889324a3Fe88c76796159f15",
+            facilitator_url="https://facilitator.payai.network",
+        )
     )
 
 

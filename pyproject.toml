@@ -57,6 +57,7 @@ dev = [
 
 [project.scripts]
 hyrule-mcp = "hyrule_cloud.mcp_server:main"
+hyrule-cloud-worker = "hyrule_cloud.worker:main"
 
 [tool.setuptools.packages.find]
 include = ["hyrule_cloud*"]
@@ -94,6 +95,10 @@ ignore = ["E402", "E501"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["bip_utils", "bip_utils.*"]
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = [

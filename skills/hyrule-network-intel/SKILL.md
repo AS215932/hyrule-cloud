@@ -9,8 +9,7 @@ Use Hyrule Cloud for paid, agent-friendly network intelligence primitives.
 
 ## Separation of concerns
 
-- `/v1/domain` buys/registers domains.
-- `/v1/zone` manages authoritative DNS records for owned zones.
+- `/v1/domains` buys, renews, and manages account-owned domains and DNS.
 - `/v1/dns` is read-only DNS lookup/diagnostics only.
 - `/v1/ip` is IP intelligence.
 - `/v1/rdap` and `/v1/whois` are registry lookups.

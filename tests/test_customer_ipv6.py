@@ -54,9 +54,7 @@ def test_debian_network_config_uses_on_link_gateway():
     iface = body["ethernets"]["enX0"]
     assert iface["addresses"] == ["2a0c:b641:b51:1::2/64"]
     assert iface["nameservers"]["addresses"] == ["2a0c:b641:b51::1"]
-    assert iface["routes"] == [
-        {"to": "::/0", "via": "2a0c:b641:b51::1", "on-link": True}
-    ]
+    assert iface["routes"] == [{"to": "::/0", "via": "2a0c:b641:b51::1", "on-link": True}]
 
 
 def test_debian_network_config_rejects_non_64_prefix():
@@ -138,11 +136,91 @@ async def test_wait_for_ipv6_requires_expected_address(session_factory):
     orch = Orchestrator(cfg, session_factory)
     orch.xcpng = StubXCPNG()
 
-    assert await orch._wait_for_ipv6(
-        "vm-uuid",
-        timeout=1,
-        expected_ipv6="2a0c:b641:b51:1::2",
-    ) == "2a0c:b641:b51:1::2"
+    assert (
+        await orch._wait_for_ipv6(
+            "vm-uuid",
+            timeout=1,
+            expected_ipv6="2a0c:b641:b51:1::2",
+        )
+        == "2a0c:b641:b51:1::2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_restarted_provisioner_replaces_untracked_exact_label_clone(
+    session_factory, monkeypatch
+):
+    """A crash after XO cloned but before its UUID commit cannot duplicate a VM."""
+    monkeypatch.setattr("hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True)
+
+    class StubXCPNG:
+        def __init__(self) -> None:
+            self.destroyed: list[str] = []
+            self.created: list[dict] = []
+
+        async def find_vm_ids_by_name_label(self, name_label: str) -> list[str]:
+            assert name_label == "hyrule-vm_recover_clone"
+            return ["orphan-clone"]
+
+        async def destroy_vm(self, uuid: str) -> None:
+            self.destroyed.append(uuid)
+
+        async def create_vm(self, **kwargs) -> str:
+            self.created.append(kwargs)
+            return "fresh-clone"
+
+        async def get_vm_ipv6(self, vm_uuid: str) -> str | None:
+            assert vm_uuid == "fresh-clone"
+            return "2a0c:b641:b51:9::2"
+
+    class StubDNS:
+        def __init__(self) -> None:
+            self.created: list[tuple[str, str]] = []
+
+        async def create_aaaa(self, subdomain: str, ipv6: str) -> None:
+            self.created.append((subdomain, ipv6))
+
+        async def verify_aaaa(self, subdomain: str, ipv6: str) -> bool:
+            return True
+
+    cfg = HyruleConfig()
+    cfg.xcpng.templates["debian-13"] = "template"
+    orch = Orchestrator(cfg, session_factory)
+    xcpng = StubXCPNG()
+    dns = StubDNS()
+    orch.xcpng = xcpng
+    orch.dns = dns
+
+    async def probe_ssh(ipv6: str) -> bool:
+        return True
+
+    monkeypatch.setattr(orch, "_probe_ssh", probe_ssh)
+    async with session_factory() as session:
+        session.add(
+            VMRow(
+                vm_id="vm_recover_clone",
+                owner_wallet="0x" + "1" * 40,
+                status=VMStatus.PROVISIONING,
+                size=VMSize.XS,
+                os="debian-13",
+                ipv6_prefix_index=9,
+                ipv6_prefix="2a0c:b641:b51:9::/64",
+                ssh_pubkey="ssh-ed25519 AAAA test",
+                open_ports=[22],
+                cost_total=Decimal("0.05"),
+            )
+        )
+        await session.commit()
+
+    await orch._provision_vm("vm_recover_clone")
+
+    async with session_factory() as session:
+        recovered = await session.get(VMRow, "vm_recover_clone")
+    assert xcpng.destroyed == ["orphan-clone"]
+    assert len(xcpng.created) == 1
+    assert recovered.xcpng_uuid == "fresh-clone"
+    assert recovered.status == VMStatus.READY
+    assert recovered.ipv6 == "2a0c:b641:b51:9::2"
 
 
 def test_debian_network_config_allows_off_supernet_dns():
@@ -290,9 +368,7 @@ def test_vm_order_validation_rejects_unsupported_os_in_real_mode(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_create_vm_refuses_unsupported_os_before_persisting(
-    session_factory, monkeypatch
-):
+async def test_create_vm_refuses_unsupported_os_before_persisting(session_factory, monkeypatch):
     """Defense in depth: even a pre-validation settled intent cannot create a
     paid VM row for an OS real provisioning cannot deliver."""
     from sqlalchemy import func, select
@@ -429,17 +505,30 @@ class _StubDNSDelete:
         pass
 
 
-class _FailingOpenprovider:
-    async def delete_zone_record(self, **kwargs) -> None:
-        raise RuntimeError("openprovider down")
-
-
-class _OkOpenprovider:
+class _FailingDomains:
     def __init__(self) -> None:
-        self.deleted: list[dict] = []
+        self.enqueued: list[tuple[str, str, str, bool]] = []
 
-    async def delete_zone_record(self, **kwargs) -> None:
-        self.deleted.append(kwargs)
+    async def detach_vm(self, account_id: str, domain: str, vm_id: str) -> None:
+        raise RuntimeError("managed DNS control down")
+
+    async def enqueue_vm_detachment(
+        self,
+        account_id: str,
+        domain: str,
+        vm_id: str,
+        *,
+        release_prefix: bool = False,
+    ) -> None:
+        self.enqueued.append((account_id, domain, vm_id, release_prefix))
+
+
+class _OkDomains:
+    def __init__(self) -> None:
+        self.detached: list[tuple[str, str, str]] = []
+
+    async def detach_vm(self, account_id: str, domain: str, vm_id: str) -> None:
+        self.detached.append((account_id, domain, vm_id))
 
 
 def _vm_row(vm_id: str, *, prefix_index: int, **overrides) -> VMRow:
@@ -472,15 +561,23 @@ async def test_destroy_quarantines_prefix_when_custom_dns_cleanup_fails(session_
     orch = Orchestrator(cfg, session_factory)
     orch.xcpng = _StubXCPNGDestroy()
     orch.dns = _StubDNSDelete()
-    orch.openprovider = _FailingOpenprovider()
+    domains = _FailingDomains()
+    orch.domains = domains
 
     async with session_factory() as session:
         session.add(
-            _vm_row("vm_cd", prefix_index=9, domain_mode=DomainMode.CUSTOM, domain="cust.dev")
+            _vm_row(
+                "vm_cd",
+                prefix_index=9,
+                domain_mode=DomainMode.CUSTOM,
+                domain="cust.dev",
+                owner_account_id="H1234567890",
+            )
         )
         await session.commit()
 
     assert await orch.destroy_vm("vm_cd") is True
+    assert domains.enqueued == [("H1234567890", "cust.dev", "vm_cd", True)]
 
     async with session_factory() as session:
         row = await session.get(VMRow, "vm_cd")
@@ -497,17 +594,23 @@ async def test_destroy_releases_prefix_after_custom_dns_cleanup(session_factory)
     orch = Orchestrator(cfg, session_factory)
     orch.xcpng = _StubXCPNGDestroy()
     orch.dns = _StubDNSDelete()
-    op = _OkOpenprovider()
-    orch.openprovider = op
+    domains = _OkDomains()
+    orch.domains = domains
 
     async with session_factory() as session:
         session.add(
-            _vm_row("vm_cd2", prefix_index=10, domain_mode=DomainMode.CUSTOM, domain="cust2.dev")
+            _vm_row(
+                "vm_cd2",
+                prefix_index=10,
+                domain_mode=DomainMode.CUSTOM,
+                domain="cust2.dev",
+                owner_account_id="H1234567890",
+            )
         )
         await session.commit()
 
     assert await orch.destroy_vm("vm_cd2") is True
-    assert op.deleted == [{"zone_name": "cust2.dev", "name": "", "rtype": "AAAA"}]
+    assert domains.detached == [("H1234567890", "cust2.dev", "vm_cd2")]
 
     async with session_factory() as session:
         row = await session.get(VMRow, "vm_cd2")
