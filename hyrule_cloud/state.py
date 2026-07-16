@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from hyrule_cloud.providers.network_client import NetworkProvider
     from hyrule_cloud.providers.prober_client import ProberProvider
     from hyrule_cloud.providers.rates import RateProvider
+    from hyrule_cloud.services.signing import ResponseSigner
 
 
 @dataclass
@@ -25,6 +26,9 @@ class AppState:
     # tests can construct AppState without it; path routes treat None as
     # "prober not configured" and refuse before charging.
     prober_provider: ProberProvider | None = field(default=None)
+    # x402 trust layer: signs paid 2xx JSON responses. None = signing disabled
+    # (no key configured); the signing middleware then passes responses through.
+    response_signer: ResponseSigner | None = field(default=None)
     # Block E: native crypto path. Optional so existing tests can wire only
     # what they need; routes that require them check for None.
     native_crypto: NativeCryptoProvider | None = field(default=None)

@@ -266,6 +266,14 @@ class HyruleConfig(BaseSettings):
     prober_token: str = ""
     prober_health_ttl_seconds: int = 30
 
+    # ed25519 response signing (x402 trust layer). Signs the exact bytes of
+    # every paid 2xx JSON response so buyers can verify a measurement against
+    # the key published at /.well-known/hyrule-signing-key.json. An empty key
+    # disables signing (no headers, no manifest advertisement) — the feature
+    # ships dark until an operator provisions a key from Vault.
+    response_signing_key: str = ""  # base64-encoded 32-byte ed25519 seed
+    response_signing_key_id: str = ""  # e.g. "hyrule-2026-07"
+
     # Block F (Wave 5): origin bound into wallet-recovery challenges. Per-env so
     # staging / alternate domains emit a matching origin without a code change.
     recovery_origin: str = "https://hyrule.host"

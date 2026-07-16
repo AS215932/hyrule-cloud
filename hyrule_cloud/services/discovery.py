@@ -778,13 +778,34 @@ def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
         if maximum is not None:
             resource["maxPrice"] = str(maximum)
         resources.append(resource)
-    return {
+    manifest: dict[str, Any] = {
         "x402Version": 2,
         "name": "Hyrule Cloud",
         "description": catalog_description(),
         "resources": resources,
         "facilitator": getattr(config.payment, "facilitator_url", ""),
         "contact": "https://github.com/AS215932",
+    }
+    signing_key = _manifest_signing_key(config)
+    if signing_key is not None:
+        manifest["signingKey"] = signing_key
+    return manifest
+
+
+def _manifest_signing_key(config: HyruleConfig) -> dict[str, Any] | None:
+    """Advertise the ed25519 response-signing key when configured, so buyers can
+    discover that paid responses are verifiable and where to fetch the key."""
+    from hyrule_cloud.services.signing import load_signer
+
+    signer = load_signer(config)
+    if signer is None:
+        return None
+    return {
+        "algorithm": "ed25519",
+        "keyId": signer.key_id,
+        "publicKeyBase64": signer.public_key_b64,
+        "signatureHeader": "Hyrule-Signature",
+        "wellKnown": "/.well-known/hyrule-signing-key.json",
     }
 
 

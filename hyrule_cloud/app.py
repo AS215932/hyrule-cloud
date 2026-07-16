@@ -108,6 +108,14 @@ async def lifespan(app: FastAPI):
     )
     set_active_prober(prober_provider)
 
+    # x402 trust layer: load the ed25519 response signer (None when no key is
+    # configured — signing then ships dark). The signing middleware reads it
+    # from AppState per request.
+    from hyrule_cloud.services.signing import load_signer
+    response_signer = load_signer(config)
+    if response_signer is not None:
+        log.info("response_signing_enabled", key_id=response_signer.key_id)
+
     # Orchestrator
     orchestrator = Orchestrator(config, session_factory)
     await orchestrator.startup()
@@ -131,6 +139,7 @@ async def lifespan(app: FastAPI):
         payment_gate=payment_gate,
         network_provider=network_provider,
         prober_provider=prober_provider,
+        response_signer=response_signer,
         native_crypto=native_crypto,
         rate_provider=rate_provider,
         native_payment_assets=native_payment_assets,
@@ -257,6 +266,14 @@ async def llms_txt(request: Request) -> PlainTextResponse:
         lines.append(
             f"  {operation.method} {operation.path} — ${price} — {operation.description}"
         )
+    if getattr(state, "response_signer", None) is not None:
+        lines += [
+            "",
+            "Verifiable measurements: every paid 2xx JSON response carries an ed25519 "
+            "detached signature over the exact body in the 'Hyrule-Signature' header "
+            "(ed25519=<base64>), with the key id in 'Hyrule-Signature-Key'. Fetch the "
+            f"public key at {base}/.well-known/hyrule-signing-key.json to verify.",
+        ]
     return PlainTextResponse("\n".join(lines) + "\n")
 
 
@@ -350,10 +367,32 @@ app.include_router(metrics_router)
 # append) and bounded in memory.
 install_metrics(app)
 
+# x402 trust layer: sign paid 2xx JSON responses. Added last so it is the
+# outermost middleware and signs the exact bytes the buyer receives. No-ops
+# unless a signer is configured (read from AppState per request).
+from hyrule_cloud.middleware.signing import ResponseSigningMiddleware
+
+app.add_middleware(ResponseSigningMiddleware)
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "hyrule-cloud"}
+
+
+@app.get("/.well-known/hyrule-signing-key.json", include_in_schema=False)
+async def hyrule_signing_key(request: Request) -> Response:
+    """Publish the active ed25519 response-signing public key. 404 when signing
+    is not configured so buyers never trust a key that isn't in use."""
+    from fastapi.responses import JSONResponse
+
+    from hyrule_cloud.services.signing import signing_key_document
+
+    state = getattr(request.app.state, "_typed_state", None)
+    signer = getattr(state, "response_signer", None)
+    if signer is None:
+        return JSONResponse(status_code=404, content={"error": "response signing is not configured"})
+    return JSONResponse(content=signing_key_document(signer))
 
 
 @app.get("/.well-known/x402.json", include_in_schema=False)

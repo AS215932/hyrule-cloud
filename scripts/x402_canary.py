@@ -113,6 +113,39 @@ def _client(usd: str, network: str) -> x402Client:
     return client
 
 
+# Set by --verify-signature: assert every paid 2xx JSON carries a valid
+# ed25519 signature over its body, verified against the published key.
+VERIFY_SIGNATURE = False
+_SIGNING_PUBKEY: str | None = None
+_SIGNING_PUBKEY_FETCHED = False
+
+
+async def _verify_response_signature(resp: httpx.Response) -> tuple[bool, str]:
+    """Verify the Hyrule-Signature header over the exact response body against
+    the key published at /.well-known/hyrule-signing-key.json."""
+    global _SIGNING_PUBKEY, _SIGNING_PUBKEY_FETCHED
+    from hyrule_cloud.services.signing import verify_signature
+
+    header = resp.headers.get("hyrule-signature")
+    if not header or not header.startswith("ed25519="):
+        return False, "(no ed25519 Hyrule-Signature header on a paid 2xx)"
+    if not _SIGNING_PUBKEY_FETCHED:
+        _SIGNING_PUBKEY_FETCHED = True
+        try:
+            async with httpx.AsyncClient(base_url=API, timeout=15.0) as http:
+                doc = (await http.get("/.well-known/hyrule-signing-key.json")).json()
+            _SIGNING_PUBKEY = doc["keys"][0]["publicKeyBase64"]
+        except Exception as e:
+            return False, f"(could not fetch signing key: {e!r})"
+    if not _SIGNING_PUBKEY:
+        return False, "(no published signing key)"
+    signature = header.split("=", 1)[1]
+    if verify_signature(_SIGNING_PUBKEY, resp.content, signature):
+        kid = resp.headers.get("hyrule-signature-key", "?")
+        return True, f"OK ed25519 (kid={kid})"
+    return False, "(signature did NOT verify against the published key)"
+
+
 def _settlement(resp: httpx.Response) -> tuple[bool, str]:
     """(settled_ok, human detail). ``settled_ok`` is True only when the paid
     response actually carried a successful x402 settlement. A 2xx WITHOUT one
@@ -234,6 +267,12 @@ async def _run_one(
         # not actually charged — a broken gate, not a passing canary.
         print("    !! paid 2xx with no successful settlement — route not charged; FAILING.")
         return False
+
+    if VERIFY_SIGNATURE:
+        sig_ok, sig_detail = await _verify_response_signature(r)
+        print(f"    signature: {sig_detail}")
+        if not sig_ok:
+            return False
 
     if name == "vm":
         # The 202 only means the create was accepted + charged; the Phase-3d
@@ -469,11 +508,18 @@ async def _main() -> None:
     ap.add_argument("--quote", action="store_true", help="pay the vm create against a locked quote_id (POST /v1/vm/quote first)")
     ap.add_argument("--yes", action="store_true", help="skip the spend + destroy confirmation prompts")
     ap.add_argument(
+        "--verify-signature",
+        action="store_true",
+        help="assert every paid 2xx JSON carries a valid ed25519 Hyrule-Signature (trust layer)",
+    )
+    ap.add_argument(
         "--network",
         default="eip155:8453",
         help="CAIP-2 chain to pay on (default Base mainnet); CANARY_KEY must be funded there",
     )
     args = ap.parse_args()
+    global VERIFY_SIGNATURE
+    VERIFY_SIGNATURE = args.verify_signature
 
     if args.target == "list":
         print(f"API: {API}\n")
