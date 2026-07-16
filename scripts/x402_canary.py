@@ -97,18 +97,18 @@ def _cap_units(usd: str) -> int:
     return math.ceil(Decimal(usd) * Decimal("1.10") * Decimal(10**6))
 
 
-def _client(usd: str) -> x402Client:
+def _client(usd: str, network: str) -> x402Client:
     key = os.environ.get("CANARY_KEY")
     if not key:
-        sys.exit("ERROR: set CANARY_KEY to a funded Base wallet private key (0x...).")
+        sys.exit(f"ERROR: set CANARY_KEY to a wallet private key (0x...) funded on {network}.")
     signer = EthAccountSigner(Account.from_key(key))
     client = x402Client()
-    # Pin to Base mainnet (eip155:8453) + a per-call max-amount guardrail. The
-    # canary key is Base-funded; without the network pin the SDK would sign for
-    # whatever EVM chain the API advertises first (e.g. Polygon/Arbitrum if CDP
-    # enables them before Base), causing a false failure or wrong-chain spend.
+    # Pin to ONE chain (--network, default Base mainnet) + a per-call
+    # max-amount guardrail. Without the pin the SDK would sign for whatever
+    # EVM chain the API advertises first, causing a false failure or a
+    # wrong-chain spend from an unfunded/differently-funded wallet.
     register_exact_evm_client(
-        client, signer, networks="eip155:8453", policies=[max_amount(_cap_units(usd))]
+        client, signer, networks=network, policies=[max_amount(_cap_units(usd))]
     )
     return client
 
@@ -160,7 +160,15 @@ async def _domain_check_price(name: str, extension: str) -> Decimal | None:
         return None
 
 
-async def _run_one(name: str, *, destroy: bool, domain_name: str | None, use_quote: bool, yes: bool) -> bool:
+async def _run_one(
+    name: str,
+    *,
+    destroy: bool,
+    domain_name: str | None,
+    use_quote: bool,
+    yes: bool,
+    network: str = "eip155:8453",
+) -> bool:
     t = TESTS[name]
     body = json.loads(json.dumps(t["body"]))  # deep copy
     quote_id: str | None = None
@@ -201,7 +209,7 @@ async def _run_one(name: str, *, destroy: bool, domain_name: str | None, use_quo
     if quote_id:
         print(f"    quote_id: {quote_id}")
     print(f"    body: {json.dumps(body)}")
-    client = _client(cap_usd)
+    client = _client(cap_usd, network)
     async with x402HttpxClient(client, base_url=API, timeout=60.0) as http:
         try:
             r = await http.post(t["path"], json=body)
@@ -460,6 +468,11 @@ async def _main() -> None:
     ap.add_argument("--destroy", action="store_true", help="destroy the VM after it comes up (vm test)")
     ap.add_argument("--quote", action="store_true", help="pay the vm create against a locked quote_id (POST /v1/vm/quote first)")
     ap.add_argument("--yes", action="store_true", help="skip the spend + destroy confirmation prompts")
+    ap.add_argument(
+        "--network",
+        default="eip155:8453",
+        help="CAIP-2 chain to pay on (default Base mainnet); CANARY_KEY must be funded there",
+    )
     args = ap.parse_args()
 
     if args.target == "list":
@@ -484,7 +497,7 @@ async def _main() -> None:
     total = sum(Decimal(TESTS[n]["usd"]) for n in names)
     spendy = [n for n in names if TESTS[n].get("spendy")]
     print(f"About to run {len(names)} canary payment(s) on {API}: {', '.join(names)}")
-    print(f"Estimated total spend: ${total} (real USDC on Base mainnet)")
+    print(f"Estimated total spend: ${total} (real USDC on {args.network})")
     if spendy:
         print(f"⚠  side-effecting / higher-cost: {', '.join(spendy)}")
     if not args.yes:
@@ -494,7 +507,14 @@ async def _main() -> None:
 
     ok = 0
     for n in names:
-        if await _run_one(n, destroy=args.destroy, domain_name=args.name, use_quote=args.quote, yes=args.yes):
+        if await _run_one(
+            n,
+            destroy=args.destroy,
+            domain_name=args.name,
+            use_quote=args.quote,
+            yes=args.yes,
+            network=args.network,
+        ):
             ok += 1
     print(f"\n=== done: {ok}/{len(names)} succeeded ===")
     if ok != len(names):

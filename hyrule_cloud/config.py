@@ -51,12 +51,9 @@ class PaymentNetwork:
     enabled: bool = True
 
 
-# Default chain list. Only chains advertised by the *default* facilitator
-# (x402.org public, testnet-only) are `enabled=True` out of the box — that's
-# Base mainnet, verified via its testnet sibling Base Sepolia. Polygon and
-# Arbitrum are coded but DISABLED by default because the public x402.org
-# facilitator doesn't list them; production deployments using Coinbase CDP
-# (which does list all three) flip them on in Vault per
+# Default chain list. Both the default facilitator (payai) and Coinbase CDP
+# advertise all three chains; what gates `enabled=True` is a live paid canary
+# per chain (`scripts/x402_canary.py dns --network <caip2>`) per
 # [[feedback_verified_payment_chains]] — we only advertise what verifies.
 #
 # World and Solana are intentionally omitted until Wave 5 (Block H) wires
@@ -92,7 +89,7 @@ _DEFAULT_NETWORKS: list[PaymentNetwork] = [
         rpc_url="https://polygon-rpc.com",
         block_explorer_url="https://polygonscan.com",
         testnet=False,
-        enabled=False,  # flip on in Vault when facilitator_url points at CDP
+        enabled=True,
     ),
     PaymentNetwork(
         key="arbitrum",
@@ -107,7 +104,7 @@ _DEFAULT_NETWORKS: list[PaymentNetwork] = [
         rpc_url="https://arb1.arbitrum.io/rpc",
         block_explorer_url="https://arbiscan.io",
         testnet=False,
-        enabled=False,  # flip on in Vault when facilitator_url points at CDP
+        enabled=True,
     ),
 ]
 
