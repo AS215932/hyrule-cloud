@@ -43,6 +43,7 @@ from hyrule_cloud.domains.errors import DomainProblem, problem_response
 from hyrule_cloud.domains.service import DomainService
 from hyrule_cloud.domains.wallet_auth import WalletAuthService
 from hyrule_cloud.domains.wallet_auth import router as wallet_auth_router
+from hyrule_cloud.logging_config import SAFE_DICT_TRACEBACKS
 from hyrule_cloud.middleware.metrics import install_metrics
 from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
@@ -57,7 +58,7 @@ structlog.configure(
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True, key="ts"),
         structlog.contextvars.merge_contextvars,
-        structlog.processors.dict_tracebacks,
+        SAFE_DICT_TRACEBACKS,
         structlog.processors.JSONRenderer(),
     ],
     wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),

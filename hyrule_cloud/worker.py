@@ -14,6 +14,7 @@ import structlog
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
 from hyrule_cloud.domains.service import DomainService
+from hyrule_cloud.logging_config import SAFE_DICT_TRACEBACKS
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
@@ -23,7 +24,7 @@ structlog.configure(
     processors=[
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True, key="ts"),
-        structlog.processors.dict_tracebacks,
+        SAFE_DICT_TRACEBACKS,
         structlog.processors.JSONRenderer(),
     ],
     wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
