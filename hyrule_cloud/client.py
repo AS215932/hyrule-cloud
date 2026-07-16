@@ -27,10 +27,14 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
+import platform
 import secrets
 from typing import Any
 
 import httpx
+
+from hyrule_cloud.agent_probe import stun_binding_address, trigger_dns_observation
 
 
 class HyruleError(Exception):
@@ -309,6 +313,212 @@ class HyruleClient:
         if views:
             payload["views"] = views
         return await self._request("POST", "/v1/ip/lookup", json=payload)
+
+    async def ip_sources(self) -> dict[str, Any]:
+        """Free inventory of IP-intelligence sources and launch readiness."""
+        return await self._request("GET", "/v1/ip/sources")
+
+    async def ip_check_session(
+        self, expected_dns_resolvers: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Create a free, short-lived machine-readable network probe session."""
+        return await self._request(
+            "POST",
+            "/v1/ip-check/sessions",
+            json={"expected_dns_resolvers": expected_dns_resolvers or []},
+        )
+
+    async def ip_check_report(self, session_id: str, token: str) -> dict[str, Any]:
+        """Fetch a network observation report with its session bearer."""
+        return await self._request(
+            "GET",
+            f"/v1/ip-check/sessions/{session_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    async def ip_check_agent_fingerprint(
+        self,
+        session_id: str,
+        token: str,
+        fingerprint: dict[str, object],
+    ) -> dict[str, Any]:
+        """Submit declared agent provenance and an optional signed identity proof."""
+        return await self._request(
+            "POST",
+            f"/v1/ip-check/sessions/{session_id}/fingerprints/agent",
+            headers={"Authorization": f"Bearer {token}"},
+            json=fingerprint,
+        )
+
+    async def ip_check_browser_fingerprint(
+        self,
+        session_id: str,
+        token: str,
+        fingerprint: dict[str, object],
+    ) -> dict[str, Any]:
+        """Submit explicit browser traits to the session-scoped fingerprint endpoint."""
+        return await self._request(
+            "POST",
+            f"/v1/ip-check/sessions/{session_id}/fingerprints/browser",
+            headers={"Authorization": f"Bearer {token}"},
+            json=fingerprint,
+        )
+
+    async def network_environment_check(
+        self,
+        *,
+        expected_dns_resolvers: list[str] | None = None,
+        protocol: str = "sdk",
+        model_vendor_claim: str | None = None,
+        model_name_claim: str | None = None,
+    ) -> dict[str, Any]:
+        """Run HTTP, DNS, and STUN probes from this client process.
+
+        This measures the environment where the Python client/MCP process runs,
+        not the Hyrule API host and not a different browser or remote gateway.
+        """
+        created = await self.ip_check_session(expected_dns_resolvers)
+        session_id = str(created["session_id"])
+        token = str(created["token"])
+        auth = {"Authorization": f"Bearer {token}"}
+        outcomes: dict[str, object] = {}
+
+        async def http_probe(name: str, url: str) -> None:
+            try:
+                observed = await self._request("POST", url, headers=auth)
+                outcomes[name] = {
+                    "status": "observed",
+                    "address": observed.get("address"),
+                }
+            except (HyruleError, httpx.HTTPError) as exc:
+                outcomes[name] = {"status": "unavailable", "reason": str(exc)[:256]}
+
+        await asyncio.gather(
+            http_probe("https_ipv4", str(created["ipv4_probe_url"])),
+            http_probe("https_ipv6", str(created["ipv6_probe_url"])),
+        )
+
+        dns_hostname = str(created["dns_probe_hostname"])
+        outcomes["dns"] = {
+            "status": (
+                "query_sent" if await trigger_dns_observation(dns_hostname) else "unavailable"
+            ),
+            "hostname": dns_hostname,
+        }
+
+        stun_addresses: list[str] = []
+        stun_errors: list[str] = []
+        for url in created.get("stun_urls", []):
+            try:
+                address = await stun_binding_address(str(url))
+            except (OSError, ValueError) as exc:
+                stun_errors.append(f"{url}: {str(exc)[:160]}")
+                continue
+            if address is not None and address not in stun_addresses:
+                stun_addresses.append(address)
+        stun_status = "collected" if stun_addresses else "failed"
+        outcomes["stun"] = {
+            "status": stun_status,
+            "public_addresses": stun_addresses,
+            "errors": stun_errors,
+        }
+        try:
+            await self._request(
+                "POST",
+                f"/v1/ip-check/sessions/{session_id}/observe/network",
+                headers=auth,
+                json={
+                    "adapter": "stun",
+                    "status": stun_status,
+                    "public_addresses": stun_addresses,
+                },
+            )
+        except (HyruleError, httpx.HTTPError) as exc:
+            outcomes["stun_submission"] = {
+                "status": "unavailable",
+                "reason": str(exc)[:256],
+            }
+
+        agent_payload: dict[str, object] = {
+            "runtime": f"{platform.python_implementation()} HyruleClient",
+            "runtime_version": platform.python_version(),
+            "operating_system": platform.system(),
+            "architecture": platform.machine(),
+            "protocol": protocol,
+            "capabilities": ["https-ipv4", "https-ipv6", "dns", "stun-rfc5389"],
+        }
+        if model_vendor_claim is not None:
+            agent_payload["model_vendor_claim"] = model_vendor_claim
+        if model_name_claim is not None:
+            agent_payload["model_name_claim"] = model_name_claim
+        try:
+            await self._request(
+                "POST",
+                f"/v1/ip-check/sessions/{session_id}/fingerprints/agent",
+                headers=auth,
+                json=agent_payload,
+            )
+            outcomes["agent_fingerprint"] = {"status": "recorded"}
+        except (HyruleError, httpx.HTTPError) as exc:
+            outcomes["agent_fingerprint"] = {
+                "status": "unavailable",
+                "reason": str(exc)[:256],
+            }
+
+        report = await self.ip_check_report(session_id, token)
+        for _ in range(4):
+            if report.get("dns_resolver_addresses"):
+                break
+            await asyncio.sleep(0.25)
+            report = await self.ip_check_report(session_id, token)
+
+        manifest = dict(created.get("probe_manifest") or {})
+        manifest["probes"] = [
+            {
+                **dict(probe),
+                "headers": {
+                    name: "Bearer <redacted>" if name.lower() == "authorization" else value
+                    for name, value in dict(probe.get("headers") or {}).items()
+                },
+            }
+            for probe in manifest.get("probes", [])
+            if isinstance(probe, dict)
+        ]
+        return {
+            "measurement_scope": "process_running_hyrule_client",
+            "session_id": session_id,
+            "expires_at": created.get("expires_at"),
+            "probe_manifest": manifest,
+            "probe_outcomes": outcomes,
+            "report": report,
+        }
+
+    async def ip_quality(
+        self,
+        address: str,
+        *,
+        expected_country_code: str | None = None,
+        user_agent: str | None = None,
+        accept_language: str | None = None,
+        timezone: str | None = None,
+        history_days: int = 90,
+    ) -> dict[str, Any]:
+        """Paid licensed IP quality, risk, routing, and consistency report."""
+        payload: dict[str, Any] = {"address": address, "history_days": history_days}
+        if expected_country_code is not None:
+            payload["expected_country_code"] = expected_country_code
+        context = {
+            key: value
+            for key, value in {
+                "user_agent": user_agent,
+                "accept_language": accept_language,
+                "timezone": timezone,
+            }.items()
+            if value is not None
+        }
+        if context:
+            payload["client_context"] = context
+        return await self._request("POST", "/v1/ip/quality", json=payload)
 
     async def dns_lookup(
         self,

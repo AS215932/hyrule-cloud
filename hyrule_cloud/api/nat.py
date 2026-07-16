@@ -6,7 +6,12 @@ import ipaddress
 
 from fastapi import APIRouter, Request, Response
 
-from hyrule_cloud.api._contract import diagnostic_quote, payment_price, require_paid_diagnostic
+from hyrule_cloud.api._contract import (
+    config_from_request,
+    diagnostic_quote,
+    payment_price,
+    require_paid_diagnostic,
+)
 from hyrule_cloud.models import (
     CapabilityEndpoint,
     DiagnosticResponse,
@@ -16,23 +21,60 @@ from hyrule_cloud.models import (
     PaidEndpointQuote,
     ProductCapabilityResponse,
 )
+from hyrule_cloud.services.ip_check import ip_check_ready
 from hyrule_cloud.services.nat import classify_address
 from hyrule_cloud.services.ports.checks import run_port_check
 
 router = APIRouter(prefix="/v1/nat", tags=["NAT/CGNAT"])
 
 
+def _safe_header(value: str | None, *, max_length: int) -> str | None:
+    """Return a printable, single-line, bounded echo of a request header."""
+
+    if value is None:
+        return None
+    printable = "".join(character for character in value if character.isprintable())
+    normalized = " ".join(printable.split())
+    return normalized[:max_length] or None
+
+
 @router.get("/capabilities", response_model=ProductCapabilityResponse)
-async def get_nat_capabilities() -> ProductCapabilityResponse:
+async def get_nat_capabilities(request: Request) -> ProductCapabilityResponse:
+    free_endpoints = [
+        CapabilityEndpoint(path="/v1/nat/ip", method="GET", description="Return caller-observed public IP, CGNAT/scope classification, and selected headers"),
+        CapabilityEndpoint(path="/v1/nat/capabilities", method="GET", description="NAT diagnostic capabilities"),
+        CapabilityEndpoint(path="/v1/nat/pricing", method="GET", description="NAT diagnostic pricing"),
+    ]
+    if ip_check_ready(config_from_request(request).ip_check):
+        free_endpoints.extend(
+            [
+                CapabilityEndpoint(
+                    path="/v1/ip-check/sessions",
+                    method="POST",
+                    description="Create a 15-minute machine-readable HTTP, DNS, and STUN probe manifest",
+                ),
+                CapabilityEndpoint(
+                    path="/v1/ip-check/sessions/{session_id}",
+                    method="GET",
+                    description="Read the authenticated agent or browser environment report",
+                ),
+                CapabilityEndpoint(
+                    path="/v1/ip-check/sessions/{session_id}/fingerprints/agent",
+                    method="POST",
+                    description="Record declared agent provenance and optionally verify an EVM signature",
+                ),
+                CapabilityEndpoint(
+                    path="/v1/ip-check/sessions/{session_id}/fingerprints/browser",
+                    method="POST",
+                    description="Build an expiring, session-scoped browser fingerprint",
+                ),
+            ]
+        )
     return ProductCapabilityResponse(
         service="nat",
-        purpose="Free server-observed public IP with CGNAT/scope classification, plus paid outside-in port-forward reachability. Browser/WebRTC/STUN NAT typing is deferred.",
+        purpose="Free server-observed public IP and short-lived agent/browser HTTP, DNS, STUN, WebRTC, and fingerprint checks, plus paid outside-in port-forward reachability.",
         separation_of_concerns="/v1/nat reports what this server observes about the caller; /v1/ports performs outside-in service reachability.",
-        free_endpoints=[
-            CapabilityEndpoint(path="/v1/nat/ip", method="GET", description="Return caller-observed public IP, CGNAT/scope classification, and selected headers"),
-            CapabilityEndpoint(path="/v1/nat/capabilities", method="GET", description="NAT diagnostic capabilities"),
-            CapabilityEndpoint(path="/v1/nat/pricing", method="GET", description="NAT diagnostic pricing"),
-        ],
+        free_endpoints=free_endpoints,
         paid_endpoints=[
             CapabilityEndpoint(path="/v1/nat/port-forward/check", method="POST", paid=True, description="Check a declared port-forward from outside"),
         ],
@@ -51,9 +93,13 @@ async def nat_ip(request: Request) -> NATIPResponse:
         classification=classification,
         cgnat_likely=cgnat_likely,
         headers_seen={
-            "x_forwarded_for": headers.get("x-forwarded-for"),
-            "x_real_ip": headers.get("x-real-ip"),
-            "cf_connecting_ip": headers.get("cf-connecting-ip"),
+            "x_forwarded_for": _safe_header(headers.get("x-forwarded-for"), max_length=256),
+            "x_real_ip": _safe_header(headers.get("x-real-ip"), max_length=64),
+            "cf_connecting_ip": _safe_header(headers.get("cf-connecting-ip"), max_length=64),
+        },
+        client_context={
+            "user_agent": _safe_header(headers.get("user-agent"), max_length=512),
+            "accept_language": _safe_header(headers.get("accept-language"), max_length=256),
         },
     )
 

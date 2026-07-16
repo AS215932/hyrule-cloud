@@ -203,6 +203,55 @@ class DomainConfig(BaseSettings):
     transfer_authcode_ttl_seconds: int = Field(default=900, ge=60, le=3600)
 
 
+class IPQualityConfig(BaseSettings):
+    """Licensed IP-quality provider and launch-readiness configuration.
+
+    The product is deliberately dark unless both provider contracts permit
+    resale, both credentials are present, the operator explicitly enables it,
+    and the declared provider cost stays within the configured margin guard.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="IP_QUALITY_", env_file=".env", extra="ignore"
+    )
+
+    enabled: bool = False
+    maxmind_account_id: str = ""
+    maxmind_license_key: str = ""
+    maxmind_resale_approved: bool = False
+    maxmind_unit_cost_usd: Decimal = Field(default=Decimal("0"), ge=Decimal("0"))
+    maxmind_base_url: str = "https://geoip.maxmind.com/geoip/v2.1/insights"
+
+    ipqs_api_key: str = ""
+    ipqs_resale_approved: bool = False
+    ipqs_unit_cost_usd: Decimal = Field(default=Decimal("0"), ge=Decimal("0"))
+    ipqs_base_url: str = "https://www.ipqualityscore.com/api/json/ip"
+
+    provider_timeout_seconds: float = Field(default=5.0, ge=1.0, le=10.0)
+    # Provider responses are never cached unless contract review has approved
+    # it explicitly. Even then the TTL is intentionally short and in-process.
+    cache_rights_approved: bool = False
+    cache_ttl_seconds: int = Field(default=0, ge=0, le=3600)
+
+
+class IPCheckConfig(BaseSettings):
+    """Short-lived network observations for agent and browser probe adapters."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="IP_CHECK_", env_file=".env", extra="ignore"
+    )
+
+    enabled: bool = False
+    session_ttl_seconds: int = Field(default=900, ge=60, le=900)
+    api_base_url: str = "https://cloud.hyrule.host"
+    v4_probe_base_url: str = "https://v4.check.hyrule.host"
+    v6_probe_base_url: str = "https://v6.check.hyrule.host"
+    dns_zone: str = "dns.check.hyrule.host"
+    stun_urls: list[str] = Field(default_factory=lambda: ["stun:stun.hyrule.host:3478"])
+    dns_observer_secret: str = ""
+    dns_observer_clock_skew_seconds: int = Field(default=60, ge=10, le=300)
+
+
 class PaymentConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PAYMENT_", env_file=".env", extra="ignore")
 
@@ -259,6 +308,7 @@ class PaymentConfig(BaseSettings):
     price_bgpstream_rib: Decimal = Decimal("0.10")
     price_bgp_router_table: Decimal = Decimal("0.10")
     price_ip_lookup: Decimal = Decimal("0.003")
+    price_ip_quality: Decimal = Decimal("0.02")
     price_dns_lookup: Decimal = Decimal("0.001")
     price_rdap_lookup: Decimal = Decimal("0.003")
     price_whois_lookup: Decimal = Decimal("0.005")
@@ -365,4 +415,6 @@ class HyruleConfig(BaseSettings):
     xcpng: XCPNGConfig = Field(default_factory=XCPNGConfig)
     openprovider: OpenproviderConfig = Field(default_factory=OpenproviderConfig)
     domain: DomainConfig = Field(default_factory=DomainConfig)
+    ip_check: IPCheckConfig = Field(default_factory=IPCheckConfig)
+    ip_quality: IPQualityConfig = Field(default_factory=IPQualityConfig)
     payment: PaymentConfig = Field(default_factory=PaymentConfig)

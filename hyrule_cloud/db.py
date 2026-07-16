@@ -676,6 +676,42 @@ class NetworkLookupCacheRow(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class IPCheckSessionRow(Base):
+    """Privacy-minimized network check retained for at most 15 minutes."""
+
+    __tablename__ = "ip_check_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    dns_label: Mapped[str] = mapped_column(String(63), nullable=False, unique=True, index=True)
+    expected_dns_resolvers: Mapped[list[str]] = mapped_column(_JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class IPCheckObservationRow(Base):
+    __tablename__ = "ip_check_observations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("ip_check_sessions.session_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    address: Mapped[str | None] = mapped_column(String(64))
+    family: Mapped[int | None] = mapped_column(Integer)
+    details: Mapped[dict | None] = mapped_column(_JSONB)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+    __table_args__ = (Index("ix_ip_check_observations_session_kind", "session_id", "kind"),)
+
+
 class DiagnosticJobRow(Base):
     """Generic async job row for x402 diagnostic evidence packs.
 

@@ -247,6 +247,14 @@ async def test_diagnostic_tools_always_registered_for_remote_client():
     names = {t.name for t in await mcp_server.mcp.list_tools()}
     for tool in ("path_report", "threat_reputation_lookup", "voip_number_lookup", "voip_sip_check"):
         assert tool in names
+    assert "ip_sources" in names
+    assert "network_probe_manifest" in names
+    assert "network_environment_check" in names
+    assert "network_check_report" in names
+    # Licensed resale has a stricter dark-launch requirement than the legacy
+    # diagnostic stubs: the paid tool is absent unless the deployment sets the
+    # explicit MCP switch after the API entitlement is live.
+    assert "ip_quality" not in names
 
 
 def test_err_surfaces_clear_not_live_message_for_501():

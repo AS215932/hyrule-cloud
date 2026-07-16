@@ -49,6 +49,9 @@ _dev_bypass = os.environ.get("HYRULE_DEV_BYPASS", "")
 # authenticated via that bearer (no x402 payment needed for free endpoints,
 # scope-gated for paid ones).
 _api_key = os.environ.get("HYRULE_API_KEY", "")
+_ip_quality_tool_enabled = os.environ.get(
+    "HYRULE_IP_QUALITY_TOOL_ENABLED", ""
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _client() -> HyruleClient:
@@ -632,6 +635,99 @@ async def ip_lookup(address: str, views: list[str] | None = None) -> str:
             return str(await hc.ip_lookup(address, views=views))
     except HyruleError as e:
         return _err(e)
+
+
+@mcp.tool()
+async def ip_sources() -> str:
+    """Free IP-intelligence source inventory and quality-report readiness."""
+    try:
+        async with _client() as hc:
+            return str(await hc.ip_sources())
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def network_probe_manifest(expected_dns_resolvers: list[str] | None = None) -> str:
+    """Create a free 15-minute HTTP/DNS/STUN probe manifest for an agent runtime.
+
+    The probes must be executed from the environment being measured. Use this
+    when the calling agent has its own HTTP, DNS, and STUN capabilities.
+    """
+    try:
+        async with _client() as hc:
+            return str(await hc.ip_check_session(expected_dns_resolvers))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def network_environment_check(
+    expected_dns_resolvers: list[str] | None = None,
+    model_vendor_claim: str | None = None,
+    model_name_claim: str | None = None,
+) -> str:
+    """Run a free agent-first IP, DNS, STUN, and runtime-provenance check.
+
+    This actively probes from the process hosting this MCP server. A local
+    stdio MCP deployment measures the agent host; a remote MCP gateway measures
+    that gateway and must not be described as the user's local network.
+    Model/vendor fields are explicitly self-declared, never inferred identity.
+    """
+    try:
+        async with _client() as hc:
+            return str(
+                await hc.network_environment_check(
+                    expected_dns_resolvers=expected_dns_resolvers,
+                    protocol="mcp",
+                    model_vendor_claim=model_vendor_claim,
+                    model_name_claim=model_name_claim,
+                )
+            )
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def network_check_report(session_id: str, token: str) -> str:
+    """Fetch a short-lived network observation session report."""
+    try:
+        async with _client() as hc:
+            return str(await hc.ip_check_report(session_id, token))
+    except HyruleError as e:
+        return _err(e)
+
+
+async def ip_quality(
+    address: str,
+    expected_country_code: str | None = None,
+    user_agent: str | None = None,
+    accept_language: str | None = None,
+    timezone: str | None = None,
+    history_days: int = 90,
+) -> str:
+    """Paid licensed IP quality, proxy/VPN risk, routing, and consistency report."""
+    try:
+        async with _client() as hc:
+            return str(
+                await hc.ip_quality(
+                    address,
+                    expected_country_code=expected_country_code,
+                    user_agent=user_agent,
+                    accept_language=accept_language,
+                    timezone=timezone,
+                    history_days=history_days,
+                )
+            )
+    except HyruleError as e:
+        return _err(e)
+
+
+# MCP tool registration is an explicit second launch switch. The customer MCP
+# catalog stays dark until the hosted API has both resale approvals and the
+# deployment sets this flag alongside the API entitlement.
+if _ip_quality_tool_enabled:
+    mcp.tool()(ip_quality)
 
 
 @mcp.tool()

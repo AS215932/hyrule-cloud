@@ -63,28 +63,54 @@ def _parse_cymru_txt(value: str) -> IPNetworkResult:
         asn = int(parts[0])
     return IPNetworkResult(
         asn=asn,
-        asn_name=f"AS{asn}" if asn is not None else None,
-        isp=f"AS{asn}" if asn is not None else None,
         prefix=parts[1] if len(parts) > 1 else None,
         registry=parts[3].lower() if len(parts) > 3 else None,
+        country_code=parts[2].upper() if len(parts) > 2 and len(parts[2]) == 2 else None,
     )
+
+
+def _parse_cymru_as_name(value: str) -> str | None:
+    # Format: "15169 | US | arin | 2000-03-30 | GOOGLE, US"
+    cleaned = value.strip().strip('"')
+    parts = [part.strip() for part in cleaned.split("|")]
+    return parts[4] if len(parts) > 4 and parts[4] else None
+
+
+def _resolve_txt(name: str) -> str | None:
+    resolver = dns.resolver.Resolver()
+    resolver.lifetime = 5
+    resolver.timeout = 3
+    answer = resolver.resolve(name, "TXT")
+    for rdata in answer:
+        strings = getattr(rdata, "strings", None)
+        if strings:
+            return str(b"".join(strings).decode())
+        return str(rdata.to_text())
+    return None
 
 
 def _asn_lookup_sync(address: str) -> IPNetworkResult:
     name = _team_cymru_name(address)
-    resolver = dns.resolver.Resolver()
-    resolver.lifetime = 5
-    resolver.timeout = 3
     try:
-        answer = resolver.resolve(name, "TXT")
-        for rdata in answer:
-            strings = getattr(rdata, "strings", None)
-            if strings:
-                return _parse_cymru_txt(b"".join(strings).decode())
-            return _parse_cymru_txt(rdata.to_text())
+        origin_text = _resolve_txt(name)
+        if origin_text is None:
+            return IPNetworkResult()
+        result = _parse_cymru_txt(origin_text)
+        organization = None
+        if result.asn is not None:
+            try:
+                as_name_text = _resolve_txt(f"AS{result.asn}.asn.cymru.com")
+                if as_name_text is not None:
+                    organization = _parse_cymru_as_name(as_name_text)
+            except Exception:
+                # Origin/prefix evidence is still useful if the separate ASN
+                # name query is unavailable.
+                organization = None
+        return result.model_copy(
+            update={"asn_name": organization, "organization": organization, "isp": None}
+        )
     except Exception:
         return IPNetworkResult()
-    return IPNetworkResult()
 
 
 async def lookup_ip(req: IPLookupRequest) -> IPLookupResponse:

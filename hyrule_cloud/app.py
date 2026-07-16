@@ -6,9 +6,10 @@ Agentic VPS hosting on AS215932 with x402 payments.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import structlog
@@ -23,6 +24,8 @@ from hyrule_cloud.api.bgp import router as bgp_router
 from hyrule_cloud.api.dns import router as dns_router
 from hyrule_cloud.api.internal_bgp import router as internal_bgp_router
 from hyrule_cloud.api.ip import router as ip_router
+from hyrule_cloud.api.ip_check import internal_router as internal_ip_check_router
+from hyrule_cloud.api.ip_check import router as ip_check_router
 from hyrule_cloud.api.metrics import router as metrics_router
 from hyrule_cloud.api.mx import router as mx_router
 from hyrule_cloud.api.nat import router as nat_router
@@ -45,6 +48,7 @@ from hyrule_cloud.logging_config import SAFE_DICT_TRACEBACKS
 from hyrule_cloud.middleware.metrics import install_metrics
 from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
+from hyrule_cloud.providers.ip_quality import IPQualityProvider
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
 
@@ -101,6 +105,7 @@ async def lifespan(app: FastAPI):
         token=config.network_proxy_token,
         health_ttl_seconds=config.network_proxy_health_ttl_seconds,
     )
+    ip_quality_provider = IPQualityProvider(config.ip_quality)
 
     # Orchestrator
     orchestrator = Orchestrator(config, session_factory)
@@ -131,12 +136,20 @@ async def lifespan(app: FastAPI):
     wallet_auth = WalletAuthService(config, session_factory)
     orchestrator.domains = domains
 
+    from hyrule_cloud.services.ip_check import run_ip_check_cleanup
+
+    ip_check_cleanup_task = asyncio.create_task(
+        run_ip_check_cleanup(session_factory),
+        name="ip-check-retention-cleanup",
+    )
+
     # Wire up app state
     app.state._typed_state = AppState(
         config=config,
         orchestrator=orchestrator,
         payment_gate=payment_gate,
         network_provider=network_provider,
+        ip_quality_provider=ip_quality_provider,
         native_crypto=native_crypto,
         rate_provider=rate_provider,
         native_payment_assets=native_payment_assets,
@@ -154,7 +167,11 @@ async def lifespan(app: FastAPI):
     yield
 
     await domains.close()
+    ip_check_cleanup_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await ip_check_cleanup_task
     await orchestrator.shutdown()
+    await ip_quality_provider.close()
     await network_provider.close()
     await native_crypto.close()
     await rate_provider.close()
@@ -352,6 +369,7 @@ app.include_router(router)
 # stable OpenAPI surfaces in the next execution steps.
 app.include_router(bgp_router)
 app.include_router(ip_router)
+app.include_router(ip_check_router)
 app.include_router(dns_router)
 app.include_router(registry_router)
 app.include_router(web_router)
@@ -362,6 +380,7 @@ app.include_router(nat_router)
 app.include_router(threat_router)
 app.include_router(voip_router)
 app.include_router(internal_bgp_router)
+app.include_router(internal_ip_check_router)
 app.include_router(status_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
 app.include_router(auth_router)
