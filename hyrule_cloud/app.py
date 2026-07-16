@@ -207,6 +207,12 @@ async def apple_touch_icon() -> FileResponse:
     return FileResponse(_STATIC_DIR / "apple-touch-icon.png", media_type="image/png")
 
 
+# Referenced as iconUrl in 402 Bazaar resource metadata (middleware/x402.py).
+@app.get("/icon-192.png", include_in_schema=False)
+async def icon_192() -> FileResponse:
+    return FileResponse(_STATIC_DIR / "icon-192.png", media_type="image/png")
+
+
 @app.get("/llms.txt", include_in_schema=False)
 async def llms_txt(request: Request) -> PlainTextResponse:
     """Agent-facing plaintext guide, generated from the enabled catalog only."""

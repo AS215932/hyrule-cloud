@@ -260,6 +260,33 @@ class PaymentGate:
             log.warning("bazaar_extension_enrich_failed", exc_info=True)
             return declared
 
+    def _resource_info(self, request_url: str | None, description: str | None) -> ResourceInfo:
+        """Bazaar resource metadata for the 402 challenge.
+
+        The CDP quality score weighs metadata completeness, so when the URL
+        maps to an enabled catalog operation the challenge carries service
+        name, tags, mime type, and icon — not just url+description.
+        """
+        from urllib.parse import urlsplit
+
+        from hyrule_cloud.services.discovery import match_enabled_operation_any_method
+
+        operation = None
+        if request_url:
+            operation = match_enabled_operation_any_method(urlsplit(request_url).path)
+        if operation is None:
+            return ResourceInfo(url=request_url or "", description=description or None)
+        return ResourceInfo(
+            url=request_url or "",
+            description=description or operation.description,
+            mime_type="application/json",
+            service_name="Hyrule Cloud",
+            tags=list(operation.tags),
+            icon_url=(
+                f"{self.public_base_url}/icon-192.png" if self.public_base_url else None
+            ),
+        )
+
     async def _payment_required_response(
         self,
         requirements: list[PaymentRequirements],
@@ -270,7 +297,7 @@ class PaymentGate:
         error: str | None = None,
         extensions: dict[str, Any] | None = None,
     ) -> Response:
-        resource = ResourceInfo(url=request_url or "", description=description or None)
+        resource = self._resource_info(request_url, description)
         payment_required = self.server.create_payment_required_response(
             requirements,
             resource=resource,
