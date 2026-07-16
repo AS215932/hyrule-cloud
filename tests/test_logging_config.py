@@ -8,9 +8,8 @@ from hyrule_cloud.logging_config import SAFE_DICT_TRACEBACKS
 
 
 def test_structured_tracebacks_never_serialize_frame_locals() -> None:
-    secret_marker = "must-never-reach-logs"
-
     try:
+        secret_marker = "must-never-reach-logs"
         raise RuntimeError("provider authentication failed")
     except RuntimeError:
         event = SAFE_DICT_TRACEBACKS(
