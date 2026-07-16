@@ -108,7 +108,7 @@ class SSHSmokeStatus(enum.StrEnum):
 
 
 class DomainMode(enum.StrEnum):
-    AUTO = "auto"      # subdomain under the configured deploy domain
+    AUTO = "auto"  # subdomain under the configured deploy domain
     CUSTOM = "custom"  # attach an already-active managed domain
 
 
@@ -141,6 +141,7 @@ class CryptoIntentStatus(enum.StrEnum):
     Happy path:  CREATED → WAITING_PAYMENT → SETTLED → PROVISIONING → PROVISIONED
     Error/edge:  UNDERPAID | OVERPAID | LATE_PAID | EXPIRED | FAILED | REFUND_MANUAL
     """
+
     # Pre-Block-E values kept as aliases so any in-flight intent rows still
     # round-trip cleanly through the StrEnum on read.
     PENDING = "pending"
@@ -172,6 +173,7 @@ class QuoteStatus(enum.StrEnum):
     CREATED = "created"
     CONSUMED = "consumed"
     EXPIRED = "expired"
+
 
 # --- VM Size Specifications ---
 
@@ -418,7 +420,7 @@ class CryptoIntentResponse(BaseModel):
     status: CryptoIntentStatus
     confirmations: int = 0
     amount_received_crypto: str | None = None
-    qr_code_uri: str | None = None   # bitcoin:<addr>?amount=<x> or monero:<addr>?tx_amount=<x>
+    qr_code_uri: str | None = None  # bitcoin:<addr>?amount=<x> or monero:<addr>?tx_amount=<x>
     expires_at: datetime
     vm_id: str | None = None
     management_token: str | None = None
@@ -455,9 +457,11 @@ class VMRecord(BaseModel):
 # Forward ref resolution
 VMStatusResponse.model_rebuild()
 
+
 class GenericActionResponse(BaseModel):
     status: str
     message: str | None = None
+
 
 class DomainCheckResponse(BaseModel):
     domain: str
@@ -468,6 +472,7 @@ class DomainCheckResponse(BaseModel):
     currency: str = "USD"
     premium: bool = False
     price: str | None = None
+
 
 class DomainRegisterRequest(BaseModel):
     domain: str | None = Field(default=None, min_length=3, max_length=253)
@@ -485,6 +490,7 @@ class DomainRegisterResponse(BaseModel):
     management_url: str | None = None
     message: str | None = None
 
+
 class DNSRecordType(enum.StrEnum):
     A = "A"
     AAAA = "AAAA"
@@ -498,6 +504,7 @@ class DNSRecordType(enum.StrEnum):
     SVCB = "SVCB"
     HTTPS = "HTTPS"
 
+
 class DNSRecord(BaseModel):
     type: DNSRecordType
     name: str
@@ -505,9 +512,11 @@ class DNSRecord(BaseModel):
     ttl: int = 3600
     prio: int | None = None
 
+
 class VMLogEvent(BaseModel):
     ts: str
     event: str
+
 
 class VMLogsResponse(BaseModel):
     vm_id: str
@@ -534,7 +543,9 @@ class SourceStatus(enum.StrEnum):
 
 
 class SourceHealth(BaseModel):
-    status: SourceStatus | str = Field(description="ok, stale, degraded, unavailable, error, or source_not_configured")
+    status: SourceStatus | str = Field(
+        description="ok, stale, degraded, unavailable, error, or source_not_configured"
+    )
     age_seconds: int | None = None
     message: str | None = None
     checked_at: datetime | None = None
@@ -679,6 +690,109 @@ class WebCheck(enum.StrEnum):
     DOWN = "down"
 
 
+class WebAvailabilityStatus(enum.StrEnum):
+    UP = "up"
+    DEGRADED = "degraded"
+    DOWN = "down"
+    INCONCLUSIVE = "inconclusive"
+
+
+class WebFailurePhase(enum.StrEnum):
+    DNS = "dns"
+    TCP = "tcp"
+    TLS = "tls"
+    HTTP = "http"
+    TIMEOUT = "timeout"
+    REDIRECT = "redirect"
+    PROBE = "probe"
+    UNKNOWN = "unknown"
+
+
+class WebRootCauseConfidence(enum.StrEnum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class WebOutageScope(enum.StrEnum):
+    NONE = "none"
+    ORIGIN = "origin"
+    APPLICATION = "application"
+    DNS = "dns"
+    TLS = "tls"
+    REGIONAL = "regional"
+    ACCESS_CONTROL = "access_control"
+    REDIRECT = "redirect"
+    UNKNOWN = "unknown"
+
+
+class WebProbeLocation(BaseModel):
+    city: str | None = None
+    state: str | None = None
+    country: str | None = None
+    continent: str | None = None
+    region: str | None = None
+    asn: int | None = None
+    network: str | None = None
+
+
+class WebRedirectHop(BaseModel):
+    url: str
+    status_code: int
+    location: str | None = None
+    latency_ms: float | None = None
+
+
+class WebTLSObservation(BaseModel):
+    authorized: bool | None = None
+    protocol: str | None = None
+    cipher: str | None = None
+    subject: dict[str, object] = Field(default_factory=dict)
+    issuer: dict[str, object] = Field(default_factory=dict)
+    not_before: str | None = None
+    not_after: str | None = None
+    days_remaining: int | None = None
+    fingerprint_sha256: str | None = None
+    error: str | None = None
+
+
+class WebVantageResult(BaseModel):
+    vantage: str
+    provider: str
+    location: WebProbeLocation | None = None
+    status: WebAvailabilityStatus
+    failure_phase: WebFailurePhase | None = None
+    status_code: int | None = None
+    status_text: str | None = None
+    resolved_address: str | None = None
+    latency_ms: float | None = None
+    timings_ms: dict[str, float | int | None] = Field(default_factory=dict)
+    redirects: list[WebRedirectHop] = Field(default_factory=list)
+    final_url: str | None = None
+    headers: dict[str, str | list[str]] = Field(default_factory=dict)
+    tls: WebTLSObservation | None = None
+    error: str | None = None
+
+
+class WebAvailabilitySummary(BaseModel):
+    status: WebAvailabilityStatus
+    is_down: bool | None
+    total_vantages: int
+    responding_vantages: int
+    degraded_vantages: int
+    failed_vantages: int
+    down_ratio: float = Field(ge=0, le=1)
+
+
+class WebRootCauseAnalysis(BaseModel):
+    code: str
+    scope: WebOutageScope
+    confidence: WebRootCauseConfidence
+    summary: str
+    evidence: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+
+
 class WebTLSDeepCheck(enum.StrEnum):
     PROTOCOL_VERSIONS = "protocol_versions"
     CIPHER_SUITES = "cipher_suites"
@@ -689,12 +803,48 @@ class WebTLSDeepCheck(enum.StrEnum):
     SECURITY_HEADERS = "security_headers"
 
 
+WEB_CHECK_DEFAULT_VANTAGES: list[DiagnosticVantage] = [
+    DiagnosticVantage.EXTMON,
+    DiagnosticVantage.GLOBALPING,
+]
+WEB_CHECK_DEFAULT_LOCATIONS: list[str] = [
+    "Western Europe",
+    "Northern America",
+    "Eastern Asia",
+]
+
+
 class WebCheckRequest(BaseModel):
     target: str = Field(min_length=1, max_length=2048)
-    checks: list[WebCheck] = Field(default_factory=lambda: [WebCheck.DNS, WebCheck.HTTP, WebCheck.TLS, WebCheck.CERT, WebCheck.HEADERS, WebCheck.CDN_WAF])
-    vantages: list[DiagnosticVantage] = Field(default_factory=lambda: [DiagnosticVantage.EXTMON])
+    checks: list[WebCheck] = Field(
+        default_factory=lambda: [
+            WebCheck.DNS,
+            WebCheck.HTTP,
+            WebCheck.TLS,
+            WebCheck.CERT,
+            WebCheck.HEADERS,
+            WebCheck.CDN_WAF,
+        ]
+    )
+    vantages: list[DiagnosticVantage] = Field(
+        default_factory=lambda: list(WEB_CHECK_DEFAULT_VANTAGES),
+        min_length=1,
+    )
+    locations: list[str] = Field(
+        default_factory=lambda: list(WEB_CHECK_DEFAULT_LOCATIONS),
+        min_length=1,
+        max_length=8,
+        description="Globalping location selectors; one probe is requested per location.",
+    )
     timeout_ms: int = Field(default=10000, ge=500, le=60000)
+    max_redirects: int = Field(default=5, ge=0, le=10)
     include_raw: bool = False
+
+
+class WebCheckResponse(DiagnosticResponse):
+    availability: WebAvailabilitySummary
+    vantage_results: list[WebVantageResult]
+    root_cause: WebRootCauseAnalysis
 
 
 class WebReportRequest(WebCheckRequest):
@@ -705,7 +855,9 @@ class WebTLSDeepRequest(BaseModel):
     host: str = Field(min_length=1, max_length=253)
     port: int = Field(default=443, ge=1, le=65535)
     scan_profile: str = "ssl_labs_style"
-    checks: list[WebTLSDeepCheck] = Field(default_factory=lambda: [check for check in WebTLSDeepCheck])
+    checks: list[WebTLSDeepCheck] = Field(
+        default_factory=lambda: [check for check in WebTLSDeepCheck]
+    )
     include_raw: bool = False
 
 
@@ -760,7 +912,16 @@ class PathReportRequest(BaseModel):
     vantages: list[DiagnosticVantage] = Field(
         default_factory=lambda: list(PATH_REPORT_DEFAULT_VANTAGES)
     )
-    checks: list[PathReportCheck] = Field(default_factory=lambda: [PathReportCheck.PING, PathReportCheck.TRACEROUTE, PathReportCheck.MTR, PathReportCheck.BGP, PathReportCheck.RPKI, PathReportCheck.ROUTER_TABLE])
+    checks: list[PathReportCheck] = Field(
+        default_factory=lambda: [
+            PathReportCheck.PING,
+            PathReportCheck.TRACEROUTE,
+            PathReportCheck.MTR,
+            PathReportCheck.BGP,
+            PathReportCheck.RPKI,
+            PathReportCheck.ROUTER_TABLE,
+        ]
+    )
     max_duration_seconds: int = Field(default=60, ge=5, le=300)
     include_raw: bool = False
 
@@ -883,7 +1044,16 @@ class _FlatSubjectRequest(BaseModel):
 
 class ThreatLookupRequest(_FlatSubjectRequest):
     subject: ThreatSubject
-    views: list[ThreatView] = Field(default_factory=lambda: [ThreatView.RBL, ThreatView.CT, ThreatView.RDAP, ThreatView.WHOIS, ThreatView.DNS, ThreatView.REPUTATION])
+    views: list[ThreatView] = Field(
+        default_factory=lambda: [
+            ThreatView.RBL,
+            ThreatView.CT,
+            ThreatView.RDAP,
+            ThreatView.WHOIS,
+            ThreatView.DNS,
+            ThreatView.REPUTATION,
+        ]
+    )
     include_raw: bool = False
 
 
@@ -918,7 +1088,14 @@ class VoIPCheckRequest(BaseModel):
 class VoIPNumberLookupRequest(BaseModel):
     number: str = Field(min_length=3, max_length=32)
     country: str | None = Field(default=None, max_length=2)
-    checks: list[VoIPCheck] = Field(default_factory=lambda: [VoIPCheck.NUMBER_INTEL, VoIPCheck.CNAM, VoIPCheck.SPAM_REPUTATION, VoIPCheck.E911])
+    checks: list[VoIPCheck] = Field(
+        default_factory=lambda: [
+            VoIPCheck.NUMBER_INTEL,
+            VoIPCheck.CNAM,
+            VoIPCheck.SPAM_REPUTATION,
+            VoIPCheck.E911,
+        ]
+    )
     include_raw: bool = False
 
 
@@ -982,7 +1159,9 @@ class BGPFilters(BaseModel):
 
 class BGPAssertions(BaseModel):
     expected_origin_asns: list[int] = Field(default_factory=list)
-    expected_rpki: str | None = Field(default=None, description="valid, invalid, not_found, or unknown")
+    expected_rpki: str | None = Field(
+        default=None, description="valid, invalid, not_found, or unknown"
+    )
 
 
 class BGPLookupRequest(_FlatSubjectRequest):
@@ -1230,7 +1409,9 @@ class DNSPropagationRequest(BaseModel):
     name: str = Field(min_length=1, max_length=253)
     type: DNSLookupRecordType = DNSLookupRecordType.A
     expected: list[str] = Field(default_factory=list)
-    resolvers: list[str] = Field(default_factory=lambda: ["cloudflare", "google", "quad9", "system"])
+    resolvers: list[str] = Field(
+        default_factory=lambda: ["cloudflare", "google", "quad9", "system"]
+    )
     authoritative: bool = True
     timeout_ms: int = Field(default=3000, ge=500, le=30000)
 
@@ -1239,7 +1420,9 @@ class DNSAuthorityCompareRequest(BaseModel):
     name: str = Field(min_length=1, max_length=253)
     type: DNSLookupRecordType = DNSLookupRecordType.A
     authoritative: bool = True
-    recursive_resolvers: list[str] = Field(default_factory=lambda: ["1.1.1.1", "8.8.8.8", "9.9.9.9"])
+    recursive_resolvers: list[str] = Field(
+        default_factory=lambda: ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+    )
     timeout_ms: int = Field(default=3000, ge=500, le=30000)
 
 
@@ -1460,7 +1643,9 @@ class MXToolDescription(BaseModel):
 
 class MXToolsResponse(BaseModel):
     tools: list[MXToolDescription]
-    disclaimer: str = "Hyrule implements compatible diagnostics internally and is not affiliated with MXToolbox."
+    disclaimer: str = (
+        "Hyrule implements compatible diagnostics internally and is not affiliated with MXToolbox."
+    )
 
 
 class MXPricingResponse(BaseModel):

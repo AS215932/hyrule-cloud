@@ -154,6 +154,12 @@ the canary reports them **SKIPPED (501)**, not failed. Configure a prober and
 re-run `python scripts/x402_canary.py path-report` to validate the paid path
 evidence before treating 3a as complete.
 
+For `/v1/web/check`, set `GLOBALPING_ENABLED=true`; set `GLOBALPING_TOKEN` from
+Vault when authenticated provider capacity is required. Its canary must expose
+`availability`, per-location `vantage_results`, and `root_cause`, with
+DNS/TCP/TLS/first-byte timing data where Globalping returns it. A provider
+failure must set `partial=true` and must not be counted as a target outage.
+
 ### 3b Network proxy
 
 1. On netproxy: `systemctl status hyrule-network-proxy`; token match between
