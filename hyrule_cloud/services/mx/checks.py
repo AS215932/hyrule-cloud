@@ -45,6 +45,16 @@ def normalize_request(req: MXCheckRequest) -> tuple[MXTool, str]:
     return req.tool, req.target.strip()
 
 
+def _ip_target(tool: MXTool, target: str) -> str:
+    """Return a canonical IP or a contract-level error for IP-only tools."""
+    try:
+        return str(ipaddress.ip_address(target))
+    except ValueError as exc:
+        raise MXInputError(
+            f"{tool.value} target must be an IPv4 or IPv6 address"
+        ) from exc
+
+
 def _finding(severity: MXStatus, code: str, message: str, recommendation: str | None = None, **evidence: object) -> MXFinding:
     return MXFinding(
         severity=severity,
@@ -495,7 +505,7 @@ async def run_check(req: MXCheckRequest) -> MXCheckResponse:
         if tool == MXTool.PTR:
             from hyrule_cloud.services.dns.lookup import reverse
 
-            ptr = await reverse(target)
+            ptr = await reverse(_ip_target(tool, target))
             findings = [_finding(MXStatus.OK if ptr.answers else MXStatus.WARNING, "ptr_result", "PTR records found." if ptr.answers else "No PTR records found.", records=[a.value for a in ptr.answers])]
             return MXCheckResponse(request_id="mxq_contract", tool=tool, target=target, status=_overall(findings), summary=findings[0].message, findings=findings, raw={"dns": ptr.model_dump(mode="json")}, sources={"dns": "ok"}, generated_at=datetime.now(UTC))
         if tool == MXTool.MX:
@@ -525,7 +535,7 @@ async def run_check(req: MXCheckRequest) -> MXCheckResponse:
         if tool == MXTool.BLACKLIST:
             return await _blacklist(target)
         if tool == MXTool.ASN:
-            return await _ip_asn(target)
+            return await _ip_asn(_ip_target(tool, target))
         if tool in {MXTool.WHOIS, MXTool.ARIN}:
             return await _whois(target, tool)
         if tool in {MXTool.PING, MXTool.TRACE}:

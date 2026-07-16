@@ -104,6 +104,84 @@ async def test_mx_tools_include_full_supertool_contract():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["ptr", "asn"])
+async def test_mx_ip_only_tools_reject_domain_as_structured_result(tool: str):
+    from hyrule_cloud.models import MXCheckRequest, MXStatus, MXTool
+    from hyrule_cloud.services.mx.checks import run_check
+
+    result = await run_check(MXCheckRequest(tool=MXTool(tool), target="example.com"))
+
+    assert result.status == MXStatus.ERROR
+    assert result.findings[0].code == "invalid_or_unsafe_target"
+    assert result.summary == f"{tool} target must be an IPv4 or IPv6 address"
+
+
+@pytest.mark.asyncio
+async def test_paid_mx_job_survives_one_diagnostic_failure(monkeypatch):
+    from datetime import UTC, datetime
+
+    from hyrule_cloud.models import (
+        MXCheckRequest,
+        MXCheckResponse,
+        MXStatus,
+        MXTool,
+    )
+
+    seen: list[MXTool] = []
+
+    async def fake_run_check(request: MXCheckRequest) -> MXCheckResponse:
+        assert request.tool is not None
+        seen.append(request.tool)
+        if request.tool == MXTool.SMTP:
+            raise RuntimeError("simulated provider failure")
+        return MXCheckResponse(
+            request_id="mxq_test",
+            tool=request.tool,
+            target=request.target or "",
+            status=MXStatus.OK,
+            summary="ok",
+            sources={"test": "ok"},
+            generated_at=datetime.now(UTC),
+        )
+
+    class PaidGate:
+        async def check_payment(self, request, amount, description, extra_body):
+            request.state.payment_response_headers = {
+                "PAYMENT-RESPONSE": "settled-test"
+            }
+            return "0xwallet"
+
+    monkeypatch.setattr("hyrule_cloud.api.mx.run_check", fake_run_check)
+    old_state = getattr(app.state, "_typed_state", None)
+    had_state = hasattr(app.state, "_typed_state")
+    app.state._typed_state = SimpleNamespace(
+        config=HyruleConfig(), payment_gate=PaidGate()
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/mx/jobs",
+                json={"profile": "mail_delivery", "target": "example.com"},
+            )
+    finally:
+        if had_state:
+            app.state._typed_state = old_state
+        else:
+            delattr(app.state, "_typed_state")
+
+    assert response.status_code == 200
+    assert response.headers["payment-response"] == "settled-test"
+    assert MXTool.PTR not in seen
+    assert MXTool.ASN not in seen
+    assert len(seen) == 11
+    smtp = next(result for result in response.json()["results"] if result["tool"] == "smtp")
+    assert smtp["status"] == "error"
+    assert smtp["findings"][0]["code"] == "diagnostic_failed"
+
+
+@pytest.mark.asyncio
 async def test_paid_network_intel_endpoints_fail_closed_without_payment():
     old_state = getattr(app.state, "_typed_state", None)
     if hasattr(app.state, "_typed_state"):
