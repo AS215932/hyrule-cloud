@@ -109,6 +109,7 @@ class PaidOperation:
     price: PriceSpec
     declaration: dict[str, Any]
     request_model: type[BaseModel] | None
+    input_schema: dict[str, Any] | None
     input_example: dict[str, Any] | None
     output_example: Any
     path_examples: dict[str, Any]
@@ -161,9 +162,52 @@ def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
     return resolved
 
 
+def _flat_subject_schema(
+    model_cls: type[BaseModel],
+    *,
+    type_description: str,
+    value_description: str,
+) -> dict[str, Any]:
+    """Advertise a scalar subject form that discovery UIs can render.
+
+    The request models accept both this form and the original nested
+    ``subject`` object.  Keeping the Bazaar schema scalar avoids unusable
+    marketplace rows such as ``subject | object | null`` while preserving
+    backwards compatibility for existing clients.
+    """
+
+    schema = _inline_defs(model_cls.model_json_schema())
+    properties = dict(schema.get("properties", {}))
+    subject = properties.pop("subject", {})
+    subject_properties = subject.get("properties", {})
+    subject_type = dict(subject_properties.get("type", {"type": "string"}))
+    subject_value = dict(subject_properties.get("value", {"type": "string"}))
+    subject_type.update(
+        {
+            "title": "Subject Type",
+            "description": type_description,
+        }
+    )
+    subject_value.update(
+        {
+            "title": "Subject Value",
+            "description": value_description,
+        }
+    )
+    schema["properties"] = {
+        "subject_type": subject_type,
+        "subject_value": subject_value,
+        **properties,
+    }
+    required = [name for name in schema.get("required", []) if name != "subject"]
+    schema["required"] = ["subject_type", "subject_value", *required]
+    return schema
+
+
 def _json_body(
     model_cls: type[BaseModel],
     example: dict[str, Any],
+    input_schema: dict[str, Any],
     output_model: type[BaseModel],
     output_example: Any,
 ) -> dict[str, Any]:
@@ -173,7 +217,7 @@ def _json_body(
     output_model.model_validate(output_example)
     return declare_discovery_extension(
         input=example,
-        input_schema=_inline_defs(model_cls.model_json_schema()),
+        input_schema=input_schema,
         body_type="json",
         output=OutputConfig(
             example=output_example,
@@ -192,7 +236,9 @@ def _body_operation(
     output_example: Any,
     *,
     gate: str = "always",
+    input_schema: dict[str, Any] | None = None,
 ) -> PaidOperation:
+    resolved_input_schema = input_schema or _inline_defs(request_model.model_json_schema())
     return PaidOperation(
         method="POST",
         path=path,
@@ -201,10 +247,12 @@ def _body_operation(
         declaration=_json_body(
             request_model,
             input_example,
+            resolved_input_schema,
             output_model,
             output_example,
         ),
         request_model=request_model,
+        input_schema=resolved_input_schema,
         input_example=input_example,
         output_example=output_example,
         path_examples={},
@@ -245,6 +293,7 @@ def _download_operation(
         price=price,
         declaration=declaration,
         request_model=None,
+        input_schema=None,
         input_example=None,
         output_example=output_example,
         path_examples=path_examples,
@@ -424,7 +473,12 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Make a micro-proxy network request over Direct, Tor, I2P, or Yggdrasil",
         _PROXY_PRICE,
         models.NetworkRequest,
-        {"url": "https://example.com", "method": "GET", "proxy_mode": "direct"},
+        {
+            "url": "https://example.com",
+            "method": "GET",
+            "proxy_mode": "direct",
+            "timeout_seconds": 15,
+        },
         models.NetworkResponse,
         {
             "status_code": 200,
@@ -439,9 +493,21 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid BGP/routing lookup by prefix, IP, ASN, or AS215932 router-table dataset",
         _BGP_LOOKUP_PRICE,
         models.BGPLookupRequest,
-        {"subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"}},
+        {
+            "subject_type": "prefix",
+            "subject_value": "2a0c:b641:b50::/44",
+            "datasets": ["public_routing", "rpki"],
+            "views": ["origins", "rpki"],
+            "sources": ["auto"],
+            "limit": 500,
+        },
         models.BGPLookupResponse,
         _BGP_LOOKUP_OUTPUT,
+        input_schema=_flat_subject_schema(
+            models.BGPLookupRequest,
+            type_description="Lookup subject kind: prefix, IP address, or ASN",
+            value_description="CIDR prefix, IP address, or ASN/AS-prefixed ASN",
+        ),
     ),
     _body_operation(
         "/v1/bgp/jobs",
@@ -449,12 +515,21 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         _BGP_JOB_PRICE,
         models.BGPStreamJobRequest,
         {
-            "subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"},
+            "subject_type": "prefix",
+            "subject_value": "2a0c:b641:b50::/44",
+            "projects": ["routeviews", "ris"],
             "record_type": "updates",
+            "collectors": [],
+            "limit": 100000,
         },
         models.BGPJobResponse,
         _BGP_JOB_OUTPUT,
         gate="bgpstream_worker",
+        input_schema=_flat_subject_schema(
+            models.BGPStreamJobRequest,
+            type_description="Historical BGP subject kind: prefix, IP address, or ASN",
+            value_description="CIDR prefix, IP address, or ASN/AS-prefixed ASN",
+        ),
     ),
     _download_operation(
         "/v1/bgp/snapshots/router/{snapshot_id}/download",
@@ -467,7 +542,11 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid IP ASN/ISP, reverse DNS, RDAP/WHOIS, and BGP-context lookup",
         _fixed("price_ip_lookup", "0.003"),
         models.IPLookupRequest,
-        {"address": "2a0c:b641:b50::1"},
+        {
+            "address": "2a0c:b641:b50::1",
+            "views": ["asn", "rdns", "rdap", "whois", "bgp"],
+            "max_age_seconds": 3600,
+        },
         models.IPLookupResponse,
         _IP_LOOKUP_OUTPUT,
     ),
@@ -476,7 +555,14 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid read-only DNS lookup, reverse lookup, resolver-validated DNSSEC (AD/DS), and trace diagnostics",
         _fixed("price_dns_lookup", "0.001"),
         models.DNSLookupRequest,
-        {"name": "example.com", "type": "AAAA"},
+        {
+            "name": "example.com",
+            "type": "AAAA",
+            "resolver": "system",
+            "dnssec": False,
+            "trace": False,
+            "timeout_ms": 3000,
+        },
         models.DNSLookupResponse,
         _DNS_LOOKUP_OUTPUT,
     ),
@@ -485,7 +571,14 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid DNS propagation comparison across public recursive resolvers",
         _fixed("price_dns_lookup", "0.001"),
         models.DNSPropagationRequest,
-        {"name": "example.com", "type": "A"},
+        {
+            "name": "example.com",
+            "type": "A",
+            "expected": [],
+            "resolvers": ["cloudflare", "google", "quad9", "system"],
+            "authoritative": True,
+            "timeout_ms": 3000,
+        },
         models.DNSDiagnosticResponse,
         _diagnostic_output("example.com", "domain", "DNS propagation compared"),
     ),
@@ -494,7 +587,12 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid structured RDAP lookup for domains, IPs, prefixes, ASNs, and entities",
         _fixed("price_rdap_lookup", "0.003"),
         models.RDAPLookupRequest,
-        {"subject": {"type": "domain", "value": "example.com"}},
+        {
+            "subject_type": "domain",
+            "subject_value": "example.com",
+            "include_raw": False,
+            "max_age_seconds": 86400,
+        },
         models.RDAPLookupResponse,
         {
             "request_id": "rdap_a1b2c3d4",
@@ -503,13 +601,23 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
             "parsed": {},
             "generated_at": _GENERATED_AT,
         },
+        input_schema=_flat_subject_schema(
+            models.RDAPLookupRequest,
+            type_description="Registry subject kind: domain, IP, prefix, ASN, or entity",
+            value_description="Domain, IP address, CIDR prefix, ASN, or entity handle",
+        ),
     ),
     _body_operation(
         "/v1/whois/lookup",
         "Paid legacy WHOIS lookup for domains, IPs, prefixes/network blocks, and ASNs",
         _fixed("price_whois_lookup", "0.005"),
         models.WhoisLookupRequest,
-        {"subject": {"type": "domain", "value": "example.com"}},
+        {
+            "subject_type": "domain",
+            "subject_value": "example.com",
+            "include_raw": False,
+            "max_age_seconds": 86400,
+        },
         models.WhoisLookupResponse,
         {
             "request_id": "whois_a1b2c3d4",
@@ -520,13 +628,24 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
             "redacted": True,
             "generated_at": _GENERATED_AT,
         },
+        input_schema=_flat_subject_schema(
+            models.WhoisLookupRequest,
+            type_description="Registry subject kind: domain, IP, prefix, ASN, or entity",
+            value_description="Domain, IP address, CIDR prefix, ASN, or entity handle",
+        ),
     ),
     _body_operation(
         "/v1/web/check",
         "Paid web reachability, HTTP/HTTPS, TLS certificate, security headers, and CDN/WAF diagnostic check",
         _fixed("price_web_check", "0.005"),
         models.WebCheckRequest,
-        {"target": "https://example.com"},
+        {
+            "target": "https://example.com",
+            "checks": ["dns", "http", "tls", "cert", "headers", "cdn_waf"],
+            "vantages": ["extmon"],
+            "timeout_ms": 10000,
+            "include_raw": False,
+        },
         models.DiagnosticResponse,
         _diagnostic_output("https://example.com", "url", "Web diagnostic completed"),
     ),
@@ -535,7 +654,21 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid deep TLS protocol, certificate, and negotiated-cipher scan with grade",
         _fixed("price_web_tls_deep", "0.10"),
         models.WebTLSDeepRequest,
-        {"host": "example.com", "port": 443},
+        {
+            "host": "example.com",
+            "port": 443,
+            "scan_profile": "ssl_labs_style",
+            "checks": [
+                "protocol_versions",
+                "cipher_suites",
+                "certificate_chain",
+                "ocsp",
+                "hsts",
+                "caa",
+                "security_headers",
+            ],
+            "include_raw": False,
+        },
         models.DiagnosticResponse,
         _diagnostic_output("example.com", "host", "Deep TLS scan completed"),
     ),
@@ -566,7 +699,11 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid full mail-delivery diagnostic report (synchronous, results returned inline)",
         _fixed("price_mx_report", "0.03"),
         models.MXJobRequest,
-        {"profile": "mail_delivery", "target": "example.com"},
+        {
+            "profile": "mail_delivery",
+            "target": "example.com",
+            "checks": [],
+        },
         models.MXJobResponse,
         _MX_JOB_OUTPUT,
     ),
@@ -575,7 +712,14 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid routing/path evidence pack using extmon, AS215932, BGP/RPKI, and optional multi-vantage sources",
         _fixed("price_path_report", "0.05"),
         models.PathReportRequest,
-        {"target": "example.com"},
+        {
+            "target": "example.com",
+            "address_family": "auto",
+            "vantages": ["extmon", "as215932", "globalping"],
+            "checks": ["ping", "traceroute", "mtr", "bgp", "rpki", "router_table"],
+            "max_duration_seconds": 60,
+            "include_raw": False,
+        },
         models.DiagnosticResponse,
         _diagnostic_output("example.com", "host", "Path evidence pack completed"),
         gate="path_report",
@@ -585,7 +729,14 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid ping/path probe from approved Hyrule diagnostic vantages",
         _fixed("price_path_probe", "0.005"),
         models.PathProbeRequest,
-        {"target": "example.com"},
+        {
+            "target": "example.com",
+            "probe": "ping",
+            "address_family": "auto",
+            "vantages": ["extmon"],
+            "count": 4,
+            "timeout_ms": 10000,
+        },
         models.DiagnosticResponse,
         _diagnostic_output("example.com", "host", "Path probe completed"),
         gate="path_probe",
@@ -595,7 +746,15 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid outside-in single declared service reachability check with strict port allowlist",
         _fixed("price_port_check", "0.003"),
         models.PortCheckRequest,
-        {"target": "example.com", "port": 443},
+        {
+            "target": "example.com",
+            "port": 443,
+            "protocol": "tcp",
+            "profile": "https",
+            "vantage": "extmon",
+            "timeout_ms": 5000,
+            "include_banner": False,
+        },
         models.DiagnosticResponse,
         _diagnostic_output("example.com:443", "host", "Port is reachable"),
     ),
@@ -604,7 +763,15 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid outside-in NAT port-forward reachability check for one declared service",
         _fixed("price_nat_port_forward_check", "0.005"),
         models.NATPortForwardCheckRequest,
-        {"target": "example.com", "port": 443},
+        {
+            "target": "example.com",
+            "port": 443,
+            "protocol": "tcp",
+            "profile": "https",
+            "vantage": "extmon",
+            "timeout_ms": 5000,
+            "include_banner": False,
+        },
         models.DiagnosticResponse,
         _diagnostic_output("example.com:443", "host", "Port forward is reachable"),
     ),
@@ -613,17 +780,33 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid open-source-first threat/reputation lookup with licensed provider adapters disabled until configured",
         _fixed("price_threat_lookup", "0.01"),
         models.ThreatLookupRequest,
-        {"subject": {"type": "domain", "value": "example.com"}},
+        {
+            "subject_type": "domain",
+            "subject_value": "example.com",
+            "views": ["rbl", "ct", "rdap", "whois", "dns", "reputation"],
+            "include_raw": False,
+        },
         models.DiagnosticResponse,
         _diagnostic_output("example.com", "domain", "Threat lookup completed"),
         gate="threat",
+        input_schema=_flat_subject_schema(
+            models.ThreatLookupRequest,
+            type_description="Threat subject kind: domain, IP, certificate, or URL",
+            value_description="Domain, IP address, certificate identifier, or URL",
+        ),
     ),
     _body_operation(
         "/v1/voip/check",
         "Paid SIP DNS, SIP TLS, OPTIONS, STUN/TURN diagnostic check",
         _fixed("price_voip_check", "0.01"),
         models.VoIPCheckRequest,
-        {"target": "sip.example.com"},
+        {
+            "target": "sip.example.com",
+            "checks": ["sip_dns", "sip_tls"],
+            "sip_port": 5061,
+            "timeout_ms": 10000,
+            "include_raw": False,
+        },
         models.DiagnosticResponse,
         _diagnostic_output("sip.example.com", "host", "SIP diagnostic completed"),
     ),
@@ -632,7 +815,12 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         "Paid pluggable number carrier/CNAM/spam/E911 lookup",
         _fixed("price_voip_number_lookup", "0.05"),
         models.VoIPNumberLookupRequest,
-        {"number": "+31201234567"},
+        {
+            "number": "+31201234567",
+            "country": "NL",
+            "checks": ["number_intel", "cnam", "spam_reputation", "e911"],
+            "include_raw": False,
+        },
         models.DiagnosticResponse,
         _diagnostic_output(
             "+31201234567",
@@ -749,8 +937,8 @@ _CATALOG_PHRASES: tuple[tuple[str, str], ...] = (
 )
 
 
-def catalog_description() -> str:
-    """Capability copy assembled from the enabled catalog only.
+def service_overview() -> str:
+    """Marketplace-ready capability copy assembled from enabled routes only.
 
     Generated from live gate state so a product that is gated off (VM
     simulation, missing prober/worker/provider) can never appear in
@@ -764,11 +952,29 @@ def catalog_description() -> str:
         if any(path == prefix or path.startswith(prefix + "/") for path in enabled_paths):
             phrases.append(phrase)
     return (
-        "First-party network infrastructure for AI agents on AS215932: "
+        "Hyrule Cloud is pay-per-use infrastructure for AI agents on AS215932: "
         + ", ".join(phrases)
-        + ". Pay per request in USDC via x402. "
-        "Domain registration is deferred from this launch catalog."
+        + ". Calls settle in USDC via x402."
     )
+
+
+def catalog_description() -> str:
+    """Public catalog description plus current launch-scope caveats."""
+
+    return f"{service_overview()} Domain registration is deferred from this launch catalog."
+
+
+def marketplace_resource_description(operation: PaidOperation) -> str:
+    """Make any endpoint safe for a marketplace to select as service copy.
+
+    Agentic Market currently derives its service overview from one endpoint's
+    resource description.  Prefixing every indexed resource with the real
+    service scope prevents an arbitrary route (for example MX diagnostics)
+    from being mistaken for the whole product.
+    """
+
+    endpoint = operation.description.rstrip(".")
+    return f"{service_overview()} This endpoint: {endpoint}."
 
 
 def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
@@ -830,6 +1036,8 @@ def _annotate_operation(
     if operation.input_example is not None and isinstance(request_body, dict):
         json_content = request_body.get("content", {}).get("application/json")
         if isinstance(json_content, dict):
+            if operation.input_schema is not None:
+                json_content["schema"] = operation.input_schema
             json_content["example"] = operation.input_example
 
     for parameter in openapi_operation.get("parameters", []):

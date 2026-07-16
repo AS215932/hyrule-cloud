@@ -128,6 +128,64 @@ def test_every_catalog_operation_has_complete_x402_openapi_metadata(
         ), operation.key
 
 
+def test_post_examples_are_executable_and_marketplace_renderable() -> None:
+    """Agentic Market builds its parameter table from ``info.input.body``.
+
+    It currently turns object-valued examples into ``object / null``, so the
+    curated example surface must stay scalar/array-only and agree with the
+    advertised schema. Rich nested options remain available in JSON Schema.
+    """
+
+    for operation in PAID_OPERATIONS:
+        if operation.method != "POST":
+            continue
+        assert operation.request_model is not None
+        assert operation.input_schema is not None
+        assert operation.input_example is not None
+        operation.request_model.model_validate(operation.input_example)
+
+        properties = operation.input_schema["properties"]
+        assert set(operation.input_example) <= set(properties), operation.key
+        assert set(operation.input_schema.get("required", [])) <= set(operation.input_example), (
+            operation.key
+        )
+        assert not any(isinstance(value, dict) for value in operation.input_example.values()), (
+            operation.key
+        )
+
+        bazaar_body = operation.declaration["bazaar"]["info"]["input"]["body"]
+        assert bazaar_body == operation.input_example
+
+
+@pytest.mark.parametrize(
+    ("path", "subject_type", "subject_value"),
+    [
+        ("/v1/bgp/lookup", "prefix", "2a0c:b641:b50::/44"),
+        ("/v1/bgp/jobs", "prefix", "2a0c:b641:b50::/44"),
+        ("/v1/rdap/lookup", "domain", "example.com"),
+        ("/v1/whois/lookup", "domain", "example.com"),
+        ("/v1/threat/lookup", "domain", "example.com"),
+    ],
+)
+def test_flat_subject_discovery_form_preserves_nested_api_contract(
+    path: str,
+    subject_type: str,
+    subject_value: str,
+) -> None:
+    operation = next(item for item in PAID_OPERATIONS if item.path == path)
+    assert operation.request_model is not None
+    assert operation.input_schema is not None
+    parsed = operation.request_model.model_validate(operation.input_example)
+
+    assert parsed.subject.type == subject_type
+    assert parsed.subject.value == subject_value
+    assert "subject" not in operation.input_schema["properties"]
+    assert operation.input_schema["required"][:2] == [
+        "subject_type",
+        "subject_value",
+    ]
+
+
 def test_manifest_openapi_and_bazaar_share_the_same_enabled_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -193,6 +251,12 @@ async def test_unpaid_catalog_probes_reach_valid_402_before_validation(
                 resource = decoded["resource"]
                 assert resource["serviceName"] == "Hyrule Cloud", operation.key
                 assert resource["mimeType"] == "application/json", operation.key
+                assert resource["description"].startswith(
+                    "Hyrule Cloud is pay-per-use infrastructure for AI agents on AS215932"
+                ), operation.key
+                assert operation.description in resource["description"], operation.key
+                for capability in ("IPv6-native compute", "Tor", "BGP", "VoIP"):
+                    assert capability in resource["description"], operation.key
                 assert resource["iconUrl"] == "https://cloud.hyrule.host/icon-192.png", (
                     operation.key
                 )

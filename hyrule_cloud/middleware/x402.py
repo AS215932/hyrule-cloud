@@ -269,7 +269,10 @@ class PaymentGate:
         """
         from urllib.parse import urlsplit
 
-        from hyrule_cloud.services.discovery import match_enabled_operation_any_method
+        from hyrule_cloud.services.discovery import (
+            marketplace_resource_description,
+            match_enabled_operation_any_method,
+        )
 
         operation = None
         if request_url:
@@ -278,7 +281,7 @@ class PaymentGate:
             return ResourceInfo(url=request_url or "", description=description or None)
         return ResourceInfo(
             url=request_url or "",
-            description=description or operation.description,
+            description=marketplace_resource_description(operation),
             mime_type="application/json",
             service_name="Hyrule Cloud",
             tags=list(operation.tags),
