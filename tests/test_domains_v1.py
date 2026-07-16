@@ -459,6 +459,82 @@ async def test_pending_registration_schedules_prompt_reconciliation(domain_servi
 
 
 @pytest.mark.asyncio
+async def test_terminal_pending_registration_creates_refund_obligation(domain_service):
+    service, provider, sessions = domain_service
+    provider.register_domain = AsyncMock(
+        return_value={
+            "id": 1234,
+            "status": "PEN",
+            "expiration_date": "2027-07-15T00:00:00Z",
+        }
+    )
+    provider.get_domain = AsyncMock(
+        return_value={
+            "id": 1234,
+            "status": "EXP",
+            "expiration_date": "2026-07-15T00:00:00Z",
+        }
+    )
+    quote = await service.create_quote(
+        "terminal-registration.dev", DomainAction.REGISTER, "H1234567890"
+    )
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="terminal-registration",
+    )
+    await service.mark_x402_paid(
+        order.order_id,
+        payer="0x" + "1" * 40,
+        tx_hash="0xterminal-registration",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+    async with sessions() as session:
+        reconcile = (
+            await session.execute(
+                select(DomainJobRow).where(
+                    DomainJobRow.dedupe_key == f"provider-pending:{order.order_id}"
+                )
+            )
+        ).scalar_one()
+        reconcile.available_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+    async with sessions() as session:
+        failed_order = await session.get(DomainOrderRow, order.order_id)
+        assert failed_order is not None
+        operation = await session.get(DomainOperationRow, failed_order.operation_id)
+        domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "terminal-registration.dev")
+            )
+        ).scalar_one()
+        refunds = list(
+            await session.scalars(
+                select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
+            )
+        )
+    assert failed_order.status == "refund_due"
+    assert failed_order.error_code == "registrar_terminal_status"
+    assert failed_order.provider_status == "EXP"
+    assert operation is not None and operation.status == "failed"
+    assert str(domain.status) == "expired"
+    assert domain.can_renew is False
+    assert len(refunds) == 1
+    assert refunds[0].amount_usd == order.amount_usd
+    assert refunds[0].extra["order_id"] == order.order_id
+    assert await service.reconcile_pending() == 0
+
+
+@pytest.mark.asyncio
 async def test_domain_quote_is_reserved_before_payment(domain_service):
     service, _provider, sessions = domain_service
     quote = await service.create_quote("single-order.dev", DomainAction.REGISTER, "H1234567890")
@@ -701,6 +777,100 @@ async def test_renewal_service_passes_domain_identity_to_registrar(domain_servic
         ).scalar_one()
     assert active_order is not None and active_order.status == "active"
     assert renewed_domain.expires_at.replace(tzinfo=UTC) == renewed_expiry
+
+
+@pytest.mark.asyncio
+async def test_terminal_pending_renewal_creates_refund_obligation(domain_service):
+    service, provider, sessions = domain_service
+    old_expiry = datetime.now(UTC) + timedelta(days=20)
+    provider.get_domain = AsyncMock(
+        side_effect=[
+            {"id": 7654, "status": "ACT", "expiration_date": old_expiry.isoformat()},
+            {"id": 7654, "status": "EXP", "expiration_date": old_expiry.isoformat()},
+        ]
+    )
+    provider.renew_domain = AsyncMock(
+        return_value={
+            "id": 7654,
+            "status": "PEN",
+            "expiration_date": old_expiry.isoformat(),
+        }
+    )
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="terminal-renewal",
+                extension="dev",
+                fqdn="terminal-renewal.dev",
+                owner_wallet="0x" + "1" * 40,
+                owner_account_id="H1234567890",
+                status="renewal_due",
+                openprovider_id=7654,
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+                expires_at=old_expiry,
+                can_renew=True,
+            )
+        )
+        await session.commit()
+    quote = await service.create_quote(
+        "terminal-renewal.dev", DomainAction.RENEW, "H1234567890"
+    )
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="terminal-renewal",
+    )
+    await service.mark_x402_paid(
+        order.order_id,
+        payer="0x" + "1" * 40,
+        tx_hash="0xterminal-renewal",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+    async with sessions() as session:
+        reconcile = (
+            await session.execute(
+                select(DomainJobRow).where(
+                    DomainJobRow.dedupe_key == f"provider-pending:{order.order_id}"
+                )
+            )
+        ).scalar_one()
+        reconcile.available_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+    async with sessions() as session:
+        failed_order = await session.get(DomainOrderRow, order.order_id)
+        assert failed_order is not None
+        operation = await session.get(DomainOperationRow, failed_order.operation_id)
+        domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "terminal-renewal.dev")
+            )
+        ).scalar_one()
+        refunds = list(
+            await session.scalars(
+                select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
+            )
+        )
+    assert failed_order.status == "refund_due"
+    assert failed_order.error_code == "registrar_terminal_status"
+    assert failed_order.provider_status == "EXP"
+    assert operation is not None and operation.status == "failed"
+    assert str(domain.status) == "expired"
+    assert domain.can_renew is False
+    assert len(refunds) == 1
+    assert refunds[0].amount_usd == order.amount_usd
+    assert refunds[0].extra["order_id"] == order.order_id
 
 
 @pytest.mark.asyncio
@@ -955,6 +1125,119 @@ async def test_dns_changeset_uses_optimistic_revision(domain_service):
             idempotency_key="dns-change-2",
         )
     assert stale.value.status == 412
+
+
+@pytest.mark.asyncio
+async def test_dns_changeset_rejects_cname_owner_conflicts(domain_service):
+    service, _provider, sessions = domain_service
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="cname-conflict",
+                extension="dev",
+                fqdn="cname-conflict.dev",
+                owner_wallet="0x" + "1" * 40,
+                owner_account_id="H1234567890",
+                status="active",
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+            )
+        )
+        session.add(
+            DomainDNSRecordRow(
+                fqdn="cname-conflict.dev",
+                name="www",
+                type="A",
+                ttl=300,
+                values=["192.0.2.1"],
+            )
+        )
+        await session.commit()
+
+    conflicts = [
+        DNSChangesetRequest(
+            changes=[
+                DNSChange(
+                    action=DNSChangeAction.UPSERT,
+                    rrset=DNSRRSet(
+                        name="www.cname-conflict.dev",
+                        type=ManagedRecordType.CNAME,
+                        ttl=300,
+                        values=["target.cname-conflict.dev."],
+                    ),
+                )
+            ]
+        ),
+        DNSChangesetRequest(
+            changes=[
+                DNSChange(
+                    action=DNSChangeAction.UPSERT,
+                    rrset=DNSRRSet(
+                        name="api",
+                        type=ManagedRecordType.CNAME,
+                        ttl=300,
+                        values=["target.cname-conflict.dev."],
+                    ),
+                ),
+                DNSChange(
+                    action=DNSChangeAction.UPSERT,
+                    rrset=DNSRRSet(
+                        name="api",
+                        type=ManagedRecordType.AAAA,
+                        ttl=300,
+                        values=["2001:db8::1"],
+                    ),
+                ),
+            ]
+        ),
+    ]
+    for index, changes in enumerate(conflicts, start=1):
+        with pytest.raises(DomainProblem) as conflict:
+            await service.apply_changeset(
+                "H1234567890",
+                "cname-conflict.dev",
+                1,
+                changes,
+                idempotency_key=f"cname-conflict-{index}",
+            )
+        assert conflict.value.status == 422
+        assert conflict.value.code == "cname_conflict"
+    assert service.dns.zones == {}
+
+    replacement = await service.apply_changeset(
+        "H1234567890",
+        "cname-conflict.dev",
+        1,
+        DNSChangesetRequest(
+            changes=[
+                DNSChange(
+                    action=DNSChangeAction.DELETE,
+                    rrset=DNSRRSet(
+                        name="www",
+                        type=ManagedRecordType.A,
+                        ttl=300,
+                        values=["192.0.2.1"],
+                    ),
+                ),
+                DNSChange(
+                    action=DNSChangeAction.UPSERT,
+                    rrset=DNSRRSet(
+                        name="www",
+                        type=ManagedRecordType.CNAME,
+                        ttl=300,
+                        values=["target.cname-conflict.dev."],
+                    ),
+                ),
+            ]
+        ),
+        idempotency_key="cname-valid-replacement",
+    )
+    assert replacement.revision == 2
+    assert [(record.name, record.type) for record in replacement.records] == [
+        ("www", ManagedRecordType.CNAME)
+    ]
 
 
 @pytest.mark.asyncio

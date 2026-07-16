@@ -945,6 +945,18 @@ class DomainService:
                 else:
                     existing.ttl = rrset.ttl
                     existing.values = rrset.values
+            record_types_by_name: dict[str, set[str]] = {}
+            for record_name, record_type in desired:
+                record_types_by_name.setdefault(record_name, set()).add(record_type)
+            if any(
+                ManagedRecordType.CNAME.value in record_types and len(record_types) > 1
+                for record_types in record_types_by_name.values()
+            ):
+                raise DomainProblem(
+                    422,
+                    "cname_conflict",
+                    "A CNAME record cannot share its name with another DNS record type.",
+                )
             if len(desired) > self.domain_config.max_dns_rrsets:
                 raise DomainProblem(422, "zone_limit_exceeded", "This zone has too many RRsets.")
             revision = domain.zone_revision + 1
@@ -2332,6 +2344,34 @@ class DomainService:
         expired = status in {"EXP", "EXPIRED", "REDEMPTION", "QUARANTINE"} or (
             departed and not transferred
         )
+        terminal_order_id: str | None = None
+        if expired:
+            async with self.db() as session:
+                terminal_order_id = (
+                    (
+                        await session.execute(
+                            select(DomainOrderRow.order_id)
+                            .where(
+                                DomainOrderRow.fqdn == fqdn,
+                                DomainOrderRow.status.in_(
+                                    [
+                                        DomainOrderStatus.PROVIDER_PENDING.value,
+                                        DomainOrderStatus.SUBMITTING.value,
+                                    ]
+                                ),
+                            )
+                            .order_by(DomainOrderRow.created_at.desc())
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+            if terminal_order_id is not None:
+                await self._fail_paid_order(
+                    terminal_order_id,
+                    "registrar_terminal_status",
+                    f"The registrar reported terminal status {status} before the paid domain order completed.",
+                )
         async with self.db() as session:
             current = await session.get(DomainRow, domain.id)
             if current is None:
@@ -2358,6 +2398,8 @@ class DomainService:
                 .scalars()
                 .first()
             )
+            if order is None and terminal_order_id is not None:
+                order = await session.get(DomainOrderRow, terminal_order_id)
             if transferred:
                 current.status = DomainStatus.TRANSFERRED
                 current.transferred_at = current.transferred_at or _now()
@@ -2382,7 +2424,7 @@ class DomainService:
                     if baseline is not None:
                         response_payload["_hyrule_renewal_baseline"] = baseline
                 order.provider_response = response_payload
-                if not active:
+                if not active and not expired:
                     order.status = DomainOrderStatus.PROVIDER_PENDING.value
                     operation = (
                         await session.get(DomainOperationRow, order.operation_id)
