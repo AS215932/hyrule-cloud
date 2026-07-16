@@ -607,7 +607,6 @@ class DiagnosticJobKind(enum.StrEnum):
     WEB_REPORT = "web_report"
     WEB_TLS_DEEP = "web_tls_deep"
     PATH_REPORT = "path_report"
-    SPEEDTEST = "speedtest"
     VOIP_REPORT = "voip_report"
     THREAT_REPORT = "threat_report"
     MX_MAIL_DELIVERY = "mx_mail_delivery"
@@ -704,7 +703,6 @@ class WebTLSDeepRequest(BaseModel):
 
 class WebPricingResponse(BaseModel):
     check_usd: str
-    report_usd: str
     tls_deep_usd: str
 
 
@@ -809,22 +807,13 @@ class PortPricingResponse(BaseModel):
 class NATIPResponse(BaseModel):
     ip: str
     ip_version: int
+    # Scope of the server-observed caller address: cgnat | private | global |
+    # non_global. cgnat_likely is true only for 100.64.0.0/10 addresses.
+    classification: str | None = None
+    cgnat_likely: bool | None = None
     asn: int | None = None
     reverse_dns: list[str] = Field(default_factory=list)
     headers_seen: dict[str, str | None] = Field(default_factory=dict)
-    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-
-
-class NATLookupRequest(BaseModel):
-    observed_public_ip: str | None = None
-    customer_reported_wan_ip: str | None = None
-    customer_reported_lan_ip: str | None = None
-
-
-class NATLookupResponse(BaseModel):
-    cgnat_likely: bool
-    evidence: list[str] = Field(default_factory=list)
-    recommendation: str | None = None
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -833,7 +822,6 @@ class NATPortForwardCheckRequest(PortCheckRequest):
 
 
 class NATPricingResponse(BaseModel):
-    lookup_usd: str
     port_forward_check_usd: str
     what_is_my_ip_usd: str = "0"
 
@@ -903,29 +891,10 @@ class VoIPNumberLookupRequest(BaseModel):
 class VoIPPricingResponse(BaseModel):
     check_usd: str
     number_lookup_usd: str
-    report_usd: str
 
 
 class VoIPSourcesResponse(BaseModel):
     sources: dict[str, SourceHealth]
-
-
-class SpeedtestDirection(enum.StrEnum):
-    DOWNLOAD = "download"
-    UPLOAD = "upload"
-    BIDIRECTIONAL = "bidirectional"
-
-
-class SpeedtestRequest(BaseModel):
-    target: str = "hyrule"
-    direction: SpeedtestDirection = SpeedtestDirection.BIDIRECTIONAL
-    duration_seconds: int = Field(default=10, ge=3, le=60)
-    max_megabytes: int = Field(default=25, ge=1, le=250)
-    vantages: list[DiagnosticVantage] = Field(default_factory=lambda: [DiagnosticVantage.AS215932])
-
-
-class SpeedtestPricingResponse(BaseModel):
-    test_usd: str
 
 
 class BGPSubjectType(enum.StrEnum):
@@ -1040,7 +1009,6 @@ class BGPPricingResponse(BaseModel):
     bgpstream_update_hour_usd: str
     bgpstream_rib_usd: str
     router_snapshot_download_usd: str
-    router_snapshot_bundle_usd: str
 
 
 class BGPSnapshotSummary(BaseModel):
@@ -1241,26 +1209,6 @@ class DNSAuthorityCompareRequest(BaseModel):
     timeout_ms: int = Field(default=3000, ge=500, le=30000)
 
 
-class DNSRecordRecommendationUseCase(enum.StrEnum):
-    WEB = "web"
-    MAIL = "mail"
-    SIP = "sip"
-    VERIFY = "verify"
-    REVERSE_DNS = "reverse_dns"
-
-
-class DNSRecordRecommendationRequest(BaseModel):
-    domain: str = Field(min_length=1, max_length=253)
-    use_case: DNSRecordRecommendationUseCase = DNSRecordRecommendationUseCase.WEB
-    hostname: str | None = None
-    ipv4: str | None = None
-    ipv6: str | None = None
-    mail_provider: str | None = None
-    verification_name: str | None = None
-    verification_value: str | None = None
-    sip_target: str | None = None
-
-
 class DNSDiagnosticResponse(DiagnosticResponse):
     pass
 
@@ -1347,21 +1295,6 @@ class MailBounceParseResponse(BaseModel):
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
-class MailRecordPolicy(BaseModel):
-    dmarc: str = "quarantine"
-    tls_reporting: bool = True
-    mta_sts: bool = True
-    bimi: bool = False
-
-
-class MailRecordRecommendationRequest(BaseModel):
-    domain: str = Field(min_length=3, max_length=253)
-    provider: str = "custom"
-    sending_hosts: list[str] = Field(default_factory=list)
-    sending_ips: list[str] = Field(default_factory=list)
-    policy: MailRecordPolicy = Field(default_factory=MailRecordPolicy)
-
-
 class MailRecordRecommendation(BaseModel):
     type: DNSLookupRecordType
     name: str
@@ -1369,14 +1302,6 @@ class MailRecordRecommendation(BaseModel):
     ttl: int = 3600
     purpose: str
     notes: str | None = None
-
-
-class MailRecordRecommendationResponse(BaseModel):
-    domain: str
-    provider: str
-    records: list[MailRecordRecommendation]
-    warnings: list[str] = Field(default_factory=list)
-    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class MXTool(enum.StrEnum):
@@ -1484,6 +1409,9 @@ class MXJobResponse(BaseModel):
     status_url: str | None = None
     download_url: str | None = None
     results: list[MXCheckResponse] = Field(default_factory=list)
+    # Concrete records derived from the observed lookups (never placeholders);
+    # empty when options.include_recommendations is false or nothing applies.
+    recommendations: list[MailRecordRecommendation] = Field(default_factory=list)
     error: str | None = None
     created_at: datetime
     expires_at: datetime | None = None
@@ -1504,222 +1432,6 @@ class MXToolsResponse(BaseModel):
 class MXPricingResponse(BaseModel):
     single_check_usd: str
     mail_delivery_report_usd: str
-
-
-class MailPlan(enum.StrEnum):
-    AGENT_BASIC = "agent-basic"
-    AGENT_PRO = "agent-pro"
-
-
-class MailAccountStatus(enum.StrEnum):
-    PROVISIONING = "provisioning"
-    ACTIVE = "active"
-    SUSPENDED = "suspended"
-    DELETED = "deleted"
-    FAILED = "failed"
-
-
-class MailSecurityMode(enum.StrEnum):
-    TLS = "tls"
-    STARTTLS = "starttls"
-
-
-class MailAccountFeatures(BaseModel):
-    smtp_imap: bool = True
-    api_access: bool = True
-    inbound_webhooks: bool = True
-
-
-class MailAccountCreateRequest(BaseModel):
-    plan: MailPlan = MailPlan.AGENT_BASIC
-    duration_days: int = Field(default=30, ge=1, le=365)
-    local_part: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9._+-]+$")
-    domain: str = Field(default="agentmail.hyrule.host", min_length=3, max_length=253)
-    display_name: str | None = Field(default=None, max_length=128)
-    features: MailAccountFeatures = Field(default_factory=MailAccountFeatures)
-    client_order_id: str | None = Field(default=None, max_length=64)
-
-
-class MailEndpointConfig(BaseModel):
-    host: str
-    port: int
-    security: MailSecurityMode
-    username: str
-
-
-class MailAPIAccessConfig(BaseModel):
-    base_url: str
-    auth: str
-
-
-class MailLimits(BaseModel):
-    storage_mb: int
-    outbound_messages_per_day: int
-    inbound_messages_per_day: int
-
-
-class MailAccountResponse(BaseModel):
-    mailbox_id: str
-    address: str
-    status: MailAccountStatus
-    management_token: str | None = None
-    management_url: str | None = None
-    smtp: MailEndpointConfig | None = None
-    imap: MailEndpointConfig | None = None
-    api: MailAPIAccessConfig | None = None
-    limits: MailLimits
-    expires_at: datetime | None = None
-
-
-class MailAccountUpdateRequest(BaseModel):
-    display_name: str | None = Field(default=None, max_length=128)
-    features: MailAccountFeatures | None = None
-
-
-class MailAccountExtendRequest(BaseModel):
-    days: int = Field(ge=1, le=365)
-
-
-class MailDomainCreateRequest(BaseModel):
-    domain: str = Field(min_length=3, max_length=253)
-
-
-class MailDomainResponse(BaseModel):
-    domain_id: str
-    domain: str
-    status: str
-    required_dns: list[DNSRecordAnswer] = Field(default_factory=list)
-
-
-class MailAliasRequest(BaseModel):
-    address: str = Field(min_length=3, max_length=320)
-    destination: str | None = Field(default=None, max_length=320)
-
-
-class MailAliasResponse(BaseModel):
-    alias_id: str
-    address: str
-    destination: str
-
-
-class MailIdentityRequest(BaseModel):
-    address: str = Field(min_length=3, max_length=320)
-    display_name: str | None = Field(default=None, max_length=128)
-    reply_to: str | None = Field(default=None, max_length=320)
-
-
-class MailIdentityResponse(BaseModel):
-    identity_id: str
-    address: str
-    display_name: str | None = None
-    reply_to: str | None = None
-    verified: bool = False
-
-
-class MailAPIKeyCreateRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=64)
-    scopes: list[str] = Field(default_factory=lambda: ["mail:read", "mail:send"])
-
-
-class MailAPIKeyResponse(BaseModel):
-    key_id: str
-    name: str
-    token: str | None = None
-    scopes: list[str]
-    created_at: datetime
-
-
-class MailAttachment(BaseModel):
-    filename: str
-    content_type: str = "application/octet-stream"
-    content_base64: str | None = None
-    attachment_id: str | None = None
-    size_bytes: int | None = None
-
-
-class MailSendRequest(BaseModel):
-    mailbox_id: str
-    from_: str = Field(alias="from")
-    to: list[str]
-    cc: list[str] = Field(default_factory=list)
-    bcc: list[str] = Field(default_factory=list)
-    subject: str = Field(max_length=998)
-    text: str | None = None
-    html: str | None = None
-    attachments: list[MailAttachment] = Field(default_factory=list)
-    idempotency_key: str | None = Field(default=None, max_length=128)
-
-
-class MailMessageSummary(BaseModel):
-    message_id: str
-    mailbox_id: str
-    folder: str = "INBOX"
-    from_: str = Field(alias="from")
-    to: list[str] = Field(default_factory=list)
-    subject: str | None = None
-    received_at: datetime | None = None
-    sent_at: datetime | None = None
-    flags: list[str] = Field(default_factory=list)
-    has_attachments: bool = False
-
-
-class MailMessageResponse(MailMessageSummary):
-    text: str | None = None
-    html: str | None = None
-    headers: dict[str, str] = Field(default_factory=dict)
-    attachments: list[MailAttachment] = Field(default_factory=list)
-
-
-class MailMessageListResponse(BaseModel):
-    messages: list[MailMessageSummary]
-    next_cursor: str | None = None
-
-
-class MailSearchRequest(BaseModel):
-    mailbox_id: str
-    query: str = Field(max_length=1024)
-    folder: str | None = None
-    limit: int = Field(default=50, ge=1, le=500)
-    cursor: str | None = None
-
-
-class MailMessageActionRequest(BaseModel):
-    text: str | None = None
-    html: str | None = None
-    attachments: list[MailAttachment] = Field(default_factory=list)
-    idempotency_key: str | None = Field(default=None, max_length=128)
-
-
-class MailWebhookRequest(BaseModel):
-    url: str = Field(max_length=2048)
-    events: list[str]
-    secret: str | None = Field(default=None, max_length=128)
-
-
-class MailWebhookResponse(BaseModel):
-    webhook_id: str
-    url: str
-    events: list[str]
-    created_at: datetime
-
-
-class MailEventResponse(BaseModel):
-    event_id: str
-    type: str
-    message_id: str | None = None
-    payload: dict[str, object] = Field(default_factory=dict)
-    created_at: datetime
-
-
-class MailProductsResponse(BaseModel):
-    currency: str = "USD"
-    products: list[dict[str, object]]
-
-
-class MailPricingResponse(BaseModel):
-    agent_basic_usd_day: str
-    storage_extra_usd_gb_day: str
-    outbound_overage_usd_message: str
 
 
 # Rebuild all refs if needed

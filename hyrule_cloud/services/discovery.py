@@ -440,7 +440,7 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
     ),
     _body_operation(
         "/v1/dns/lookup",
-        "Paid read-only DNS lookup, reverse lookup, DNSSEC, and trace diagnostics",
+        "Paid read-only DNS lookup, reverse lookup, resolver-validated DNSSEC (AD/DS), and trace diagnostics",
         _fixed("price_dns_lookup", "0.001"),
         models.DNSLookupRequest,
         {"name": "example.com", "type": "AAAA"},
@@ -455,19 +455,6 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         {"name": "example.com", "type": "A"},
         models.DNSDiagnosticResponse,
         _diagnostic_output("example.com", "domain", "DNS propagation compared"),
-    ),
-    _body_operation(
-        "/v1/dns/recommend-records",
-        "Paid DNS record recommendations for web, mail, SIP, verification, and reverse DNS workflows",
-        _fixed("price_dns_lookup", "0.001"),
-        models.DNSRecordRecommendationRequest,
-        {
-            "domain": "example.com",
-            "use_case": "web",
-            "ipv6": "2a0c:b641:b50::1",
-        },
-        models.DNSDiagnosticResponse,
-        _diagnostic_output("example.com", "domain", "DNS records recommended"),
     ),
     _body_operation(
         "/v1/rdap/lookup",
@@ -512,7 +499,7 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
     ),
     _body_operation(
         "/v1/web/tls/deep",
-        "Paid Hyrule-native SSL Labs-style deep TLS scanner and grade",
+        "Paid deep TLS protocol, certificate, and negotiated-cipher scan with grade",
         _fixed("price_web_tls_deep", "0.10"),
         models.WebTLSDeepRequest,
         {"host": "example.com", "port": 443},
@@ -540,15 +527,6 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
             "classification": "auth_failure",
             "recommended_actions": ["Check SPF, DKIM, and DMARC alignment"],
         },
-    ),
-    _body_operation(
-        "/v1/mx/recommend-records",
-        "Paid SPF, DKIM, DMARC, MTA-STS, TLS-RPT, and BIMI recommendation engine",
-        _fixed("price_mx_check", "0.005"),
-        models.MailRecordRecommendationRequest,
-        {"domain": "example.com", "provider": "custom"},
-        models.MailRecordRecommendationResponse,
-        {"domain": "example.com", "provider": "custom", "records": []},
     ),
     _body_operation(
         "/v1/mx/jobs",
@@ -587,18 +565,6 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         {"target": "example.com", "port": 443},
         models.DiagnosticResponse,
         _diagnostic_output("example.com:443", "host", "Port is reachable"),
-    ),
-    _body_operation(
-        "/v1/nat/lookup",
-        "Paid server-only CGNAT/NAT hint report from caller and customer WAN/LAN evidence",
-        _fixed("price_nat_lookup", "0.003"),
-        models.NATLookupRequest,
-        {"customer_reported_wan_ip": "100.64.1.1"},
-        models.NATLookupResponse,
-        {
-            "cgnat_likely": True,
-            "evidence": ["Customer WAN address is inside 100.64.0.0/10"],
-        },
     ),
     _body_operation(
         "/v1/nat/port-forward/check",
@@ -713,13 +679,44 @@ def match_enabled_operation(method: str, concrete_path: str) -> PaidOperation | 
     return None
 
 
-_MANIFEST_DESCRIPTION = (
-    "Launch-ready, first-party network infrastructure for AI agents on AS215932: "
-    "IPv6-native compute, BGP/routing, IP/ASN, DNS diagnostics, "
-    "RDAP/WHOIS, web and TLS, mail deliverability, port/NAT/CGNAT, VoIP/SIP, "
-    "and outbound requests over Direct, Tor, I2P, or Yggdrasil. Pay per request "
-    "in USDC via x402. Domain registration is deferred from this launch catalog."
+_CATALOG_PHRASES: tuple[tuple[str, str], ...] = (
+    ("/v1/vm", "IPv6-native compute"),
+    ("/v1/network", "outbound requests over Direct, Tor, I2P, or Yggdrasil"),
+    ("/v1/bgp", "BGP/routing intelligence"),
+    ("/v1/ip", "IP/ASN intelligence"),
+    ("/v1/dns", "DNS diagnostics"),
+    ("/v1/rdap", "RDAP/WHOIS registry lookups"),
+    ("/v1/whois", "RDAP/WHOIS registry lookups"),
+    ("/v1/web", "web and deep TLS checks"),
+    ("/v1/mx", "mail deliverability"),
+    ("/v1/path", "multi-vantage path evidence"),
+    ("/v1/ports", "outside-in port reachability"),
+    ("/v1/nat", "NAT port-forward checks"),
+    ("/v1/threat", "threat/reputation lookups"),
+    ("/v1/voip", "VoIP/SIP diagnostics"),
 )
+
+
+def catalog_description() -> str:
+    """Capability copy assembled from the enabled catalog only.
+
+    Generated from live gate state so a product that is gated off (VM
+    simulation, missing prober/worker/provider) can never appear in
+    manifest/OpenAPI marketing copy.
+    """
+    enabled_paths = [operation.path for operation in enabled_paid_operations()]
+    phrases: list[str] = []
+    for prefix, phrase in _CATALOG_PHRASES:
+        if phrase in phrases:
+            continue
+        if any(path == prefix or path.startswith(prefix + "/") for path in enabled_paths):
+            phrases.append(phrase)
+    return (
+        "First-party network infrastructure for AI agents on AS215932: "
+        + ", ".join(phrases)
+        + ". Pay per request in USDC via x402. "
+        "Domain registration is deferred from this launch catalog."
+    )
 
 
 def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
@@ -740,7 +737,7 @@ def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
     return {
         "x402Version": 2,
         "name": "Hyrule Cloud",
-        "description": _MANIFEST_DESCRIPTION,
+        "description": catalog_description(),
         "resources": resources,
         "facilitator": getattr(config.payment, "facilitator_url", ""),
         "contact": "https://github.com/AS215932",
@@ -835,7 +832,7 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
         openapi_version=application.openapi_version,
         summary=application.summary,
         description=(
-            f"{application.description} This OpenAPI document intentionally contains only "
+            f"{catalog_description()} This OpenAPI document intentionally contains only "
             "the launch-ready, independently payable agent surface."
         ),
         routes=selected_routes,

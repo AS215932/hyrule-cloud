@@ -413,7 +413,7 @@ class DiagnosticJobRow(Base):
     """Generic async job row for x402 diagnostic evidence packs.
 
     Product namespaces (/v1/web, /v1/path, /v1/threat, /v1/voip,
-    /v1/speedtest, etc.) share this shape so job tokens, artifacts, expiry,
+    etc.) share this shape so job tokens, artifacts, expiry,
     and source metadata behave consistently.
     """
 

@@ -37,8 +37,6 @@ cross-references resolve:
 
 ## Withheld — do NOT publish
 
-- `hyrule-mail` — every paid `/v1/mail` endpoint returns 501; contract preview only
-- `hyrule-speedtest` — measurement backend (payload/upload endpoints) not routed
 - `hyrule-routing-path` — `/v1/path/*` returns 501 until an active-probe vantage
   (Globalping/RIPE Atlas) is configured; only a "probe accepted" contract today
 - `hyrule-threat-reputation` — `/v1/threat/lookup` returns 501 until a licensed

@@ -190,7 +190,6 @@ class PaymentConfig(BaseSettings):
     price_vm_sm: Decimal = Decimal("0.10")
     price_vm_md: Decimal = Decimal("0.20")
     price_vm_lg: Decimal = Decimal("0.40")
-    price_vpn: Decimal = Decimal("0.02")
     price_domain_markup: Decimal = Decimal("1.00")
     
     price_proxy_direct: Decimal = Decimal("0.01")
@@ -205,7 +204,6 @@ class PaymentConfig(BaseSettings):
     price_bgpstream_hour: Decimal = Decimal("0.05")
     price_bgpstream_rib: Decimal = Decimal("0.10")
     price_bgp_router_table: Decimal = Decimal("0.10")
-    price_bgp_router_table_all: Decimal = Decimal("0.25")
     price_ip_lookup: Decimal = Decimal("0.003")
     price_dns_lookup: Decimal = Decimal("0.001")
     price_rdap_lookup: Decimal = Decimal("0.003")
@@ -213,21 +211,14 @@ class PaymentConfig(BaseSettings):
     price_mx_check: Decimal = Decimal("0.005")
     price_mx_report: Decimal = Decimal("0.03")
     price_web_check: Decimal = Decimal("0.005")
-    price_web_report: Decimal = Decimal("0.03")
     price_web_tls_deep: Decimal = Decimal("0.10")
     price_path_probe: Decimal = Decimal("0.005")
     price_path_report: Decimal = Decimal("0.05")
     price_port_check: Decimal = Decimal("0.003")
-    price_nat_lookup: Decimal = Decimal("0.003")
     price_nat_port_forward_check: Decimal = Decimal("0.005")
     price_threat_lookup: Decimal = Decimal("0.01")
     price_voip_check: Decimal = Decimal("0.01")
     price_voip_number_lookup: Decimal = Decimal("0.05")
-    price_voip_report: Decimal = Decimal("0.08")
-    price_speedtest: Decimal = Decimal("0.10")
-    price_mail_agent_basic_day: Decimal = Decimal("0.05")
-    price_mail_storage_gb_day: Decimal = Decimal("0.01")
-    price_mail_outbound_message: Decimal = Decimal("0.001")
 
     # Dev bypass: set to a non-empty string to allow skipping payment
     # via X-DEV-BYPASS header. NEVER set in production.

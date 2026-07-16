@@ -15,11 +15,10 @@ Use Hyrule Cloud for paid, agent-friendly network intelligence primitives.
 - `/v1/ip` is IP intelligence.
 - `/v1/rdap` and `/v1/whois` are registry lookups.
 - `/v1/mx` is mail/domain troubleshooting.
-- `/v1/mail` is the paid mailbox product.
 
 ## Capabilities
 
-- IP geolocation placeholder/provider output
+- IP geolocation (activates once a provider is configured; requests 501 before charging until then)
 - IP-to-ASN/ISP lookup
 - Reverse DNS
 - RDAP for domains, IPs, prefixes, ASNs, entities

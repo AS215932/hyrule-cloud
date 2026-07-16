@@ -75,7 +75,7 @@ TESTS: dict[str, dict] = {
     # prober goes live, without failing the pre-launch sweep.
     "path-report": {"path": "/v1/path/report", "body": {"target": "example.com", "vantages": ["extmon", "as215932", "globalping"], "checks": ["ping", "traceroute"]}, "usd": "0.05", "group": "intel"},
     "ports":     {"path": "/v1/ports/check", "body": {"target": "example.com", "port": 443}, "usd": "0.003", "group": "intel"},
-    "nat":       {"path": "/v1/nat/lookup",  "body": {"customer_reported_wan_ip": "100.64.1.1"}, "usd": "0.003", "group": "intel"},
+    "nat":       {"path": "/v1/nat/port-forward/check", "body": {"target": "example.com", "port": 443}, "usd": "0.005", "group": "intel"},
     "threat":    {"path": "/v1/threat/lookup","body": {"subject": {"type": "domain", "value": "example.com"}}, "usd": "0.01", "group": "intel"},
     "voip":      {"path": "/v1/voip/check",  "body": {"target": "sip.example.com"}, "usd": "0.01", "group": "intel"},
     "voipnum":   {"path": "/v1/voip/number/lookup", "body": {"number": "+31201234567"}, "usd": "0.05", "group": "intel"},

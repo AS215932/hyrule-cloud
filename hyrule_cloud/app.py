@@ -15,7 +15,7 @@ from pathlib import Path
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from x402.http import PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER
 
 from hyrule_cloud.api.auth import router as auth_router
@@ -23,7 +23,6 @@ from hyrule_cloud.api.bgp import router as bgp_router
 from hyrule_cloud.api.dns import router as dns_router
 from hyrule_cloud.api.internal_bgp import router as internal_bgp_router
 from hyrule_cloud.api.ip import router as ip_router
-from hyrule_cloud.api.mail import router as mail_router
 from hyrule_cloud.api.metrics import router as metrics_router
 from hyrule_cloud.api.mx import router as mx_router
 from hyrule_cloud.api.nat import router as nat_router
@@ -31,7 +30,6 @@ from hyrule_cloud.api.path import router as path_router
 from hyrule_cloud.api.ports import router as ports_router
 from hyrule_cloud.api.registry import router as registry_router
 from hyrule_cloud.api.routes import router
-from hyrule_cloud.api.speedtest import router as speedtest_router
 from hyrule_cloud.api.status import router as status_router
 from hyrule_cloud.api.threat import router as threat_router
 from hyrule_cloud.api.voip import router as voip_router
@@ -175,15 +173,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Hyrule Cloud",
+    # Deliberately product-list-free: the payable capability list is generated
+    # from the enabled catalog (see services/discovery.py catalog_description)
+    # so gated-off products can never be advertised here.
     description=(
-        "Full-stack network infrastructure for AI agents on AS215932 (RIPE): "
-        "IPv6-native VMs with SSH and automatic HTTPS subdomains, domain "
-        "registration and DNS, a broad network-intelligence suite (BGP/routing, "
-        "IP/ASN, DNS, RDAP/WHOIS, web & deep TLS, mail "
-        "deliverability, port/NAT/CGNAT, VoIP/SIP), and proxied requests over "
-        "Direct/Tor/I2P/Yggdrasil. "
-        "Pay per request in USDC on Base via x402; VM checkout may also accept "
-        "BTC/XMR when advertised."
+        "First-party network infrastructure for AI agents on AS215932 (RIPE), "
+        "paid per request in USDC via x402. The live payable capability list is "
+        "generated from the enabled catalog in /.well-known/x402.json, "
+        "/openapi.json, and /llms.txt."
     ),
     contact={
         "name": "Hyrule Cloud (AS215932)",
@@ -208,6 +205,39 @@ async def favicon_ico() -> FileResponse:
 @app.get("/apple-touch-icon-precomposed.png", include_in_schema=False)
 async def apple_touch_icon() -> FileResponse:
     return FileResponse(_STATIC_DIR / "apple-touch-icon.png", media_type="image/png")
+
+
+@app.get("/llms.txt", include_in_schema=False)
+async def llms_txt(request: Request) -> PlainTextResponse:
+    """Agent-facing plaintext guide, generated from the enabled catalog only."""
+    from hyrule_cloud.services.discovery import catalog_description, enabled_paid_operations
+
+    state = getattr(request.app.state, "_typed_state", None)
+    config = getattr(state, "config", None) or HyruleConfig()
+    base = config.public_base_url.rstrip("/")
+    lines = [
+        "# Hyrule Cloud — x402-payable network services for AI agents",
+        "",
+        catalog_description(),
+        "",
+        f"Machine-readable catalog: {base}/.well-known/x402.json",
+        f"OpenAPI (payable surface only): {base}/openapi.json",
+        "Payment: HTTP 402 challenge (x402 v2), USDC; accepted networks at "
+        f"{base}/v1/payments/networks",
+        "",
+        "Golden path:",
+        f"  curl -s -X POST {base}/v1/dns/lookup \\",
+        "    -H 'Content-Type: application/json' -d '{\"name\":\"example.com\",\"type\":\"AAAA\"}'",
+        "  -> HTTP 402 with payment requirements; retry with an X-PAYMENT header to settle.",
+        "",
+        "Paid operations (method path — min USD — description):",
+    ]
+    for operation in enabled_paid_operations():
+        price = operation.price.minimum(config.payment)
+        lines.append(
+            f"  {operation.method} {operation.path} — ${price} — {operation.description}"
+        )
+    return PlainTextResponse("\n".join(lines) + "\n")
 
 
 @app.middleware("http")
@@ -288,8 +318,6 @@ app.include_router(ports_router)
 app.include_router(nat_router)
 app.include_router(threat_router)
 app.include_router(voip_router)
-app.include_router(speedtest_router)
-app.include_router(mail_router)
 app.include_router(internal_bgp_router)
 app.include_router(status_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.

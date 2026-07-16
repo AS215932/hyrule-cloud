@@ -17,8 +17,6 @@ from hyrule_cloud.models import (
     CapabilityEndpoint,
     MailBounceParseRequest,
     MailBounceParseResponse,
-    MailRecordRecommendationRequest,
-    MailRecordRecommendationResponse,
     MXCheckRequest,
     MXCheckResponse,
     MXJobRequest,
@@ -33,7 +31,7 @@ from hyrule_cloud.models import (
     ProductCapabilityResponse,
 )
 from hyrule_cloud.services.mx.checks import run_check
-from hyrule_cloud.services.mx.deliverability import parse_bounce, recommend_records
+from hyrule_cloud.services.mx.deliverability import derive_recommendations, parse_bounce
 
 router = APIRouter(prefix="/v1/mx", tags=["MX diagnostics"])
 
@@ -80,7 +78,7 @@ async def get_mx_capabilities() -> ProductCapabilityResponse:
     return ProductCapabilityResponse(
         service="mx",
         purpose="MXToolbox-compatible mail/domain deliverability diagnostics for AI agents and ISP support workflows.",
-        separation_of_concerns="/v1/mx diagnoses mail/DNS delivery; /v1/mail creates and operates mailboxes; /v1/dns is the lower-level read-only DNS API.",
+        separation_of_concerns="/v1/mx diagnoses mail/DNS delivery; /v1/dns is the lower-level read-only DNS API.",
         free_endpoints=[
             CapabilityEndpoint(path="/v1/mx/tools", method="GET", description="List supported SuperTool-compatible tools"),
             CapabilityEndpoint(path="/v1/mx/pricing", method="GET", description="MX diagnostic pricing"),
@@ -91,7 +89,6 @@ async def get_mx_capabilities() -> ProductCapabilityResponse:
             CapabilityEndpoint(path="/v1/mx/check", method="POST", paid=True, description="Run one MX diagnostic check"),
             CapabilityEndpoint(path="/v1/mx/{tool}/{target}", method="GET", paid=True, description="SuperTool-style single check"),
             CapabilityEndpoint(path="/v1/mx/bounce/parse", method="POST", paid=True, description="Parse and classify a mail bounce/rejection message"),
-            CapabilityEndpoint(path="/v1/mx/recommend-records", method="POST", paid=True, description="Recommend SPF, DKIM, DMARC, MTA-STS, TLS-RPT, and BIMI DNS records"),
             CapabilityEndpoint(path="/v1/mx/reports/mail-delivery", method="POST", paid=True, description="Run full mail-delivery diagnostic report (results returned inline)"),
             CapabilityEndpoint(path="/v1/mx/jobs", method="POST", paid=True, description="Run full mail troubleshooting report (synchronous, results returned inline)"),
         ],
@@ -142,13 +139,6 @@ async def parse_mx_bounce(request: Request, body: MailBounceParseRequest) -> Mai
     return parse_bounce(body)
 
 
-@router.post("/recommend-records", response_model=MailRecordRecommendationResponse)
-async def mx_recommend_records(request: Request, body: MailRecordRecommendationRequest) -> MailRecordRecommendationResponse | Response:
-    if payment := await _paid_check(request):
-        return payment
-    return recommend_records(body)
-
-
 @router.post("/reports/mail-delivery", response_model=MXJobResponse)
 async def create_mx_mail_delivery_report(request: Request, body: MXJobRequest) -> MXJobResponse | Response:
     body.profile = MXProfile.MAIL_DELIVERY
@@ -185,6 +175,11 @@ async def create_mx_job(request: Request, body: MXJobRequest) -> MXJobResponse |
         target=body.target,
         profile=body.profile,
         results=results,
+        recommendations=(
+            derive_recommendations(body.target, results)
+            if body.options.include_recommendations
+            else []
+        ),
         created_at=created,
         expires_at=created + timedelta(hours=24),
     )

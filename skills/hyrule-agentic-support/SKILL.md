@@ -12,7 +12,7 @@ description: "NOT YET LAUNCHED. Umbrella skill that cross-references not-yet-lau
 
 Hyrule Agentic ISP Support is the umbrella Skill for x402-paid network facts
 that LLMs cannot infer: live reachability, DNS, BGP, mail deliverability,
-routing/path evidence, TLS, reputation, VoIP, NAT hints, speedtests, and
+routing/path evidence, TLS, reputation, VoIP, NAT hints, and
 AS215932-backed external vantage data.
 
 ## Focused subskills
@@ -32,12 +32,12 @@ AS215932-backed external vantage data.
 2. For website outages, run `/v1/web/check`; use `/v1/web/tls/deep` for deep TLS.
 3. For mail delivery, run `/v1/mx/reports/mail-delivery`; parse bounces with
    `/v1/mx/bounce/parse`.
-4. For DNS/registry, use `/v1/dns/propagation`, `/v1/dns/recommend-records`,
-   `/v1/rdap/lookup`, and `/v1/whois/lookup`.
+4. For DNS/registry, use `/v1/dns/propagation`, `/v1/rdap/lookup`, and
+   `/v1/whois/lookup`.
 5. For routing/path claims, use `/v1/path/report` and `/v1/bgp/lookup`.
 6. For outside-in reachability, use `/v1/ports/check` or
    `/v1/nat/port-forward/check`.
-7. For NAT/CGNAT, start with free `/v1/nat/ip`, then paid `/v1/nat/lookup`.
+7. For NAT/CGNAT, use free `/v1/nat/ip` (includes CGNAT/scope classification).
 8. For reputation, use `/v1/threat/lookup`; for VoIP, use `/v1/voip/check`.
 
 ## Discovery
