@@ -66,14 +66,14 @@ TESTS: dict[str, dict] = {
     "web":       {"path": "/v1/web/check",   "body": {"target": "https://example.com"}, "usd": "0.005", "group": "intel"},
     "web-tls":   {"path": "/v1/web/tls/deep","body": {"host": "example.com"}, "usd": "0.10", "group": "intel"},
     "mx":        {"path": "/v1/mx/check",    "body": {"tool": "mx", "target": "example.com"}, "usd": "0.005", "group": "intel"},
-    "path":      {"path": "/v1/path/ping",   "body": {"target": "example.com", "vantages": ["extmon", "as215932", "globalping"]}, "usd": "0.005", "group": "intel"},
-    # /v1/path/report (Phase-3a path evidence) uses the endpoint's default
-    # vantage set so it actually probes once a vantage (Globalping/RIPE Atlas) is
-    # configured. Until then it returns 501 before charging (PR #42), which the
-    # sweep treats as "not launched yet, skipped" rather than a failure — so the
-    # runbook's required paid /v1/path/report call is validated the moment a
-    # prober goes live, without failing the pre-launch sweep.
-    "path-report": {"path": "/v1/path/report", "body": {"target": "example.com", "vantages": ["extmon", "as215932", "globalping"], "checks": ["ping", "traceroute"]}, "usd": "0.05", "group": "intel"},
+    # /v1/path/ping runs a real ping from the AS215932 prober vantage (Phase 4a).
+    "path":      {"path": "/v1/path/ping",   "body": {"target": "example.com", "vantages": ["as215932"]}, "usd": "0.005", "group": "intel"},
+    # /v1/path/report combines ping + traceroute + classification from the
+    # AS215932 prober. Until the prober is deployed (HYRULE_PROBER_TOKEN set) it
+    # returns 501 before charging, which the sweep treats as "not launched yet,
+    # skipped" rather than a failure — so the runbook's required paid
+    # /v1/path/report call is validated the moment the prober goes live.
+    "path-report": {"path": "/v1/path/report", "body": {"target": "example.com", "vantages": ["as215932", "extmon"], "checks": ["ping", "traceroute"]}, "usd": "0.05", "group": "intel"},
     "ports":     {"path": "/v1/ports/check", "body": {"target": "example.com", "port": 443}, "usd": "0.003", "group": "intel"},
     "nat":       {"path": "/v1/nat/port-forward/check", "body": {"target": "example.com", "port": 443}, "usd": "0.005", "group": "intel"},
     "threat":    {"path": "/v1/threat/lookup","body": {"subject": {"type": "domain", "value": "example.com"}}, "usd": "0.01", "group": "intel"},

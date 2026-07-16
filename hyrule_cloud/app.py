@@ -97,6 +97,17 @@ async def lifespan(app: FastAPI):
         health_ttl_seconds=config.network_proxy_health_ttl_seconds,
     )
 
+    # Prober sidecar client for x402-gated /v1/path/* active measurements.
+    # Registered as the process-wide active prober so the synchronous manifest
+    # gate (path_active_probe_enabled) sees the same configuration.
+    from hyrule_cloud.providers.prober_client import ProberProvider, set_active_prober
+    prober_provider = ProberProvider(
+        prober_url=config.prober_url,
+        token=config.prober_token,
+        health_ttl_seconds=config.prober_health_ttl_seconds,
+    )
+    set_active_prober(prober_provider)
+
     # Orchestrator
     orchestrator = Orchestrator(config, session_factory)
     await orchestrator.startup()
@@ -119,6 +130,7 @@ async def lifespan(app: FastAPI):
         orchestrator=orchestrator,
         payment_gate=payment_gate,
         network_provider=network_provider,
+        prober_provider=prober_provider,
         native_crypto=native_crypto,
         rate_provider=rate_provider,
         native_payment_assets=native_payment_assets,
@@ -165,6 +177,8 @@ async def lifespan(app: FastAPI):
         pass
     await orchestrator.shutdown()
     await network_provider.close()
+    set_active_prober(None)
+    await prober_provider.close()
     await native_crypto.close()
     await rate_provider.close()
     await engine.dispose()

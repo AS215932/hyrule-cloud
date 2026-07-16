@@ -404,42 +404,38 @@ async def test_bgp_jobs_readvertises_and_charges_once_worker_deployed(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_manifest_advertises_path_endpoints_by_their_default_request(monkeypatch):
-    """Even with an active prober configured, only endpoints whose DEFAULT
-    request actually probes may be advertised. /v1/path/report defaults to a
-    vantage set that includes globalping, but the ping-family defaults to extmon
-    (never probes), so it must stay out of the manifest — an agent following
-    discovery with defaults would otherwise hit a 501."""
-    import hyrule_cloud.services.path.diagnostics as pd
-    from hyrule_cloud.models import DiagnosticVantage
-    from hyrule_cloud.services.diagnostics.sources import source_ok
-
-    real_sources = pd._sources
-
-    def fake_sources(vantages):
-        out = real_sources(vantages)
-        for v in vantages:
-            if v == DiagnosticVantage.GLOBALPING:
-                out[v.value] = source_ok()  # pretend Globalping is configured
-        return out
-
-    monkeypatch.setattr(pd, "_sources", fake_sources)
+async def test_manifest_lists_path_endpoints_only_when_prober_configured(monkeypatch):
+    """path/ping and path/report default to the AS215932 prober vantage, so they
+    auto-list exactly when a prober is deployed and stay out of the manifest
+    otherwise — an agent following discovery with defaults must never hit a 501.
+    Only catalog paths appear; /v1/path/trace is capabilities-only, never in the
+    manifest."""
     old_state = getattr(app.state, "_typed_state", None)
     if hasattr(app.state, "_typed_state"):
         delattr(app.state, "_typed_state")
-    try:
+
+    async def manifest_paths() -> set[str]:
         app.state._typed_state = SimpleNamespace(config=HyruleConfig())
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             manifest = await client.get("/.well-known/x402.json")
+        return {resource["path"] for resource in manifest.json()["resources"]}
+
+    try:
+        monkeypatch.delenv("HYRULE_PROBER_TOKEN", raising=False)
+        without_prober = await manifest_paths()
+        monkeypatch.setenv("HYRULE_PROBER_TOKEN", "test-prober-token")
+        with_prober = await manifest_paths()
     finally:
         if old_state is not None:
             app.state._typed_state = old_state
         elif hasattr(app.state, "_typed_state"):
             delattr(app.state, "_typed_state")
-    paths = {resource["path"] for resource in manifest.json()["resources"]}
-    assert "/v1/path/report" in paths  # default vantages include globalping
-    assert "/v1/path/ping" not in paths  # default is extmon-only -> 501
-    assert "/v1/path/trace" not in paths
+
+    assert "/v1/path/ping" not in without_prober
+    assert "/v1/path/report" not in without_prober
+    assert "/v1/path/ping" in with_prober
+    assert "/v1/path/report" in with_prober
+    assert "/v1/path/trace" not in with_prober  # capabilities-only, not a catalog op
 
 
 def test_source_usable_only_accepts_configured_working_statuses():
@@ -467,32 +463,25 @@ def test_source_usable_only_accepts_configured_working_statuses():
 
 
 @pytest.mark.asyncio
-async def test_path_capabilities_gated_per_endpoint_default_vantages(monkeypatch):
-    """With globalping configured, /v1/path/capabilities advertises the report
-    (its default vantages include globalping) but NOT the ping-family (default
-    [extmon] 501s) — mirroring the manifest's per-endpoint gate."""
-    import hyrule_cloud.services.path.diagnostics as pd
+async def test_path_capabilities_reflect_prober_deployment(monkeypatch):
+    """With the prober deployed, /v1/path/capabilities advertises ping, trace,
+    and the report (+quote). MTR and reverse-path asymmetry have no honest
+    backend, so they are never advertised. With no prober, none are advertised."""
     from hyrule_cloud.api.path import get_path_capabilities
-    from hyrule_cloud.models import DiagnosticVantage
-    from hyrule_cloud.services.diagnostics.sources import source_ok
 
-    real_sources = pd._sources
-
-    def fake_sources(vantages):
-        out = real_sources(vantages)
-        for v in vantages:
-            if v == DiagnosticVantage.GLOBALPING:
-                out[v.value] = source_ok()
-        return out
-
-    monkeypatch.setattr(pd, "_sources", fake_sources)
+    monkeypatch.setenv("HYRULE_PROBER_TOKEN", "test-prober-token")
     caps = await get_path_capabilities()
     paid = {e.path for e in caps.paid_endpoints}
     free = {e.path for e in caps.free_endpoints}
-    assert "/v1/path/report" in paid
+    assert paid == {"/v1/path/ping", "/v1/path/trace", "/v1/path/report"}
     assert "/v1/path/report/quote" in free
-    assert "/v1/path/ping" not in paid
-    assert "/v1/path/trace" not in paid
+    assert "/v1/path/mtr" not in paid
+    assert "/v1/path/asymmetry" not in paid
+
+    monkeypatch.delenv("HYRULE_PROBER_TOKEN", raising=False)
+    caps_off = await get_path_capabilities()
+    assert {e.path for e in caps_off.paid_endpoints} == set()
+    assert not any(e.path == "/v1/path/report/quote" for e in caps_off.free_endpoints)
 
 
 def test_threat_predicate_rejects_configured_but_unhealthy_source(monkeypatch):
@@ -508,24 +497,20 @@ def test_threat_predicate_rejects_configured_but_unhealthy_source(monkeypatch):
 def test_path_gate_is_per_requested_vantage(monkeypatch):
     import hyrule_cloud.services.path.diagnostics as pd
     from hyrule_cloud.models import DiagnosticVantage
-    from hyrule_cloud.services.diagnostics.sources import source_ok
 
-    real_sources = pd._sources
-
-    def fake_sources(vantages):
-        out = real_sources(vantages)
-        for v in vantages:
-            if v == DiagnosticVantage.GLOBALPING:
-                out[v.value] = source_ok()  # pretend Globalping is configured
-        return out
-
-    monkeypatch.setattr(pd, "_sources", fake_sources)
-
-    # A request for only built-in vantages can't produce probe data => gated,
-    # even though an active prober is configured process-wide.
-    assert pd.path_active_probe_enabled([DiagnosticVantage.EXTMON]) is False
-    assert pd.path_active_probe_enabled([DiagnosticVantage.GLOBALPING]) is True
+    monkeypatch.setenv("HYRULE_PROBER_TOKEN", "test-prober-token")
+    # AS215932/extmon are executed by the prober, so they become active once a
+    # prober is deployed.
+    assert pd.path_active_probe_enabled([DiagnosticVantage.AS215932]) is True
+    assert pd.path_active_probe_enabled([DiagnosticVantage.EXTMON]) is True
+    # A request for only an unconfigured third-party vantage is still gated,
+    # even with a prober deployed process-wide.
+    assert pd.path_active_probe_enabled([DiagnosticVantage.GLOBALPING]) is False
     assert pd.path_active_probe_enabled() is True
+
+    monkeypatch.delenv("HYRULE_PROBER_TOKEN", raising=False)
+    assert pd.path_active_probe_enabled([DiagnosticVantage.AS215932]) is False
+    assert pd.path_active_probe_enabled() is False
 
 
 @pytest.mark.asyncio
