@@ -1115,7 +1115,9 @@ class IPLookupView(enum.StrEnum):
 class IPLookupRequest(BaseModel):
     address: str
     views: list[IPLookupView] = Field(
-        default_factory=lambda: [IPLookupView.GEO, IPLookupView.ASN, IPLookupView.RDNS]
+        # geo stays out of the default until a real provider is configured;
+        # requesting it explicitly 501s before charging (see api/ip.py).
+        default_factory=lambda: [IPLookupView.ASN, IPLookupView.RDNS]
     )
     max_age_seconds: int = Field(default=3600, ge=0, le=604800)
 
