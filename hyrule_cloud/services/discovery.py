@@ -422,6 +422,7 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         },
         models.BGPJobResponse,
         _BGP_JOB_OUTPUT,
+        gate="bgpstream_worker",
     ),
     _download_operation(
         "/v1/bgp/snapshots/router/{snapshot_id}/download",
@@ -430,7 +431,7 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
     ),
     _body_operation(
         "/v1/ip/lookup",
-        "Paid IP geolocation, ASN/ISP, reverse DNS, RDAP/WHOIS, reputation, and BGP-context lookup",
+        "Paid IP ASN/ISP, reverse DNS, RDAP/WHOIS, and BGP-context lookup",
         _fixed("price_ip_lookup", "0.003"),
         models.IPLookupRequest,
         {"address": "2a0c:b641:b50::1"},
@@ -679,6 +680,10 @@ def _gate_enabled(gate: str) -> bool:
         from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
 
         return number_intel_enabled()
+    if gate == "bgpstream_worker":
+        from hyrule_cloud.services.bgp.stream import bgpstream_worker_enabled
+
+        return bgpstream_worker_enabled()
     raise ValueError(f"Unknown paid-operation gate: {gate}")
 
 
@@ -710,7 +715,7 @@ def match_enabled_operation(method: str, concrete_path: str) -> PaidOperation | 
 
 _MANIFEST_DESCRIPTION = (
     "Launch-ready, first-party network infrastructure for AI agents on AS215932: "
-    "IPv6-native compute, BGP/routing, IP/ASN and reputation, DNS diagnostics, "
+    "IPv6-native compute, BGP/routing, IP/ASN, DNS diagnostics, "
     "RDAP/WHOIS, web and TLS, mail deliverability, port/NAT/CGNAT, VoIP/SIP, "
     "and outbound requests over Direct, Tor, I2P, or Yggdrasil. Pay per request "
     "in USDC via x402. Domain registration is deferred from this launch catalog."

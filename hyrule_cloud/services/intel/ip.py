@@ -28,6 +28,24 @@ from hyrule_cloud.services.registry.lookup import rdap_lookup, whois_lookup
 _cache: TTLCache[IPLookupResponse] = TTLCache(max_entries=2048)
 
 
+def geo_intel_enabled() -> bool:
+    """Whether a real geolocation provider (e.g. a local MaxMind DB) is configured.
+
+    Until then the geo view only returns a not_configured placeholder, so paid
+    requests for it are refused before charging (see api/ip.py).
+    """
+    return False
+
+
+def reputation_intel_enabled() -> bool:
+    """Whether a real IP reputation source is configured.
+
+    Mirrors threat_intel_enabled: the view is a placeholder until a licensed or
+    owner-verified provider adapter exists, so it must not be billable.
+    """
+    return False
+
+
 def _team_cymru_name(address: str) -> str:
     ip = ipaddress.ip_address(address)
     if ip.version == 4:

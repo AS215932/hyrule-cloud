@@ -179,7 +179,7 @@ app = FastAPI(
         "Full-stack network infrastructure for AI agents on AS215932 (RIPE): "
         "IPv6-native VMs with SSH and automatic HTTPS subdomains, domain "
         "registration and DNS, a broad network-intelligence suite (BGP/routing, "
-        "IP/ASN & reputation, DNS, RDAP/WHOIS, web & deep TLS, mail "
+        "IP/ASN, DNS, RDAP/WHOIS, web & deep TLS, mail "
         "deliverability, port/NAT/CGNAT, VoIP/SIP), and proxied requests over "
         "Direct/Tor/I2P/Yggdrasil. "
         "Pay per request in USDC on Base via x402; VM checkout may also accept "
