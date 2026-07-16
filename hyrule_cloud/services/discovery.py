@@ -75,6 +75,32 @@ class PriceSpec:
         return result
 
 
+# Bazaar resource tags per catalog area (spec: <=5 tags, each <=32 ASCII).
+_TAG_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("/v1/vm", ("compute", "vps")),
+    ("/v1/network", ("proxy", "tor", "anonymity")),
+    ("/v1/bgp", ("network-intel", "bgp")),
+    ("/v1/ip", ("network-intel", "ip")),
+    ("/v1/dns", ("network-intel", "dns")),
+    ("/v1/rdap", ("network-intel", "registry")),
+    ("/v1/whois", ("network-intel", "registry")),
+    ("/v1/web", ("network-intel", "tls")),
+    ("/v1/mx", ("network-intel", "email")),
+    ("/v1/path", ("network-intel", "looking-glass")),
+    ("/v1/ports", ("network-intel", "reachability")),
+    ("/v1/nat", ("network-intel", "reachability")),
+    ("/v1/threat", ("network-intel", "reputation")),
+    ("/v1/voip", ("network-intel", "voip")),
+)
+
+
+def _default_tags(path: str) -> tuple[str, ...]:
+    for prefix, tags in _TAG_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return tags
+    return ()
+
+
 @dataclass(frozen=True, slots=True)
 class PaidOperation:
     method: str
@@ -87,6 +113,7 @@ class PaidOperation:
     output_example: Any
     path_examples: dict[str, Any]
     gate: str = "always"
+    tags: tuple[str, ...] = ()
 
     @property
     def key(self) -> tuple[str, str]:
@@ -182,6 +209,7 @@ def _body_operation(
         output_example=output_example,
         path_examples={},
         gate=gate,
+        tags=_default_tags(path),
     )
 
 
@@ -218,6 +246,7 @@ def _download_operation(
         input_example=None,
         output_example=output_example,
         path_examples=path_examples,
+        tags=_default_tags(path),
     )
 
 
@@ -673,6 +702,21 @@ def match_enabled_operation(method: str, concrete_path: str) -> PaidOperation | 
     normalized_path = concrete_path.rstrip("/") or "/"
     for operation, path_regex in _PATH_MATCHERS:
         if operation.method != wanted_method or not _gate_enabled(operation.gate):
+            continue
+        if path_regex.fullmatch(normalized_path):
+            return operation
+    return None
+
+
+def match_enabled_operation_any_method(concrete_path: str) -> PaidOperation | None:
+    """Match a request path to an enabled operation regardless of method.
+
+    Catalog paths are method-unique, so this is unambiguous; used where only
+    the URL survives (402 resource-metadata construction in PaymentGate).
+    """
+    normalized_path = concrete_path.rstrip("/") or "/"
+    for operation, path_regex in _PATH_MATCHERS:
+        if not _gate_enabled(operation.gate):
             continue
         if path_regex.fullmatch(normalized_path):
             return operation
