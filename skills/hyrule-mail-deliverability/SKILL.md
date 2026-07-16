@@ -55,17 +55,12 @@ curl -X POST https://cloud.hyrule.host/v1/mx/bounce/parse \
 
 ## DNS record recommendations
 
-```bash
-curl -X POST https://cloud.hyrule.host/v1/mx/recommend-records \
-  -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
-  -d '{
-    "domain":"example.com",
-    "provider":"custom",
-    "sending_ips":["203.0.113.10"],
-    "policy":{"dmarc":"quarantine","tls_reporting":true,"mta_sts":true,"bimi":false}
-  }'
-```
+The mail-delivery report (`/v1/mx/reports/mail-delivery` and `/v1/mx/jobs`)
+includes a `recommendations` block with concrete records derived from the
+report's own observed lookups (for example a monitoring DMARC or TLS-RPT
+policy when none was found). Anything that requires data Hyrule cannot
+observe — DKIM keys, your sending sources — surfaces as per-finding
+`recommendation` text instead of a fabricated record.
 
 ## Agent guidance
 

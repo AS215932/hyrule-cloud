@@ -66,9 +66,9 @@ def _err(e: HyruleError) -> str:
         # so it can't know the hosted API's config locally — it must NOT gate
         # tool registration on its own package's stub state. Keep the tool
         # registered and surface an honest, non-charging "not available yet"
-        # message. Kept generic: 501 routes (diagnostics, speedtest, mail) fail
-        # for different backend reasons, so the specific cause rides in e.detail
-        # rather than being asserted here.
+        # message. Kept generic: 501 routes fail for different backend reasons,
+        # so the specific cause rides in e.detail rather than being asserted
+        # here.
         return (
             f"This isn't available yet: {e.detail}\n\n"
             "The endpoint returned HTTP 501 (not implemented / backend not "
@@ -706,7 +706,7 @@ async def web_reachability_check(target: str) -> str:
 
 @mcp.tool()
 async def web_tls_deep_scan(host: str, port: int = 443) -> str:
-    """Paid Hyrule-native SSL Labs-style TLS deep scan and grade."""
+    """Paid deep TLS protocol/certificate/cipher scan and grade."""
     try:
         async with _client() as hc:
             return str(await hc.web_tls_deep(host, port))
@@ -720,16 +720,6 @@ async def dns_propagation_check(name: str, record_type: str = "A", expected: lis
     try:
         async with _client() as hc:
             return str(await hc.dns_propagation(name, record_type, expected=expected))
-    except HyruleError as e:
-        return _err(e)
-
-
-@mcp.tool()
-async def dns_record_recommendations(payload: dict) -> str:
-    """Paid DNS record recommendations for web, mail, SIP, verification, or reverse DNS."""
-    try:
-        async with _client() as hc:
-            return str(await hc.dns_recommend_records(payload))
     except HyruleError as e:
         return _err(e)
 
@@ -775,16 +765,6 @@ async def nat_what_is_my_ip() -> str:
 
 
 @mcp.tool()
-async def nat_cgnat_lookup(payload: dict) -> str:
-    """Paid server-only CGNAT/NAT hint report."""
-    try:
-        async with _client() as hc:
-            return str(await hc.nat_lookup(payload))
-    except HyruleError as e:
-        return _err(e)
-
-
-@mcp.tool()
 async def threat_reputation_lookup(subject_type: str, value: str, views: list[str] | None = None) -> str:
     """Paid open-source-first threat/reputation lookup."""
     try:
@@ -810,56 +790,6 @@ async def voip_number_lookup(number: str, country: str | None = None) -> str:
     try:
         async with _client() as hc:
             return str(await hc.voip_number_lookup(number, country))
-    except HyruleError as e:
-        return _err(e)
-
-
-@mcp.tool()
-async def hyrule_speedtest() -> str:
-    """Paid throughput/latency/jitter evidence contract to Hyrule/AS215932 endpoints."""
-    try:
-        async with _client() as hc:
-            return str(await hc.speedtest(target="hyrule"))
-    except HyruleError as e:
-        return _err(e)
-
-
-@mcp.tool()
-async def mail_products() -> str:
-    """Free Agent Mail product catalog."""
-    try:
-        async with _client() as hc:
-            return str(await hc.mail_products())
-    except HyruleError as e:
-        return _err(e)
-
-
-@mcp.tool()
-async def mail_account_quote(local_part: str, duration_days: int = 30, domain: str = "agentmail.hyrule.host") -> str:
-    """Free quote for a paid Agent Mail mailbox."""
-    try:
-        async with _client() as hc:
-            return str(await hc.mail_account_quote(local_part, duration_days, domain))
-    except HyruleError as e:
-        return _err(e)
-
-
-@mcp.tool()
-async def mail_account_create(local_part: str, duration_days: int = 30, domain: str = "agentmail.hyrule.host") -> str:
-    """Paid Agent Mail mailbox creation. SMTP/IMAP and API access are exposed by the account response once the backend adapter is enabled."""
-    try:
-        async with _client() as hc:
-            return str(await hc.create_mail_account(local_part, duration_days, domain))
-    except HyruleError as e:
-        return _err(e)
-
-
-@mcp.tool()
-async def mail_send(payload: dict) -> str:
-    """Paid API email send through an Agent Mail mailbox."""
-    try:
-        async with _client() as hc:
-            return str(await hc.mail_send(payload))
     except HyruleError as e:
         return _err(e)
 

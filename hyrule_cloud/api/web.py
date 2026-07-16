@@ -37,7 +37,7 @@ async def get_web_capabilities() -> ProductCapabilityResponse:
             CapabilityEndpoint(path="/v1/web/capabilities", method="GET", description="Web diagnostic capabilities"),
             CapabilityEndpoint(path="/v1/web/pricing", method="GET", description="Web diagnostic pricing"),
             CapabilityEndpoint(path="/v1/web/check/quote", method="POST", description="Quote a web diagnostic check"),
-            CapabilityEndpoint(path="/v1/web/tls/deep/quote", method="POST", description="Quote a Hyrule-native SSL Labs-style scan"),
+            CapabilityEndpoint(path="/v1/web/tls/deep/quote", method="POST", description="Quote a deep TLS protocol/certificate/cipher scan"),
         ],
         paid_endpoints=[
             CapabilityEndpoint(path="/v1/web/check", method="POST", paid=True, description="Run a synchronous web diagnostic check"),
@@ -57,7 +57,6 @@ async def get_web_capabilities() -> ProductCapabilityResponse:
 async def get_web_pricing(request: Request) -> WebPricingResponse:
     return WebPricingResponse(
         check_usd=str(payment_price(request, "price_web_check", "0.005")),
-        report_usd=str(payment_price(request, "price_web_report", "0.03")),
         tls_deep_usd=str(payment_price(request, "price_web_tls_deep", "0.10")),
     )
 
@@ -129,7 +128,7 @@ async def create_web_report(request: Request, body: WebReportRequest) -> Diagnos
 
 @router.post("/tls/deep", response_model=DiagnosticResponse)
 async def create_web_tls_deep(request: Request, body: WebTLSDeepRequest) -> DiagnosticResponse | Response:
-    if payment := await require_paid_diagnostic(request, price_attr="price_web_tls_deep", default="0.10", description="Hyrule SSL Labs-style deep TLS scan"):
+    if payment := await require_paid_diagnostic(request, price_attr="price_web_tls_deep", default="0.10", description="Hyrule deep TLS protocol/certificate/cipher scan"):
         return payment
     return await run_web_tls_deep(body)
 

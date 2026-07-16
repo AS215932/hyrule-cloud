@@ -341,10 +341,6 @@ class HyruleClient:
             payload["resolvers"] = resolvers
         return await self._request("POST", "/v1/dns/propagation", json=payload)
 
-    async def dns_recommend_records(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Paid DNS record recommendation helper."""
-        return await self._request("POST", "/v1/dns/recommend-records", json=payload)
-
     async def rdap_lookup(self, subject_type: str, value: str | int, *, include_raw: bool = False) -> dict[str, Any]:
         """Paid RDAP lookup for domain/IP/prefix/ASN/entity."""
         return await self._request(
@@ -369,7 +365,7 @@ class HyruleClient:
         return await self._request("POST", "/v1/web/check", json=payload)
 
     async def web_tls_deep(self, host: str, port: int = 443) -> dict[str, Any]:
-        """Paid Hyrule-native SSL Labs-style TLS scan."""
+        """Paid deep TLS protocol/certificate/cipher scan with grade."""
         return await self._request("POST", "/v1/web/tls/deep", json={"host": host, "port": port})
 
     async def mx_tools(self) -> dict[str, Any]:
@@ -405,10 +401,6 @@ class HyruleClient:
         """Paid bounce/rejection parser."""
         return await self._request("POST", "/v1/mx/bounce/parse", json={"message": message, "context": context or {}})
 
-    async def mx_recommend_records(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Paid mail DNS authentication record recommendations."""
-        return await self._request("POST", "/v1/mx/recommend-records", json=payload)
-
     async def path_report(self, target: str, **kwargs: Any) -> dict[str, Any]:
         """Paid routing/path evidence pack."""
         return await self._request("POST", "/v1/path/report", json={"target": target, **kwargs})
@@ -420,10 +412,6 @@ class HyruleClient:
     async def nat_ip(self) -> dict[str, Any]:
         """Free caller-observed IP."""
         return await self._request("GET", "/v1/nat/ip")
-
-    async def nat_lookup(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Paid server-only NAT/CGNAT hint report."""
-        return await self._request("POST", "/v1/nat/lookup", json=payload)
 
     async def nat_port_forward_check(self, target: str, port: int, protocol: str = "tcp", profile: str = "custom") -> dict[str, Any]:
         """Paid NAT port-forward outside-in check."""
@@ -449,34 +437,6 @@ class HyruleClient:
         if country:
             payload["country"] = country
         return await self._request("POST", "/v1/voip/number/lookup", json=payload)
-
-    async def speedtest(self, **payload: Any) -> dict[str, Any]:
-        """Paid Hyrule/AS215932 speedtest evidence contract."""
-        return await self._request("POST", "/v1/speedtest", json=payload or {"target": "hyrule"})
-
-    async def mail_products(self) -> dict[str, Any]:
-        """Free Agent Mail product catalog."""
-        return await self._request("GET", "/v1/mail/products")
-
-    async def mail_account_quote(self, local_part: str, duration_days: int = 30, domain: str = "agentmail.hyrule.host") -> dict[str, Any]:
-        """Free quote for creating an Agent Mail account."""
-        return await self._request(
-            "POST",
-            "/v1/mail/accounts/quote",
-            json={"plan": "agent-basic", "duration_days": duration_days, "local_part": local_part, "domain": domain},
-        )
-
-    async def create_mail_account(self, local_part: str, duration_days: int = 30, domain: str = "agentmail.hyrule.host") -> dict[str, Any]:
-        """Paid Agent Mail account creation."""
-        return await self._request(
-            "POST",
-            "/v1/mail/accounts",
-            json={"plan": "agent-basic", "duration_days": duration_days, "local_part": local_part, "domain": domain},
-        )
-
-    async def mail_send(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Paid API send through an Agent Mail mailbox."""
-        return await self._request("POST", "/v1/mail/messages/send", json=payload)
 
     # -- Discovery --
 

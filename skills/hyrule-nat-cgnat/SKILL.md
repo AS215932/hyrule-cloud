@@ -1,33 +1,23 @@
 ---
 name: hyrule-nat-cgnat
-description: "Use Hyrule Cloud when an AI agent needs server-side NAT or CGNAT hints for a customer. This MVP does not require browser/WebRTC/STUN participation."
+description: "Use Hyrule Cloud when an AI agent needs server-observed NAT/CGNAT hints or an outside-in port-forward check. This MVP does not require browser/WebRTC/STUN participation."
 ---
 
 # Hyrule NAT/CGNAT Skill
 
-Use Hyrule Cloud when an AI agent needs server-side NAT or CGNAT hints for a
-customer. This MVP does not require browser/WebRTC/STUN participation.
+Use Hyrule Cloud when an AI agent needs server-observed NAT or CGNAT hints for
+a customer. This MVP does not require browser/WebRTC/STUN participation.
 
-## Free caller IP
+## Free caller IP with CGNAT/scope classification
 
 ```bash
 curl https://cloud.hyrule.host/v1/nat/ip
 ```
 
-Returns the IP Hyrule sees plus selected proxy headers.
-
-## Paid CGNAT hint report
-
-```bash
-curl -X POST https://cloud.hyrule.host/v1/nat/lookup \
-  -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
-  -d '{
-    "observed_public_ip":"198.51.100.10",
-    "customer_reported_wan_ip":"100.64.12.34",
-    "customer_reported_lan_ip":"192.168.1.10"
-  }'
-```
+Returns the IP Hyrule sees, its classification (`cgnat`, `private`, `global`,
+or `non_global`), a `cgnat_likely` flag, and selected proxy headers. Run it
+from the customer's network to learn how their egress address is classified —
+Hyrule only classifies addresses it actually observes.
 
 ## Paid port-forward check
 
@@ -40,7 +30,7 @@ curl -X POST https://cloud.hyrule.host/v1/nat/port-forward/check \
 
 ## Agent guidance
 
-CGNAT is likely when the customer WAN IP is inside `100.64.0.0/10`, when the
-customer-reported WAN IP differs from Hyrule's observed public IP, or when the
-customer only has RFC1918 WAN addressing. For precise NAT type, a future
-client-assisted STUN/WebRTC test is required.
+CGNAT is likely when the observed egress IP is inside `100.64.0.0/10`, or when
+the address the customer reports for their WAN differs from what `/v1/nat/ip`
+observes. For precise NAT type, a future client-assisted STUN/WebRTC test is
+required.

@@ -33,16 +33,14 @@ def test_openapi_exposes_only_enabled_paid_launch_contracts():
         "/v1/ip/lookup",
         "/v1/dns/lookup",
         "/v1/dns/propagation",
-        "/v1/dns/recommend-records",
         "/v1/rdap/lookup",
         "/v1/whois/lookup",
         "/v1/web/check",
         "/v1/web/tls/deep",
         "/v1/mx/check",
         "/v1/mx/bounce/parse",
-        "/v1/mx/recommend-records",
         "/v1/ports/check",
-        "/v1/nat/lookup",
+        "/v1/nat/port-forward/check",
         "/v1/voip/check",
     }:
         assert required in paths
@@ -118,7 +116,7 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
             mx = await client.post("/v1/mx/check", json={"tool": "mx", "target": "example.com"})
             bounce = await client.post("/v1/mx/bounce/parse", json={"message": "550 5.7.26 auth failed"})
             port = await client.post("/v1/ports/check", json={"target": "example.com", "port": 443})
-            nat = await client.post("/v1/nat/lookup", json={"customer_reported_wan_ip": "100.64.1.1"})
+            nat = await client.post("/v1/nat/port-forward/check", json={"target": "example.com", "port": 443})
             voip = await client.post("/v1/voip/check", json={"target": "example.com"})
             bgp = await client.post("/v1/bgp/lookup", json={"subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"}})
     finally:
@@ -145,24 +143,8 @@ async def test_unbuilt_paid_endpoints_return_501_before_charging():
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             responses = {
-                "/v1/mail/accounts": await client.post(
-                    "/v1/mail/accounts",
-                    json={"plan": "agent-basic", "duration_days": 1, "local_part": "a", "domain": "agentmail.hyrule.host"},
-                ),
-                "/v1/mail/messages/send": await client.post(
-                    "/v1/mail/messages/send",
-                    json={
-                        "mailbox_id": "mb_x",
-                        "from": "agent@agentmail.hyrule.host",
-                        "to": ["a@example.com"],
-                        "subject": "s",
-                        "text": "t",
-                    },
-                ),
                 "/v1/web/reports": await client.post("/v1/web/reports", json={"target": "https://example.com"}),
                 "/v1/path/jobs": await client.post("/v1/path/jobs", json={"target": "example.com"}),
-                "/v1/speedtest": await client.post("/v1/speedtest", json={"target": "hyrule"}),
-                "/v1/speedtest/jobs": await client.post("/v1/speedtest/jobs", json={"target": "hyrule"}),
                 "/v1/voip/report": await client.post("/v1/voip/report", json={"target": "example.com"}),
                 "/v1/voip/jobs": await client.post("/v1/voip/jobs", json={"target": "example.com"}),
                 # Diagnostics whose real data source isn't configured must also
@@ -201,6 +183,45 @@ async def test_unbuilt_paid_endpoints_return_501_before_charging():
     for endpoint, res in responses.items():
         assert res.status_code == 501, f"{endpoint} returned {res.status_code}, expected 501 before any charge"
         assert res.json()["error"] == "not_implemented", endpoint
+
+
+@pytest.mark.asyncio
+async def test_removed_dead_products_return_404():
+    """Agent Mail, speedtest, the two zero-I/O recommend templaters, and the
+    paid NAT range-check were removed from the API surface entirely (not just
+    gated) — their routes must 404, and nothing may advertise them."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        removed = {
+            "/v1/mail/accounts": await client.post("/v1/mail/accounts", json={}),
+            "/v1/mail/products": await client.get("/v1/mail/products"),
+            "/v1/speedtest": await client.post("/v1/speedtest", json={"target": "hyrule"}),
+            "/v1/speedtest/jobs": await client.post("/v1/speedtest/jobs", json={}),
+            "/v1/dns/recommend-records": await client.post(
+                "/v1/dns/recommend-records", json={"domain": "example.com"}
+            ),
+            "/v1/mx/recommend-records": await client.post(
+                "/v1/mx/recommend-records", json={"domain": "example.com"}
+            ),
+            "/v1/nat/lookup": await client.post(
+                "/v1/nat/lookup", json={"customer_reported_wan_ip": "100.64.1.1"}
+            ),
+        }
+    for endpoint, res in removed.items():
+        assert res.status_code == 404, f"{endpoint} returned {res.status_code}, expected 404"
+
+
+@pytest.mark.asyncio
+async def test_nat_ip_reports_server_observed_classification():
+    """The free /v1/nat/ip endpoint classifies the address this server actually
+    observed for the caller (the honest remnant of the removed paid
+    /v1/nat/lookup range-check)."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.get("/v1/nat/ip")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["classification"] in {"cgnat", "private", "global", "non_global"}
+    assert isinstance(body["cgnat_likely"], bool)
+    assert body["cgnat_likely"] == (body["classification"] == "cgnat")
 
 
 @pytest.mark.asyncio
@@ -247,17 +268,19 @@ async def test_x402_manifest_lists_network_intel_resources():
     assert "/v1/ip/lookup" in paths
     assert "/v1/dns/lookup" in paths
     assert "/v1/dns/propagation" in paths
-    assert "/v1/dns/recommend-records" in paths
     assert "/v1/rdap/lookup" in paths
     assert "/v1/whois/lookup" in paths
     assert "/v1/web/check" in paths
     assert "/v1/web/tls/deep" in paths
     assert "/v1/mx/check" in paths
     assert "/v1/mx/bounce/parse" in paths
-    assert "/v1/mx/recommend-records" in paths
     assert "/v1/ports/check" in paths
-    assert "/v1/nat/lookup" in paths
+    assert "/v1/nat/port-forward/check" in paths
     assert "/v1/voip/check" in paths
+    # Removed zero-I/O SKUs must never reappear in discovery.
+    assert "/v1/dns/recommend-records" not in paths
+    assert "/v1/mx/recommend-records" not in paths
+    assert "/v1/nat/lookup" not in paths
     # Unbuilt services must never be advertised in the discovery manifest:
     # they 501 before charging, so listing them would advertise dead ends.
     assert "/v1/speedtest" not in paths
@@ -284,23 +307,13 @@ async def test_quotes_for_unbuilt_endpoints_return_501():
     on the quote→pay→create flow would be handed a payable-looking order
     that can never succeed."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        mail_quote = await client.post(
-            "/v1/mail/accounts/quote",
-            json={
-                "plan": "agent-basic",
-                "duration_days": 30,
-                "local_part": "agent-123",
-                "domain": "agentmail.hyrule.host",
-            },
-        )
-        speedtest_quote = await client.post("/v1/speedtest/quote", json={"target": "hyrule"})
         web_report_quote = await client.post(
             "/v1/web/reports/quote", json={"target": "https://example.com"}
         )
         ip_geo_quote = await client.post(
             "/v1/ip/lookup/quote", json={"address": "192.0.2.10", "views": ["geo"]}
         )
-    for res in (mail_quote, speedtest_quote, web_report_quote, ip_geo_quote):
+    for res in (web_report_quote, ip_geo_quote):
         assert res.status_code == 501
         assert res.json()["error"] == "not_implemented"
 
@@ -579,6 +592,147 @@ def test_bazaar_discovery_hides_gated_diagnostics_by_default():
     assert discovery_for("POST", "/v1/threat/lookup") is None
     assert discovery_for("POST", "/v1/voip/number/lookup") is None
     assert discovery_for("POST", "/v1/bgp/jobs") is None
-    # An ungated diagnostic is still advertised.
+    # Ungated diagnostics are still advertised.
     assert discovery_for("POST", "/v1/dns/lookup") is not None
     assert discovery_for("POST", "/v1/mx/check") is not None
+
+
+def test_mx_recommendations_derive_only_from_observed_findings():
+    """The mx/jobs recommendations block emits records only when the report's
+    own lookups observed the gap, and never contains placeholder tokens the
+    buyer would have to guess-replace."""
+    from datetime import UTC, datetime
+
+    from hyrule_cloud.models import MXCheckResponse, MXFinding, MXStatus, MXTool
+    from hyrule_cloud.services.mx.deliverability import derive_recommendations
+
+    def _result(tool: MXTool, code: str) -> MXCheckResponse:
+        return MXCheckResponse(
+            request_id="mxq_test",
+            tool=tool,
+            target="example.com",
+            status=MXStatus.WARNING,
+            summary=code,
+            findings=[MXFinding(severity=MXStatus.WARNING, code=code, message=code)],
+            sources={"dns": "ok"},
+            generated_at=datetime.now(UTC),
+        )
+
+    missing_both = derive_recommendations(
+        "Example.COM.",
+        [_result(MXTool.DMARC, "dmarc_missing"), _result(MXTool.TLSRPT, "tlsrpt_missing")],
+    )
+    assert {record.name for record in missing_both} == {
+        "_dmarc.example.com",
+        "_smtp._tls.example.com",
+    }
+    for record in missing_both:
+        for token in (".example", "<publish-", "example.com/bimi", "<provider"):
+            assert token not in record.value, (record.name, record.value)
+
+    present = derive_recommendations(
+        "example.com",
+        [_result(MXTool.DMARC, "dmarc_present"), _result(MXTool.TLSRPT, "tlsrpt_present")],
+    )
+    assert present == []
+
+
+def test_manifest_description_generated_from_enabled_catalog(monkeypatch):
+    """Marketing copy is assembled from the enabled catalog: gated-off products
+    (VM simulation, threat, path) can never be advertised, and flipping a gate
+    on brings its phrase back without touching copy."""
+    from hyrule_cloud.services.discovery import catalog_description
+
+    monkeypatch.delenv("HYRULE_BGPSTREAM_WORKER_ENABLED", raising=False)
+    default_copy = catalog_description()
+    for absent in ("IPv6-native compute", "threat/reputation", "path evidence"):
+        assert absent not in default_copy, absent
+    for present in (
+        "Tor",
+        "BGP/routing intelligence",
+        "mail deliverability",
+        "VoIP/SIP diagnostics",
+    ):
+        assert present in default_copy, present
+
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.threat.lookup.threat_intel_enabled", lambda: True
+    )
+    enabled_copy = catalog_description()
+    assert "IPv6-native compute" in enabled_copy
+    assert "threat/reputation lookups" in enabled_copy
+
+
+@pytest.mark.asyncio
+async def test_llms_txt_generated_from_enabled_catalog():
+    old_state = getattr(app.state, "_typed_state", None)
+    app.state._typed_state = SimpleNamespace(config=HyruleConfig())
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            res = await client.get("/llms.txt")
+    finally:
+        if old_state is not None:
+            app.state._typed_state = old_state
+        elif hasattr(app.state, "_typed_state"):
+            delattr(app.state, "_typed_state")
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/plain")
+    text = res.text
+    assert "/.well-known/x402.json" in text
+    assert "POST /v1/dns/lookup" in text
+    # Gated or removed operations never appear in the agent guide.
+    for absent in ("/v1/bgp/jobs", "/v1/path/ping", "recommend-records", "/v1/nat/lookup"):
+        assert absent not in text, absent
+
+
+def test_dnssec_validated_reflects_resolver_ad_flag(monkeypatch):
+    import dns.flags
+    import dns.resolver
+
+    from hyrule_cloud.models import DNSLookupRecordType, DNSLookupRequest
+    from hyrule_cloud.services.dns.lookup import _resolve_sync
+
+    class _FakeResponse:
+        def __init__(self, flags: int) -> None:
+            self.flags = flags
+
+    class _FakeAnswer:
+        def __init__(self, flags: int) -> None:
+            self.rrset = None
+            self.response = _FakeResponse(flags)
+
+        def __iter__(self):
+            return iter(())
+
+    def _fake_resolver_class(ad_flag: int):
+        class _FakeResolver:
+            def __init__(self, configure: bool = True) -> None:
+                self.nameservers: list[str] = []
+                self.lifetime = 1.0
+                self.timeout = 1.0
+                self.flags = None
+
+            def use_edns(self, *args, **kwargs) -> None:
+                pass
+
+            def resolve(self, name, rtype, raise_on_no_answer=False):
+                return _FakeAnswer(ad_flag)
+
+        return _FakeResolver
+
+    monkeypatch.setattr(dns.resolver, "Resolver", _fake_resolver_class(dns.flags.AD))
+    validated = _resolve_sync(
+        DNSLookupRequest(name="ad-set.test", type=DNSLookupRecordType.A, dnssec=True)
+    )
+    assert validated.dnssec is not None
+    assert validated.dnssec.validated is True
+
+    monkeypatch.setattr(dns.resolver, "Resolver", _fake_resolver_class(0))
+    unvalidated = _resolve_sync(
+        DNSLookupRequest(name="ad-clear.test", type=DNSLookupRecordType.A, dnssec=True)
+    )
+    assert unvalidated.dnssec is not None
+    assert unvalidated.dnssec.validated is False

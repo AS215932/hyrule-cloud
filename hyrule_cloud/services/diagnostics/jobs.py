@@ -1,7 +1,7 @@
 """Generic async diagnostic job helpers.
 
 These helpers are intentionally small and product-neutral. Concrete APIs such
-as /v1/web, /v1/path, /v1/voip, and /v1/speedtest can use them to issue the
+as /v1/web, /v1/path, and /v1/voip can use them to issue the
 same ownerless job id/token shape while storing the durable row in their route
 or service layer.
 """

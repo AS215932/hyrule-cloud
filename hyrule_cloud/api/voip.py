@@ -77,7 +77,6 @@ async def get_voip_pricing(request: Request) -> VoIPPricingResponse:
     return VoIPPricingResponse(
         check_usd=str(payment_price(request, "price_voip_check", "0.01")),
         number_lookup_usd=str(payment_price(request, "price_voip_number_lookup", "0.05")),
-        report_usd=str(payment_price(request, "price_voip_report", "0.08")),
     )
 
 

@@ -136,9 +136,9 @@ TESTS: dict[str, dict] = {
         "group": "intel",
     },
     "nat": {
-        "path": "/v1/nat/lookup",
-        "body": {"customer_reported_wan_ip": "100.64.1.1"},
-        "usd": "0.003",
+        "path": "/v1/nat/port-forward/check",
+        "body": {"target": "example.com", "port": 443},
+        "usd": "0.005",
         "group": "intel",
     },
     "threat": {

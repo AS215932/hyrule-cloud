@@ -119,7 +119,6 @@ async def get_bgp_pricing(request: Request) -> BGPPricingResponse:
         bgpstream_update_hour_usd=str(payment_price(request, "price_bgpstream_hour", "0.05")),
         bgpstream_rib_usd=str(payment_price(request, "price_bgpstream_rib", "0.10")),
         router_snapshot_download_usd=str(payment_price(request, "price_bgp_router_table", "0.10")),
-        router_snapshot_bundle_usd=str(payment_price(request, "price_bgp_router_table_all", "0.25")),
     )
 
 
