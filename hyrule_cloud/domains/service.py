@@ -477,6 +477,24 @@ class DomainService:
                     "quote_unavailable",
                     "This domain quote is already bound to another order.",
                 )
+            if body.vm_quote_id:
+                vm_quote_claim = await session.execute(
+                    update(VMQuoteRow)
+                    .where(
+                        VMQuoteRow.quote_id == body.vm_quote_id,
+                        VMQuoteRow.status == QuoteStatus.CREATED.value,
+                        VMQuoteRow.expires_at > now,
+                    )
+                    .values(status=QuoteStatus.CONSUMED.value)
+                    .execution_options(synchronize_session=False)
+                )
+                if int(getattr(vm_quote_claim, "rowcount", 0) or 0) != 1:
+                    await session.rollback()
+                    raise DomainProblem(
+                        409,
+                        "vm_quote_expired",
+                        "The VM quote is no longer payable.",
+                    )
             order = DomainOrderRow(
                 order_id=generate_domain_order_id(),
                 quote_id=quote.quote_id,
@@ -716,7 +734,7 @@ class DomainService:
                 quote.consumed_at = _now()
                 if order.vm_quote_id:
                     vm_quote = await session.get(VMQuoteRow, order.vm_quote_id)
-                    if vm_quote is None or vm_quote.status != QuoteStatus.CREATED:
+                    if vm_quote is None or vm_quote.status != QuoteStatus.CONSUMED:
                         order.status = DomainOrderStatus.REFUND_DUE.value
                         order.error_code = "vm_quote_already_consumed"
                         session.add(
@@ -724,7 +742,6 @@ class DomainService:
                         )
                         await session.commit()
                         return order
-                    vm_quote.status = QuoteStatus.CONSUMED
                 order.status = DomainOrderStatus.QUEUED.value
                 operation = DomainOperationRow(
                     operation_id=generate_domain_operation_id(),
@@ -1027,6 +1044,7 @@ class DomainService:
             "nameservers",
             {"mode": body.mode.value, "nameservers": nameservers},
             idempotency_key,
+            reject_vm_attachment=body.mode is NameserverMode.EXTERNAL,
         )
 
     async def enqueue_dnssec_update(
@@ -2215,6 +2233,8 @@ class DomainService:
         payload = operation.request_payload or {}
         mode = NameserverMode(payload["mode"])
         nameservers = list(payload.get("nameservers") or [])
+        if mode is NameserverMode.EXTERNAL:
+            self._assert_external_delegation_allowed(domain)
         if domain.openprovider_id is None:
             raise RuntimeError("domain has no registrar id")
         if mode is NameserverMode.MANAGED:
@@ -2489,16 +2509,18 @@ class DomainService:
             revision=domain.zone_revision,
             records=[self._record_payload(row) for row in records],
         )
-        keys = await self.dns.dnssec_keys(fqdn)
+        managed_dnssec = domain.dnssec_mode == DNSSECMode.MANAGED.value
+        keys = await self.dns.dnssec_keys(fqdn) if managed_dnssec else []
         await self.provider.update_nameservers(provider_id, self.domain_config.managed_nameservers)
-        await self.provider.set_dnssec_keys(provider_id, keys)
+        if managed_dnssec:
+            await self.provider.set_dnssec_keys(provider_id, keys)
         async with self.db() as session:
             current = await session.get(DomainRow, domain.id)
             if current is not None:
                 current.nameserver_mode = NameserverMode.MANAGED.value
                 current.nameservers = self.domain_config.managed_nameservers
-                current.dnssec_mode = DNSSECMode.MANAGED.value
-                current.dnssec_status = "active"
+                if current.dnssec_mode == DNSSECMode.MANAGED.value:
+                    current.dnssec_status = "active"
                 await session.commit()
 
     async def _resolve_matching_dnskeys(
@@ -2579,6 +2601,8 @@ class DomainService:
         kind: str,
         payload: dict[str, Any],
         idempotency_key: str,
+        *,
+        reject_vm_attachment: bool = False,
     ) -> DomainOperationResponse:
         if not idempotency_key or len(idempotency_key) > 128:
             raise DomainProblem(
@@ -2596,6 +2620,20 @@ class DomainService:
                 if operation is not None:
                     self._validate_operation_replay(operation, fqdn, kind, payload)
                     return self._operation_response(operation)
+            if reject_vm_attachment:
+                domain = (
+                    await session.execute(
+                        select(DomainRow)
+                        .where(
+                            DomainRow.fqdn == fqdn,
+                            DomainRow.owner_account_id == owner_account_id,
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if domain is None:
+                    raise DomainProblem(404, "domain_not_found", "Domain not found.")
+                self._assert_external_delegation_allowed(domain)
             operation = DomainOperationRow(
                 operation_id=generate_domain_operation_id(),
                 fqdn=fqdn,
@@ -2640,6 +2678,15 @@ class DomainService:
             "op:"
             + hashlib.sha256(f"{owner_account_id}:{kind}:{idempotency_key}".encode()).hexdigest()
         )
+
+    @staticmethod
+    def _assert_external_delegation_allowed(domain: DomainRow) -> None:
+        if domain.vm_id is not None or domain.vm_ipv6 is not None:
+            raise DomainProblem(
+                409,
+                "domain_attached_to_vm",
+                "Detach the VM before switching this domain to external nameservers.",
+            )
 
     @staticmethod
     def _validate_operation_replay(

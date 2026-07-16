@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -1541,6 +1542,137 @@ async def test_operation_idempotency_cannot_be_rebound_to_another_domain(domain_
 
 
 @pytest.mark.asyncio
+async def test_external_nameservers_are_blocked_for_vm_attachment_and_worker_race(
+    domain_service,
+):
+    service, provider, sessions = domain_service
+    provider.update_nameservers = AsyncMock(return_value={})
+    provider.set_dnssec_keys = AsyncMock(return_value={})
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="attached-delegation",
+                extension="dev",
+                fqdn="attached-delegation.dev",
+                owner_wallet="0x" + "1" * 40,
+                owner_account_id="H1234567890",
+                status="active",
+                openprovider_id=8123,
+                vm_id="vm_attached_delegation",
+                vm_ipv6="2001:db8::81",
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+            )
+        )
+        await session.commit()
+    body = NameserverUpdateRequest(
+        mode=NameserverMode.EXTERNAL,
+        nameservers=["ns1.example.net", "ns2.example.net"],
+    )
+
+    with pytest.raises(DomainProblem) as attached:
+        await service.enqueue_nameserver_update(
+            "H1234567890",
+            "attached-delegation.dev",
+            body,
+            "attached-delegation-blocked",
+        )
+    assert attached.value.status == 409
+    assert attached.value.code == "domain_attached_to_vm"
+
+    async with sessions() as session:
+        domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "attached-delegation.dev")
+            )
+        ).scalar_one()
+        domain.vm_id = None
+        domain.vm_ipv6 = None
+        await session.commit()
+    operation = await service.enqueue_nameserver_update(
+        "H1234567890",
+        "attached-delegation.dev",
+        body,
+        "attached-delegation-race",
+    )
+    async with sessions() as session:
+        domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "attached-delegation.dev")
+            )
+        ).scalar_one()
+        domain.vm_id = "vm_attached_delegation"
+        domain.vm_ipv6 = "2001:db8::81"
+        await session.commit()
+    replay = await service.enqueue_nameserver_update(
+        "H1234567890",
+        "attached-delegation.dev",
+        body,
+        "attached-delegation-race",
+    )
+    assert replay.operation_id == operation.operation_id
+
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+    async with sessions() as session:
+        failed_operation = await session.get(DomainOperationRow, operation.operation_id)
+        domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "attached-delegation.dev")
+            )
+        ).scalar_one()
+    assert failed_operation is not None and failed_operation.status == "failed"
+    assert failed_operation.error_code == "domain_attached_to_vm"
+    assert domain.nameserver_mode == "managed"
+    assert domain.vm_id == "vm_attached_delegation"
+    provider.update_nameservers.assert_not_awaited()
+    provider.set_dnssec_keys.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_preserves_dnssec_off(domain_service):
+    service, provider, sessions = domain_service
+    provider.update_nameservers = AsyncMock(return_value={})
+    provider.set_dnssec_keys = AsyncMock(return_value={})
+    service.dns.dnssec_keys = AsyncMock(return_value=[])
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="dnssec-off",
+                extension="dev",
+                fqdn="dnssec-off.dev",
+                owner_wallet="0x" + "1" * 40,
+                owner_account_id="H1234567890",
+                status="active",
+                openprovider_id=8456,
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="off",
+                dnssec_status="off",
+            )
+        )
+        await session.commit()
+
+    await service._reconcile_domain("dnssec-off.dev")
+
+    async with sessions() as session:
+        domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "dnssec-off.dev")
+            )
+        ).scalar_one()
+    assert domain.dnssec_mode == "off"
+    assert domain.dnssec_status == "off"
+    assert service.dns.zones["dnssec-off.dev"]["revision"] == 1
+    service.dns.dnssec_keys.assert_not_awaited()
+    provider.set_dnssec_keys.assert_not_awaited()
+    provider.update_nameservers.assert_awaited_once_with(
+        8456, ["ns1.hyrule.host", "ns2.hyrule.host"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_renewal_window_and_stale_job_recovery(domain_service):
     service, _provider, sessions = domain_service
     now = datetime.now(UTC)
@@ -1730,6 +1862,76 @@ async def test_bundle_claims_domain_before_creating_vm(domain_service):
             await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
         ).scalar_one()
     assert domain.vm_id == observed_claim[0]
+
+
+@pytest.mark.asyncio
+async def test_bundle_vm_quote_is_claimed_by_only_one_domain_order(domain_service):
+    service, _provider, sessions = domain_service
+    fqdn = "contended-bundle.dev"
+    domain_quotes = [
+        await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890")
+        for _ in range(2)
+    ]
+    vm_quote_id = "vmq_contended_bundle"
+    async with sessions() as session:
+        session.add(
+            VMQuoteRow(
+                quote_id=vm_quote_id,
+                order_payload=_bundle_spec(fqdn).model_dump(mode="json", exclude={"quote_id"}),
+                amount_usd=Decimal("5"),
+                status=QuoteStatus.CREATED,
+                owner_account_id="H1234567890",
+                expires_at=datetime.now(UTC) + timedelta(minutes=15),
+            )
+        )
+        await session.commit()
+
+    async def create_bundle_order(index: int):
+        return await service.create_order(
+            DomainOrderRequest(
+                quote_id=domain_quotes[index].quote_id,
+                payment_method=DomainPaymentMethod.USDC,
+                terms_version=service.domain_config.terms_version,
+                vm_quote_id=vm_quote_id,
+            ),
+            owner_account_id="H1234567890",
+            idempotency_key=f"contended-bundle-{index}",
+        )
+
+    results = await asyncio.gather(
+        create_bundle_order(0),
+        create_bundle_order(1),
+        return_exceptions=True,
+    )
+    successes = [result for result in results if isinstance(result, tuple)]
+    failures = [result for result in results if isinstance(result, DomainProblem)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert failures[0].code == "vm_quote_expired"
+    winning_order, created = successes[0]
+    assert created is True
+
+    queued = await service.mark_x402_paid(
+        winning_order.order_id,
+        payer="0x" + "6" * 40,
+        tx_hash="0xcontended-bundle",
+    )
+    assert queued.status == "queued"
+    async with sessions() as session:
+        vm_quote = await session.get(VMQuoteRow, vm_quote_id)
+        orders = list(await session.scalars(select(DomainOrderRow)))
+        stored_domain_quotes = list(
+            await session.scalars(
+                select(DomainQuoteRow).where(
+                    DomainQuoteRow.quote_id.in_(
+                        [domain_quote.quote_id for domain_quote in domain_quotes]
+                    )
+                )
+            )
+        )
+    assert vm_quote is not None and vm_quote.status == QuoteStatus.CONSUMED
+    assert [order.order_id for order in orders] == [winning_order.order_id]
+    assert sorted(quote.status for quote in stored_domain_quotes) == ["active", "consumed"]
 
 
 @pytest.mark.asyncio
