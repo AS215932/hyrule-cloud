@@ -321,6 +321,7 @@ async def test_quotes_for_unbuilt_endpoints_return_501():
 def test_diagnostic_enablement_predicates_default_off(monkeypatch):
     """With no external data source configured, the pluggable diagnostics report
     disabled — this is what makes their routes 501 before charging."""
+    from hyrule_cloud.services.bgp.snapshots import router_snapshot_download_enabled
     from hyrule_cloud.services.bgp.stream import bgpstream_worker_enabled
     from hyrule_cloud.services.intel.ip import geo_intel_enabled, reputation_intel_enabled
     from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
@@ -328,10 +329,12 @@ def test_diagnostic_enablement_predicates_default_off(monkeypatch):
     from hyrule_cloud.services.voip.diagnostics import number_intel_enabled
 
     monkeypatch.delenv("HYRULE_BGPSTREAM_WORKER_ENABLED", raising=False)
+    monkeypatch.delenv("HYRULE_BGP_ROUTER_SNAPSHOT_DOWNLOAD_ENABLED", raising=False)
     assert threat_intel_enabled() is False
     assert number_intel_enabled() is False
     assert path_active_probe_enabled() is False
     assert bgpstream_worker_enabled() is False
+    assert router_snapshot_download_enabled() is False
     assert geo_intel_enabled() is False
     assert reputation_intel_enabled() is False
 
