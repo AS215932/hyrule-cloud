@@ -18,7 +18,10 @@ permissions:
   issues: write
 
 concurrency:
-  group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}
+  # A normal review reply emits issue_comment even when it is not a slash
+  # command and the job will be skipped. Keep that event from cancelling the
+  # required pull_request review run for the same PR.
+  group: pr-agent-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
 jobs:
