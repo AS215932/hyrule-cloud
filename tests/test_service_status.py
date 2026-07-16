@@ -22,6 +22,7 @@ def _prometheus(alerts: list[dict]) -> dict:
 _PUBLIC_RULES = (
     "HyrulePublicApiUnavailable",
     "HyrulePublicComputeControlPlaneUnavailable",
+    "HyrulePublicApiAddressFamilyDegraded",
     "HyrulePublicPaymentFailureRatio",
     "HyrulePublicComputeHostDegraded",
     "HyrulePublicRoutingDegraded",
@@ -38,6 +39,10 @@ _PUBLIC_RULE_METADATA = {
         "api_checkout,intelligence,domains_dns,network_proxy",
     ),
     "HyrulePublicComputeControlPlaneUnavailable": ("degraded", "compute"),
+    "HyrulePublicApiAddressFamilyDegraded": (
+        "degraded",
+        "api_checkout,compute,intelligence,domains_dns,network_proxy",
+    ),
     "HyrulePublicPaymentFailureRatio": ("degraded", "api_checkout"),
     "HyrulePublicComputeHostDegraded": ("degraded", "compute"),
     "HyrulePublicRoutingDegraded": (
@@ -236,6 +241,38 @@ async def test_highest_incident_state_wins_per_component(status_state, client):
     assert body["status"] == "outage"
     assert components["compute"]["status"] == "degraded"
     assert components["network_proxy"]["status"] == "outage"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_address_family_degradation_affects_every_public_component(status_state, client):
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(
+            200,
+            json=_prometheus(
+                [
+                    _alert(
+                        name="HyrulePublicApiAddressFamilyDegraded",
+                        state="degraded",
+                        components=("api_checkout,compute,intelligence,domains_dns,network_proxy"),
+                    )
+                ]
+            ),
+        )
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "degraded"
+    assert {component["status"] for component in body["components"]} == {"degraded"}
+    assert body["incidents"][0]["component_ids"] == [
+        "api_checkout",
+        "compute",
+        "intelligence",
+        "domains_dns",
+        "network_proxy",
+    ]
 
 
 @pytest.mark.asyncio
