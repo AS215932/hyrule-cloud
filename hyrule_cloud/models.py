@@ -734,11 +734,12 @@ class PathReportCheck(enum.StrEnum):
 # manifest/capabilities/discovery gates can reference the SAME defaults without
 # calling FieldInfo.default_factory (mypy strict types it as possibly-None /
 # wrong-arity). These stay the single source of truth for the field defaults.
-PATH_PROBE_DEFAULT_VANTAGES: list[DiagnosticVantage] = [DiagnosticVantage.EXTMON]
+# The defaults probe from AS215932 (the vantage only this operator owns), so
+# path/ping and path/report auto-list exactly when the prober is deployed.
+PATH_PROBE_DEFAULT_VANTAGES: list[DiagnosticVantage] = [DiagnosticVantage.AS215932]
 PATH_REPORT_DEFAULT_VANTAGES: list[DiagnosticVantage] = [
-    DiagnosticVantage.EXTMON,
     DiagnosticVantage.AS215932,
-    DiagnosticVantage.GLOBALPING,
+    DiagnosticVantage.EXTMON,
 ]
 
 

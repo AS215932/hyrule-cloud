@@ -107,23 +107,23 @@ TESTS: dict[str, dict] = {
         "usd": "0.005",
         "group": "intel",
     },
+    # /v1/path/ping runs a real ping from the AS215932 prober vantage (Phase 4a).
     "path": {
         "path": "/v1/path/ping",
-        "body": {"target": "example.com", "vantages": ["extmon", "as215932", "globalping"]},
+        "body": {"target": "example.com", "vantages": ["as215932"]},
         "usd": "0.005",
         "group": "intel",
     },
-    # /v1/path/report (Phase-3a path evidence) uses the endpoint's default
-    # vantage set so it actually probes once a vantage (Globalping/RIPE Atlas) is
-    # configured. Until then it returns 501 before charging (PR #42), which the
-    # sweep treats as "not launched yet, skipped" rather than a failure — so the
-    # runbook's required paid /v1/path/report call is validated the moment a
-    # prober goes live, without failing the pre-launch sweep.
+    # /v1/path/report combines ping + traceroute + classification from the
+    # AS215932 prober. Until the prober is deployed (HYRULE_PROBER_TOKEN set) it
+    # returns 501 before charging, which the sweep treats as "not launched yet,
+    # skipped" rather than a failure — so the runbook's required paid
+    # /v1/path/report call is validated the moment the prober goes live.
     "path-report": {
         "path": "/v1/path/report",
         "body": {
             "target": "example.com",
-            "vantages": ["extmon", "as215932", "globalping"],
+            "vantages": ["as215932", "extmon"],
             "checks": ["ping", "traceroute"],
         },
         "usd": "0.05",

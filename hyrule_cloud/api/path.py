@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request, Response
+from collections.abc import Awaitable, Callable
+
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 
 from hyrule_cloud.api._contract import (
     diagnostic_quote,
     not_implemented,
     payment_price,
-    require_paid_diagnostic,
 )
 from hyrule_cloud.models import (
     PATH_PROBE_DEFAULT_VANTAGES,
@@ -25,23 +27,70 @@ from hyrule_cloud.models import (
     PathVantagesResponse,
     ProductCapabilityResponse,
 )
+from hyrule_cloud.providers.prober_client import (
+    ProbeRejectedError,
+    ProberProvider,
+    ProbeUnavailableError,
+)
 from hyrule_cloud.services.path.diagnostics import (
     path_active_probe_enabled,
     path_probe,
     path_report,
 )
+from hyrule_cloud.state import AppState
 
 router = APIRouter(prefix="/v1/path", tags=["Path diagnostics"])
+
+
+def _typed_state(request: Request) -> AppState | None:
+    return getattr(request.app.state, "_typed_state", None)
+
+
+def _prober(request: Request) -> ProberProvider | None:
+    return getattr(_typed_state(request), "prober_provider", None)
+
+
+async def _charge_then_deliver(
+    request: Request,
+    *,
+    price_attr: str,
+    default: str,
+    description: str,
+    deliver: Callable[[], Awaitable[DiagnosticResponse]],
+) -> DiagnosticResponse | Response:
+    """Deliver-then-settle: verify the payment, run the measurement, and settle
+    only if the prober actually produced evidence. A prober outage (or a target
+    that resolves to nothing) never moves the customer's money."""
+    state = _typed_state(request)
+    gate = getattr(state, "payment_gate", None)
+    amount = payment_price(request, price_attr, default)
+    if gate is None:
+        # App state not wired (tests / OpenAPI import): closed, never free.
+        return JSONResponse(
+            status_code=402,
+            content={"payment_required": True, "amount": str(amount), "description": description},
+        )
+    verified = await gate.verify_only(request, amount, description=description)
+    if isinstance(verified, Response):
+        return verified
+    try:
+        result = await deliver()
+    except ProbeRejectedError as exc:
+        # Prober defense-in-depth rejected the target as unsafe/invalid.
+        raise HTTPException(400, str(exc)) from exc
+    except ProbeUnavailableError as exc:
+        # Never delivered a measurement — do not settle.
+        raise HTTPException(502, str(exc)) from exc
+    if not await gate.settle_verified(request, verified):
+        raise HTTPException(402, "payment settlement failed")
+    return result
 
 
 @router.get("/capabilities", response_model=ProductCapabilityResponse)
 async def get_path_capabilities() -> ProductCapabilityResponse:
     # Advertise each paid path endpoint only when ITS default request would
-    # actually probe. The ping-family defaults to [extmon] (never an active
-    # vantage) so its default body 501s even with a prober configured, while
-    # /v1/path/report defaults to a set that includes globalping. Mirror the
-    # manifest's per-endpoint gate so capabilities never list a route whose
-    # default request 501s.
+    # actually probe. Mirror the manifest's per-endpoint gate so capabilities
+    # never list a route whose default request 501s.
     probe_enabled = path_active_probe_enabled(PATH_PROBE_DEFAULT_VANTAGES)
     report_enabled = path_active_probe_enabled(PATH_REPORT_DEFAULT_VANTAGES)
     _free_endpoints = [
@@ -51,22 +100,23 @@ async def get_path_capabilities() -> ProductCapabilityResponse:
     ]
     _paid_endpoints: list[CapabilityEndpoint] = []
     if probe_enabled:
+        # Only ping and traceroute are truly delivered by the prober. MTR
+        # (per-hop loss) and reverse-path asymmetry have no honest backend yet,
+        # so they are not advertised and 501 before charging.
         _paid_endpoints.extend([
-            CapabilityEndpoint(path="/v1/path/ping", method="POST", paid=True, description="Run/queue ping evidence from approved vantages"),
-            CapabilityEndpoint(path="/v1/path/trace", method="POST", paid=True, description="Run/queue traceroute evidence"),
-            CapabilityEndpoint(path="/v1/path/mtr", method="POST", paid=True, description="Run/queue MTR packet-loss evidence"),
-            CapabilityEndpoint(path="/v1/path/asymmetry", method="POST", paid=True, description="Collect path asymmetry evidence where possible"),
+            CapabilityEndpoint(path="/v1/path/ping", method="POST", paid=True, description="Ping reachability (loss/RTT) from AS215932 vantages"),
+            CapabilityEndpoint(path="/v1/path/trace", method="POST", paid=True, description="Traceroute path from AS215932 vantages"),
         ])
     if report_enabled:
         _free_endpoints.append(
             CapabilityEndpoint(path="/v1/path/report/quote", method="POST", description="Quote a path evidence pack")
         )
         _paid_endpoints.append(
-            CapabilityEndpoint(path="/v1/path/report", method="POST", paid=True, description="Create synchronous path report")
+            CapabilityEndpoint(path="/v1/path/report", method="POST", paid=True, description="Create synchronous path report (ping + traceroute + classification)")
         )
     return ProductCapabilityResponse(
         service="path",
-        purpose="Paid routing/path diagnostics using extmon, AS215932, public BGP/RPKI, router-table snapshots, and optional Globalping/RIPE Atlas evidence.",
+        purpose="Paid routing/path diagnostics: ping and traceroute evidence from AS215932 vantages, with control-plane context from /v1/bgp and router-table snapshots.",
         separation_of_concerns="/v1/path diagnoses reachability paths; /v1/bgp diagnoses routing control-plane state; /v1/ports checks one declared service port.",
         free_endpoints=_free_endpoints,
         paid_endpoints=_paid_endpoints,
@@ -75,10 +125,12 @@ async def get_path_capabilities() -> ProductCapabilityResponse:
 
 @router.get("/vantages", response_model=PathVantagesResponse)
 async def get_path_vantages() -> PathVantagesResponse:
+    prober_up = path_active_probe_enabled([DiagnosticVantage.AS215932])
+    prober_status = "supported" if prober_up else "not_configured"
     return PathVantagesResponse(
         vantages=[
-            {"id": DiagnosticVantage.EXTMON.value, "owner": "hyrule", "role": "external neutral monitor", "status": "supported"},
-            {"id": DiagnosticVantage.AS215932.value, "owner": "hyrule", "role": "AS215932 internal/router perspective", "status": "supported"},
+            {"id": DiagnosticVantage.EXTMON.value, "owner": "hyrule", "role": "external neutral monitor", "status": prober_status},
+            {"id": DiagnosticVantage.AS215932.value, "owner": "hyrule", "role": "AS215932 internal/router perspective", "status": prober_status},
             {"id": DiagnosticVantage.GLOBALPING.value, "owner": "third_party", "role": "public multi-vantage active probes", "status": "token_ready"},
             {"id": DiagnosticVantage.RIPE_ATLAS.value, "owner": "third_party", "role": "RIPE Atlas measurements", "status": "token_ready"},
         ]
@@ -101,45 +153,41 @@ async def quote_path_report(request: Request, body: PathReportRequest) -> PaidEn
     return diagnostic_quote(request, price_attr="price_path_report", default="0.05", name="path_report", paid_endpoint="/v1/path/report")
 
 
-async def _paid_probe(request: Request, vantages: list[DiagnosticVantage]) -> Response | None:
-    # No active-probe vantage among the requested set is configured, so a probe
-    # would only return a "probe accepted" acknowledgement with no reachability
-    # data. Refuse before charging until Globalping/RIPE Atlas is wired up.
-    if not path_active_probe_enabled(vantages):
+async def _run_probe(request: Request, body: PathProbeRequest, kind: PathProbeKind) -> DiagnosticResponse | Response:
+    if not path_active_probe_enabled(body.vantages):
         return not_implemented("path.probe")
-    return await require_paid_diagnostic(request, price_attr="price_path_probe", default="0.005", description="Hyrule path diagnostic probe")
+    body.probe = kind
+    return await _charge_then_deliver(
+        request,
+        price_attr="price_path_probe",
+        default="0.005",
+        description=f"Hyrule path {kind.value} probe",
+        deliver=lambda: path_probe(body, _prober(request)),
+    )
 
 
 @router.post("/ping", response_model=DiagnosticResponse)
 async def path_ping(request: Request, body: PathProbeRequest) -> DiagnosticResponse | Response:
-    if payment := await _paid_probe(request, body.vantages):
-        return payment
-    body.probe = PathProbeKind.PING
-    return await path_probe(body)
+    return await _run_probe(request, body, PathProbeKind.PING)
 
 
 @router.post("/trace", response_model=DiagnosticResponse)
 async def path_trace(request: Request, body: PathProbeRequest) -> DiagnosticResponse | Response:
-    if payment := await _paid_probe(request, body.vantages):
-        return payment
-    body.probe = PathProbeKind.TRACE
-    return await path_probe(body)
+    return await _run_probe(request, body, PathProbeKind.TRACE)
 
 
 @router.post("/mtr", response_model=DiagnosticResponse)
-async def path_mtr(request: Request, body: PathProbeRequest) -> DiagnosticResponse | Response:
-    if payment := await _paid_probe(request, body.vantages):
-        return payment
-    body.probe = PathProbeKind.MTR
-    return await path_probe(body)
+async def path_mtr(request: Request, body: PathProbeRequest) -> Response:
+    # Per-hop packet loss (MTR) needs many probes per hop; the prober does not
+    # collect it. Refuse before charging rather than relabel a traceroute.
+    return not_implemented("path.mtr", "Per-hop MTR loss is not collected; use /v1/path/ping and /v1/path/trace.")
 
 
 @router.post("/asymmetry", response_model=DiagnosticResponse)
-async def path_asymmetry(request: Request, body: PathProbeRequest) -> DiagnosticResponse | Response:
-    if payment := await _paid_probe(request, body.vantages):
-        return payment
-    body.probe = PathProbeKind.ASYMMETRY
-    return await path_probe(body)
+async def path_asymmetry(request: Request, body: PathProbeRequest) -> Response:
+    # Reverse-path evidence requires a probe originating at the target; not
+    # available without a RIPE Atlas / reverse-traceroute source.
+    return not_implemented("path.asymmetry", "Reverse-path asymmetry evidence is not available; only forward traceroute is offered via /v1/path/trace.")
 
 
 @router.post("/report", response_model=DiagnosticResponse)
@@ -148,9 +196,13 @@ async def create_path_report(request: Request, body: PathReportRequest) -> Diagn
     # before charging until one of the requested vantages is configured.
     if not path_active_probe_enabled(body.vantages):
         return not_implemented("path.report")
-    if payment := await require_paid_diagnostic(request, price_attr="price_path_report", default="0.05", description="Hyrule routing/path evidence pack"):
-        return payment
-    return await path_report(body)
+    return await _charge_then_deliver(
+        request,
+        price_attr="price_path_report",
+        default="0.05",
+        description="Hyrule routing/path evidence pack",
+        deliver=lambda: path_report(body, _prober(request)),
+    )
 
 
 @router.post("/jobs", response_model=DiagnosticJobResponse)
