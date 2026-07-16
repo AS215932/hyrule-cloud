@@ -179,6 +179,19 @@ async def test_unpaid_catalog_probes_reach_valid_402_before_validation(
                 ):
                     assert body[canonical_field] == decoded[canonical_field], operation.key
                 assert body["extensions"]["bazaar"]["info"]["input"]["method"] == operation.method
+
+                # Bazaar quality scoring weighs metadata completeness: every
+                # catalog 402 must carry full resource metadata on the wire.
+                resource = decoded["resource"]
+                assert resource["serviceName"] == "Hyrule Cloud", operation.key
+                assert resource["mimeType"] == "application/json", operation.key
+                assert resource["iconUrl"] == "https://cloud.hyrule.host/icon-192.png", (
+                    operation.key
+                )
+                tags = resource["tags"]
+                assert 1 <= len(tags) <= 5, operation.key
+                assert all(len(tag) <= 32 and tag.isascii() for tag in tags), operation.key
+                assert len(resource["serviceName"]) <= 32
     finally:
         if old_state is not None:
             app.state._typed_state = old_state
