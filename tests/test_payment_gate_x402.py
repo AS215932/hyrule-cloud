@@ -237,28 +237,69 @@ def test_non_cdp_facilitator_does_not_attach_cdp_auth(monkeypatch: pytest.Monkey
     assert config.auth_provider is None
 
 
-def test_cdp_auth_provider_generates_endpoint_scoped_bearer_jwts() -> None:
-    import jwt
+def _test_ec_pem() -> str:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
     private_key = ec.generate_private_key(ec.SECP256R1())
-    private_pem = private_key.private_bytes(
+    return private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     ).decode()
+
+
+def test_cdp_auth_provider_generates_endpoint_scoped_bearer_jwts() -> None:
+    import jwt
+
     provider = CdpFacilitatorAuthProvider(
         "organizations/test/apiKeys/key-id",
-        private_pem,
+        _test_ec_pem(),
         "https://api.cdp.coinbase.com/platform/v2/x402",
     )
 
     token = provider.get_auth_headers().supported["Authorization"].removeprefix("Bearer ")
     claims = jwt.decode(token, options={"verify_signature": False})
+    header = jwt.get_unverified_header(token)
 
-    assert claims["iss"] == "organizations/test/apiKeys/key-id"
-    assert claims["uri"] == "GET api.cdp.coinbase.com/platform/v2/x402/supported"
+    # CDP's auth contract (coinbase/cdp-sdk generate_jwt): iss is the literal
+    # "cdp"; the key id appears only as sub and the kid header. iss=<key id>
+    # is rejected with 401 by the live facilitator.
+    assert claims["iss"] == "cdp"
+    assert claims["sub"] == "organizations/test/apiKeys/key-id"
+    assert claims["uris"] == ["GET api.cdp.coinbase.com/platform/v2/x402/supported"]
+    assert header["kid"] == "organizations/test/apiKeys/key-id"
+
+
+def test_cdp_facilitator_without_credentials_fails_at_config_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CDP_API_KEY_ID", raising=False)
+    monkeypatch.delenv("CDP_API_KEY_SECRET", raising=False)
+
+    with pytest.raises(ValueError, match="CDP_API_KEY_ID/CDP_API_KEY_SECRET are unset"):
+        _facilitator_config(
+            PaymentConfig(
+                receiver_address=RECEIVER,
+                facilitator_url="https://api.cdp.coinbase.com/platform/v2/x402",
+            )
+        )
+
+
+def test_cdp_facilitator_with_credentials_attaches_auth_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CDP_API_KEY_ID", "organizations/test/apiKeys/key-id")
+    monkeypatch.setenv("CDP_API_KEY_SECRET", _test_ec_pem())
+
+    config = _facilitator_config(
+        PaymentConfig(
+            receiver_address=RECEIVER,
+            facilitator_url="https://api.cdp.coinbase.com/platform/v2/x402",
+        )
+    )
+
+    assert isinstance(config.auth_provider, CdpFacilitatorAuthProvider)
 
 
 @pytest.mark.asyncio
