@@ -2293,11 +2293,22 @@ class DomainService:
             self._assert_external_delegation_allowed(domain)
         if domain.openprovider_id is None:
             raise RuntimeError("domain has no registrar id")
-        if mode is NameserverMode.MANAGED:
-            await self._ensure_managed_zone(domain.fqdn, domain.openprovider_id)
-        elif domain.dnssec_mode == DNSSECMode.MANAGED.value:
+        incompatible_dnssec = (
+            mode is NameserverMode.MANAGED and domain.dnssec_mode == DNSSECMode.EXTERNAL.value
+        ) or (mode is NameserverMode.EXTERNAL and domain.dnssec_mode == DNSSECMode.MANAGED.value)
+        if incompatible_dnssec:
+            # Parent DS material for the previous authority must disappear
+            # before delegation moves. Otherwise validating resolvers can use
+            # the old DS records against the new zone and return SERVFAIL.
             await self.provider.set_dnssec_keys(domain.openprovider_id, [])
-        await self.provider.update_nameservers(domain.openprovider_id, nameservers)
+        if mode is NameserverMode.MANAGED:
+            await self._ensure_managed_zone(
+                domain.fqdn,
+                domain.openprovider_id,
+                dnssec_mode=DNSSECMode.OFF if incompatible_dnssec else None,
+            )
+        else:
+            await self.provider.update_nameservers(domain.openprovider_id, nameservers)
         if (
             mode is NameserverMode.EXTERNAL
             and domain.nameserver_mode == NameserverMode.MANAGED.value
@@ -2312,12 +2323,10 @@ class DomainService:
             if current is not None:
                 current.nameserver_mode = mode.value
                 current.nameservers = nameservers
-                if (
-                    mode is NameserverMode.EXTERNAL
-                    and current.dnssec_mode == DNSSECMode.MANAGED.value
-                ):
+                if incompatible_dnssec:
                     current.dnssec_mode = DNSSECMode.OFF.value
                     current.dnssec_status = "off"
+                    current.ds_records = []
             if op is not None:
                 op.status = DomainOperationStatus.SUCCEEDED.value
                 op.result_payload = {"mode": mode.value, "nameservers": nameservers}

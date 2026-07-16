@@ -1633,6 +1633,74 @@ async def test_external_nameservers_are_blocked_for_vm_attachment_and_worker_rac
 
 
 @pytest.mark.asyncio
+async def test_external_dnssec_is_cleared_before_switching_to_managed_nameservers(
+    domain_service,
+):
+    service, provider, sessions = domain_service
+    provider_calls: list[tuple[str, int, list]] = []
+
+    async def set_dnssec_keys(domain_id, keys):
+        provider_calls.append(("dnssec", domain_id, keys))
+        return {}
+
+    async def update_nameservers(domain_id, nameservers):
+        provider_calls.append(("nameservers", domain_id, nameservers))
+        return {}
+
+    provider.set_dnssec_keys = AsyncMock(side_effect=set_dnssec_keys)
+    provider.update_nameservers = AsyncMock(side_effect=update_nameservers)
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="external-dnssec",
+                extension="dev",
+                fqdn="external-dnssec.dev",
+                owner_wallet="0x" + "1" * 40,
+                owner_account_id="H1234567890",
+                status="active",
+                openprovider_id=8345,
+                nameserver_mode="external",
+                nameservers=["ns1.example.net", "ns2.example.net"],
+                dnssec_mode="external",
+                dnssec_status="active",
+                ds_records=[
+                    {
+                        "key_tag": 12345,
+                        "algorithm": 13,
+                        "digest_type": 2,
+                        "digest": "A" * 64,
+                    }
+                ],
+            )
+        )
+        await session.commit()
+
+    operation = await service.enqueue_nameserver_update(
+        "H1234567890",
+        "external-dnssec.dev",
+        NameserverUpdateRequest(mode=NameserverMode.MANAGED),
+        "external-dnssec-to-managed",
+    )
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+
+    async with sessions() as session:
+        domain = (
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == "external-dnssec.dev"))
+        ).scalar_one()
+        completed = await session.get(DomainOperationRow, operation.operation_id)
+    assert completed is not None and completed.status == "succeeded"
+    assert domain.nameserver_mode == "managed"
+    assert domain.nameservers == ["ns1.hyrule.host", "ns2.hyrule.host"]
+    assert domain.dnssec_mode == "off"
+    assert domain.dnssec_status == "off"
+    assert domain.ds_records == []
+    assert provider_calls == [
+        ("dnssec", 8345, []),
+        ("nameservers", 8345, ["ns1.hyrule.host", "ns2.hyrule.host"]),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_preserves_dnssec_off_and_managed_enable_installs_keys(
     domain_service,
 ):
