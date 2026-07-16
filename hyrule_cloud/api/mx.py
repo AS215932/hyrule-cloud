@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import structlog
 from fastapi import APIRouter, Request, Response
 
 from hyrule_cloud.api._contract import (
@@ -19,11 +20,13 @@ from hyrule_cloud.models import (
     MailBounceParseResponse,
     MXCheckRequest,
     MXCheckResponse,
+    MXFinding,
     MXJobRequest,
     MXJobResponse,
     MXJobStatus,
     MXPricingResponse,
     MXProfile,
+    MXStatus,
     MXTool,
     MXToolDescription,
     MXToolsResponse,
@@ -34,6 +37,7 @@ from hyrule_cloud.services.mx.checks import run_check
 from hyrule_cloud.services.mx.deliverability import derive_recommendations, parse_bounce
 
 router = APIRouter(prefix="/v1/mx", tags=["MX diagnostics"])
+log = structlog.get_logger()
 
 _TOOL_DESCRIPTIONS: dict[MXTool, tuple[str, str, bool]] = {
     MXTool.A: ("hostname", "DNS A record IPv4 address for host name", False),
@@ -61,6 +65,24 @@ _TOOL_DESCRIPTIONS: dict[MXTool, tuple[str, str, bool]] = {
     MXTool.TXT: ("domain_or_host", "DNS TXT lookup", False),
     MXTool.WHOIS: ("domain_ip_or_prefix", "Domain or network WHOIS lookup", False),
 }
+
+# A job target is a domain. PTR and ASN are intentionally absent because those
+# tools require an IP address; applying them to the domain itself is both
+# misleading and, before the input hardening in checks.py, could raise after an
+# x402 payment had already settled.
+_DEFAULT_DOMAIN_JOB_CHECKS: tuple[MXTool, ...] = (
+    MXTool.DNS,
+    MXTool.MX,
+    MXTool.SMTP,
+    MXTool.SPF,
+    MXTool.DKIM,
+    MXTool.DMARC,
+    MXTool.BIMI,
+    MXTool.MTA_STS,
+    MXTool.TLSRPT,
+    MXTool.BLACKLIST,
+    MXTool.WHOIS,
+)
 
 
 @router.get("/tools", response_model=MXToolsResponse)
@@ -125,6 +147,33 @@ async def _paid_job(request: Request) -> Response | None:
     return result if isinstance(result, Response) else None
 
 
+async def _run_job_check(body: MXJobRequest, tool: MXTool) -> MXCheckResponse:
+    """Keep one diagnostic failure from discarding an already-paid report."""
+    try:
+        return await run_check(
+            MXCheckRequest(tool=tool, target=body.target, options=body.options)
+        )
+    except Exception:
+        log.exception("mx_job_check_failed", tool=tool.value, target=body.target)
+        message = f"{tool.value.upper()} diagnostic failed unexpectedly."
+        return MXCheckResponse(
+            request_id="mxq_contract",
+            tool=tool,
+            target=body.target,
+            status=MXStatus.ERROR,
+            summary=message,
+            findings=[
+                MXFinding(
+                    severity=MXStatus.ERROR,
+                    code="diagnostic_failed",
+                    message=message,
+                )
+            ],
+            sources={"diagnostic": "error"},
+            generated_at=now_utc(),
+        )
+
+
 @router.post("/check", response_model=MXCheckResponse)
 async def mx_check(request: Request, body: MXCheckRequest) -> MXCheckResponse | Response:
     if payment := await _paid_check(request):
@@ -149,25 +198,8 @@ async def create_mx_mail_delivery_report(request: Request, body: MXJobRequest) -
 async def create_mx_job(request: Request, body: MXJobRequest) -> MXJobResponse | Response:
     if payment := await _paid_job(request):
         return payment
-    checks = body.checks or [
-        MXTool.DNS,
-        MXTool.MX,
-        MXTool.SMTP,
-        MXTool.SPF,
-        MXTool.DKIM,
-        MXTool.DMARC,
-        MXTool.BIMI,
-        MXTool.MTA_STS,
-        MXTool.TLSRPT,
-        MXTool.BLACKLIST,
-        MXTool.PTR,
-        MXTool.ASN,
-        MXTool.WHOIS,
-    ]
-    results = [
-        await run_check(MXCheckRequest(tool=tool, target=body.target, options=body.options))
-        for tool in checks
-    ]
+    checks = body.checks or _DEFAULT_DOMAIN_JOB_CHECKS
+    results = [await _run_job_check(body, tool) for tool in checks]
     created = now_utc()
     return MXJobResponse(
         job_id="mxj_inline_contract",
