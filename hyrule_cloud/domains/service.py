@@ -652,7 +652,13 @@ class DomainService:
 
     async def assert_x402_payable(self, order_id: str) -> None:
         async with self.db() as session:
-            order = await session.get(DomainOrderRow, order_id)
+            order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
             quote = await session.get(DomainQuoteRow, order.quote_id)
@@ -661,8 +667,9 @@ class DomainService:
                 or quote.status not in {"active", "reserved"}
                 or (_aware(quote.expires_at) is not None and _aware(quote.expires_at) <= _now())
             ):
-                order.status = DomainOrderStatus.EXPIRED.value
-                if quote is not None and _aware(quote.expires_at) <= _now():
+                now = _now()
+                await self._expire_unpaid_order(session, order, now=now)
+                if quote is not None and _aware(quote.expires_at) <= now:
                     quote.status = "expired"
                 await session.commit()
                 raise DomainProblem(
@@ -779,27 +786,30 @@ class DomainService:
                 and str(intent.status) == CryptoIntentStatus.EXPIRED.value
                 and row.status == DomainOrderStatus.AWAITING_PAYMENT.value
             ):
-                row.status = DomainOrderStatus.EXPIRED.value
+                await self._expire_unpaid_order(session, row, now=_now())
                 await session.commit()
                 await session.refresh(row)
         return self._order_response(row, intent)
 
     async def order_response(self, row: DomainOrderRow) -> DomainOrderResponse:
         async with self.db() as session:
+            current = await session.get(DomainOrderRow, row.order_id)
+            if current is None:
+                raise DomainProblem(404, "order_not_found", "Domain order not found.")
             intent = (
-                await session.get(CryptoIntentRow, row.native_intent_id)
-                if row.native_intent_id
+                await session.get(CryptoIntentRow, current.native_intent_id)
+                if current.native_intent_id
                 else None
             )
             if (
                 intent is not None
                 and str(intent.status) == CryptoIntentStatus.EXPIRED.value
-                and row.status == DomainOrderStatus.AWAITING_PAYMENT.value
+                and current.status == DomainOrderStatus.AWAITING_PAYMENT.value
             ):
-                row.status = DomainOrderStatus.EXPIRED.value
+                await self._expire_unpaid_order(session, current, now=_now())
                 await session.commit()
-                await session.refresh(row)
-        return self._order_response(row, intent)
+                await session.refresh(current)
+        return self._order_response(current, intent)
 
     async def list_domains(self, owner_account_id: str) -> DomainListResponse:
         async with self.db() as session:
@@ -1283,17 +1293,63 @@ class DomainService:
         return recovered
 
     async def expire_quotes(self) -> int:
+        now = _now()
         async with self.db() as session:
+            unpaid_orders = list(
+                await session.scalars(
+                    select(DomainOrderRow)
+                    .join(DomainQuoteRow, DomainQuoteRow.quote_id == DomainOrderRow.quote_id)
+                    .where(
+                        DomainOrderRow.status == DomainOrderStatus.AWAITING_PAYMENT.value,
+                        DomainQuoteRow.status.in_(["active", "reserved"]),
+                        DomainQuoteRow.expires_at < now,
+                    )
+                    .with_for_update(of=DomainOrderRow)
+                )
+            )
+            for order in unpaid_orders:
+                await self._expire_unpaid_order(session, order, now=now)
             result = await session.execute(
                 update(DomainQuoteRow)
                 .where(
                     DomainQuoteRow.status.in_(["active", "reserved"]),
-                    DomainQuoteRow.expires_at < _now(),
+                    DomainQuoteRow.expires_at < now,
                 )
                 .values(status="expired")
             )
             await session.commit()
             return int(getattr(result, "rowcount", 0) or 0)
+
+    async def _expire_unpaid_order(
+        self,
+        session: Any,
+        order: DomainOrderRow,
+        *,
+        now: datetime,
+    ) -> None:
+        if order.status != DomainOrderStatus.AWAITING_PAYMENT.value:
+            return
+        order.status = DomainOrderStatus.EXPIRED.value
+        order.error_code = "quote_expired"
+        if not order.vm_quote_id:
+            return
+        vm_quote = (
+            await session.execute(
+                select(VMQuoteRow)
+                .where(VMQuoteRow.quote_id == order.vm_quote_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            vm_quote is not None
+            and vm_quote.status == QuoteStatus.CONSUMED.value
+            and vm_quote.vm_id is None
+        ):
+            vm_quote.status = (
+                QuoteStatus.EXPIRED
+                if _aware(vm_quote.expires_at) <= now
+                else QuoteStatus.CREATED
+            )
 
     async def reconcile_pending(self) -> int:
         scheduled = 0
@@ -2279,7 +2335,11 @@ class DomainService:
                 raise DomainProblem(
                     409, "managed_dns_disabled", "Managed DNSSEC requires managed nameservers."
                 )
-            await self._ensure_managed_zone(domain.fqdn, domain.openprovider_id)
+            await self._ensure_managed_zone(
+                domain.fqdn,
+                domain.openprovider_id,
+                dnssec_mode=DNSSECMode.MANAGED,
+            )
             ds_records: list[dict[str, Any]] = []
         elif mode is DNSSECMode.EXTERNAL:
             if domain.nameserver_mode != NameserverMode.EXTERNAL.value:
@@ -2492,7 +2552,13 @@ class DomainService:
                     current.status = DomainStatus.ACTIVE
                     await session.commit()
 
-    async def _ensure_managed_zone(self, fqdn: str, provider_id: int) -> None:
+    async def _ensure_managed_zone(
+        self,
+        fqdn: str,
+        provider_id: int,
+        *,
+        dnssec_mode: DNSSECMode | None = None,
+    ) -> None:
         async with self.db() as session:
             domain = (
                 await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
@@ -2509,7 +2575,11 @@ class DomainService:
             revision=domain.zone_revision,
             records=[self._record_payload(row) for row in records],
         )
-        managed_dnssec = domain.dnssec_mode == DNSSECMode.MANAGED.value
+        managed_dnssec = (
+            dnssec_mode is DNSSECMode.MANAGED
+            if dnssec_mode is not None
+            else domain.dnssec_mode == DNSSECMode.MANAGED.value
+        )
         keys = await self.dns.dnssec_keys(fqdn) if managed_dnssec else []
         await self.provider.update_nameservers(provider_id, self.domain_config.managed_nameservers)
         if managed_dnssec:

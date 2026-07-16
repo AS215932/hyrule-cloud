@@ -40,6 +40,8 @@ from hyrule_cloud.domains.models import (
     DNSChangeAction,
     DNSChangesetRequest,
     DNSRRSet,
+    DNSSECMode,
+    DNSSECUpdateRequest,
     DomainAction,
     DomainFailurePolicy,
     DomainOrderRequest,
@@ -1631,7 +1633,9 @@ async def test_external_nameservers_are_blocked_for_vm_attachment_and_worker_rac
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_preserves_dnssec_off(domain_service):
+async def test_reconciliation_preserves_dnssec_off_and_managed_enable_installs_keys(
+    domain_service,
+):
     service, provider, sessions = domain_service
     provider.update_nameservers = AsyncMock(return_value={})
     provider.set_dnssec_keys = AsyncMock(return_value={})
@@ -1670,6 +1674,29 @@ async def test_reconciliation_preserves_dnssec_off(domain_service):
     provider.update_nameservers.assert_awaited_once_with(
         8456, ["ns1.hyrule.host", "ns2.hyrule.host"]
     )
+
+    keys = [{"flags": 257, "protocol": 3, "alg": 13, "pub_key": "AA=="}]
+    service.dns.dnssec_keys.return_value = keys
+    operation = await service.enqueue_dnssec_update(
+        "H1234567890",
+        "dnssec-off.dev",
+        DNSSECUpdateRequest(mode=DNSSECMode.MANAGED),
+        "enable-managed-dnssec",
+    )
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+
+    async with sessions() as session:
+        domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "dnssec-off.dev")
+            )
+        ).scalar_one()
+        completed = await session.get(DomainOperationRow, operation.operation_id)
+    assert domain.dnssec_mode == "managed"
+    assert domain.dnssec_status == "active"
+    assert completed is not None and completed.status == "succeeded"
+    service.dns.dnssec_keys.assert_awaited_once_with("dnssec-off.dev")
+    provider.set_dnssec_keys.assert_awaited_once_with(8456, keys)
 
 
 @pytest.mark.asyncio
@@ -1932,6 +1959,75 @@ async def test_bundle_vm_quote_is_claimed_by_only_one_domain_order(domain_servic
     assert vm_quote is not None and vm_quote.status == QuoteStatus.CONSUMED
     assert [order.order_id for order in orders] == [winning_order.order_id]
     assert sorted(quote.status for quote in stored_domain_quotes) == ["active", "consumed"]
+
+
+@pytest.mark.asyncio
+async def test_expiring_unpaid_bundle_order_releases_unlinked_vm_quote(domain_service):
+    service, _provider, sessions = domain_service
+    fqdn = "abandoned-bundle.dev"
+    domain_quote = await service.create_quote(
+        fqdn, DomainAction.REGISTER, "H1234567890"
+    )
+    vm_quote_id = "vmq_abandoned_bundle"
+    async with sessions() as session:
+        session.add(
+            VMQuoteRow(
+                quote_id=vm_quote_id,
+                order_payload=_bundle_spec(fqdn).model_dump(mode="json", exclude={"quote_id"}),
+                amount_usd=Decimal("5"),
+                status=QuoteStatus.CREATED,
+                owner_account_id="H1234567890",
+                expires_at=datetime.now(UTC) + timedelta(minutes=15),
+            )
+        )
+        await session.commit()
+    abandoned_order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=domain_quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+            vm_quote_id=vm_quote_id,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="abandoned-bundle",
+    )
+    async with sessions() as session:
+        expired_quote = await session.get(DomainQuoteRow, domain_quote.quote_id)
+        assert expired_quote is not None
+        expired_quote.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    assert await service.expire_quotes() == 1
+    async with sessions() as session:
+        stored_order = await session.get(DomainOrderRow, abandoned_order.order_id)
+        stored_domain_quote = await session.get(DomainQuoteRow, domain_quote.quote_id)
+        released_vm_quote = await session.get(VMQuoteRow, vm_quote_id)
+    assert stored_order is not None and stored_order.status == "expired"
+    assert stored_order.error_code == "quote_expired"
+    assert stored_domain_quote is not None and stored_domain_quote.status == "expired"
+    assert released_vm_quote is not None
+    assert released_vm_quote.status == QuoteStatus.CREATED
+    assert released_vm_quote.vm_id is None
+
+    replacement_quote = await service.create_quote(
+        fqdn, DomainAction.REGISTER, "H1234567890"
+    )
+    replacement_order, created = await service.create_order(
+        DomainOrderRequest(
+            quote_id=replacement_quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+            vm_quote_id=vm_quote_id,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="replacement-bundle",
+    )
+    assert created is True
+    assert replacement_order.order_id != abandoned_order.order_id
+    async with sessions() as session:
+        reclaimed_vm_quote = await session.get(VMQuoteRow, vm_quote_id)
+    assert reclaimed_vm_quote is not None
+    assert reclaimed_vm_quote.status == QuoteStatus.CONSUMED
 
 
 @pytest.mark.asyncio
