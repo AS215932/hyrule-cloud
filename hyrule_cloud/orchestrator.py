@@ -11,6 +11,7 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from ipaddress import IPv6Address, IPv6Network
+from typing import TYPE_CHECKING
 
 import structlog
 from sqlalchemy import delete as sql_delete
@@ -19,13 +20,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import CryptoIntentRow, DomainRow, PaymentEventRow, VMQuoteRow, VMRow
+from hyrule_cloud.db import CryptoIntentRow, PaymentEventRow, VMQuoteRow, VMRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
     CryptoIntentStatus,
     DomainMode,
-    DomainStatus,
     SSHSmokeStatus,
     VMCreateRequest,
     VMSize,
@@ -50,6 +50,9 @@ from hyrule_cloud.providers.openprovider import OpenproviderClient
 from hyrule_cloud.providers.xcpng import XCPNGProvider
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
+
+if TYPE_CHECKING:
+    from hyrule_cloud.domains.service import DomainService
 
 log = structlog.get_logger()
 
@@ -85,12 +88,14 @@ class Orchestrator:
         self.xcpng = XCPNGProvider(config.xcpng)
         self.dns = DNSProvider(config)
         self.openprovider = OpenproviderClient(config.openprovider)
+        self.domains: DomainService | None = None
         # Refund obligations for paid VMs that fail to provision. The ledger is
         # a thin writer over the session factory, so a dedicated instance here
         # is fine and keeps the constructor signature stable for callers/tests.
         self.refunds = RefundService(PaymentLedger(session_factory))
 
         self._tasks: set[asyncio.Task] = set()
+        self._provisioning_vm_ids: set[str] = set()
 
     async def startup(self) -> None:
         # Fail fast on malformed customer-network settings: an operator typo
@@ -130,9 +135,9 @@ class Orchestrator:
         vm_daily = price_map[request.size]
         vm_cost = vm_daily * request.duration_days
 
+        # Domain registration is a separate durable quote/order. A VM with
+        # domain_mode=custom only attaches an already-active managed domain.
         domain_cost = Decimal("0")
-        if request.domain_mode == DomainMode.CUSTOM and request.domain:
-            domain_cost = self.config.payment.price_domain_markup
 
         total = vm_cost + domain_cost
         breakdown = CostBreakdown(
@@ -178,6 +183,7 @@ class Orchestrator:
         request: VMCreateRequest,
         owner_wallet: str,
         owner_account_id: str | None = None,
+        vm_id: str | None = None,
     ) -> tuple[VMRow, str]:
         """Persist a VM row and atomically claim a customer /64 (unique index).
 
@@ -202,15 +208,23 @@ class Orchestrator:
         total, _ = self.compute_price(request)
         anon_token = generate_anon_management_token()
 
+        requested_vm_id = vm_id
         for _ in range(5):
-            vm_id = generate_vm_id()
-            hostname_prefix = self._generate_hostname(vm_id)
+            candidate_vm_id = requested_vm_id or generate_vm_id()
+            hostname_prefix = self._generate_hostname(candidate_vm_id)
             hostname = f"{hostname_prefix}.{self.config.deploy_domain}"
 
             async with self.db() as session:
-                prefix_index, prefix = await self._allocate_customer_prefix(session, vm_id)
+                if requested_vm_id:
+                    existing = await session.get(VMRow, candidate_vm_id)
+                    if existing is not None:
+                        self._validate_replayed_vm(existing, request, owner_account_id)
+                        return existing, ""
+                prefix_index, prefix = await self._allocate_customer_prefix(
+                    session, candidate_vm_id
+                )
                 row = VMRow(
-                    vm_id=vm_id,
+                    vm_id=candidate_vm_id,
                     owner_wallet=owner_wallet,
                     owner_account_id=owner_account_id,
                     status=VMStatus.PROVISIONING,
@@ -234,7 +248,16 @@ class Orchestrator:
                     await session.commit()
                 except IntegrityError:
                     await session.rollback()
-                    log.warning("customer_ipv6_prefix_collision", vm_id=vm_id, prefix=str(prefix))
+                    if requested_vm_id:
+                        existing = await session.get(VMRow, candidate_vm_id)
+                        if existing is not None:
+                            self._validate_replayed_vm(existing, request, owner_account_id)
+                            return existing, ""
+                    log.warning(
+                        "customer_ipv6_prefix_collision",
+                        vm_id=candidate_vm_id,
+                        prefix=str(prefix),
+                    )
                     continue
                 # Refresh to get server defaults
                 await session.refresh(row)
@@ -242,10 +265,33 @@ class Orchestrator:
 
         raise RuntimeError("Could not allocate a unique customer IPv6 prefix")
 
+    @staticmethod
+    def _validate_replayed_vm(
+        row: VMRow,
+        request: VMCreateRequest,
+        owner_account_id: str | None,
+    ) -> None:
+        if (
+            row.owner_account_id != owner_account_id
+            or VMSize(row.size) is not request.size
+            or row.os != request.os
+            or row.domain_mode != request.domain_mode
+            or row.domain != request.domain
+        ):
+            raise RuntimeError("planned VM id is already bound to another order")
+
     def _spawn_provisioning(self, vm_id: str) -> None:
+        if vm_id in self._provisioning_vm_ids:
+            return
+        self._provisioning_vm_ids.add(vm_id)
         task = asyncio.create_task(self._provision_vm(vm_id))
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+
+        def completed(done: asyncio.Task) -> None:
+            self._tasks.discard(done)
+            self._provisioning_vm_ids.discard(vm_id)
+
+        task.add_done_callback(completed)
 
     def start_provisioning(self, vm_id: str) -> None:
         """Kick off background provisioning for an already-created VM row.
@@ -261,6 +307,7 @@ class Orchestrator:
         request: VMCreateRequest,
         owner_wallet: str,
         owner_account_id: str | None = None,
+        vm_id: str | None = None,
         start_provisioning: bool = True,
     ) -> tuple[VMRow, str]:
         """Create a VM record in DB and start background provisioning.
@@ -280,7 +327,12 @@ class Orchestrator:
         background task so the caller can first link the row to its paying
         record, then call ``start_provisioning(vm_id)``.
         """
-        row, anon_token = await self._insert_vm_row(request, owner_wallet, owner_account_id)
+        row, anon_token = await self._insert_vm_row(
+            request,
+            owner_wallet,
+            owner_account_id,
+            vm_id=vm_id,
+        )
         if start_provisioning:
             self._spawn_provisioning(row.vm_id)
         return row, anon_token
@@ -300,7 +352,9 @@ class Orchestrator:
         release_vm_reservation() on failure. Abandoned reservations (crash
         mid-payment) are purged by check_expiries.
         """
-        return await self._insert_vm_row(request, owner_wallet="", owner_account_id=owner_account_id)
+        return await self._insert_vm_row(
+            request, owner_wallet="", owner_account_id=owner_account_id
+        )
 
     async def activate_vm_reservation(
         self,
@@ -351,7 +405,9 @@ class Orchestrator:
         # wins — a retried provision keeps the original start.
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
-            if row is not None and row.provision_started_at is None:
+            if row is None or str(row.status) != VMStatus.PROVISIONING.value:
+                return
+            if row.provision_started_at is None:
                 row.provision_started_at = _now()
                 await session.commit()
 
@@ -372,12 +428,15 @@ class Orchestrator:
                 open_ports = list(row.open_ports)
                 setup_script = row.setup_script
                 ipv6_prefix = row.ipv6_prefix
+                xcpng_uuid = row.xcpng_uuid
 
             template_uuid = self.config.xcpng.templates.get(os_name)
             if not template_uuid:
                 raise ValueError(f"Unknown OS template: {os_name}")
             if not supports_static_network_config(os_name):
-                raise ValueError(f"Static network config is not supported for OS template: {os_name}")
+                raise ValueError(
+                    f"Static network config is not supported for OS template: {os_name}"
+                )
             if not ipv6_prefix:
                 raise ValueError(f"VM {vm_id} has no allocated IPv6 prefix")
 
@@ -398,20 +457,34 @@ class Orchestrator:
                 setup_script=setup_script,
             )
 
-            xcpng_uuid = await self.xcpng.create_vm(
-                template_uuid=template_uuid,
-                name_label=f"hyrule-{vm_id}",
-                os_name=os_name,
-                size=VMSize(size),
-                cloud_init_config=cloud_config,
-                network_config=network_config,
-            )
-            
-            async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
-                if row:
-                    row.xcpng_uuid = xcpng_uuid
-                    await session.commit()
+            if xcpng_uuid is None:
+                name_label = f"hyrule-{vm_id}"
+                # XO may contain a clone whose create call completed before the
+                # process could durably store its UUID. It is not safe to adopt
+                # a possibly half-resized/half-started clone, so delete any
+                # untracked exact-label candidates and recreate cleanly.
+                stale_ids = await self.xcpng.find_vm_ids_by_name_label(name_label)
+                for stale_uuid in stale_ids:
+                    log.warning(
+                        "orphaned_vm_clone_replaced",
+                        vm_id=vm_id,
+                        xcpng_uuid=stale_uuid,
+                    )
+                    await self.xcpng.destroy_vm(stale_uuid)
+                xcpng_uuid = await self.xcpng.create_vm(
+                    template_uuid=template_uuid,
+                    name_label=name_label,
+                    os_name=os_name,
+                    size=VMSize(size),
+                    cloud_init_config=cloud_config,
+                    network_config=network_config,
+                )
+
+                async with self.db() as session:
+                    row = await session.get(VMRow, vm_id)
+                    if row:
+                        row.xcpng_uuid = xcpng_uuid
+                        await session.commit()
 
             # Wait for IPv6 (outside DB session to avoid long-held connections)
             ipv6 = await self._wait_for_ipv6(
@@ -436,6 +509,8 @@ class Orchestrator:
             )
 
             # Update DB with final state
+            custom_domain: str | None = None
+            custom_account_id: str | None = None
             async with self.db() as session:
                 row = await session.get(VMRow, vm_id)
                 if not row:
@@ -456,9 +531,28 @@ class Orchestrator:
                 row.metadata_ = meta
 
                 if row.domain_mode == DomainMode.CUSTOM and row.domain:
-                    await self._register_custom_domain(row)
+                    custom_domain = row.domain
+                    custom_account_id = row.owner_account_id
 
                 await session.commit()
+
+            # A DNS control-plane outage must not turn a healthy, paid VM into
+            # a refund. The VM is already READY; attachment is retryable and
+            # leaves the managed-domain lifecycle as the source of truth.
+            if custom_domain:
+                try:
+                    await self._register_custom_domain(
+                        vm_id=vm_id,
+                        domain=custom_domain,
+                        ipv6=ipv6,
+                        owner_account_id=custom_account_id,
+                    )
+                except Exception:
+                    log.exception(
+                        "custom_domain_attachment_failed",
+                        vm_id=vm_id,
+                        domain=custom_domain,
+                    )
 
             log.info("provision_complete", vm_id=vm_id, ipv6=ipv6)
 
@@ -673,9 +767,7 @@ class Orchestrator:
         async with self.db() as session:
             intent = (
                 await session.execute(
-                    select(CryptoIntentRow.intent_id)
-                    .where(CryptoIntentRow.vm_id == vm_id)
-                    .limit(1)
+                    select(CryptoIntentRow.intent_id).where(CryptoIntentRow.vm_id == vm_id).limit(1)
                 )
             ).scalar_one_or_none()
         if intent is None:
@@ -725,7 +817,11 @@ class Orchestrator:
             event = None
             if not already_owed:
                 event = self.refunds.build_owed_event(
-                    resource_path="/v1/vm/create",
+                    resource_path=(
+                        "/v1/domains/orders"
+                        if intent.resource_type == "domain_order"
+                        else "/v1/vm/create"
+                    ),
                     payer=intent_id,
                     amount=intent.amount_usd,
                     network="native",
@@ -736,6 +832,9 @@ class Orchestrator:
                     extra={
                         "intent_id": intent_id,
                         "native_deposit_address": intent.address,
+                        "native_refund_address": intent.refund_address,
+                        "resource_type": intent.resource_type,
+                        "resource_id": intent.resource_id,
                         "amount_received_crypto": (
                             str(intent.amount_received_crypto)
                             if intent.amount_received_crypto is not None
@@ -815,9 +914,7 @@ class Orchestrator:
         deadline = loop.time() + timeout_seconds
         while True:
             try:
-                _, writer = await asyncio.wait_for(
-                    asyncio.open_connection(ipv6, port), timeout=5
-                )
+                _, writer = await asyncio.wait_for(asyncio.open_connection(ipv6, port), timeout=5)
                 writer.close()
                 await writer.wait_closed()
                 return True
@@ -849,56 +946,17 @@ class Orchestrator:
             elapsed += interval
         return None
 
-    async def _register_custom_domain(self, row: VMRow) -> None:
-        if not row.domain or not row.ipv6:
-            return
-        parts = row.domain.rsplit(".", 1)
-        if len(parts) != 2:
-            raise ValueError(f"Invalid domain: {row.domain}")
-        name, extension = parts
-        op_result = await self.openprovider.register_domain(name, extension)
-        try:
-            await self.openprovider.create_zone(row.domain)
-        except Exception:
-            log.warning("zone_create_fallback", zone=row.domain)
-        await self.openprovider.create_zone_record(
-            zone_name=row.domain,
-            name="",
-            rtype="AAAA",
-            value=row.ipv6,
-            ttl=300,
-        )
-        raw_openprovider_id = (
-            op_result.get("id")
-            or op_result.get("domain", {}).get("id")
-            or op_result.get("data", {}).get("id")
-        )
-        try:
-            openprovider_id = int(raw_openprovider_id) if raw_openprovider_id is not None else None
-        except (TypeError, ValueError):
-            openprovider_id = None
-        async with self.db() as session:
-            existing = (
-                await session.execute(select(DomainRow).where(DomainRow.fqdn == row.domain))
-            ).scalar_one_or_none()
-            if existing is None:
-                session.add(
-                    DomainRow(
-                        name=name,
-                        extension=extension,
-                        fqdn=row.domain,
-                        vm_id=row.vm_id,
-                        owner_wallet=row.owner_wallet,
-                        owner_account_id=row.owner_account_id,
-                        status=DomainStatus.ACTIVE,
-                        openprovider_id=openprovider_id,
-                    )
-                )
-            else:
-                existing.vm_id = row.vm_id
-                existing.status = DomainStatus.ACTIVE
-                existing.openprovider_id = openprovider_id
-            await session.commit()
+    async def _register_custom_domain(
+        self,
+        *,
+        vm_id: str,
+        domain: str,
+        ipv6: str,
+        owner_account_id: str | None,
+    ) -> None:
+        if self.domains is None or owner_account_id is None:
+            raise ValueError("custom domains require an authenticated managed-domain account")
+        await self.domains.attach_vm(owner_account_id, domain, vm_id, ipv6)
 
     # --- VM Management ---
 
@@ -915,9 +973,7 @@ class Orchestrator:
 
     async def get_quote_for_vm(self, vm_id: str) -> VMQuoteRow | None:
         async with self.db() as session:
-            result = await session.execute(
-                select(VMQuoteRow).where(VMQuoteRow.vm_id == vm_id)
-            )
+            result = await session.execute(select(VMQuoteRow).where(VMQuoteRow.vm_id == vm_id))
             return result.scalar_one_or_none()
 
     async def extend_vm(self, vm_id: str, days: int) -> VMRow | None:
@@ -929,18 +985,18 @@ class Orchestrator:
             now = _now()
             base = max(row.expires_at, now)
             row.expires_at = base + timedelta(days=days)
-            
-            suspend_status = (row.status == VMStatus.SUSPENDED)
+
+            suspend_status = row.status == VMStatus.SUSPENDED
             xcpng_uuid = row.xcpng_uuid
 
             await session.commit()
             await session.refresh(row)
-            
+
         if suspend_status and xcpng_uuid:
             power = await self.xcpng.get_vm_power_state(xcpng_uuid)
             if power == "Halted":
                 await self.xcpng.start_vm(xcpng_uuid)
-                
+
             async with self.db() as session:
                 row = await session.get(VMRow, vm_id)
                 if row:
@@ -961,7 +1017,7 @@ class Orchestrator:
             if not row or not row.xcpng_uuid:
                 return False
             xcpng_uuid = row.xcpng_uuid
-            
+
         await self.xcpng.reboot_vm(xcpng_uuid)
         return True
 
@@ -975,6 +1031,7 @@ class Orchestrator:
             status = str(row.status)
             domain_mode = row.domain_mode
             domain = row.domain
+            owner_account_id = row.owner_account_id
 
         # Track whether every user of the deterministic ::2 address is
         # verifiably gone; the /64 is only released when they are. A
@@ -1000,9 +1057,9 @@ class Orchestrator:
 
         if domain_mode == DomainMode.CUSTOM and domain:
             try:
-                await self.openprovider.delete_zone_record(
-                    zone_name=domain, name="", rtype="AAAA"
-                )
+                if self.domains is None or owner_account_id is None:
+                    raise RuntimeError("managed-domain cleanup is unavailable for this VM")
+                await self.domains.detach_vm(owner_account_id, domain, vm_id)
             except Exception:
                 log.warning(
                     "custom_domain_dns_cleanup_failed",
@@ -1065,12 +1122,14 @@ class Orchestrator:
             )
             expired_vms = []
             for r in result.scalars().all():
-                expired_vms.append({
-                    "vm_id": r.vm_id,
-                    "expires_at": r.expires_at,
-                    "status": r.status,
-                    "xcpng_uuid": r.xcpng_uuid
-                })
+                expired_vms.append(
+                    {
+                        "vm_id": r.vm_id,
+                        "expires_at": r.expires_at,
+                        "status": r.status,
+                        "xcpng_uuid": r.xcpng_uuid,
+                    }
+                )
 
         for vm in expired_vms:
             if not vm["expires_at"]:

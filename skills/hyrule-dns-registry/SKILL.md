@@ -13,8 +13,8 @@ RDAP, WHOIS, registrar/delegation, or record-publication guidance.
 - `/v1/dns` is read-only DNS diagnostics and recommendations.
 - `/v1/rdap` is structured registry lookup.
 - `/v1/whois` is legacy WHOIS lookup.
-- `/v1/domain` registers domains.
-- `/v1/zone` mutates authoritative DNS records.
+- `/v1/domains` provides account-owned registration, renewal, and managed DNS.
+- `/v1/domains/{domain}/dns/changesets` mutates authoritative DNS records.
 
 This Skill must not mutate zones or register domains.
 
@@ -74,5 +74,5 @@ Use DNS propagation when a customer says a recent change is visible in one
 place but not another. Use RDAP/WHOIS when registrar, registry, expiration,
 allocation, abuse contact, or nameserver delegation ownership matters. Use
 record recommendations to explain what the customer should publish, but do not
-publish records unless the agent intentionally calls `/v1/zone` with the
-customer's authorization.
+publish records unless the agent intentionally calls the revision-checked
+`/v1/domains/{domain}/dns/changesets` endpoint with the customer's authorization.

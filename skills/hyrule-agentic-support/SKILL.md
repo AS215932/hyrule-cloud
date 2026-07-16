@@ -50,8 +50,7 @@ AS215932-backed external vantage data.
 
 ## Product boundaries
 
-- Domain sales: `/v1/domain`
-- Authoritative DNS mutation: `/v1/zone`
+- Domain sales and authoritative DNS mutation: `/v1/domains`
 - Recursive/read-only DNS diagnostics: `/v1/dns`
 - Mail deliverability diagnostics: `/v1/mx`
 - BGP/routing intelligence: `/v1/bgp`

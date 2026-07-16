@@ -24,6 +24,8 @@ log = structlog.get_logger()
 # prefixes are disjoint.
 _SERVICE_GROUPS: tuple[tuple[str, str], ...] = (
     ("/v1/vm", "vm"),
+    ("/v1/domains", "domain"),
+    # Historic rows retain their original retired resource paths.
     ("/v1/domain", "domain"),
     ("/v1/zone", "domain"),
     ("/v1/network", "network_proxy"),

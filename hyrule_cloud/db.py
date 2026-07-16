@@ -14,10 +14,17 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
-from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncAttrs,
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # Portable JSON: PG gets ARRAY(Integer) / JSONB for performance; SQLite (tests
@@ -169,9 +176,260 @@ class DomainRow(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     payment_tx: Mapped[str | None] = mapped_column(String(128))
 
+    # Managed-domain v1 lifecycle. The registrar remains OpenProvider while
+    # authoritative records live on Hyrule's Knot pair.
+    provider_status: Mapped[str | None] = mapped_column(String(32))
+    provider_operation_id: Mapped[str | None] = mapped_column(String(128))
+    nameserver_mode: Mapped[str] = mapped_column(
+        String(16), default="managed", server_default="managed"
+    )
+    nameservers: Mapped[list] = mapped_column(_JSONB, default=list)
+    dnssec_mode: Mapped[str] = mapped_column(
+        String(16), default="managed", server_default="managed"
+    )
+    dnssec_status: Mapped[str] = mapped_column(
+        String(32), default="pending", server_default="pending"
+    )
+    ds_records: Mapped[list] = mapped_column(_JSONB, default=list)
+    zone_revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    can_renew: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    transferred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
     __table_args__ = (
         Index("ix_domains_status", "status"),
     )
+
+
+class DomainTLDRow(Base):
+    """Cached intersection of OpenProvider and IANA TLD metadata."""
+
+    __tablename__ = "domain_tlds"
+
+    tld: Mapped[str] = mapped_column(String(63), primary_key=True)
+    iana_type: Mapped[str | None] = mapped_column(String(32), index=True)
+    provider_status: Mapped[str | None] = mapped_column(String(32))
+    eligible: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    ineligible_reason: Mapped[str | None] = mapped_column(String(128))
+    registration_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    renewal_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    currency: Mapped[str | None] = mapped_column(String(8))
+    metadata_: Mapped[dict | None] = mapped_column("metadata", _JSONB)
+    refreshed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class DomainQuoteRow(Base):
+    __tablename__ = "domain_quotes"
+
+    quote_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    fqdn: Mapped[str] = mapped_column(String(253), index=True)
+    action: Mapped[str] = mapped_column(String(16), index=True)
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    provider_cost: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    provider_currency: Mapped[str] = mapped_column(String(8))
+    fx_rate: Mapped[Decimal] = mapped_column(Numeric(20, 10))
+    provider_cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    hyrule_fee_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    tax_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+    total_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    available: Mapped[bool] = mapped_column(Boolean)
+    premium: Mapped[bool] = mapped_column(Boolean, default=False)
+    provider_snapshot: Mapped[dict | None] = mapped_column(_JSONB)
+    terms_version: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DomainOrderRow(Base):
+    __tablename__ = "domain_orders"
+
+    order_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    quote_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("domain_quotes.quote_id", ondelete="RESTRICT"), index=True
+    )
+    fqdn: Mapped[str] = mapped_column(String(253), index=True)
+    action: Mapped[str] = mapped_column(String(16), index=True)
+    owner_account_id: Mapped[str] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="RESTRICT"), index=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32), default="awaiting_payment", index=True)
+    amount_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    domain_amount_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    vm_amount_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+    payment_method: Mapped[str] = mapped_column(String(8))
+    payment_network: Mapped[str | None] = mapped_column(String(64))
+    payment_asset: Mapped[str | None] = mapped_column(String(16))
+    payer: Mapped[str | None] = mapped_column(String(128))
+    payment_tx: Mapped[str | None] = mapped_column(String(128), index=True)
+    refund_address: Mapped[str | None] = mapped_column(String(128))
+    native_intent_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("crypto_intents.intent_id", ondelete="SET NULL"), index=True
+    )
+    operation_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    provider_domain_id: Mapped[int | None] = mapped_column(Integer)
+    provider_status: Mapped[str | None] = mapped_column(String(32))
+    provider_response: Mapped[dict | None] = mapped_column(_JSONB)
+    vm_quote_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    vm_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    on_domain_failure: Mapped[str] = mapped_column(
+        String(24), default="keep_vm", server_default="keep_vm"
+    )
+    terms_version: Mapped[str] = mapped_column(String(64))
+    terms_accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_account_id", "idempotency_key", name="uq_domain_orders_account_idempotency"
+        ),
+    )
+
+
+class DomainOperationRow(Base):
+    __tablename__ = "domain_operations"
+
+    operation_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    fqdn: Mapped[str] = mapped_column(String(253), index=True)
+    owner_account_id: Mapped[str] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="CASCADE"), index=True
+    )
+    order_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("domain_orders.order_id", ondelete="SET NULL"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    request_payload: Mapped[dict | None] = mapped_column(_JSONB)
+    result_payload: Mapped[dict | None] = mapped_column(_JSONB)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    secret_ciphertext: Mapped[str | None] = mapped_column(Text)
+    secret_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    secret_revealed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DomainDNSRecordRow(Base):
+    __tablename__ = "domain_dns_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    fqdn: Mapped[str] = mapped_column(
+        String(253), ForeignKey("domains.fqdn", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(253))
+    type: Mapped[str] = mapped_column(String(16))
+    ttl: Mapped[int] = mapped_column(Integer)
+    values: Mapped[list] = mapped_column(_JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("fqdn", "name", "type", name="uq_domain_dns_rrset"),
+    )
+
+
+class DomainIdempotencyRow(Base):
+    """Stored response for synchronous, account-scoped domain mutations."""
+
+    __tablename__ = "domain_idempotency"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_account_id: Mapped[str] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(64))
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    response_payload: Mapped[dict] = mapped_column(_JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_account_id",
+            "kind",
+            "idempotency_key",
+            name="uq_domain_idempotency_account_kind_key",
+        ),
+    )
+
+
+class DomainJobRow(Base):
+    __tablename__ = "domain_jobs"
+
+    job_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    resource_id: Mapped[str] = mapped_column(String(64), index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(160), unique=True)
+    payload: Mapped[dict | None] = mapped_column(_JSONB)
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    locked_by: Mapped[str | None] = mapped_column(String(128))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AccountWalletRow(Base):
+    __tablename__ = "account_wallets"
+
+    wallet_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    account_id: Mapped[str] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="CASCADE"), unique=True, index=True
+    )
+    address: Mapped[str] = mapped_column(String(42), unique=True, index=True)
+    chain_id: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WalletChallengeRow(Base):
+    __tablename__ = "wallet_challenges"
+
+    nonce: Mapped[str] = mapped_column(String(64), primary_key=True)
+    action: Mapped[str] = mapped_column(String(24), index=True)
+    address: Mapped[str] = mapped_column(String(42), index=True)
+    chain_id: Mapped[int] = mapped_column(Integer)
+    account_id: Mapped[str | None] = mapped_column(String(11), index=True)
+    resource: Mapped[str | None] = mapped_column(String(253), index=True)
+    message: Mapped[str] = mapped_column(Text)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OpenproviderWebhookRow(Base):
+    __tablename__ = "openprovider_webhooks"
+
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    event_type: Mapped[str | None] = mapped_column(String(64), index=True)
+    payload: Mapped[dict] = mapped_column(_JSONB)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class VPNTunnelRow(Base):
@@ -249,6 +507,12 @@ class CryptoIntentRow(Base):
     # The next successful GET /v1/intent/{id} returns this AND nulls the column,
     # mirroring the A0 anon-checkout reveal pattern. Sha256 lives on VMRow.
     anon_token_cleartext: Mapped[str | None] = mapped_column(String(64))
+    # Generic resource binding. Legacy rows default to VM; domain orders use
+    # the same monitored receive-address machinery without pretending to be a
+    # VM payload.
+    resource_type: Mapped[str] = mapped_column(String(32), default="vm", server_default="vm")
+    resource_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    refund_address: Mapped[str | None] = mapped_column(String(128))
 
     __table_args__ = (
         Index("ix_crypto_intents_status_expires", "status", "expires_at"),
@@ -596,7 +860,7 @@ class MailQuarantineRow(Base):
 # --- Session factory ---
 
 
-def create_db_engine(database_url: str):
+def create_db_engine(database_url: str) -> AsyncEngine:
     """
     Create an async SQLAlchemy engine.
 
@@ -611,11 +875,11 @@ def create_db_engine(database_url: str):
     )
 
 
-def create_session_factory(engine):
+def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
-async def init_db(engine) -> None:
+async def init_db(engine: AsyncEngine) -> None:
     """Create all tables. Use Alembic migrations in production."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

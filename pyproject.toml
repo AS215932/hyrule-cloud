@@ -57,6 +57,7 @@ dev = [
 
 [project.scripts]
 hyrule-mcp = "hyrule_cloud.mcp_server:main"
+hyrule-cloud-worker = "hyrule_cloud.worker:main"
 
 [tool.setuptools.packages.find]
 include = ["hyrule_cloud*"]

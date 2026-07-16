@@ -36,7 +36,7 @@ async def get_dns_capabilities() -> ProductCapabilityResponse:
     return ProductCapabilityResponse(
         service="dns",
         purpose="Read-only recursive DNS lookup, reverse lookup, trace, DNSSEC, resolver, and zone health diagnostics.",
-        separation_of_concerns="/v1/dns never registers domains and never mutates authoritative zone records; use /v1/domain and /v1/zone for those workflows.",
+        separation_of_concerns="/v1/dns never registers domains and never mutates authoritative zone records; use /v1/domains for those workflows.",
         free_endpoints=[
             CapabilityEndpoint(path="/v1/dns/capabilities", method="GET", description="DNS lookup capabilities"),
             CapabilityEndpoint(path="/v1/dns/record-types", method="GET", description="Supported DNS lookup record types"),

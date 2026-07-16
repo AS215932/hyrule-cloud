@@ -14,12 +14,13 @@ Usage
   export CANARY_KEY=0x<private key of a funded Base wallet (USDC + gas)>
   # optional: export HYRULE_API_URL=https://cloud.hyrule.host
   # optional (vm): export SSH_PUBKEY="ssh-ed25519 AAAA... you@host"
+  # domain: export HYRULE_API_KEY=<account key with domain purchase/read/dns scopes>
 
   python x402_canary.py list                 # show tests + prices, no spend
   python x402_canary.py dns                  # cheapest first live spend ($0.001)
   python x402_canary.py intel                # every network-intel probe (~$0.06)
   python x402_canary.py proxy                # direct + tor network requests
-  python x402_canary.py domain --name mytest12345   # REAL registration ($6)
+  python x402_canary.py domain --name mytest12345   # REAL account-owned registration
   python x402_canary.py vm                   # provision a real VM + print SSH target
   python x402_canary.py vm --quote --destroy # via the locked-quote flow, then tear down
   python x402_canary.py path-report          # gated probe: run by name once a prober is live
@@ -58,37 +59,144 @@ SSH_PUBKEY = os.environ.get("SSH_PUBKEY", "")
 # discovery examples so they hit a real backend.
 TESTS: dict[str, dict] = {
     # --- 3a network-intel ---
-    "dns":       {"path": "/v1/dns/lookup",  "body": {"name": "example.com", "type": "AAAA"}, "usd": "0.001", "group": "intel"},
-    "ip":        {"path": "/v1/ip/lookup",   "body": {"address": "2a0c:b641:b50::1"}, "usd": "0.003", "group": "intel"},
-    "bgp":       {"path": "/v1/bgp/lookup",  "body": {"subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"}}, "usd": "0.005", "group": "intel"},
-    "rdap":      {"path": "/v1/rdap/lookup", "body": {"subject": {"type": "domain", "value": "example.com"}}, "usd": "0.003", "group": "intel"},
-    "whois":     {"path": "/v1/whois/lookup","body": {"subject": {"type": "domain", "value": "example.com"}}, "usd": "0.005", "group": "intel"},
-    "web":       {"path": "/v1/web/check",   "body": {"target": "https://example.com"}, "usd": "0.005", "group": "intel"},
-    "web-tls":   {"path": "/v1/web/tls/deep","body": {"host": "example.com"}, "usd": "0.10", "group": "intel"},
-    "mx":        {"path": "/v1/mx/check",    "body": {"tool": "mx", "target": "example.com"}, "usd": "0.005", "group": "intel"},
-    "path":      {"path": "/v1/path/ping",   "body": {"target": "example.com", "vantages": ["extmon", "as215932", "globalping"]}, "usd": "0.005", "group": "intel"},
+    "dns": {
+        "path": "/v1/dns/lookup",
+        "body": {"name": "example.com", "type": "AAAA"},
+        "usd": "0.001",
+        "group": "intel",
+    },
+    "ip": {
+        "path": "/v1/ip/lookup",
+        "body": {"address": "2a0c:b641:b50::1"},
+        "usd": "0.003",
+        "group": "intel",
+    },
+    "bgp": {
+        "path": "/v1/bgp/lookup",
+        "body": {"subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"}},
+        "usd": "0.005",
+        "group": "intel",
+    },
+    "rdap": {
+        "path": "/v1/rdap/lookup",
+        "body": {"subject": {"type": "domain", "value": "example.com"}},
+        "usd": "0.003",
+        "group": "intel",
+    },
+    "whois": {
+        "path": "/v1/whois/lookup",
+        "body": {"subject": {"type": "domain", "value": "example.com"}},
+        "usd": "0.005",
+        "group": "intel",
+    },
+    "web": {
+        "path": "/v1/web/check",
+        "body": {"target": "https://example.com"},
+        "usd": "0.005",
+        "group": "intel",
+    },
+    "web-tls": {
+        "path": "/v1/web/tls/deep",
+        "body": {"host": "example.com"},
+        "usd": "0.10",
+        "group": "intel",
+    },
+    "mx": {
+        "path": "/v1/mx/check",
+        "body": {"tool": "mx", "target": "example.com"},
+        "usd": "0.005",
+        "group": "intel",
+    },
+    "path": {
+        "path": "/v1/path/ping",
+        "body": {"target": "example.com", "vantages": ["extmon", "as215932", "globalping"]},
+        "usd": "0.005",
+        "group": "intel",
+    },
     # /v1/path/report (Phase-3a path evidence) uses the endpoint's default
     # vantage set so it actually probes once a vantage (Globalping/RIPE Atlas) is
     # configured. Until then it returns 501 before charging (PR #42), which the
     # sweep treats as "not launched yet, skipped" rather than a failure — so the
     # runbook's required paid /v1/path/report call is validated the moment a
     # prober goes live, without failing the pre-launch sweep.
-    "path-report": {"path": "/v1/path/report", "body": {"target": "example.com", "vantages": ["extmon", "as215932", "globalping"], "checks": ["ping", "traceroute"]}, "usd": "0.05", "group": "intel"},
-    "ports":     {"path": "/v1/ports/check", "body": {"target": "example.com", "port": 443}, "usd": "0.003", "group": "intel"},
-    "nat":       {"path": "/v1/nat/lookup",  "body": {"customer_reported_wan_ip": "100.64.1.1"}, "usd": "0.003", "group": "intel"},
-    "threat":    {"path": "/v1/threat/lookup","body": {"subject": {"type": "domain", "value": "example.com"}}, "usd": "0.01", "group": "intel"},
-    "voip":      {"path": "/v1/voip/check",  "body": {"target": "sip.example.com"}, "usd": "0.01", "group": "intel"},
-    "voipnum":   {"path": "/v1/voip/number/lookup", "body": {"number": "+31201234567"}, "usd": "0.05", "group": "intel"},
+    "path-report": {
+        "path": "/v1/path/report",
+        "body": {
+            "target": "example.com",
+            "vantages": ["extmon", "as215932", "globalping"],
+            "checks": ["ping", "traceroute"],
+        },
+        "usd": "0.05",
+        "group": "intel",
+    },
+    "ports": {
+        "path": "/v1/ports/check",
+        "body": {"target": "example.com", "port": 443},
+        "usd": "0.003",
+        "group": "intel",
+    },
+    "nat": {
+        "path": "/v1/nat/lookup",
+        "body": {"customer_reported_wan_ip": "100.64.1.1"},
+        "usd": "0.003",
+        "group": "intel",
+    },
+    "threat": {
+        "path": "/v1/threat/lookup",
+        "body": {"subject": {"type": "domain", "value": "example.com"}},
+        "usd": "0.01",
+        "group": "intel",
+    },
+    "voip": {
+        "path": "/v1/voip/check",
+        "body": {"target": "sip.example.com"},
+        "usd": "0.01",
+        "group": "intel",
+    },
+    "voipnum": {
+        "path": "/v1/voip/number/lookup",
+        "body": {"number": "+31201234567"},
+        "usd": "0.05",
+        "group": "intel",
+    },
     # --- 3b network proxy ---
-    "proxy-direct": {"path": "/v1/network/request", "body": {"url": "https://example.com", "method": "GET", "proxy_mode": "direct"}, "usd": "0.01", "group": "proxy"},
-    "proxy-tor":    {"path": "/v1/network/request", "body": {"url": "https://example.com", "method": "GET", "proxy_mode": "tor"}, "usd": "0.05", "group": "proxy"},
+    "proxy-direct": {
+        "path": "/v1/network/request",
+        "body": {"url": "https://example.com", "method": "GET", "proxy_mode": "direct"},
+        "usd": "0.01",
+        "group": "proxy",
+    },
+    "proxy-tor": {
+        "path": "/v1/network/request",
+        "body": {"url": "https://example.com", "method": "GET", "proxy_mode": "tor"},
+        "usd": "0.05",
+        "group": "proxy",
+    },
     # --- 3c domain (REAL registration, side effects) ---
-    # /v1/domain/register prices dynamically from Openprovider at request time
-    # (registrar fee + markup, ~$10 fallback), so the cap is set generously; the
-    # operator still confirms the actual spend interactively before it runs.
-    "domain":    {"path": "/v1/domain/register", "body": {"name": None, "extension": "dev", "duration_years": 1}, "usd": "15.00", "group": "domain", "spendy": True},
+    # The dedicated runner performs check -> quote -> authenticated x402 order
+    # -> durable poll -> revisioned managed-DNS write -> public resolution.
+    "domain": {
+        "path": "/v1/domains/orders",
+        "body": {},
+        "usd": "15.00",
+        "group": "domain",
+        "spendy": True,
+    },
     # --- 3d VM (provisions a real VM) ---
-    "vm":        {"path": "/v1/vm/create", "body": {"duration_days": 1, "size": "xs", "os": "debian-13", "ssh_pubkey": None, "domain_mode": "auto", "open_ports": [80, 443]}, "usd": "0.05", "group": "vm", "spendy": True},
+    "vm": {
+        "path": "/v1/vm/create",
+        "body": {
+            "duration_days": 1,
+            "size": "xs",
+            "os": "debian-13",
+            "ssh_pubkey": None,
+            "domain_mode": "auto",
+            "open_ports": [80, 443],
+        },
+        "usd": "0.05",
+        "group": "vm",
+        "spendy": True,
+    },
 }
 
 
@@ -133,35 +241,45 @@ def _settlement(resp: httpx.Response) -> tuple[bool, str]:
         return False, f"(settlement header present but undecodable: {e}) raw={raw[:80]}"
 
 
-async def _domain_check_price(name: str, extension: str) -> Decimal | None:
-    """GET /v1/domain/check (free) for the REAL registration price, so the
-    payment cap tracks the actual quote instead of a generous static guess.
-    Returns the total (registrar + markup) USD when available, else None."""
+async def _create_domain_quote(fqdn: str) -> dict | None:
+    """Check availability and create the exact 15-minute registration quote."""
     async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
         try:
-            r = await http.get("/v1/domain/check", params={"name": name, "extension": extension})
+            check = await http.get("/v1/domains/check", params={"domain": fqdn})
         except Exception as e:
-            print(f"    !! /v1/domain/check failed: {e!r}")
+            print(f"    !! /v1/domains/check failed: {e!r}")
             return None
-    if r.status_code >= 400:
-        print(f"    !! /v1/domain/check HTTP {r.status_code} {r.text[:200]}")
+        if check.status_code >= 400:
+            print(f"    !! /v1/domains/check HTTP {check.status_code} {check.text[:200]}")
+            return None
+        check_data = check.json()
+        if not check_data.get("eligible") or not check_data.get("available"):
+            print(f"    !! {fqdn} is not eligible and available for registration.")
+            return None
+        try:
+            quote = await http.post(
+                "/v1/domains/quotes",
+                json={"domain": fqdn, "action": "register"},
+            )
+        except Exception as e:
+            print(f"    !! /v1/domains/quotes failed: {e!r}")
+            return None
+    if quote.status_code >= 400:
+        print(f"    !! /v1/domains/quotes HTTP {quote.status_code} {quote.text[:200]}")
         return None
-    data = r.json()
-    if not data.get("available"):
-        print(f"    !! {name}.{extension} is not available for registration.")
+    data = quote.json()
+    if not data.get("quote_id") or not data.get("terms_version"):
+        print(f"    !! domain quote omitted required fields: {quote.text[:200]}")
         return None
-    total = data.get("total") or data.get("price")
-    if total is None:
-        print("    !! /v1/domain/check returned no price to cap against.")
-        return None
-    try:
-        return Decimal(str(total))
-    except (ArithmeticError, ValueError):
-        return None
+    return data
 
 
-async def _run_one(name: str, *, destroy: bool, domain_name: str | None, use_quote: bool, yes: bool) -> bool:
+async def _run_one(
+    name: str, *, destroy: bool, domain_name: str | None, use_quote: bool, yes: bool
+) -> bool:
     t = TESTS[name]
+    if name == "domain":
+        return await _run_domain(domain_name)
     body = json.loads(json.dumps(t["body"]))  # deep copy
     quote_id: str | None = None
     if name == "vm":
@@ -176,27 +294,6 @@ async def _run_one(name: str, *, destroy: bool, domain_name: str | None, use_quo
                 return False
             body["quote_id"] = quote_id
     cap_usd = t["usd"]
-    if name == "domain":
-        if not domain_name:
-            sys.exit("ERROR: domain test needs --name <label> (registers <label>.dev for REAL money).")
-        body["name"] = domain_name
-        # /v1/domain/register is dynamically priced, so cap on the ACTUAL quote
-        # from /v1/domain/check rather than a static guess — otherwise a
-        # malformed/higher registrar price could still be auto-signed up to the
-        # generous static cap.
-        extension = body.get("extension", "dev")
-        price = await _domain_check_price(domain_name, extension)
-        if price is None:
-            print("    !! /v1/domain/check gave no available price; refusing to sign blind. FAILING.")
-            return False
-        ceiling = Decimal(t["usd"])
-        if price > ceiling:
-            print(f"    !! domain price ${price} exceeds the ${ceiling} canary ceiling; "
-                  "refusing to overspend. FAILING.")
-            return False
-        cap_usd = str(price)
-        print(f"    /v1/domain/check price: ${price} (cap set to this, not the ${ceiling} default)")
-
     print(f"\n=== {name}  POST {t['path']}  (~${cap_usd})  cap={_cap_units(cap_usd)} units ===")
     if quote_id:
         print(f"    quote_id: {quote_id}")
@@ -232,9 +329,6 @@ async def _run_one(name: str, *, destroy: bool, domain_name: str | None, use_quo
         # gate isn't passed until the VM reaches ready AND its launch-proof
         # (SSH smoke + DNS AAAA) verifies. Propagate that.
         return await _poll_and_report_vm(r, destroy=destroy, yes=yes)
-    if name == "domain":
-        # Phase-3c gate is register -> zone-record write -> public resolve.
-        return await _zone_write_after_register(r, domain_name)
     return True
 
 
@@ -256,41 +350,153 @@ async def _create_quote(order_payload: dict) -> str | None:
     return quote_id
 
 
-async def _zone_write_after_register(reg_resp: httpx.Response, domain_name: str | None) -> bool:
-    """After a real registration, write one AAAA record and poll public DNS
-    until it resolves — the full Phase-3c gate (register -> zone write -> public
-    resolution). Returns False if the record never resolves."""
-    data = reg_resp.json()
-    zone = data.get("domain") or (f"{domain_name}.dev" if domain_name else None)
-    token = data.get("management_token")
-    if not zone or not token:
-        print("    !! registration response lacked domain/management_token — cannot write zone record.")
+async def _run_domain(domain_name: str | None) -> bool:
+    """Run the account-owned managed-domain contract end to end."""
+    if not domain_name:
+        sys.exit("ERROR: domain test needs --name <label> (registers <label>.dev for REAL money).")
+    api_key = os.environ.get("HYRULE_API_KEY")
+    if not api_key:
+        sys.exit(
+            "ERROR: set HYRULE_API_KEY to an account key with "
+            "domain:purchase, domain:read, and domain:dns scopes."
+        )
+    fqdn = f"{domain_name}.dev"
+    quote = await _create_domain_quote(fqdn)
+    if quote is None:
+        print("    !! no payable domain quote; refusing to sign blind. FAILING.")
         return False
-    record = {"type": "AAAA", "name": "canary", "value": "2a0c:b641:b50::1", "ttl": 300}
-    print(f"    --- writing AAAA canary.{zone} -> {record['value']} ---")
+    try:
+        price = Decimal(str(quote["price"]["total_usd"]))
+    except (KeyError, TypeError, ArithmeticError, ValueError):
+        print("    !! domain quote has no valid total_usd; refusing to sign. FAILING.")
+        return False
+    ceiling = Decimal(TESTS["domain"]["usd"])
+    if price > ceiling:
+        print(
+            f"    !! domain price ${price} exceeds the ${ceiling} canary ceiling; "
+            "refusing to overspend. FAILING."
+        )
+        return False
+    body = {
+        "quote_id": quote["quote_id"],
+        "payment_method": "usdc",
+        "terms_version": quote["terms_version"],
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Idempotency-Key": f"canary-domain-{quote['quote_id']}",
+    }
+    print(
+        f"\n=== domain  POST /v1/domains/orders  (${price})  cap={_cap_units(str(price))} units ==="
+    )
+    print(f"    domain: {fqdn}  quote_id: {quote['quote_id']}")
+    client = _client(str(price))
+    async with x402HttpxClient(client, base_url=API, timeout=60.0) as http:
+        try:
+            response = await http.post("/v1/domains/orders", json=body, headers=headers)
+        except Exception as e:
+            print(f"    !! domain order failed: {e!r}")
+            return False
+    settled_ok, settlement = _settlement(response)
+    print(f"    HTTP {response.status_code}   {settlement}")
+    print(f"    body: {response.text[:600]}")
+    if response.status_code >= 400 or not settled_ok:
+        print("    !! domain order was not accepted with a successful settlement. FAILING.")
+        return False
+    order_id = response.json().get("order_id")
+    if not order_id:
+        print("    !! domain order response omitted order_id. FAILING.")
+        return False
+    return await _poll_domain_order(str(order_id), fqdn, api_key)
+
+
+async def _poll_domain_order(order_id: str, fqdn: str, api_key: str) -> bool:
+    """Wait for durable registrar/DNS fulfillment before mutating the zone."""
+    headers = {"Authorization": f"Bearer {api_key}"}
+    previous: str | None = None
+    async with httpx.AsyncClient(base_url=API, timeout=30.0, headers=headers) as http:
+        for attempt in range(120):  # up to ten minutes
+            if attempt:
+                await asyncio.sleep(5)
+            try:
+                response = await http.get(f"/v1/domains/orders/{order_id}")
+            except Exception as e:
+                print(f"    [{attempt}] order poll error: {e!r}")
+                continue
+            if response.status_code >= 400:
+                print(
+                    f"    [{attempt}] order poll HTTP {response.status_code}: {response.text[:200]}"
+                )
+                continue
+            data = response.json()
+            status = str(data.get("status") or "unknown")
+            if status != previous:
+                print(f"    [{attempt}] domain order status={status}")
+                previous = status
+            if status == "active":
+                return await _write_domain_dns(fqdn, api_key)
+            if status in {"refund_due", "refunded", "failed", "cancelled", "expired"}:
+                print(
+                    f"    !! domain order reached terminal status={status}: "
+                    f"{data.get('error_code')}; FAILING."
+                )
+                return False
+    print(
+        "    !! domain order did not become active within ten minutes; "
+        "leave it for reconciliation and do not repurchase. FAILING."
+    )
+    return False
+
+
+async def _write_domain_dns(zone: str, api_key: str) -> bool:
+    """Write one revision-checked AAAA RRset, then verify public DNS."""
+    record = {
+        "action": "upsert",
+        "rrset": {
+            "type": "AAAA",
+            "name": "canary",
+            "values": ["2a0c:b641:b50::1"],
+            "ttl": 300,
+        },
+    }
+    auth = {"Authorization": f"Bearer {api_key}"}
+    print(f"    --- writing AAAA canary.{zone} -> {record['rrset']['values'][0]} ---")
     async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
         try:
+            current = await http.get(f"/v1/domains/{zone}/dns", headers=auth)
+            if current.status_code >= 400:
+                print(f"    !! DNS read HTTP {current.status_code}: {current.text[:200]}")
+                return False
+            revision = current.json().get("revision")
+            if not isinstance(revision, int):
+                print("    !! DNS response omitted numeric revision. FAILING.")
+                return False
             resp = await http.post(
-                "/v1/zone/record",
-                params={"zone": zone},
-                json=record,
-                headers={"Authorization": f"Bearer {token}"},
+                f"/v1/domains/{zone}/dns/changesets",
+                json={"changes": [record]},
+                headers={
+                    **auth,
+                    "If-Match": str(revision),
+                    "Idempotency-Key": f"canary-dns-{zone}-{revision}",
+                },
             )
         except Exception as e:
-            print(f"    !! zone-record request failed: {e!r}")
+            print(f"    !! managed-DNS request failed: {e!r}")
             return False
-    print(f"    zone-record -> HTTP {resp.status_code} {resp.text[:200]}")
+    print(f"    DNS changeset -> HTTP {resp.status_code} {resp.text[:200]}")
     if resp.status_code >= 400:
         return False
     fqdn = f"canary.{zone}"
-    print(f"    --- polling public DNS for {fqdn} AAAA {record['value']} ---")
-    if await _resolve_aaaa(fqdn, record["value"], zone):
-        print(f"    ✅ {fqdn} resolves to {record['value']}")
+    expected = record["rrset"]["values"][0]
+    print(f"    --- polling public DNS for {fqdn} AAAA {expected} ---")
+    if await _resolve_aaaa(fqdn, expected, zone):
+        print(f"    ✅ {fqdn} resolves to {expected}")
         return True
     # The Phase-3c gate requires public resolution, not just a 2xx write — a
     # broken delegation or propagation failure must fail the canary.
-    print(f"    !! {fqdn} did not resolve to {record['value']} in time "
-          "(delegation/propagation?); FAILING.")
+    print(
+        f"    !! {fqdn} did not resolve to {expected} in time (delegation/propagation?); FAILING."
+    )
     return False
 
 
@@ -388,16 +594,22 @@ async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool, yes
                 ssh_smoke = sj.get("ssh_smoke_status")
                 proof_ok = dns_ok and ssh_smoke == "passed"
                 icon = "✅" if proof_ok else "⚠️"
-                print(f"\n    {icon} VM {st.upper()} — launch-proof: "
-                      f"ssh_smoke_status={ssh_smoke} dns_aaaa_verified={dns_ok}")
+                print(
+                    f"\n    {icon} VM {st.upper()} — launch-proof: "
+                    f"ssh_smoke_status={ssh_smoke} dns_aaaa_verified={dns_ok}"
+                )
                 print("       manually verify over IPv6:")
                 print(f"        ssh root@{host or ipv6}")
                 if mgmt_token:
                     print(f"        management: {API}/v1/vm/{vm_id}?token={mgmt_token}")
-                    print(f"        destroy:    curl -X DELETE {API}/v1/vm/{vm_id} "
-                          f"-H 'Authorization: Bearer {mgmt_token}'")
+                    print(
+                        f"        destroy:    curl -X DELETE {API}/v1/vm/{vm_id} "
+                        f"-H 'Authorization: Bearer {mgmt_token}'"
+                    )
                 if not proof_ok:
-                    print("    !! launch-proof did NOT verify (ssh smoke / DNS AAAA); FAILING gate.")
+                    print(
+                        "    !! launch-proof did NOT verify (ssh smoke / DNS AAAA); FAILING gate."
+                    )
                 destroy_ok = await _maybe_destroy(poll, vm_id, mgmt_token, destroy=destroy, yes=yes)
                 return proof_ok and destroy_ok
             if st in ("failed",):
@@ -407,7 +619,9 @@ async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool, yes
     return False
 
 
-async def _maybe_destroy(poll: httpx.AsyncClient, vm_id: str, mgmt_token: str | None, *, destroy: bool, yes: bool) -> bool:
+async def _maybe_destroy(
+    poll: httpx.AsyncClient, vm_id: str, mgmt_token: str | None, *, destroy: bool, yes: bool
+) -> bool:
     """Tear down the gate VM if requested. Pauses first (unless --yes) so the
     operator can run the manual SSH check, and treats a non-2xx DELETE as a
     failure — otherwise a billable VM is left running behind a 'passed' canary."""
@@ -421,18 +635,25 @@ async def _maybe_destroy(poll: httpx.AsyncClient, vm_id: str, mgmt_token: str | 
             # A non-interactive runner (CI/Ansible) can't answer the prompt;
             # skipping teardown would silently leak a billable VM behind a
             # "passed" gate. Require --yes for unattended teardown.
-            print("    !! --destroy from a non-interactive runner needs --yes to confirm "
-                  "teardown; refusing to leave a billable VM ambiguous. FAILING.")
+            print(
+                "    !! --destroy from a non-interactive runner needs --yes to confirm "
+                "teardown; refusing to leave a billable VM ambiguous. FAILING."
+            )
             return False
         try:
-            input("\n    Press Enter to DESTROY the VM after you've verified SSH (Ctrl-C to keep it)... ")
+            input(
+                "\n    Press Enter to DESTROY the VM after you've verified SSH (Ctrl-C to keep it)... "
+            )
         except (EOFError, KeyboardInterrupt):
             # Requested teardown was skipped — the paid VM is still running, so
             # the gate must not report success.
-            print("\n    destroy skipped by operator — the paid VM is still running; FAILING the gate.")
+            print(
+                "\n    destroy skipped by operator — the paid VM is still running; FAILING the gate."
+            )
             return False
-    d = await poll.request("DELETE", f"{API}/v1/vm/{vm_id}",
-                           headers={"Authorization": f"Bearer {mgmt_token}"})
+    d = await poll.request(
+        "DELETE", f"{API}/v1/vm/{vm_id}", headers={"Authorization": f"Bearer {mgmt_token}"}
+    )
     print(f"    destroy -> HTTP {d.status_code} {d.text[:200]}")
     if d.status_code >= 400:
         print("    !! destroy did NOT succeed — the paid VM may still be active/billable.")
@@ -449,28 +670,40 @@ def _select(target: str) -> list[str]:
         return [n for n, t in TESTS.items() if t["group"] == target and not t.get("gated")]
     if target in TESTS:
         return [target]
-    sys.exit(f"unknown test '{target}'. Try: list, all, intel, proxy, domain, vm, or one of "
-             f"{', '.join(TESTS)}")
+    sys.exit(
+        f"unknown test '{target}'. Try: list, all, intel, proxy, domain, vm, or one of "
+        f"{', '.join(TESTS)}"
+    )
 
 
 async def _main() -> None:
     ap = argparse.ArgumentParser(description="x402 live-payment canary for Hyrule Cloud")
     ap.add_argument("target", help="a test name, a group (intel|proxy|domain|vm), 'all', or 'list'")
     ap.add_argument("--name", help="domain label to register (domain test)")
-    ap.add_argument("--destroy", action="store_true", help="destroy the VM after it comes up (vm test)")
-    ap.add_argument("--quote", action="store_true", help="pay the vm create against a locked quote_id (POST /v1/vm/quote first)")
-    ap.add_argument("--yes", action="store_true", help="skip the spend + destroy confirmation prompts")
+    ap.add_argument(
+        "--destroy", action="store_true", help="destroy the VM after it comes up (vm test)"
+    )
+    ap.add_argument(
+        "--quote",
+        action="store_true",
+        help="pay the vm create against a locked quote_id (POST /v1/vm/quote first)",
+    )
+    ap.add_argument(
+        "--yes", action="store_true", help="skip the spend + destroy confirmation prompts"
+    )
     args = ap.parse_args()
 
     if args.target == "list":
         print(f"API: {API}\n")
         print(f"{'name':14} {'price':>8}  path")
         for n, t in TESTS.items():
-            flags = "".join([
-                "  [REAL $]" if t.get("spendy") else "",
-                "  [gated: run by name only]" if t.get("gated") else "",
-            ])
-            print(f"{n:14} {'$'+t['usd']:>8}  {t['path']}{flags}")
+            flags = "".join(
+                [
+                    "  [REAL $]" if t.get("spendy") else "",
+                    "  [gated: run by name only]" if t.get("gated") else "",
+                ]
+            )
+            print(f"{n:14} {'$' + t['usd']:>8}  {t['path']}{flags}")
         return
 
     names = _select(args.target)
@@ -478,9 +711,11 @@ async def _main() -> None:
     # --yes can't answer the teardown prompt, so _maybe_destroy would refuse and
     # leave a billable VM running behind a failed gate. Reject up front instead.
     if args.destroy and not args.yes and not sys.stdin.isatty() and "vm" in names:
-        sys.exit("ERROR: --destroy from a non-interactive runner requires --yes; otherwise the "
-                 "canary would provision a billable VM and then refuse to tear it down. "
-                 "Aborting before any spend.")
+        sys.exit(
+            "ERROR: --destroy from a non-interactive runner requires --yes; otherwise the "
+            "canary would provision a billable VM and then refuse to tear it down. "
+            "Aborting before any spend."
+        )
     total = sum(Decimal(TESTS[n]["usd"]) for n in names)
     spendy = [n for n in names if TESTS[n].get("spendy")]
     print(f"About to run {len(names)} canary payment(s) on {API}: {', '.join(names)}")
@@ -494,7 +729,9 @@ async def _main() -> None:
 
     ok = 0
     for n in names:
-        if await _run_one(n, destroy=args.destroy, domain_name=args.name, use_quote=args.quote, yes=args.yes):
+        if await _run_one(
+            n, destroy=args.destroy, domain_name=args.name, use_quote=args.quote, yes=args.yes
+        ):
             ok += 1
     print(f"\n=== done: {ok}/{len(names)} succeeded ===")
     if ok != len(names):

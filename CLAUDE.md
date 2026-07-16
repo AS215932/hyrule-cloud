@@ -63,16 +63,23 @@ The API server coordinates: XCP-NG XAPI (clone template, set CPU/RAM/disk, injec
 | `/v1/vm/{id}/reboot`  | POST   | No   | Hard reboot               |
 | `/v1/vm/{id}`         | DELETE | No   | Destroy                   |
 | `/v1/vm/{id}/logs`    | GET    | No   | Provisioning log          |
-| `/v1/domain/check`    | GET    | No   | Availability check        |
-| `/v1/domain/register` | POST   | Yes  | Register via Openprovider |
+| `/v1/domains/tlds`    | GET    | No   | Eligible generic TLDs     |
+| `/v1/domains/check`   | GET    | No   | Availability and prices   |
+| `/v1/domains/quotes`  | POST   | No   | 15-minute domain quote    |
+| `/v1/domains/orders`  | POST   | Yes  | Buy or manually renew     |
+| `/v1/domains`         | GET    | No   | Account domain portfolio  |
+| `/v1/domains/{domain}/nameservers` | PUT | No | Managed/external delegation |
+| `/v1/domains/{domain}/dns` | GET | No | Read managed DNS zone     |
+| `/v1/domains/{domain}/dns/changesets` | POST | No | Revisioned DNS mutation |
+| `/v1/domains/{domain}/dnssec` | PUT | No | Managed/external DNSSEC |
+| `/v1/domains/{domain}/transfer-out` | POST | No | Signed transfer-out     |
 | `/v1/pricing`         | GET    | No   | Price list                |
 | `/v1/os/list`         | GET    | No   | Available templates       |
-| `/v1/zone/check`      | GET    | No   | DNS zone availability     |
-| `/v1/zone/buy`        | POST   | Yes  | Buy DNS zone (domain+DNS) |
-| `/v1/zone/record`     | POST   | No   | Create DNS record in zone |
-| `/v1/zone/record`     | DELETE | No   | Delete DNS record         |
 
-Management endpoints are free. Wallet-based auth on management endpoints is not yet implemented (deferred until payment integration is tested end-to-end).
+Domain purchase and management require an account session or a scoped API key.
+Wallet login/linking is additive; wallet rotation requires signatures from both
+the old and new primary wallet, and transfer-out requires a fresh primary-wallet
+signature.
 
 ## File Structure
 

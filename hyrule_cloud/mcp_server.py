@@ -254,7 +254,7 @@ async def check_domain(name: str, extension: str) -> str:
         async with _client() as hc:
             result = await hc.check_domain(name, extension)
             status = "available" if result.get("available") else "unavailable"
-            price = result.get("total") or result.get("price") or "N/A"
+            price = (result.get("registration") or {}).get("total_usd") or "N/A"
             premium = " (premium)" if result.get("premium") else ""
             return f"{name}.{extension}: {status}{premium}, total: ${price}"
     except HyruleError as e:
@@ -265,20 +265,18 @@ async def check_domain(name: str, extension: str) -> str:
 async def register_domain(
     name: str,
     extension: str,
-    ipv6: str | None = None,
 ) -> str:
     """
-    Register a domain via Openprovider. Payment required via x402.
-
-    Optionally point it at an IPv6 address immediately.
+    Create an account-owned domain quote/order. Payment is required via x402.
     """
     try:
         async with _client() as hc:
-            result = await hc.register_domain(name, extension, ipv6)
+            result = await hc.register_domain(name, extension)
             return (
-                f"Domain {result.get('domain', f'{name}.{extension}')} registered!\n"
-                f"  Status: {result.get('status', 'registered')}\n"
-                f"  Management URL: {result.get('management_url') or 'account-owned'}"
+                f"Domain order {result.get('order_id', 'created')} for "
+                f"{result.get('domain', f'{name}.{extension}')}\n"
+                f"  Status: {result.get('status', 'awaiting_payment')}\n"
+                f"  Operation: {result.get('operation_id') or 'pending payment'}"
             )
     except HyruleError as e:
         return _err(e)

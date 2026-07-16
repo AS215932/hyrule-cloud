@@ -808,7 +808,7 @@ async def test_native_intent_race_replay_rechecks_owner(
 
 
 @pytest.mark.asyncio
-async def test_quote_bound_native_intent_rechecks_custom_domain_availability(
+async def test_quote_bound_native_intent_rejects_anonymous_managed_domain_attachment(
     intent_state,
     client,
 ):
@@ -832,9 +832,9 @@ async def test_quote_bound_native_intent_rechecks_custom_domain_availability(
         json={"asset": "BTC", "order_payload": posted},
     )
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "Domain taken.test is not available"
-    check_domain.assert_awaited_once_with("taken", "test")
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Custom domains require an authenticated account"
+    check_domain.assert_not_awaited()
 
 
 @pytest.mark.asyncio

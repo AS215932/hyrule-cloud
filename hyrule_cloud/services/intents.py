@@ -19,13 +19,14 @@ import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
+from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
-from hyrule_cloud.db import CryptoIntentRow
+from hyrule_cloud.db import CryptoIntentRow, DomainOrderRow
 from hyrule_cloud.models import (
     CryptoIntentStatus,
     QuoteStatus,
@@ -92,11 +93,14 @@ async def create_intent(
     provider: NativeCryptoProvider,
     rates: RateProvider,
     asset: str,
-    order_payload: VMCreateRequest,
+    order_payload: BaseModel | dict[str, Any],
     amount_usd: Decimal,
     client_order_id: str | None,
     owner_account_id: str | None,
     expires_at: datetime | None = None,
+    resource_type: str = "vm",
+    resource_id: str | None = None,
+    refund_address: str | None = None,
 ) -> CryptoIntentRow:
     """Insert a fresh CryptoIntentRow and derive a receive address for it.
 
@@ -157,8 +161,15 @@ async def create_intent(
             expires_at=intent_expires_at,
             status=CryptoIntentStatus.CREATED,
             client_order_id=client_order_id,
-            order_payload=order_payload.model_dump(mode="json"),
+            order_payload=(
+                order_payload.model_dump(mode="json")
+                if isinstance(order_payload, BaseModel)
+                else order_payload
+            ),
             owner_account_id=owner_account_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            refund_address=refund_address,
         )
         db.add(row)
         try:
@@ -369,6 +380,64 @@ async def _trigger_provisioning(
         if row is None or row.order_payload is None:
             return
 
+    # Domain purchases reuse the native receive-address and confirmation
+    # machinery, but have their own fulfillment outbox. Handing a settled
+    # intent to that outbox is the exactly-once side effect for this resource;
+    # it must never be parsed as a VMCreateRequest.
+    if row.resource_type == "domain_order":
+        domains = getattr(orch, "domains", None)
+        if domains is None or not row.resource_id:
+            await orch.record_native_intent_refund(
+                intent_id,
+                reason="domain_fulfillment_unavailable",
+            )
+            return
+        try:
+            domain_order = await domains.native_order_settled(row.resource_id, row)
+            terminal_status = (
+                CryptoIntentStatus.REFUND_MANUAL
+                if str(domain_order.status) in {"refund_due", "refunded"}
+                else CryptoIntentStatus.PROVISIONED
+            )
+            async with session_factory() as db:
+                current = await db.get(CryptoIntentRow, intent_id)
+                if current is not None:
+                    current.status = terminal_status
+                    await db.commit()
+            log.info(
+                "native_domain_order_handed_off",
+                intent_id=intent_id,
+                order_id=row.resource_id,
+            )
+        except Exception:
+            log.exception(
+                "native_domain_order_handoff_failed",
+                intent_id=intent_id,
+                order_id=row.resource_id,
+            )
+            # The order commit can succeed even if the response/connection is
+            # lost. Re-read its durable state before recording a refund, or a
+            # queued registration could later fulfill after we refunded it.
+            handed_off = False
+            async with session_factory() as db:
+                domain_order = await db.get(DomainOrderRow, row.resource_id)
+                handed_off = domain_order is not None and str(domain_order.status) != "awaiting_payment"
+                if handed_off:
+                    current = await db.get(CryptoIntentRow, intent_id)
+                    if current is not None:
+                        current.status = (
+                            CryptoIntentStatus.REFUND_MANUAL
+                            if str(domain_order.status) in {"refund_due", "refunded"}
+                            else CryptoIntentStatus.PROVISIONED
+                        )
+                        await db.commit()
+            if not handed_off:
+                await orch.record_native_intent_refund(
+                    intent_id,
+                    reason="domain_fulfillment_handoff_failed",
+                )
+        return
+
     # Provision the VM. owner_wallet carries the bounded intent_id, NOT the
     # deposit address: XMR subaddresses (~95 chars) overflow VMRow.owner_wallet
     # (String(64)) and the insert would fail before the intent is linked or any
@@ -554,8 +623,23 @@ async def scan_pending_intents(
             )
         )
         intent_ids = [r[0] for r in result.all()]
+        domain_handoffs = list(
+            await db.scalars(
+                select(CryptoIntentRow.intent_id).where(
+                    CryptoIntentRow.status == CryptoIntentStatus.PROVISIONING,
+                    CryptoIntentRow.resource_type == "domain_order",
+                )
+            )
+        )
 
     touched = 0
+    for iid in domain_handoffs:
+        if await _resume_domain_handoff(
+            intent_id=iid,
+            session_factory=session_factory,
+            orch=orch,
+        ):
+            touched += 1
     for iid in intent_ids:
         try:
             await poll_one_intent(
@@ -569,3 +653,48 @@ async def scan_pending_intents(
         except Exception:
             log.exception("poll_one_intent_failed", intent_id=iid)
     return touched
+
+
+async def _resume_domain_handoff(
+    *,
+    intent_id: str,
+    session_factory: async_sessionmaker,
+    orch: Orchestrator,
+) -> bool:
+    """Recover a settled domain payment after a worker/process crash."""
+    domains = getattr(orch, "domains", None)
+    if domains is None:
+        return False
+    async with session_factory() as db:
+        intent = await db.get(CryptoIntentRow, intent_id)
+        if (
+            intent is None
+            or intent.status != CryptoIntentStatus.PROVISIONING
+            or intent.resource_type != "domain_order"
+            or not intent.resource_id
+        ):
+            return False
+    try:
+        order = await domains.native_order_settled(intent.resource_id, intent)
+    except Exception:
+        log.exception(
+            "native_domain_order_handoff_recovery_failed",
+            intent_id=intent_id,
+            order_id=intent.resource_id,
+        )
+        return False
+    async with session_factory() as db:
+        current = await db.get(CryptoIntentRow, intent_id)
+        if current is not None and current.status == CryptoIntentStatus.PROVISIONING:
+            current.status = (
+                CryptoIntentStatus.REFUND_MANUAL
+                if str(order.status) in {"refund_due", "refunded"}
+                else CryptoIntentStatus.PROVISIONED
+            )
+            await db.commit()
+    log.info(
+        "native_domain_order_handoff_recovered",
+        intent_id=intent_id,
+        order_id=intent.resource_id,
+    )
+    return True

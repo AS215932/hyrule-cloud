@@ -29,8 +29,7 @@ Rspamd, or another mail backend hidden behind this API.
 
 - `/v1/mail` creates and operates mailboxes.
 - `/v1/mx` diagnoses mail delivery.
-- `/v1/domain` buys domains.
-- `/v1/zone` manages DNS records.
+- `/v1/domains` buys domains and manages their DNS records.
 
 ## Examples
 

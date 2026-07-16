@@ -1,18 +1,18 @@
 ---
 name: hyrule-cloud
-description: "Deploy bare VMs, register domains, and manage DNS zones \u2014 all paid via x402 (USDC on Base)."
+description: "Deploy bare VMs and register, renew, or manage account-owned domains and DNS."
 ---
 
 # Hyrule Cloud — Agentic VPS Hosting
 
-Deploy bare VMs, register domains, and manage DNS zones — all paid via x402 (USDC on Base).
+Deploy bare VMs and register, renew, or manage account-owned domains and DNS.
 
 ## When to Use
 
 Use this skill when:
 - You need to deploy an application to the internet (provision a VM, SSH in, set it up)
 - You need to register a domain name
-- You need to buy a DNS zone and manage records (AAAA, A, CNAME, TXT, MX, etc.)
+- You need managed authoritative DNS records (AAAA, A, CNAME, TXT, MX, etc.)
 - You need to check pricing or domain availability
 
 ## API Base
@@ -25,7 +25,7 @@ Service discovery: `GET /.well-known/x402.json`
 
 ## Payment
 
-All paid endpoints use the **x402** protocol:
+VMs, network services, and USDC domain orders use the **x402** protocol:
 1. Send the request without payment → get a `402` response with pricing + payment instructions
 2. Pay via the x402 facilitator (USDC on Base, chain `eip155:8453`)
 3. Resend the request with the `X-PAYMENT` header containing the payment proof
@@ -60,6 +60,10 @@ X-PAYMENT-REQUIRED: eyJ4NDAyVmVyc2lvbiI6Mn0...   # base64 of the body below
 Sign an EIP-3009 `TransferWithAuthorization` for the `accepts[].price`, base64-
 encode the x402 payment payload, and resend the same request with
 `X-PAYMENT: <base64>`.
+
+Domain orders also support native BTC and XMR payment intents. Domain purchase,
+renewal, and management require an account session or scoped API key; public
+availability checks and quotes do not.
 
 **Durable quotes (recommended):** call `POST /v1/vm/quote` first to lock a price
 and get a `quote_id`, then pass `quote_id` to `POST /v1/vm/create`. The server
@@ -167,15 +171,31 @@ Get VM status, IP, hostname, SSH command, and expiry.
 
 Status values: `provisioning` → `ready` → `running` → `suspended` → `destroyed` (or `failed`)
 
-#### GET /v1/domain/check?name=example&extension=com
-Check domain availability.
+#### GET /v1/domains/check?domain=example.dev
+Check strict ASCII, single-label domain eligibility, live availability, and
+separate registration/renewal prices. Premium and non-generic TLDs fail closed.
 
 ```json
-{"status": "free", "is_premium": false, "price": "9.99", "currency": "USD"}
+{
+  "domain": "example.dev",
+  "eligible": true,
+  "available": true,
+  "premium": false,
+  "registration": {"provider_cost_usd":"10.00","hyrule_fee_usd":"3.00","tax_usd":"0.00","total_usd":"13.00","currency":"USD"},
+  "renewal": {"provider_cost_usd":"10.00","hyrule_fee_usd":"3.00","tax_usd":"0.00","total_usd":"13.00","currency":"USD"}
+}
 ```
 
-Domain availability doubles as DNS zone availability: registering a domain
-through Hyrule Cloud sets up the zone on our authoritative DNS.
+#### POST /v1/domains/quotes
+Create a durable 15-minute registration or renewal quote.
+
+```json
+{"domain":"example.dev","action":"register"}
+```
+
+The response includes `quote_id`, `terms_version`, `expires_at`, and an exact
+USD price breakdown. Registration is always one year; renewal is manual and
+registrar auto-renew is disabled.
 
 ### Paid Endpoints
 
@@ -224,12 +244,22 @@ Add days to a running VM.
 {"days": 30}
 ```
 
-#### POST /v1/domain/register
-Register a domain via Openprovider.
+#### POST /v1/domains/orders
+Place an idempotent account-owned registration or renewal order. Send
+`Authorization: Bearer <api-key>` and a stable `Idempotency-Key`. USDC orders
+use the normal 402/sign/retry flow; BTC/XMR return a 60-minute deposit intent.
 
 ```json
-{"name": "mysite", "extension": "dev", "ipv6": "2001:db8::1"}
+{
+  "quote_id": "dq_...",
+  "payment_method": "usdc",
+  "terms_version": "2026-07-15"
+}
 ```
+
+Poll `GET /v1/domains/orders/{order_id}` until `active`, `provider_pending`,
+`refund_due`, or `failed`. A provider timeout remains pending for reconciliation;
+do not submit a second purchase with a new idempotency key.
 
 #### POST /v1/network/request
 Make one paid HTTP request through the internal Hyrule network proxy sidecar.
@@ -261,26 +291,26 @@ Response shape:
 }
 ```
 
-#### POST /v1/domain/register
-Buy a domain + DNS zone — registers the domain via Openprovider and sets up
-Hyrule Cloud's authoritative DNS.
+### Domain Management Endpoints (Account Required)
+
+#### POST /v1/domains/{domain}/dns/changesets
+Atomically upsert/delete managed RRsets. Send the current numeric zone revision
+in `If-Match` and a stable `Idempotency-Key`; stale revisions return 412.
 
 ```json
-{"name": "mysite", "extension": "dev", "duration_years": 1}
+{
+  "changes": [{
+    "action": "upsert",
+    "rrset": {"name":"www","type":"AAAA","ttl":300,"values":["2001:db8::1"]}
+  }]
+}
 ```
 
-Response includes a `management_token` — keep it, it authorizes record
-management. After registering, manage records via:
-
-#### POST /v1/zone/record
-Create a DNS record in a zone you own.
-
-```json
-{"zone": "mysite.dev", "name": "www", "type": "AAAA", "value": "2001:db8::1", "ttl": 300}
-```
-
-#### DELETE /v1/zone/record?zone=mysite.dev&name=www&type=AAAA
-Delete a DNS record.
+Use `GET /v1/domains/{domain}/dns` to read the current records and revision.
+`PUT /v1/domains/{domain}/nameservers` switches between Hyrule-managed and
+external delegation. `PUT /v1/domains/{domain}/dnssec` manages DNSSEC. Signed
+transfer-out uses `/v1/domains/{domain}/transfer-out/challenge` followed by
+`/v1/domains/{domain}/transfer-out`; the registrar auth code is reveal-once.
 
 ### Management Endpoints (Free)
 
@@ -302,9 +332,10 @@ Get provisioning log for a VM.
 4. POST /v1/vm/create + X-PAYMENT header    # → 202 + status_url
 5. Poll GET /v1/vm/{id}                     # wait for "ready"
 6. ssh root@<hostname>                      # deploy your app
-7. (optional) POST /v1/domain/register      # buy a domain + DNS zone
-8. (optional) POST /v1/zone/record          # point domain at VM
-9. (optional) POST /v1/network/request      # paid Direct/Tor/I2P/Yggdrasil request
+7. (optional) POST /v1/domains/quotes       # lock registration price
+8. (optional) POST /v1/domains/orders       # idempotent account-owned purchase
+9. (optional) POST /v1/domains/{domain}/dns/changesets  # point domain at VM
+10. (optional) POST /v1/network/request     # paid Direct/Tor/I2P/Yggdrasil request
 ```
 
 ## Infrastructure Details
