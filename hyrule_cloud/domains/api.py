@@ -375,10 +375,18 @@ async def transfer_out(
 @router.get("/operations/{operation_id}", response_model=DomainOperationResponse)
 async def get_operation(
     operation_id: str,
+    request: Request,
     account: AccountRow = Depends(require_scope("domain:read")),
     service: DomainService = Depends(get_domains),
 ) -> DomainOperationResponse:
-    return await service.get_operation(account.account_id, operation_id)
+    reveal_secret = not getattr(request.state, "is_api_key", False) or (
+        "domain:transfer" in getattr(request.state, "api_key_scopes", set())
+    )
+    return await service.get_operation(
+        account.account_id,
+        operation_id,
+        reveal_secret=reveal_secret,
+    )
 
 
 @router.post("/{domain}/claim", response_model=DomainDetailResponse)

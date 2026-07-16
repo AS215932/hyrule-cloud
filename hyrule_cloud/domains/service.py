@@ -395,8 +395,14 @@ class DomainService:
                 raise DomainProblem(404, "quote_not_found", "Domain quote not found.")
             if quote.owner_account_id and quote.owner_account_id != owner_account_id:
                 raise DomainProblem(404, "quote_not_found", "Domain quote not found.")
-            if quote.status != "active" or _aware(quote.expires_at) < _now():
+            if _aware(quote.expires_at) < _now() or quote.status == "expired":
                 raise DomainProblem(409, "quote_expired", "This domain quote has expired.")
+            if quote.status != "active":
+                raise DomainProblem(
+                    409,
+                    "quote_unavailable",
+                    "This domain quote is already bound to another order.",
+                )
             if (
                 quote.terms_version != body.terms_version
                 or body.terms_version != self.domain_config.terms_version
@@ -406,6 +412,12 @@ class DomainService:
                 )
             vm_amount = Decimal("0")
             if body.vm_quote_id:
+                if quote.action != DomainAction.REGISTER.value:
+                    raise DomainProblem(
+                        422,
+                        "bundle_not_supported",
+                        "A VM can only be bundled with a domain registration.",
+                    )
                 vm_quote = await session.get(VMQuoteRow, body.vm_quote_id)
                 if vm_quote is None or (
                     vm_quote.owner_account_id and vm_quote.owner_account_id != owner_account_id
@@ -424,6 +436,47 @@ class DomainService:
                     )
                 vm_amount = Decimal(vm_quote.amount_usd)
             now = _now()
+            # Reserve the quote in the same transaction that creates its order.
+            # The conditional write is the concurrency guard: only one order can
+            # become payable, even if two idempotency keys race on the same quote.
+            reserved = await session.execute(
+                update(DomainQuoteRow)
+                .where(
+                    DomainQuoteRow.quote_id == quote.quote_id,
+                    DomainQuoteRow.status == "active",
+                    DomainQuoteRow.expires_at > now,
+                )
+                .values(status="reserved")
+                .execution_options(synchronize_session=False)
+            )
+            if int(getattr(reserved, "rowcount", 0) or 0) != 1:
+                await session.rollback()
+                winner = (
+                    await session.execute(
+                        select(DomainOrderRow).where(
+                            DomainOrderRow.owner_account_id == owner_account_id,
+                            DomainOrderRow.idempotency_key == idempotency_key,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if winner is not None:
+                    self._validate_order_replay(winner, body)
+                    if body.payment_method in {
+                        DomainPaymentMethod.BTC,
+                        DomainPaymentMethod.XMR,
+                    }:
+                        winner = await self._ensure_native_order_intent(
+                            winner,
+                            body,
+                            owner_account_id=owner_account_id,
+                            idempotency_key=idempotency_key,
+                        )
+                    return winner, False
+                raise DomainProblem(
+                    409,
+                    "quote_unavailable",
+                    "This domain quote is already bound to another order.",
+                )
             order = DomainOrderRow(
                 order_id=generate_domain_order_id(),
                 quote_id=quote.quote_id,
@@ -506,6 +559,14 @@ class DomainService:
     ) -> DomainOrderRow:
         if order.native_intent_id:
             return order
+        async with self.db() as session:
+            quote_expires_at = await session.scalar(
+                select(DomainQuoteRow.expires_at).where(
+                    DomainQuoteRow.quote_id == order.quote_id
+                )
+            )
+        if quote_expires_at is None:
+            raise DomainProblem(404, "quote_not_found", "Domain quote not found.")
         client_order_id = (
             "dom_"
             + hashlib.sha256(f"{owner_account_id}:{idempotency_key}".encode()).hexdigest()[:48]
@@ -520,6 +581,7 @@ class DomainService:
                 amount_usd=Decimal(order.amount_usd),
                 client_order_id=client_order_id,
                 owner_account_id=owner_account_id,
+                expires_at=quote_expires_at,
                 resource_type="domain_order",
                 resource_id=order.order_id,
                 refund_address=body.refund_address,
@@ -578,10 +640,12 @@ class DomainService:
             quote = await session.get(DomainQuoteRow, order.quote_id)
             if (
                 quote is None
-                or quote.status != "active"
+                or quote.status not in {"active", "reserved"}
                 or (_aware(quote.expires_at) is not None and _aware(quote.expires_at) <= _now())
             ):
                 order.status = DomainOrderStatus.EXPIRED.value
+                if quote is not None and _aware(quote.expires_at) <= _now():
+                    quote.status = "expired"
                 await session.commit()
                 raise DomainProblem(
                     409, "quote_expired", "This order's payment window has expired."
@@ -606,7 +670,13 @@ class DomainService:
         payment_asset: str | None = None,
     ) -> DomainOrderRow:
         async with self.db() as session:
-            order = await session.get(DomainOrderRow, order_id)
+            order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
             if order.status not in {
@@ -623,12 +693,20 @@ class DomainService:
                 order.payment_tx = tx_hash
                 order.payment_network = payment_network
                 order.payment_asset = payment_asset
-                quote = await session.get(DomainQuoteRow, order.quote_id)
-                native_settlement = payment_network == "native"
-                if quote is None or (
-                    quote.status != "active"
-                    and not (native_settlement and quote.status == "expired")
+                quote = (
+                    await session.execute(
+                        select(DomainQuoteRow)
+                        .where(DomainQuoteRow.quote_id == order.quote_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    quote is None
+                    or quote.status not in {"active", "reserved"}
+                    or _aware(quote.expires_at) <= _now()
                 ):
+                    if quote is not None and _aware(quote.expires_at) <= _now():
+                        quote.status = "expired"
                     order.status = DomainOrderStatus.REFUND_DUE.value
                     order.error_code = "quote_already_consumed"
                     session.add(self._build_refund_event(order, "quote_already_consumed"))
@@ -992,7 +1070,11 @@ class DomainService:
         return self._operation_response(operation)
 
     async def get_operation(
-        self, owner_account_id: str, operation_id: str
+        self,
+        owner_account_id: str,
+        operation_id: str,
+        *,
+        reveal_secret: bool = True,
     ) -> DomainOperationResponse:
         async with self.db() as session:
             row = await session.get(DomainOperationRow, operation_id)
@@ -1001,7 +1083,9 @@ class DomainService:
             secret: str | None = None
             secret_expires_at = _aware(row.secret_expires_at)
             if (
-                row.secret_ciphertext
+                reveal_secret
+                and row.kind == "transfer_out"
+                and row.secret_ciphertext
                 and row.secret_revealed_at is None
                 and secret_expires_at is not None
                 and secret_expires_at > _now()
@@ -1018,11 +1102,13 @@ class DomainService:
                     row.secret_revealed_at = _now()
                     row.secret_ciphertext = None
                     await session.commit()
+                    await session.refresh(row)
             elif row.secret_ciphertext and (
                 secret_expires_at is None or secret_expires_at <= _now()
             ):
                 row.secret_ciphertext = None
                 await session.commit()
+                await session.refresh(row)
             return self._operation_response(row, secret=secret)
 
     async def claim_legacy_domain(
@@ -1093,49 +1179,77 @@ class DomainService:
 
     async def recover_x402_handoffs(self, *, limit: int = 200) -> int:
         """Replay settled domain payments whose order transition was lost."""
-        async with self.db() as session:
-            events = list(
-                await session.scalars(
-                    select(PaymentEventRow)
-                    .where(
-                        PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
-                        PaymentEventRow.resource_path == "/v1/domains/orders",
-                    )
-                    .order_by(PaymentEventRow.created_at.desc())
-                    .limit(limit)
-                )
-            )
+        if limit < 1:
+            return 0
         recovered = 0
         seen: set[str] = set()
-        for event in events:
-            extra = event.extra if isinstance(event.extra, dict) else {}
-            order_id = str(extra.get("order_id") or "")
-            if not order_id or order_id in seen:
-                continue
-            seen.add(order_id)
-            async with self.db() as session:
-                order = await session.get(DomainOrderRow, order_id)
-                awaiting = bool(
-                    order is not None
-                    and order.status == DomainOrderStatus.AWAITING_PAYMENT.value
+        cursor: tuple[datetime, str] | None = None
+        while True:
+            filters = [
+                PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
+                PaymentEventRow.resource_path == "/v1/domains/orders",
+            ]
+            if cursor is not None:
+                created_at, event_id = cursor
+                filters.append(
+                    or_(
+                        PaymentEventRow.created_at < created_at,
+                        and_(
+                            PaymentEventRow.created_at == created_at,
+                            PaymentEventRow.event_id < event_id,
+                        ),
+                    )
                 )
-            if not awaiting:
-                continue
-            await self._mark_paid(
-                order_id,
-                payer=event.payer_wallet or "unknown",
-                tx_hash=event.tx_hash,
-                payment_network=event.network,
-                payment_asset=event.asset,
-            )
-            recovered += 1
+            async with self.db() as session:
+                events = list(
+                    await session.scalars(
+                        select(PaymentEventRow)
+                        .where(*filters)
+                        .order_by(
+                            PaymentEventRow.created_at.desc(),
+                            PaymentEventRow.event_id.desc(),
+                        )
+                        .limit(limit)
+                    )
+                )
+            if not events:
+                break
+            for event in events:
+                extra = event.extra if isinstance(event.extra, dict) else {}
+                order_id = str(extra.get("order_id") or "")
+                if not order_id or order_id in seen:
+                    continue
+                seen.add(order_id)
+                async with self.db() as session:
+                    order = await session.get(DomainOrderRow, order_id)
+                    awaiting = bool(
+                        order is not None
+                        and order.status == DomainOrderStatus.AWAITING_PAYMENT.value
+                    )
+                if not awaiting:
+                    continue
+                await self._mark_paid(
+                    order_id,
+                    payer=event.payer_wallet or "unknown",
+                    tx_hash=event.tx_hash,
+                    payment_network=event.network,
+                    payment_asset=event.asset,
+                )
+                recovered += 1
+            if len(events) < limit:
+                break
+            last = events[-1]
+            cursor = (_aware(last.created_at), last.event_id)
         return recovered
 
     async def expire_quotes(self) -> int:
         async with self.db() as session:
             result = await session.execute(
                 update(DomainQuoteRow)
-                .where(DomainQuoteRow.status == "active", DomainQuoteRow.expires_at < _now())
+                .where(
+                    DomainQuoteRow.status.in_(["active", "reserved"]),
+                    DomainQuoteRow.expires_at < _now(),
+                )
                 .values(status="expired")
             )
             await session.commit()
@@ -1902,6 +2016,16 @@ class DomainService:
         spec = VMCreateRequest.model_validate(quote.order_payload)
         if fallback_auto_domain:
             spec = spec.model_copy(update={"domain_mode": DomainMode.AUTO, "domain": None})
+        else:
+            # The registered domain is active at this point, but the VM row does
+            # not exist yet. Claim it for the durably planned VM id before any
+            # provisioning call so a concurrent standalone VM purchase cannot
+            # take the bundle's domain during that gap.
+            await self.claim_vm_attachment(
+                order.owner_account_id,
+                order.fqdn,
+                planned_vm_id,
+            )
         vm, _ = await self.orchestrator.create_vm(
             spec,
             owner_wallet=order.payer or order.order_id,
@@ -1994,28 +2118,6 @@ class DomainService:
         if event is None:
             raise RuntimeError("paid domain order has no recordable refund target")
         return event
-
-    async def _record_refund(
-        self, order: DomainOrderRow, reason: str, *, amount: Decimal | None = None
-    ) -> None:
-        native = order.payment_method in {
-            DomainPaymentMethod.BTC.value,
-            DomainPaymentMethod.XMR.value,
-        }
-        await self.orchestrator.refunds.record_owed(
-            resource_path="/v1/domains/orders",
-            payer=order.order_id if native else order.payer,
-            amount=amount or Decimal(order.amount_usd),
-            original_tx=order.payment_tx,
-            reason=reason,
-            network="native" if native else order.payment_network,
-            asset=order.payment_method.upper() if native else order.payment_asset,
-            extra={
-                "order_id": order.order_id,
-                "domain": order.fqdn,
-                "refund_address": order.refund_address,
-            },
-        )
 
     async def _apply_nameservers(self, operation_id: str) -> None:
         operation, domain = await self._operation_and_domain(operation_id)
@@ -2478,7 +2580,6 @@ class DomainService:
         if isinstance(exc, DNSControlError):
             retryable = exc.retryable
         failure_action = "none"
-        refund_order: DomainOrderRow | None = None
         async with self.db() as session:
             job = await session.get(DomainJobRow, job_id)
             if job is None:
@@ -2504,7 +2605,6 @@ class DomainService:
                     if order is not None
                     else None
                 )
-                refund_order = order
                 ambiguous_registration = (
                     order is not None
                     and order.action == DomainAction.REGISTER.value
@@ -2545,9 +2645,18 @@ class DomainService:
                         order.status = DomainOrderStatus.ACTIVE.value
                         order.error_code = "bundle_vm_failed"
                         order.error_detail = str(exc)[:1000]
-                        failure_action = (
-                            "partial_refund" if Decimal(order.vm_amount_usd) > 0 else "none"
-                        )
+                        if Decimal(order.vm_amount_usd) > 0:
+                            # The terminal job/order state and the partial refund
+                            # obligation are one atomic commit. If ledger event
+                            # construction or persistence fails, neither side is
+                            # left terminal and the stale job remains recoverable.
+                            session.add(
+                                self._build_refund_event(
+                                    order,
+                                    "bundle_vm_failed",
+                                    amount=Decimal(order.vm_amount_usd),
+                                )
+                            )
                         if operation is not None:
                             operation.status = DomainOperationStatus.SUCCEEDED.value
                     else:
@@ -2580,12 +2689,6 @@ class DomainService:
                 job.resource_id,
                 getattr(exc, "code", "fulfillment_failed"),
                 str(exc),
-            )
-        elif failure_action == "partial_refund" and refund_order is not None:
-            await self._record_refund(
-                refund_order,
-                "bundle_vm_failed",
-                amount=Decimal(refund_order.vm_amount_usd),
             )
         log.error("domain_job_failed", job_id=job_id, kind=job.kind, error=str(exc))
 

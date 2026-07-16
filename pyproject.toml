@@ -97,6 +97,10 @@ python_version = "3.12"
 strict = true
 
 [[tool.mypy.overrides]]
+module = ["bip_utils", "bip_utils.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = [
     "hyrule_cloud.api.auth",
     "hyrule_cloud.api.routes",

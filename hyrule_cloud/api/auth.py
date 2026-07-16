@@ -26,6 +26,7 @@ from sqlalchemy import select
 
 from hyrule_cloud.db import (
     AccountRow,
+    DomainOrderRow,
     RecoveryAttemptRow,
     RecoveryChallengeRow,
     VMRow,
@@ -849,6 +850,20 @@ async def delete_me(
     detached: list[dict] = []
 
     async with factory() as db:
+        retained_domain_order = await db.scalar(
+            select(DomainOrderRow.order_id)
+            .where(DomainOrderRow.owner_account_id == account.account_id)
+            .limit(1)
+        )
+        if retained_domain_order is not None:
+            # Registrar and payment history must remain attributable for audit
+            # and support. Refuse explicitly before touching VMs or sessions;
+            # otherwise the domain_orders RESTRICT key would fail only after a
+            # partially applied account-deletion workflow.
+            raise HTTPException(
+                409,
+                "Accounts with domain order history require assisted deletion.",
+            )
         result = await db.execute(
             select(VMRow).where(
                 VMRow.owner_account_id == account.account_id,

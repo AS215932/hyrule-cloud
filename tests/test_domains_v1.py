@@ -6,8 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
+from cryptography.fernet import Fernet
 from eth_account import Account
 from eth_account.messages import encode_defunct
+from pydantic import ValidationError
 from sqlalchemy import select
 
 from hyrule_cloud.config import HyruleConfig
@@ -19,13 +21,16 @@ from hyrule_cloud.db import (
     DomainJobRow,
     DomainOperationRow,
     DomainOrderRow,
+    DomainQuoteRow,
     DomainRow,
     DomainTLDRow,
     PaymentEventRow,
+    VMQuoteRow,
     VMRow,
     create_db_engine,
     create_session_factory,
 )
+from hyrule_cloud.domains.api import get_operation as get_operation_route
 from hyrule_cloud.domains.catalog import parse_iana_root_db
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.domains.models import (
@@ -50,7 +55,14 @@ from hyrule_cloud.domains.wallet_auth import (
     WalletChallengeRequest,
     WalletVerifyRequest,
 )
-from hyrule_cloud.models import CryptoIntentStatus, VMSize, VMStatus
+from hyrule_cloud.models import (
+    CryptoIntentStatus,
+    DomainMode,
+    QuoteStatus,
+    VMCreateRequest,
+    VMSize,
+    VMStatus,
+)
 from hyrule_cloud.providers.openprovider import (
     OpenproviderUnavailableError,
     _extract_product_price,
@@ -58,6 +70,12 @@ from hyrule_cloud.providers.openprovider import (
 from hyrule_cloud.services.passwords import hash_password
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
+
+BTC_REFUND_ADDRESS = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"
+XMR_REFUND_ADDRESS = (
+    "42Lxp5b63YJ8mVZTzcioVnCk9WQCPAMk4RH7e7ygPTkzEZhMuRMBPjF8u5PXzAzC"
+    "PDViDAyJnBL5u5mc5QVGBZXF9ySeCtM"
+)
 
 
 class _Provider:
@@ -150,6 +168,18 @@ class _Orchestrator:
         self.started_vms.append(vm_id)
 
 
+def _bundle_spec(fqdn: str) -> VMCreateRequest:
+    return VMCreateRequest(
+        duration_days=30,
+        size=VMSize.XS,
+        os="debian-13",
+        ssh_pubkey="ssh-ed25519 AAAA domain-bundle-test",
+        domain_mode=DomainMode.CUSTOM,
+        domain=fqdn,
+        open_ports=[80, 443],
+    )
+
+
 @pytest_asyncio.fixture
 async def domain_service(tmp_path):
     engine = create_db_engine(f"sqlite+aiosqlite:///{tmp_path / 'domains.db'}")
@@ -215,6 +245,38 @@ def test_ascii_second_level_validation_and_pricing():
     config = HyruleConfig().domain
     assert price_domain(Decimal("4"), Decimal("1"), config)[3] == Decimal("7.00")
     assert price_domain(Decimal("20"), Decimal("1"), config)[3] == Decimal("25.00")
+
+
+def test_native_refund_addresses_are_validated_for_the_selected_asset() -> None:
+    btc = DomainOrderRequest(
+        quote_id="dq_refund_validation",
+        payment_method=DomainPaymentMethod.BTC,
+        refund_address=f"  {BTC_REFUND_ADDRESS}  ",
+        terms_version="v1",
+    )
+    assert btc.refund_address == BTC_REFUND_ADDRESS
+    xmr = DomainOrderRequest(
+        quote_id="dq_refund_validation",
+        payment_method=DomainPaymentMethod.XMR,
+        refund_address=XMR_REFUND_ADDRESS,
+        terms_version="v1",
+    )
+    assert xmr.refund_address == XMR_REFUND_ADDRESS
+
+    with pytest.raises(ValidationError, match="valid BTC mainnet address"):
+        DomainOrderRequest(
+            quote_id="dq_refund_validation",
+            payment_method=DomainPaymentMethod.BTC,
+            refund_address="not-a-real-address",
+            terms_version="v1",
+        )
+    with pytest.raises(ValidationError, match="valid XMR mainnet address"):
+        DomainOrderRequest(
+            quote_id="dq_refund_validation",
+            payment_method=DomainPaymentMethod.XMR,
+            refund_address=BTC_REFUND_ADDRESS,
+            terms_version="v1",
+        )
 
 
 def test_iana_parser_preserves_exact_tld_type():
@@ -293,6 +355,94 @@ async def test_paid_order_is_idempotent_and_fulfills_through_outbox(domain_servi
     assert domain.nameservers == ["ns1.hyrule.host", "ns2.hyrule.host"]
     assert domain.dnssec_status == "active"
     assert provider.registration_nameservers == ["ns1.hyrule.host", "ns2.hyrule.host"]
+
+
+@pytest.mark.asyncio
+async def test_domain_quote_is_reserved_before_payment(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote("single-order.dev", DomainAction.REGISTER, "H1234567890")
+    request = DomainOrderRequest(
+        quote_id=quote.quote_id,
+        payment_method=DomainPaymentMethod.USDC,
+        terms_version=service.domain_config.terms_version,
+    )
+    order, _ = await service.create_order(
+        request,
+        owner_account_id="H1234567890",
+        idempotency_key="single-order-first",
+    )
+
+    with pytest.raises(DomainProblem) as second:
+        await service.create_order(
+            request,
+            owner_account_id="H1234567890",
+            idempotency_key="single-order-second",
+        )
+    assert second.value.code == "quote_unavailable"
+    async with sessions() as session:
+        stored_quote = await session.get(DomainQuoteRow, quote.quote_id)
+    assert stored_quote is not None and stored_quote.status == "reserved"
+
+    await service.mark_x402_paid(
+        order.order_id,
+        payer="0x" + "1" * 40,
+        tx_hash="0xsingle",
+    )
+    async with sessions() as session:
+        stored_quote = await session.get(DomainQuoteRow, quote.quote_id)
+    assert stored_quote is not None and stored_quote.status == "consumed"
+
+
+@pytest.mark.asyncio
+async def test_native_domain_intent_expires_with_its_quote(domain_service):
+    service, _provider, sessions = domain_service
+
+    async def usd_per(asset: str) -> Decimal:
+        assert asset == "BTC"
+        return Decimal("60000")
+
+    service.rates.get_usd_per = usd_per
+    service.native_crypto.derive_btc_address = lambda _index: BTC_REFUND_ADDRESS
+    quote = await service.create_quote("native-window.dev", DomainAction.REGISTER, "H1234567890")
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.BTC,
+            refund_address=BTC_REFUND_ADDRESS,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="native-window",
+    )
+
+    async with sessions() as session:
+        intent = await session.get(CryptoIntentRow, order.native_intent_id)
+    assert intent is not None
+    assert intent.expires_at.replace(tzinfo=UTC) == quote.expires_at
+
+
+@pytest.mark.asyncio
+async def test_renewal_order_rejects_vm_bundle(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote("renew-no-bundle.dev", DomainAction.REGISTER, "H1234567890")
+    async with sessions() as session:
+        stored_quote = await session.get(DomainQuoteRow, quote.quote_id)
+        assert stored_quote is not None
+        stored_quote.action = DomainAction.RENEW.value
+        await session.commit()
+
+    with pytest.raises(DomainProblem) as rejected:
+        await service.create_order(
+            DomainOrderRequest(
+                quote_id=quote.quote_id,
+                payment_method=DomainPaymentMethod.USDC,
+                terms_version=service.domain_config.terms_version,
+                vm_quote_id="vmq_not_allowed",
+            ),
+            owner_account_id="H1234567890",
+            idempotency_key="renew-no-bundle",
+        )
+    assert rejected.value.code == "bundle_not_supported"
 
 
 @pytest.mark.asyncio
@@ -600,12 +750,31 @@ async def test_settlement_ledger_recovers_lost_x402_order_handoff(domain_service
         tx_hash="0xrecover",
         extra={"order_id": order.order_id, "domain": "recover-payment.dev"},
     )
+    now = datetime.now(UTC)
+    event.created_at = now - timedelta(minutes=10)
+    newer_events = []
+    for index in range(3):
+        newer = ledger.build_event(
+            event_type="settled",
+            resource_path="/v1/domains/orders",
+            method="POST",
+            amount=Decimal("13"),
+            network="eip155:8453",
+            asset="USDC",
+            payer="0x" + "3" * 40,
+            tx_hash=f"0xalready-recovered-{index}",
+            extra={"order_id": f"do_already_recovered_{index}"},
+        )
+        newer.created_at = now + timedelta(seconds=index)
+        newer_events.append(newer)
     async with sessions() as session:
-        session.add(event)
+        session.add_all([event, *newer_events])
         await session.commit()
 
-    assert await service.recover_x402_handoffs() == 1
-    assert await service.recover_x402_handoffs() == 0
+    # The recoverable event sits beyond the first page of already-processed
+    # ledger entries, so a single fixed LIMIT would strand it forever.
+    assert await service.recover_x402_handoffs(limit=2) == 1
+    assert await service.recover_x402_handoffs(limit=2) == 0
     async with sessions() as session:
         current = await session.get(DomainOrderRow, order.order_id)
         jobs = list(
@@ -827,6 +996,256 @@ async def test_worker_recovers_only_domain_bundle_vm_provisioning(domain_service
 
     assert await service.recover_bundle_provisioning() == 1
     assert service.orchestrator.started_vms == ["vm_bundle_recovery"]
+
+
+@pytest.mark.asyncio
+async def test_bundle_claims_domain_before_creating_vm(domain_service):
+    service, _provider, sessions = domain_service
+    fqdn = "claimed-bundle.dev"
+    quote = await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890")
+    vm_quote_id = "vmq_claimed_bundle"
+    async with sessions() as session:
+        session.add(
+            VMQuoteRow(
+                quote_id=vm_quote_id,
+                order_payload=_bundle_spec(fqdn).model_dump(mode="json", exclude={"quote_id"}),
+                amount_usd=Decimal("5"),
+                status=QuoteStatus.CREATED,
+                owner_account_id="H1234567890",
+                expires_at=datetime.now(UTC) + timedelta(minutes=15),
+            )
+        )
+        await session.commit()
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+            vm_quote_id=vm_quote_id,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="claimed-bundle",
+    )
+    await service.mark_x402_paid(
+        order.order_id,
+        payer="0x" + "4" * 40,
+        tx_hash="0xbundle-claim",
+    )
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="claimed-bundle",
+                extension="dev",
+                fqdn=fqdn,
+                owner_wallet="0x" + "4" * 40,
+                owner_account_id="H1234567890",
+                status="active",
+                openprovider_id=7001,
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+            )
+        )
+        await session.commit()
+
+    observed_claim: list[str] = []
+
+    async def create_vm(_spec, **kwargs):
+        async with sessions() as session:
+            domain = (
+                await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
+            ).scalar_one()
+        assert domain.vm_id == kwargs["vm_id"]
+        observed_claim.append(domain.vm_id)
+        return SimpleNamespace(vm_id=kwargs["vm_id"], status=VMStatus.READY.value), False
+
+    async def persist_charged_amount(_vm_id: str, _amount: Decimal) -> None:
+        return None
+
+    service.orchestrator.create_vm = create_vm
+    service.orchestrator.persist_charged_amount = persist_charged_amount
+    await service._provision_bundle(order.order_id)
+
+    assert len(observed_claim) == 1
+    async with sessions() as session:
+        domain = (
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
+        ).scalar_one()
+    assert domain.vm_id == observed_claim[0]
+
+
+@pytest.mark.asyncio
+async def test_partial_bundle_refund_commits_atomically_with_terminal_job(
+    domain_service,
+    monkeypatch,
+):
+    service, _provider, sessions = domain_service
+    fqdn = "partial-refund.dev"
+    quote = await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890")
+    vm_quote_id = "vmq_partial_refund"
+    async with sessions() as session:
+        session.add(
+            VMQuoteRow(
+                quote_id=vm_quote_id,
+                order_payload=_bundle_spec(fqdn).model_dump(mode="json", exclude={"quote_id"}),
+                amount_usd=Decimal("5"),
+                status=QuoteStatus.CREATED,
+                owner_account_id="H1234567890",
+                expires_at=datetime.now(UTC) + timedelta(minutes=15),
+            )
+        )
+        await session.commit()
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+            vm_quote_id=vm_quote_id,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="partial-refund",
+    )
+    await service.mark_x402_paid(
+        order.order_id,
+        payer="0x" + "5" * 40,
+        tx_hash="0xpartial",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="partial-refund",
+                extension="dev",
+                fqdn=fqdn,
+                owner_wallet="0x" + "5" * 40,
+                owner_account_id="H1234567890",
+                status="active",
+                openprovider_id=7002,
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+            )
+        )
+        job = (
+            await session.execute(
+                select(DomainJobRow).where(DomainJobRow.resource_id == order.order_id)
+            )
+        ).scalar_one()
+        job.status = "running"
+        job.attempts = 10
+        job_id = job.job_id
+        await session.commit()
+
+    refunds = service.orchestrator.refunds
+    original_builder = refunds.build_owed_event
+
+    def ledger_failure(**_kwargs):
+        raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(refunds, "build_owed_event", ledger_failure)
+    with pytest.raises(RuntimeError, match="ledger unavailable"):
+        await service._retry_or_fail_job(job_id, RuntimeError("bundle VM failed"))
+
+    async with sessions() as session:
+        rolled_back_job = await session.get(DomainJobRow, job_id)
+        rolled_back_order = await session.get(DomainOrderRow, order.order_id)
+        refund_events = list(
+            await session.scalars(
+                select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
+            )
+        )
+    assert rolled_back_job is not None and rolled_back_job.status == "running"
+    assert rolled_back_order is not None and rolled_back_order.status == "queued"
+    assert refund_events == []
+
+    monkeypatch.setattr(refunds, "build_owed_event", original_builder)
+    await service._retry_or_fail_job(job_id, RuntimeError("bundle VM failed"))
+    async with sessions() as session:
+        failed_job = await session.get(DomainJobRow, job_id)
+        active_order = await session.get(DomainOrderRow, order.order_id)
+        refund_event = (
+            await session.execute(
+                select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
+            )
+        ).scalar_one()
+    assert failed_job is not None and failed_job.status == "failed"
+    assert active_order is not None and active_order.status == "active"
+    assert refund_event.amount_usd == Decimal("5")
+    assert refund_event.extra["order_id"] == order.order_id
+
+
+@pytest.mark.asyncio
+async def test_read_only_operation_poll_does_not_consume_transfer_secret(domain_service):
+    service, _provider, sessions = domain_service
+    key = Fernet.generate_key()
+    service.domain_config.authcode_fernet_key = key.decode()
+    operation_id = "dop_transfer_secret_test"
+    async with sessions() as session:
+        session.add(
+            DomainOperationRow(
+                operation_id=operation_id,
+                fqdn="transfer-secret.dev",
+                owner_account_id="H1234567890",
+                kind="transfer_out",
+                status="succeeded",
+                secret_ciphertext=Fernet(key).encrypt(b"AUTH-CODE-123").decode(),
+                secret_expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            )
+        )
+        await session.commit()
+
+    read_only = await service.get_operation(
+        "H1234567890",
+        operation_id,
+        reveal_secret=False,
+    )
+    assert read_only.secret is None
+    async with sessions() as session:
+        stored = await session.get(DomainOperationRow, operation_id)
+    assert stored is not None and stored.secret_ciphertext is not None
+    assert stored.secret_revealed_at is None
+
+    authorized = await service.get_operation(
+        "H1234567890",
+        operation_id,
+        reveal_secret=True,
+    )
+    assert authorized.secret == "AUTH-CODE-123"
+    async with sessions() as session:
+        stored = await session.get(DomainOperationRow, operation_id)
+    assert stored is not None and stored.secret_ciphertext is None
+    assert stored.secret_revealed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_operation_route_only_reveals_secret_to_transfer_authority() -> None:
+    reveal_values: list[bool] = []
+
+    class Service:
+        async def get_operation(self, _account_id, _operation_id, *, reveal_secret):
+            reveal_values.append(reveal_secret)
+            return SimpleNamespace()
+
+    account = SimpleNamespace(account_id="H1234567890")
+    for is_api_key, scopes in (
+        (True, {"domain:read"}),
+        (True, {"domain:read", "domain:transfer"}),
+        (False, set()),
+    ):
+        request = SimpleNamespace(
+            state=SimpleNamespace(is_api_key=is_api_key, api_key_scopes=scopes)
+        )
+        await get_operation_route(
+            "dop_scope_test",
+            request,
+            account=account,
+            service=Service(),
+        )
+
+    assert reveal_values == [False, True, True]
 
 
 @pytest.mark.asyncio

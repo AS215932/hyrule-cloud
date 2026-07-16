@@ -6,9 +6,48 @@ import string
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
+from bip_utils import (
+    P2PKHAddrDecoder,
+    P2SHAddrDecoder,
+    SegwitBech32Decoder,
+    XmrAddrDecoder,
+)
 from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 
 _ALPHABET = string.ascii_letters + string.digits
+
+
+def _valid_btc_mainnet_address(address: str) -> bool:
+    """Accept checksummed legacy and SegWit Bitcoin mainnet addresses."""
+    try:
+        SegwitBech32Decoder.Decode("bc", address)
+        return True
+    except (TypeError, ValueError):
+        pass
+    for decoder, network_version in (
+        (P2PKHAddrDecoder, b"\x00"),
+        (P2SHAddrDecoder, b"\x05"),
+    ):
+        try:
+            decoder.DecodeAddr(address, net_ver=network_version)
+            return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _valid_xmr_mainnet_address(address: str) -> bool:
+    """Accept checksummed standard and subaddress Monero mainnet addresses."""
+    for decoder, network_version in (
+        (XmrAddrDecoder, b"\x12"),
+        (XmrAddrDecoder, b"\x2a"),
+    ):
+        try:
+            decoder.DecodeAddr(address, net_ver=network_version)
+            return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def _id(prefix: str) -> str:
@@ -174,6 +213,18 @@ class DomainOrderRequest(BaseModel):
         if self.payment_method in (DomainPaymentMethod.BTC, DomainPaymentMethod.XMR):
             if not self.refund_address:
                 raise ValueError("refund_address is required for BTC/XMR payments")
+            address = self.refund_address.strip()
+            valid = (
+                _valid_btc_mainnet_address(address)
+                if self.payment_method is DomainPaymentMethod.BTC
+                else _valid_xmr_mainnet_address(address)
+            )
+            if not valid:
+                raise ValueError(
+                    f"refund_address must be a valid {self.payment_method.value.upper()} "
+                    "mainnet address"
+                )
+            self.refund_address = address
         elif self.refund_address is not None:
             raise ValueError("refund_address is only accepted for BTC/XMR payments")
         return self
