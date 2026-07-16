@@ -284,9 +284,21 @@ class OpenproviderClient(Provider):
     async def get_domain(self, domain_id: int) -> dict[str, Any]:
         return await self._request("GET", f"/domains/{domain_id}", safe_retry=True)
 
-    async def renew_domain(self, domain_id: int, *, period: int = 1) -> dict[str, Any]:
+    async def renew_domain(
+        self,
+        domain_id: int,
+        *,
+        name: str,
+        extension: str,
+        period: int = 1,
+    ) -> dict[str, Any]:
         return await self._request(
-            "POST", f"/domains/{domain_id}/renew", json={"id": domain_id, "period": period}
+            "POST",
+            f"/domains/{domain_id}/renew",
+            json={
+                "domain": {"name": name, "extension": extension},
+                "period": period,
+            },
         )
 
     async def update_domain(self, domain_id: int, **values: Any) -> dict[str, Any]:

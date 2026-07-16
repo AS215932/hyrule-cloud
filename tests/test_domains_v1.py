@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -64,6 +65,7 @@ from hyrule_cloud.models import (
     VMStatus,
 )
 from hyrule_cloud.providers.openprovider import (
+    OpenproviderClient,
     OpenproviderUnavailableError,
     _extract_product_price,
 )
@@ -82,6 +84,7 @@ class _Provider:
     def __init__(self) -> None:
         self.registration_nameservers: list[str] | None = None
         self.registrations: list[str] = []
+        self.renewals: list[tuple[int, str, str, int]] = []
 
     async def check_domain(self, name, extension):
         return {
@@ -115,6 +118,21 @@ class _Provider:
             "prices": {
                 "renew": {"price": "10", "currency": "USD"},
             },
+        }
+
+    async def get_domain(self, domain_id):
+        return {
+            "id": domain_id,
+            "status": "ACT",
+            "expiration_date": (datetime.now(UTC) + timedelta(days=20)).isoformat(),
+        }
+
+    async def renew_domain(self, domain_id, *, name, extension, period=1):
+        self.renewals.append((domain_id, name, extension, period))
+        return {
+            "id": domain_id,
+            "status": "ACT",
+            "expiration_date": (datetime.now(UTC) + timedelta(days=385)).isoformat(),
         }
 
 
@@ -443,6 +461,96 @@ async def test_renewal_order_rejects_vm_bundle(domain_service):
             idempotency_key="renew-no-bundle",
         )
     assert rejected.value.code == "bundle_not_supported"
+
+
+@pytest.mark.asyncio
+async def test_openprovider_renew_payload_includes_domain_identity() -> None:
+    client = OpenproviderClient(HyruleConfig().openprovider)
+    request = AsyncMock(return_value={"status": "ACT"})
+    client._request = request
+    try:
+        await client.renew_domain(
+            123456,
+            name="renew-me",
+            extension="dev",
+            period=2,
+        )
+    finally:
+        await client.close()
+
+    request.assert_awaited_once_with(
+        "POST",
+        "/domains/123456/renew",
+        json={
+            "domain": {"name": "renew-me", "extension": "dev"},
+            "period": 2,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_renewal_service_passes_domain_identity_to_registrar(domain_service):
+    service, provider, sessions = domain_service
+    now = datetime.now(UTC)
+    async with sessions() as session:
+        session.add_all(
+            [
+                DomainQuoteRow(
+                    quote_id="dq_renew_payload",
+                    fqdn="renew-payload.dev",
+                    action="renew",
+                    owner_account_id="H1234567890",
+                    status="consumed",
+                    provider_cost=Decimal("10"),
+                    provider_currency="USD",
+                    fx_rate=Decimal("1"),
+                    provider_cost_usd=Decimal("10"),
+                    hyrule_fee_usd=Decimal("3"),
+                    tax_usd=Decimal("0"),
+                    total_usd=Decimal("13"),
+                    available=True,
+                    premium=False,
+                    terms_version=service.domain_config.terms_version,
+                    expires_at=now + timedelta(minutes=15),
+                ),
+                DomainRow(
+                    name="renew-payload",
+                    extension="dev",
+                    fqdn="renew-payload.dev",
+                    owner_wallet="0x" + "1" * 40,
+                    owner_account_id="H1234567890",
+                    status="renewal_due",
+                    openprovider_id=123456,
+                    nameserver_mode="managed",
+                    nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                    dnssec_mode="managed",
+                    dnssec_status="active",
+                    expires_at=now + timedelta(days=20),
+                    can_renew=True,
+                ),
+                DomainOrderRow(
+                    order_id="do_renew_payload",
+                    quote_id="dq_renew_payload",
+                    fqdn="renew-payload.dev",
+                    action="renew",
+                    owner_account_id="H1234567890",
+                    idempotency_key="renew-payload",
+                    status="queued",
+                    amount_usd=Decimal("13"),
+                    domain_amount_usd=Decimal("13"),
+                    vm_amount_usd=Decimal("0"),
+                    payment_method="usdc",
+                    on_domain_failure="keep_vm",
+                    terms_version=service.domain_config.terms_version,
+                    terms_accepted_at=now,
+                ),
+            ]
+        )
+        await session.commit()
+
+    await service._fulfill_renewal("do_renew_payload")
+
+    assert provider.renewals == [(123456, "renew-payload", "dev", 1)]
 
 
 @pytest.mark.asyncio

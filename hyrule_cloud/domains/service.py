@@ -1955,13 +1955,22 @@ class DomainService:
                 if current_domain is not None and current_domain.expires_at is None:
                     current_domain.expires_at = baseline
                 await session.commit()
-            result = await self.provider.renew_domain(domain.openprovider_id, period=1)
+            result = await self.provider.renew_domain(
+                domain.openprovider_id,
+                name=domain.name,
+                extension=domain.extension,
+                period=1,
+            )
         status = _provider_status(result)
         active = status in {"ACT", "ACTIVE", ""}
         async with self.db() as session:
             current = await session.get(DomainRow, domain.id)
             order = await session.get(DomainOrderRow, order_id)
-            operation = await session.get(DomainOperationRow, order.operation_id) if order else None
+            operation = (
+                await session.get(DomainOperationRow, order.operation_id)
+                if order is not None and order.operation_id
+                else None
+            )
             if current is not None:
                 current.provider_status = status or current.provider_status
                 current.status = DomainStatus.ACTIVE if active else DomainStatus.PROVIDER_PENDING

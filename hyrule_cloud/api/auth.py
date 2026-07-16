@@ -27,6 +27,7 @@ from sqlalchemy import select
 from hyrule_cloud.db import (
     AccountRow,
     DomainOrderRow,
+    DomainRow,
     RecoveryAttemptRow,
     RecoveryChallengeRow,
     VMRow,
@@ -855,14 +856,20 @@ async def delete_me(
             .where(DomainOrderRow.owner_account_id == account.account_id)
             .limit(1)
         )
-        if retained_domain_order is not None:
+        owned_domain = await db.scalar(
+            select(DomainRow.id)
+            .where(DomainRow.owner_account_id == account.account_id)
+            .limit(1)
+        )
+        if retained_domain_order is not None or owned_domain is not None:
             # Registrar and payment history must remain attributable for audit
-            # and support. Refuse explicitly before touching VMs or sessions;
-            # otherwise the domain_orders RESTRICT key would fail only after a
-            # partially applied account-deletion workflow.
+            # and support. A migrated/claimed DomainRow may have no retained
+            # order and no bearer token, so allowing its SET NULL owner key to
+            # fire would make the domain unmanageable. Refuse explicitly before
+            # touching VMs or sessions.
             raise HTTPException(
                 409,
-                "Accounts with domain order history require assisted deletion.",
+                "Accounts with domains or domain order history require assisted deletion.",
             )
         result = await db.execute(
             select(VMRow).where(

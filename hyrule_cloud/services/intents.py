@@ -29,8 +29,10 @@ from sqlalchemy.exc import IntegrityError
 from hyrule_cloud.db import CryptoIntentRow, DomainOrderRow
 from hyrule_cloud.models import (
     CryptoIntentStatus,
+    DomainMode,
     QuoteStatus,
     VMCreateRequest,
+    generate_vm_id,
 )
 from hyrule_cloud.providers.native_crypto import AddressScanResult, NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
@@ -446,6 +448,9 @@ async def _trigger_provisioning(
     # refund could be recorded. The refund path finds the intent by vm_id and
     # reads the real deposit address from it.
     vm_row = None
+    planned_vm_id: str | None = None
+    claimed_domain = False
+    domains = getattr(orch, "domains", None)
     try:
         order = VMCreateRequest.model_validate(row.order_payload)
         quote_id = order.quote_id
@@ -499,6 +504,40 @@ async def _trigger_provisioning(
                     reason="quote_already_consumed",
                 )
                 return
+        if order.domain_mode == DomainMode.CUSTOM:
+            # The route-level check happened when the deposit address was
+            # issued, potentially many confirmations ago. Settlement is the
+            # irreversible trust boundary: reserve the domain for the exact VM
+            # id we are about to create, or refund instead of provisioning a VM
+            # whose requested hostname now belongs to another attachment.
+            if domains is None or row.owner_account_id is None or not order.domain:
+                await orch.record_native_intent_refund(
+                    intent_id,
+                    reason="custom_domain_unavailable_at_settlement",
+                )
+                return
+            planned_vm_id = row.vm_id or generate_vm_id()
+            try:
+                await domains.claim_vm_attachment(
+                    row.owner_account_id,
+                    order.domain,
+                    planned_vm_id,
+                )
+            except Exception:
+                log.warning(
+                    "native_custom_domain_claim_failed",
+                    intent_id=intent_id,
+                    domain=order.domain,
+                    vm_id=planned_vm_id,
+                    exc_info=True,
+                )
+                await orch.record_native_intent_refund(
+                    intent_id,
+                    reason="custom_domain_unavailable_at_settlement",
+                    vm_id=planned_vm_id,
+                )
+                return
+            claimed_domain = True
         # Create the VM row but DON'T start provisioning yet: link the intent to
         # the vm_id first, so a fast provisioning failure (immediate XO/API
         # error) can always find the paying intent and record its refund.
@@ -506,6 +545,7 @@ async def _trigger_provisioning(
             order,
             owner_wallet=row.intent_id,
             owner_account_id=row.owner_account_id,
+            vm_id=planned_vm_id,
             start_provisioning=False,
         )
         if quote_id is not None:
@@ -565,7 +605,7 @@ async def _trigger_provisioning(
         async with session_factory() as db:
             r = await db.get(CryptoIntentRow, intent_id)
             if r is None:
-                return
+                raise RuntimeError("native intent disappeared before VM linkage")
             r.vm_id = vm_row.vm_id
             r.status = CryptoIntentStatus.PROVISIONED
             # One-shot reveal: the next successful GET /v1/intent/{id} returns
@@ -583,7 +623,11 @@ async def _trigger_provisioning(
         # native customer must never be left without a refund_owed row. Fall back
         # to marking the intent FAILED only if recording the refund itself errors.
         try:
-            await orch.record_native_intent_refund(intent_id, reason="provisioning_failed")
+            await orch.record_native_intent_refund(
+                intent_id,
+                reason="provisioning_failed",
+                vm_id=planned_vm_id,
+            )
         except Exception:
             log.exception("native_refund_record_failed", intent_id=intent_id)
             async with session_factory() as db:
@@ -598,7 +642,29 @@ async def _trigger_provisioning(
             # background provisioner was scheduled; fail it terminally so it
             # doesn't sit in PROVISIONING (owner_wallet=intent_id) pinning a /64
             # the sweeper (unpaid rows only) won't reclaim.
-            await orch.mark_vm_failed(vm_row.vm_id, "native provisioning failed post-settlement")
+            try:
+                await orch.mark_vm_failed(
+                    vm_row.vm_id,
+                    "native provisioning failed post-settlement",
+                )
+            except Exception:
+                log.exception(
+                    "native_failed_vm_cleanup_failed",
+                    intent_id=intent_id,
+                    vm_id=vm_row.vm_id,
+                )
+        if claimed_domain and domains is not None and planned_vm_id is not None:
+            # Real Orchestrator.mark_vm_failed() already performs this release,
+            # but keep it explicit and idempotent for failures before insertion
+            # and for alternative orchestrator implementations.
+            try:
+                await domains.release_vm_attachment_claim(planned_vm_id)
+            except Exception:
+                log.exception(
+                    "native_custom_domain_claim_release_failed",
+                    intent_id=intent_id,
+                    vm_id=planned_vm_id,
+                )
 
 
 async def scan_pending_intents(

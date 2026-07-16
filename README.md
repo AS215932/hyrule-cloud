@@ -80,7 +80,8 @@ uvicorn hyrule_cloud.app:app --host :: --port 8402
 hyrule-cloud-worker
 ```
 
-Or with Docker Compose (runs migrations automatically):
+Or with Docker Compose (runs migrations once, then starts both the API and
+the dedicated worker):
 
 ```bash
 docker compose up
