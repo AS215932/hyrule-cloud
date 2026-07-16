@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Request, Response
+from fastapi.responses import JSONResponse
 
 from hyrule_cloud.api._contract import (
     config_from_request,
@@ -24,7 +25,12 @@ from hyrule_cloud.models import (
     WebReportRequest,
     WebTLSDeepRequest,
 )
-from hyrule_cloud.services.web.checks import run_web_check, run_web_tls_deep
+from hyrule_cloud.services.safety import UnsafeTargetError
+from hyrule_cloud.services.web.checks import (
+    normalize_web_target,
+    run_web_check,
+    run_web_tls_deep,
+)
 
 router = APIRouter(prefix="/v1/web", tags=["Web reachability"])
 
@@ -142,6 +148,14 @@ async def quote_web_tls_deep(request: Request, body: WebTLSDeepRequest) -> PaidE
 
 @router.post("/check", response_model=WebCheckResponse)
 async def web_check(request: Request, body: WebCheckRequest) -> WebCheckResponse | Response:
+    try:
+        # Reject a malformed or unsafe-literal target (bad scheme, embedded
+        # credentials, out-of-range port, private/reserved IP literal) BEFORE
+        # charging. A well-formed but unresolvable public hostname passes here
+        # and becomes a paid diagnostic in run_web_check.
+        normalize_web_target(body.target)
+    except (UnsafeTargetError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": "invalid_target", "detail": str(exc)})
     if payment := await require_paid_diagnostic(
         request,
         price_attr="price_web_check",

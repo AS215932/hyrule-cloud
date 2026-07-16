@@ -7,6 +7,7 @@ import pytest
 
 from hyrule_cloud.config import GlobalpingConfig
 from hyrule_cloud.models import (
+    DiagnosticVantage,
     WebAvailabilityStatus,
     WebCheckRequest,
     WebFailurePhase,
@@ -277,6 +278,79 @@ async def test_local_probe_rejects_private_redirect_target(
 
 
 @pytest.mark.asyncio
+async def test_local_probe_pins_connection_to_vetted_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # DNS-rebinding guard: the request must be dialled at the vetted IP, while
+    # the Host header and TLS SNI stay bound to the original hostname so the
+    # server routes correctly and certificate verification is unchanged.
+    seen: dict[str, object] = {}
+
+    async def resolve_safe_target(_host: str, _port: int) -> list[str]:
+        return ["93.184.216.34"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url_host"] = request.url.host
+        seen["host_header"] = request.headers.get("host")
+        seen["sni_hostname"] = request.extensions.get("sni_hostname")
+        return httpx.Response(200, headers={"server": "origin"})
+
+    monkeypatch.setattr(web_checks, "_resolve_safe_target", resolve_safe_target)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=False,
+    ) as client:
+        result = await web_checks._run_local_http_probe(
+            "https://example.com/x",
+            timeout_seconds=2,
+            max_redirects=5,
+            include_raw=False,
+            resolved_address="93.184.216.34",
+            client=client,
+        )
+
+    assert seen["url_host"] == "93.184.216.34"
+    assert seen["host_header"] == "example.com"
+    assert seen["sni_hostname"] == "example.com"
+    assert result.status == WebAvailabilityStatus.UP
+
+
+def test_normalize_web_target_rejects_malformed_or_unsafe_targets() -> None:
+    with pytest.raises(ValueError):
+        web_checks.normalize_web_target("https://example.com:999999/")
+    with pytest.raises(UnsafeTargetError):
+        web_checks.normalize_web_target("http://127.0.0.1/admin")
+    with pytest.raises(UnsafeTargetError):
+        web_checks.normalize_web_target("ftp://example.com/")
+    with pytest.raises(UnsafeTargetError):
+        web_checks.normalize_web_target("https://user:pass@example.com/")
+    # A well-formed public hostname is not resolved here and passes.
+    assert web_checks.normalize_web_target("example.com").startswith("https://")
+
+
+@pytest.mark.asyncio
+async def test_run_web_check_reports_blocked_resolution_without_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A hostname that resolves to a private/reserved address must produce a paid
+    # diagnostic (never a 500, never a dialled connection).
+    async def resolve_blocked(_host: str, _port: int) -> list[str]:
+        raise UnsafeTargetError("blocked resolved non-public target: 10.0.0.5")
+
+    monkeypatch.setattr(web_checks, "_resolve_safe_target", resolve_blocked)
+    response = await web_checks.run_web_check(
+        WebCheckRequest(target="https://rebind.example", vantages=[DiagnosticVantage.EXTMON]),
+        globalping_config=GlobalpingConfig(enabled=False),
+    )
+
+    assert any(finding.code == "dns_resolves_non_public" for finding in response.findings)
+    assert response.availability.status == WebAvailabilityStatus.DOWN
+    extmon = next(result for result in response.vantage_results if result.vantage == "extmon")
+    assert extmon.status == WebAvailabilityStatus.DOWN
+    assert extmon.failure_phase == WebFailurePhase.DNS
+
+
+@pytest.mark.asyncio
 async def test_globalping_client_requests_one_probe_per_location() -> None:
     seen_payload: dict[str, object] = {}
 
@@ -332,7 +406,7 @@ async def test_globalping_client_requests_one_probe_per_location() -> None:
     assert seen_payload["measurementOptions"] == {
         "protocol": "HTTPS",
         "port": 443,
-        "request": {"method": "HEAD", "path": "/path", "query": "q=1"},
+        "request": {"method": "GET", "path": "/path", "query": "q=1"},
     }
     assert results[0].status == WebAvailabilityStatus.UP
 

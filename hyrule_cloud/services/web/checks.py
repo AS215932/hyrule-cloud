@@ -146,6 +146,18 @@ def _normalize_web_url(target: str) -> str:
     return parsed._replace(fragment="").geturl()
 
 
+def normalize_web_target(target: str) -> str:
+    """Validate + normalize a web-check target URL.
+
+    Public wrapper over the request-shape checks (scheme, credentials, host,
+    port range, unsafe IP literals) so a route can reject a malformed or
+    unsafe-literal target *before* charging. Raises ``UnsafeTargetError`` (a
+    ``ValueError``) on rejection. Does not resolve DNS — an unresolvable but
+    well-formed public hostname passes here and becomes a paid diagnostic.
+    """
+    return _normalize_web_url(target)
+
+
 async def _resolve_safe_target(host: str, port: int) -> list[str]:
     return await asyncio.to_thread(assert_safe_active_probe_target, host, port=port)
 
@@ -217,20 +229,50 @@ def _header_value(headers: dict[str, str | list[str]], key: str) -> str | None:
     return value
 
 
+def _pin_to_address(url: str, connect_ip: str) -> tuple[str, dict[str, str], dict[str, object]]:
+    """Rewrite a logical URL so the TCP connection targets the already-vetted
+    IP, while TLS SNI, certificate verification, and the Host header stay bound
+    to the original hostname.
+
+    Without this the safety guard resolves and validates the hostname's
+    addresses but httpx then re-resolves the same hostname independently at
+    connect time — a DNS-rebinding target can pass the guard and still get the
+    request delivered to a private/reserved address. Pinning the connect target
+    to the vetted address closes that window; httpcore honours the
+    ``sni_hostname`` extension for TLS, so certificate validation is unchanged.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    literal = f"[{connect_ip}]" if ":" in connect_ip else connect_ip
+    connect_url = parsed._replace(netloc=f"{literal}:{port}").geturl()
+    default_port = port == (443 if parsed.scheme == "https" else 80)
+    headers = {"Host": host if default_port else f"{host}:{port}"}
+    extensions: dict[str, object] = {}
+    if parsed.scheme == "https":
+        extensions["sni_hostname"] = host
+    return connect_url, headers, extensions
+
+
 async def _request_headers(
     client: httpx.AsyncClient,
     method: str,
     url: str,
+    *,
+    connect_ip: str,
 ) -> tuple[int, httpx.Headers, float]:
+    connect_url, host_headers, extensions = _pin_to_address(url, connect_ip)
     started = time.perf_counter()
     async with client.stream(
         method,
-        url,
+        connect_url,
         headers={
             "Accept": "*/*",
             "User-Agent": "HyruleCloud-WebDiag/2.0",
+            **host_headers,
             **({"Range": "bytes=0-0"} if method == "GET" else {}),
         },
+        extensions=extensions,
     ) as response:
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
         return response.status_code, response.headers, latency_ms
@@ -265,12 +307,12 @@ async def _run_local_http_probe(
             current_resolved_address = current_addresses[0]
 
             status_code, response_headers, latency_ms = await _request_headers(
-                client, "HEAD", current
+                client, "HEAD", current, connect_ip=current_resolved_address
             )
             total_latency += latency_ms
             if status_code in {405, 501}:
                 status_code, response_headers, fallback_latency = await _request_headers(
-                    client, "GET", current
+                    client, "GET", current, connect_ip=current_resolved_address
                 )
                 latency_ms += fallback_latency
                 total_latency += fallback_latency
@@ -549,11 +591,7 @@ def _parse_globalping_results(
             if status_code in _REDIRECT_STATUSES and location_header
             else []
         )
-        availability = (
-            WebAvailabilityStatus.DEGRADED
-            if status_code in {405, 501}
-            else _status_for_http(status_code, tls)
-        )
+        availability = _status_for_http(status_code, tls)
         parsed_results.append(
             WebVantageResult(
                 vantage=vantage,
@@ -600,8 +638,12 @@ async def _run_globalping_http_probes(
     host = parsed.hostname or ""
     protocol = "HTTPS" if parsed.scheme == "https" else "HTTP"
     port = parsed.port or (443 if protocol == "HTTPS" else 80)
+    # GET, not HEAD: the local probe falls back to GET on a HEAD rejection
+    # (405/501), but a single Globalping measurement cannot retry, so a
+    # HEAD-averse-but-healthy origin would otherwise be scored DEGRADED from
+    # every distributed vantage and contradict the local vantage.
     request_options: dict[str, object] = {
-        "method": "HEAD",
+        "method": "GET",
         "path": parsed.path or "/",
     }
     if parsed.query:
@@ -941,17 +983,20 @@ async def run_web_check(
             )
             raw["addresses"] = addresses
     except UnsafeTargetError as exc:
-        # A non-resolving public hostname is diagnostic evidence, not an unsafe
-        # target. Private/reserved targets remain hard failures and are never
-        # sent to either the local or distributed prober.
-        if "unable to resolve target" not in str(exc) and "no usable addresses" not in str(exc):
-            raise
+        # Post-charge resolution failures are diagnostic evidence, not a crash.
+        # A hostname that will not resolve, or that resolves to a private/
+        # reserved address, is reported as a finding; `addresses` stays empty so
+        # the local prober is skipped and a blocked address is never dialled.
+        # Globalping (external, never connected from here) still contributes the
+        # public-internet view. Malformed or unsafe-literal targets are already
+        # rejected before payment in the route.
         dns_error = str(exc)
         if WebCheck.DNS in body.checks:
+            unresolved = "unable to resolve target" in dns_error or "no usable addresses" in dns_error
             findings.append(
                 _finding(
                     DiagnosticStatus.CRITICAL,
-                    "dns_resolution_failed",
+                    "dns_resolution_failed" if unresolved else "dns_resolves_non_public",
                     f"{host} did not resolve to a safe public target: {exc}",
                 )
             )
