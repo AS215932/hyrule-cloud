@@ -5,12 +5,14 @@ Domain models for Hyrule Cloud resources.
 from __future__ import annotations
 
 import enum
+import ipaddress
 import secrets
 import string
 from datetime import UTC, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Block A0: widen vm_id from 48-bit hex (vm_<12 hex>) to ~131-bit base62
 # (vm_<22 base62>). The legacy 48-bit space was borderline guessable; with
@@ -822,6 +824,7 @@ class NATIPResponse(BaseModel):
     asn: int | None = None
     reverse_dns: list[str] = Field(default_factory=list)
     headers_seen: dict[str, str | None] = Field(default_factory=dict)
+    client_context: dict[str, str | None] = Field(default_factory=dict)
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -1103,8 +1106,10 @@ class IPNetworkResult(BaseModel):
     asn: int | None = None
     asn_name: str | None = None
     isp: str | None = None
+    organization: str | None = None
     prefix: str | None = None
     registry: str | None = None
+    country_code: str | None = None
 
 
 class IPReputationListing(BaseModel):
@@ -1136,6 +1141,477 @@ class IPLookupResponse(BaseModel):
 
 class IPPricingResponse(BaseModel):
     lookup_usd: str
+    quality_report_usd: str | None = None
+
+
+class IPSourceDescriptor(BaseModel):
+    name: str
+    category: str
+    provides: list[str]
+    configured: bool
+    approved_for_resale: bool | None = None
+    enabled: bool
+
+
+class IPSourcesResponse(BaseModel):
+    sources: list[IPSourceDescriptor]
+    quality_report_enabled: bool
+
+
+class IPQualityClientContext(BaseModel):
+    user_agent: str | None = Field(default=None, min_length=1, max_length=512)
+    accept_language: str | None = Field(default=None, min_length=1, max_length=256)
+    timezone: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone must be an IANA timezone name") from exc
+        return value
+
+
+class IPQualityRequest(BaseModel):
+    address: str
+    expected_country_code: str | None = Field(
+        default=None, min_length=2, max_length=2, pattern=r"^[A-Za-z]{2}$"
+    )
+    client_context: IPQualityClientContext | None = None
+    history_days: int = Field(default=90, ge=0, le=365)
+
+    @field_validator("address")
+    @classmethod
+    def validate_public_address(cls, value: str) -> str:
+        try:
+            parsed = ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise ValueError("address must be a valid IPv4 or IPv6 address") from exc
+        if not parsed.is_global:
+            raise ValueError("address must be a globally routable public IP address")
+        return str(parsed)
+
+    @field_validator("expected_country_code")
+    @classmethod
+    def normalize_country_code(cls, value: str | None) -> str | None:
+        return value.upper() if value is not None else None
+
+
+class IPQualityLocation(BaseModel):
+    country_code: str | None = None
+    country: str | None = None
+    region: str | None = None
+    city: str | None = None
+    postal_code: str | None = None
+    timezone: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+
+
+class IPQualityRegistration(BaseModel):
+    country_code: str | None = None
+    country: str | None = None
+    represented_country_code: str | None = None
+    registry: str | None = None
+
+
+class IPQualityNetwork(BaseModel):
+    asn: int | None = None
+    asn_organization: str | None = None
+    isp: str | None = None
+    organization: str | None = None
+    network: str | None = None
+    connection_type: str | None = None
+    user_type: str | None = None
+
+
+class IPQualityConnection(BaseModel):
+    proxy: bool | None = None
+    vpn: bool | None = None
+    tor: bool | None = None
+    active_vpn: bool | None = None
+    active_tor: bool | None = None
+    anonymous: bool | None = None
+    hosting_provider: bool | None = None
+    public_proxy: bool | None = None
+    residential_proxy: bool | None = None
+
+
+class IPQualityRisk(BaseModel):
+    fraud_score: float | None = Field(default=None, ge=0, le=100)
+    recent_abuse: bool | None = None
+    bot_status: bool | None = None
+    frequent_abuser: bool | None = None
+    high_risk_attacks: bool | None = None
+    abuse_velocity: str | None = None
+
+
+class IPQualityUsageSignals(BaseModel):
+    estimated_users_24h: int | None = Field(default=None, ge=0)
+    static_ip_score: float | None = Field(default=None, ge=0, le=100)
+    shared_connection: bool | None = None
+    dynamic_connection: bool | None = None
+    mobile: bool | None = None
+
+
+class IPQualityRouting(BaseModel):
+    routed: bool | None = None
+    best_prefix: str | None = None
+    origin_asns: list[int] = Field(default_factory=list)
+    rpki_status: str | None = None
+
+
+class IPQualityRoutingHistoryEvent(BaseModel):
+    origin_asn: int
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
+    visibility: float | None = Field(default=None, ge=0, le=1)
+
+
+class IPQualityRoutingHistory(BaseModel):
+    status: str
+    days_requested: int
+    events: list[IPQualityRoutingHistoryEvent] = Field(default_factory=list, max_length=64)
+    origin_changed: bool = False
+    message: str | None = None
+
+
+class IPQualityRegistrationVersion(BaseModel):
+    version: int | None = None
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
+    country_code: str | None = None
+    organization: str | None = None
+
+
+class IPQualityRegistrationHistory(BaseModel):
+    status: str
+    days_requested: int
+    versions: list[IPQualityRegistrationVersion] = Field(default_factory=list, max_length=64)
+    country_changed: bool = False
+    message: str | None = None
+
+
+class IPQualityConsistency(BaseModel):
+    expected_country_code: str | None = None
+    observed_country_codes: dict[str, str] = Field(default_factory=dict)
+    country_matches_expectation: bool | None = None
+    timezone_matches_location: bool | None = None
+    provider_disagreements: list[str] = Field(default_factory=list)
+
+
+class IPQualityVerdictLevel(enum.StrEnum):
+    LOW_RISK = "low_risk"
+    REVIEW = "review"
+    HIGH_RISK = "high_risk"
+    INCONCLUSIVE = "inconclusive"
+
+
+class IPQualityVerdict(BaseModel):
+    level: IPQualityVerdictLevel
+    reasons: list[str] = Field(default_factory=list)
+
+
+class IPQualityResponse(BaseModel):
+    request_id: str = Field(default_factory=generate_diagnostic_request_id)
+    address: str
+    location: IPQualityLocation
+    registration: IPQualityRegistration
+    network: IPQualityNetwork
+    connection: IPQualityConnection
+    risk: IPQualityRisk
+    usage: IPQualityUsageSignals
+    routing: IPQualityRouting
+    routing_history: IPQualityRoutingHistory
+    registration_history: IPQualityRegistrationHistory
+    consistency: IPQualityConsistency
+    sources: dict[str, SourceHealth] = Field(default_factory=dict)
+    partial: bool = False
+    verdict: IPQualityVerdict
+    charged_amount_usd: str | None = None
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class IPCheckSessionCreateRequest(BaseModel):
+    expected_dns_resolvers: list[str] = Field(default_factory=list, max_length=16)
+
+    @field_validator("expected_dns_resolvers")
+    @classmethod
+    def normalize_expected_resolvers(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            try:
+                network = ipaddress.ip_network(value, strict=False)
+            except ValueError as exc:
+                raise ValueError("expected DNS resolvers must be public IPs or CIDRs") from exc
+            if not network.is_global:
+                raise ValueError("expected DNS resolvers must be globally routable")
+            rendered = str(network)
+            if rendered not in normalized:
+                normalized.append(rendered)
+        return normalized
+
+
+class IPCheckEvidenceProvenance(enum.StrEnum):
+    SERVER_OBSERVED = "server_observed"
+    CLIENT_DECLARED = "client_declared"
+    SIGNED = "signed"
+    ATTESTED = "attested"
+
+
+class IPCheckProbeDefinition(BaseModel):
+    id: str
+    protocol: str
+    target: str
+    method: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+    record_types: list[str] = Field(default_factory=list)
+    result_submission_url: str | None = None
+    provenance: IPCheckEvidenceProvenance
+    optional: bool = False
+    description: str
+
+
+class IPCheckProbeManifest(BaseModel):
+    version: str = "1"
+    execution_requirement: str = "run_from_environment_under_test"
+    probes: list[IPCheckProbeDefinition]
+    report_url: str
+    agent_identity_challenge: str
+
+
+class IPCheckSessionCreateResponse(BaseModel):
+    session_id: str
+    token: str
+    expires_at: datetime
+    retention_seconds: int = Field(ge=60, le=900)
+    ipv4_probe_url: str
+    ipv6_probe_url: str
+    dns_probe_hostname: str
+    stun_urls: list[str]
+    probe_manifest: IPCheckProbeManifest
+
+
+class IPCheckHTTPSObservationResponse(BaseModel):
+    session_id: str
+    address: str
+    family: int
+    observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class IPCheckWebRTCStatus(enum.StrEnum):
+    COLLECTED = "collected"
+    BLOCKED = "blocked"
+    UNSUPPORTED = "unsupported"
+    FAILED = "failed"
+
+
+class IPCheckBrowserObservationRequest(BaseModel):
+    status: IPCheckWebRTCStatus
+    public_addresses: list[str] = Field(default_factory=list, max_length=16)
+
+    @field_validator("public_addresses")
+    @classmethod
+    def normalize_public_candidates(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError as exc:
+                raise ValueError("WebRTC candidates must be IP addresses") from exc
+            if not address.is_global:
+                raise ValueError("only public WebRTC candidates may be submitted")
+            rendered = str(address)
+            if rendered not in normalized:
+                normalized.append(rendered)
+        return normalized
+
+
+class IPCheckNetworkAdapter(enum.StrEnum):
+    STUN = "stun"
+    WEBRTC = "webrtc"
+
+
+class IPCheckNetworkObservationRequest(BaseModel):
+    adapter: IPCheckNetworkAdapter
+    status: IPCheckWebRTCStatus
+    public_addresses: list[str] = Field(default_factory=list, max_length=16)
+
+    @field_validator("public_addresses")
+    @classmethod
+    def normalize_public_addresses(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError as exc:
+                raise ValueError("network observations must be IP addresses") from exc
+            if not address.is_global:
+                raise ValueError("only public network observations may be submitted")
+            rendered = str(address)
+            if rendered not in normalized:
+                normalized.append(rendered)
+        return normalized
+
+
+class IPCheckBrowserFingerprintRequest(BaseModel):
+    """Explicit, short-lived browser traits; never a durable tracking ID."""
+
+    user_agent: str | None = Field(default=None, max_length=512)
+    languages: list[str] = Field(default_factory=list, max_length=16)
+    timezone: str | None = Field(default=None, max_length=64)
+    platform: str | None = Field(default=None, max_length=128)
+    vendor: str | None = Field(default=None, max_length=128)
+    screen_width: int | None = Field(default=None, ge=0, le=32768)
+    screen_height: int | None = Field(default=None, ge=0, le=32768)
+    color_depth: int | None = Field(default=None, ge=0, le=128)
+    hardware_concurrency: int | None = Field(default=None, ge=0, le=1024)
+    device_memory_gib: float | None = Field(default=None, ge=0, le=1024)
+    max_touch_points: int | None = Field(default=None, ge=0, le=1024)
+    cookies_enabled: bool | None = None
+    do_not_track: str | None = Field(default=None, max_length=16)
+    webgl_vendor: str | None = Field(default=None, max_length=256)
+    webgl_renderer: str | None = Field(default=None, max_length=512)
+    canvas_sha256: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
+    audio_sha256: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
+    high_entropy_consent: bool = False
+
+    @field_validator("languages")
+    @classmethod
+    def normalize_languages(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            rendered = value.strip()[:64]
+            if rendered and rendered not in normalized:
+                normalized.append(rendered)
+        return normalized
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_browser_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone must be an IANA timezone name") from exc
+        return value
+
+    @model_validator(mode="after")
+    def require_high_entropy_consent(self) -> IPCheckBrowserFingerprintRequest:
+        high_entropy = (
+            self.webgl_vendor,
+            self.webgl_renderer,
+            self.canvas_sha256,
+            self.audio_sha256,
+        )
+        if any(value is not None for value in high_entropy) and not self.high_entropy_consent:
+            raise ValueError(
+                "high_entropy_consent is required for WebGL, canvas, or audio traits"
+            )
+        return self
+
+
+class IPCheckAgentProtocol(enum.StrEnum):
+    MCP = "mcp"
+    A2A = "a2a"
+    CLI = "cli"
+    SDK = "sdk"
+    OTHER = "other"
+
+
+class IPCheckAgentFingerprintRequest(BaseModel):
+    runtime: str = Field(min_length=1, max_length=128)
+    runtime_version: str | None = Field(default=None, max_length=128)
+    operating_system: str | None = Field(default=None, max_length=128)
+    architecture: str | None = Field(default=None, max_length=64)
+    protocol: IPCheckAgentProtocol = IPCheckAgentProtocol.OTHER
+    model_vendor_claim: str | None = Field(default=None, max_length=128)
+    model_name_claim: str | None = Field(default=None, max_length=128)
+    capabilities: list[str] = Field(default_factory=list, max_length=64)
+    wallet_address: str | None = Field(
+        default=None, pattern=r"^0x[a-fA-F0-9]{40}$"
+    )
+    wallet_signature: str | None = Field(default=None, min_length=2, max_length=1024)
+
+    @field_validator("capabilities")
+    @classmethod
+    def normalize_capabilities(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            rendered = value.strip()[:128]
+            if rendered and rendered not in normalized:
+                normalized.append(rendered)
+        return normalized
+
+    @model_validator(mode="after")
+    def require_complete_wallet_proof(self) -> IPCheckAgentFingerprintRequest:
+        if (self.wallet_address is None) != (self.wallet_signature is None):
+            raise ValueError("wallet_address and wallet_signature must be supplied together")
+        return self
+
+
+class IPCheckBrowserFingerprintReport(BaseModel):
+    fingerprint_id: str
+    scope: str = "session"
+    expires_at: datetime
+    header_traits: dict[str, str] = Field(default_factory=dict)
+    client_traits: dict[str, object] = Field(default_factory=dict)
+    consistency: dict[str, bool | None] = Field(default_factory=dict)
+    high_entropy_traits_used: bool = False
+    provenance: dict[str, IPCheckEvidenceProvenance] = Field(default_factory=dict)
+
+
+class IPCheckAgentFingerprintReport(BaseModel):
+    fingerprint_id: str
+    scope: str = "session"
+    expires_at: datetime
+    runtime: dict[str, object] = Field(default_factory=dict)
+    capabilities: list[str] = Field(default_factory=list)
+    model_claim: dict[str, str] = Field(default_factory=dict)
+    identity_subject: str | None = None
+    identity_verified: bool = False
+    identity_assurance: IPCheckEvidenceProvenance = IPCheckEvidenceProvenance.CLIENT_DECLARED
+    provenance: dict[str, IPCheckEvidenceProvenance] = Field(default_factory=dict)
+
+
+class IPCheckDNSObservationRequest(BaseModel):
+    dns_label: str = Field(min_length=8, max_length=63, pattern=r"^[a-z0-9-]+$")
+    resolver_address: str
+    query_name: str | None = Field(default=None, max_length=253)
+    observed_at: datetime | None = None
+
+    @field_validator("resolver_address")
+    @classmethod
+    def normalize_resolver_address(cls, value: str) -> str:
+        try:
+            return str(ipaddress.ip_address(value))
+        except ValueError as exc:
+            raise ValueError("resolver_address must be an IP address") from exc
+
+
+class IPCheckSessionReport(BaseModel):
+    session_id: str
+    expires_at: datetime
+    https_ipv4_addresses: list[str] = Field(default_factory=list)
+    https_ipv6_addresses: list[str] = Field(default_factory=list)
+    dns_resolver_addresses: list[str] = Field(default_factory=list)
+    webrtc_public_addresses: list[str] = Field(default_factory=list)
+    webrtc_status: IPCheckWebRTCStatus | None = None
+    stun_public_addresses: list[str] = Field(default_factory=list)
+    stun_status: IPCheckWebRTCStatus | None = None
+    ipv4_status: str
+    ipv6_status: str
+    webrtc_leak_status: str
+    nat_egress_status: str
+    dns_leak_status: str
+    dns_expectation_configured: bool
+    browser_fingerprint: IPCheckBrowserFingerprintReport | None = None
+    agent_fingerprint: IPCheckAgentFingerprintReport | None = None
+    retention_seconds: int = Field(ge=60, le=900)
 
 
 class DNSLookupRecordType(enum.StrEnum):

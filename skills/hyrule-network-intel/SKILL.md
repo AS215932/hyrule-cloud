@@ -19,6 +19,9 @@ Use Hyrule Cloud for paid, agent-friendly network intelligence primitives.
 
 - IP geolocation (activates once a provider is configured; requests 501 before charging until then)
 - IP-to-ASN/ISP lookup
+- Licensed IP-quality reports combining MaxMind Insights, IPQS, current
+  routing/RPKI, bounded routing history, and RIPE-only registration history
+  (dark-launched until both provider resale approvals and credentials are live)
 - Reverse DNS
 - RDAP for domains, IPs, prefixes, ASNs, entities
 - Legacy WHOIS for domains, IPs, prefixes/network blocks, ASNs
@@ -44,6 +47,25 @@ curl -X POST https://cloud.hyrule.host/v1/ip/lookup \
   -H 'X-PAYMENT: <x402-payment>' \
   -d '{"address":"8.8.8.8","views":["asn","rdns","rdap","whois"]}'
 ```
+
+Check `/v1/ip/capabilities` or the curated `/openapi.json` before offering the
+quality report. When enabled, quote and call it with explicit context only:
+
+```bash
+curl -X POST https://cloud.hyrule.host/v1/ip/quality \
+  -H 'Content-Type: application/json' \
+  -H 'X-PAYMENT: <x402-payment>' \
+  -d '{"address":"8.8.8.8","expected_country_code":"US","client_context":{"timezone":"America/Los_Angeles"},"history_days":90}'
+```
+
+Treat `verdict.level` as a screening outcome, not proof that a person is
+fraudulent. Hyrule intentionally does not invent a universal numeric score:
+IPQS scores at least 90 and confirmed high-risk abuse are `high_risk`; scores
+75–89, anonymity/hosting signals, consistency mismatches, RPKI invalidity, or
+origin changes are `review`; `low_risk` requires both licensed sources and no
+review reasons. Open-source enrichment can be `partial` without hiding the
+licensed evidence. Only send user-agent or language values the user explicitly
+provided.
 
 ## x402
 

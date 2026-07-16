@@ -53,6 +53,10 @@ def _enable_all_catalog_gates(monkeypatch: pytest.MonkeyPatch) -> None:
         "hyrule_cloud.api.bgp.router_snapshot_download_enabled",
         lambda: True,
     )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.intel.ip_quality.quality_report_enabled",
+        lambda _config=None: True,
+    )
 
 
 def _schema_operations(schema: dict) -> set[tuple[str, str]]:

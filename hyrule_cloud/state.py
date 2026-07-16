@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from hyrule_cloud.domains.wallet_auth import WalletAuthService
     from hyrule_cloud.middleware.x402 import PaymentGate
     from hyrule_cloud.orchestrator import Orchestrator
+    from hyrule_cloud.providers.ip_quality import IPQualityProvider
     from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
     from hyrule_cloud.providers.network_client import NetworkProvider
     from hyrule_cloud.providers.rates import RateProvider
@@ -22,6 +23,7 @@ class AppState:
     orchestrator: Orchestrator
     payment_gate: PaymentGate
     network_provider: NetworkProvider
+    ip_quality_provider: IPQualityProvider | None = field(default=None)
     # Block E: native crypto path. Optional so existing tests can wire only
     # what they need; routes that require them check for None.
     native_crypto: NativeCryptoProvider | None = field(default=None)

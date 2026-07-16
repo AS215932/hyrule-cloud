@@ -349,6 +349,51 @@ _IP_LOOKUP_OUTPUT = {
     "partial": False,
     "generated_at": _GENERATED_AT,
 }
+_IP_QUALITY_OUTPUT = {
+    "request_id": "diag_a1b2c3d4",
+    "address": "8.8.8.8",
+    "location": {"country_code": "US", "country": "United States"},
+    "registration": {"country_code": "US", "registry": "arin"},
+    "network": {"asn": 15169, "asn_organization": "GOOGLE, US"},
+    "connection": {
+        "proxy": False,
+        "vpn": False,
+        "tor": False,
+        "hosting_provider": True,
+    },
+    "risk": {"fraud_score": 5},
+    "usage": {},
+    "routing": {
+        "routed": True,
+        "best_prefix": "8.8.8.0/24",
+        "origin_asns": [15169],
+        "rpki_status": "valid",
+    },
+    "routing_history": {
+        "status": "available",
+        "days_requested": 90,
+        "events": [],
+        "origin_changed": False,
+    },
+    "registration_history": {
+        "status": "unsupported",
+        "days_requested": 90,
+        "versions": [],
+        "country_changed": False,
+    },
+    "consistency": {
+        "observed_country_codes": {"maxmind_location": "US", "ipqs_location": "US"},
+        "provider_disagreements": [],
+    },
+    "sources": {
+        "maxmind_insights": {"status": "ok"},
+        "ipqualityscore": {"status": "ok"},
+    },
+    "partial": False,
+    "verdict": {"level": "review", "reasons": ["connection_hosting_provider"]},
+    "charged_amount_usd": "0.02",
+    "generated_at": _GENERATED_AT,
+}
 _DNS_LOOKUP_OUTPUT = {
     "request_id": "dns_a1b2c3d4",
     "question": {"name": "example.com", "type": "AAAA"},
@@ -470,6 +515,20 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         {"address": "2a0c:b641:b50::1"},
         models.IPLookupResponse,
         _IP_LOOKUP_OUTPUT,
+    ),
+    _body_operation(
+        "/v1/ip/quality",
+        "Licensed IP quality, fraud-risk, network-type, routing-history, and consistency report",
+        _fixed("price_ip_quality", "0.02"),
+        models.IPQualityRequest,
+        {
+            "address": "8.8.8.8",
+            "expected_country_code": "US",
+            "history_days": 90,
+        },
+        models.IPQualityResponse,
+        _IP_QUALITY_OUTPUT,
+        gate="ip_quality",
     ),
     _body_operation(
         "/v1/dns/lookup",
@@ -655,7 +714,7 @@ DISCOVERY: dict[tuple[str, str], dict[str, Any]] = {
 }
 
 
-def _gate_enabled(gate: str) -> bool:
+def _gate_enabled(gate: str, config: HyruleConfig | None = None) -> bool:
     if gate == "always":
         return True
     if gate == "real_vm":
@@ -687,13 +746,21 @@ def _gate_enabled(gate: str) -> bool:
         from hyrule_cloud.services.bgp.snapshots import router_snapshot_download_enabled
 
         return router_snapshot_download_enabled()
+    if gate == "ip_quality":
+        from hyrule_cloud.services.intel.ip_quality import quality_report_enabled
+
+        return quality_report_enabled(config)
     raise ValueError(f"Unknown paid-operation gate: {gate}")
 
 
-def enabled_paid_operations() -> tuple[PaidOperation, ...]:
+def enabled_paid_operations(config: HyruleConfig | None = None) -> tuple[PaidOperation, ...]:
     """Return the launch catalog after applying deployment readiness gates."""
 
-    return tuple(operation for operation in PAID_OPERATIONS if _gate_enabled(operation.gate))
+    return tuple(
+        operation
+        for operation in PAID_OPERATIONS
+        if _gate_enabled(operation.gate, config)
+    )
 
 
 def discovery_for(method: str, path: str) -> dict[str, Any] | None:
@@ -749,14 +816,14 @@ _CATALOG_PHRASES: tuple[tuple[str, str], ...] = (
 )
 
 
-def catalog_description() -> str:
+def catalog_description(config: HyruleConfig | None = None) -> str:
     """Capability copy assembled from the enabled catalog only.
 
     Generated from live gate state so a product that is gated off (VM
     simulation, missing prober/worker/provider) can never appear in
     manifest/OpenAPI marketing copy.
     """
-    enabled_paths = [operation.path for operation in enabled_paid_operations()]
+    enabled_paths = [operation.path for operation in enabled_paid_operations(config)]
     phrases: list[str] = []
     for prefix, phrase in _CATALOG_PHRASES:
         if phrase in phrases:
@@ -773,7 +840,7 @@ def catalog_description() -> str:
 
 def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
     resources: list[dict[str, Any]] = []
-    for operation in enabled_paid_operations():
+    for operation in enabled_paid_operations(config):
         resource: dict[str, Any] = {
             "path": operation.path,
             "method": operation.method,
@@ -789,7 +856,7 @@ def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
     return {
         "x402Version": 2,
         "name": "Hyrule Cloud",
-        "description": catalog_description(),
+        "description": catalog_description(config),
         "resources": resources,
         "facilitator": getattr(config.payment, "facilitator_url", ""),
         "contact": "https://github.com/AS215932",
@@ -870,7 +937,7 @@ def _annotate_operation(
 def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[str, Any]:
     """Generate the sole OpenAPI document from enabled launch operations."""
 
-    enabled = enabled_paid_operations()
+    enabled = enabled_paid_operations(config)
     enabled_keys = {operation.key for operation in enabled}
     selected_routes = [
         route
@@ -884,7 +951,7 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
         openapi_version=application.openapi_version,
         summary=application.summary,
         description=(
-            f"{catalog_description()} This OpenAPI document intentionally contains only "
+            f"{catalog_description(config)} This OpenAPI document intentionally contains only "
             "the launch-ready, independently payable agent surface."
         ),
         routes=selected_routes,
