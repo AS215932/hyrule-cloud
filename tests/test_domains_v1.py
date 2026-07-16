@@ -987,6 +987,38 @@ async def test_vm_attachment_claim_is_atomic_and_detach_preserves_customer_edit(
     await service.attach_vm(
         "H1234567890", "attached.dev", "vm_claim_one", "2001:db8::20"
     )
+    protected_changes = [
+        DNSChange(
+            action=DNSChangeAction.UPSERT,
+            rrset=DNSRRSet(
+                name="@",
+                type=ManagedRecordType.AAAA,
+                ttl=300,
+                values=["2001:db8::99"],
+            ),
+        ),
+        DNSChange(
+            action=DNSChangeAction.DELETE,
+            rrset=DNSRRSet(
+                name="@",
+                type=ManagedRecordType.AAAA,
+                ttl=300,
+                values=["2001:db8::20"],
+            ),
+        ),
+    ]
+    for index, change in enumerate(protected_changes, start=1):
+        with pytest.raises(DomainProblem) as protected:
+            await service.apply_changeset(
+                "H1234567890",
+                "attached.dev",
+                2,
+                DNSChangesetRequest(changes=[change]),
+                idempotency_key=f"protected-vm-apex-{index}",
+            )
+        assert protected.value.status == 409
+        assert protected.value.code == "vm_apex_record_managed"
+
     async with sessions() as session:
         domain = (
             await session.execute(select(DomainRow).where(DomainRow.fqdn == "attached.dev"))
@@ -1001,6 +1033,9 @@ async def test_vm_attachment_claim_is_atomic_and_detach_preserves_customer_edit(
             )
         ).scalar_one()
         assert domain.vm_ipv6 == "2001:db8::20"
+        assert domain.zone_revision == 2
+        assert record.ttl == 300
+        assert record.values == ["2001:db8::20"]
         # A customer edit changes ownership of this RRset. Detach must unlink
         # the VM without deleting the customer's new value.
         record.ttl = 600

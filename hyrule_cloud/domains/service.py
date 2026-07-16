@@ -915,6 +915,16 @@ class DomainService:
             desired = {(row.name, row.type): row for row in rows}
             for change in body.changes:
                 rrset = validate_rrset(change.rrset, fqdn)
+                if (
+                    domain.vm_ipv6 is not None
+                    and rrset.name == "@"
+                    and rrset.type is ManagedRecordType.AAAA
+                ):
+                    raise DomainProblem(
+                        409,
+                        "vm_apex_record_managed",
+                        "The apex AAAA record is managed by the attached VM; detach it before changing this record.",
+                    )
                 key = (rrset.name, rrset.type.value)
                 existing = desired.get(key)
                 if change.action is DNSChangeAction.DELETE:
