@@ -64,6 +64,6 @@ When provisioning reaches `failed`:
 ```
 POST /v1/vm/quote          → quote_id, status=created    (launch: accepted)
 POST /v1/vm/create 402     → payment required              (launch: payment_required)
-POST /v1/vm/create 200     → vm_id, status=provisioning   (launch: provisioning)
+POST /v1/vm/create 202     → vm_id, status=provisioning   (launch: provisioning)
 GET  /v1/vm/{id}/status    → ssh_smoke=passed, dns=true   (launch: provisioned)
 ```

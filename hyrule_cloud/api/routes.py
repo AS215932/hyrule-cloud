@@ -706,10 +706,21 @@ async def get_vm_logs(
 # --- x402-gated endpoints ---
 
 
-@router.post("/vm/create", response_model=VMCreateResponse)
+@router.post(
+    "/vm/create",
+    response_model=VMCreateResponse,
+    status_code=202,
+    responses={
+        200: {
+            "model": VMCreateResponse,
+            "description": "Idempotent replay of an already-consumed quote.",
+        }
+    },
+)
 async def create_vm(
     body: VMCreateRequest,
     request: Request,
+    response: Response,
     orch=Depends(get_orch),
     cfg=Depends(get_cfg),
     gate=Depends(get_gate),
@@ -741,6 +752,7 @@ async def create_vm(
                 async with orch.db() as session:
                     existing_vm = await session.get(VMRow, quote_row.vm_id)
                 if existing_vm is not None:
+                    response.status_code = 200
                     return _vm_create_response(existing_vm, request, management_token=None)
             # Claimed but not yet linked → the winner is mid-provision.
             raise HTTPException(409, "Quote is being provisioned; poll the VM status")
@@ -841,6 +853,7 @@ async def create_vm(
             async with orch.db() as session:
                 existing_vm = await session.get(VMRow, latest.vm_id)
             if existing_vm is not None:
+                response.status_code = 200
                 return _vm_create_response(existing_vm, request, management_token=None)
         raise HTTPException(409, "Quote is being provisioned; poll the VM status")
 
