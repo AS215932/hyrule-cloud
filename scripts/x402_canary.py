@@ -2,7 +2,7 @@
 """x402 live-payment canary for Hyrule Cloud.
 
 Pays REAL USDC on Base mainnet to exercise a paid endpoint end to end
-(402 -> EIP-3009 sign -> retry -> 200 + settlement). Use it to run the
+(402 -> EIP-3009 sign -> retry -> successful 2xx + settlement). Use it to run the
 per-service launch canaries: 3a network-intel, 3b proxy, 3c domain, 3d VM.
 
 The x402 client auto-handles the 402 challenge, signs the payment, and retries.
@@ -331,6 +331,9 @@ async def _run_one(
         return False
 
     if name == "vm":
+        if r.status_code != 202:
+            print(f"    !! VM create returned HTTP {r.status_code}; expected 202 Accepted. FAILING.")
+            return False
         # The 202 only means the create was accepted + charged; the Phase-3d
         # gate isn't passed until the VM reaches ready AND its launch-proof
         # (SSH smoke + DNS AAAA) verifies. Propagate that.

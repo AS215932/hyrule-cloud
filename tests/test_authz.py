@@ -427,7 +427,7 @@ async def test_vm_create_surfaces_management_token_and_url(_state_create):
                 "ssh_pubkey": "ssh-ed25519 AAAA",
             },
         )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     data = res.json()
     assert data["management_token"].startswith("hyr_vm_")
     assert data["management_url"].endswith(f"?token={data['management_token']}")

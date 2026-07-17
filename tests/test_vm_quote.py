@@ -280,7 +280,7 @@ async def test_create_with_quote_paid_provisions_and_consumes(quote_state, clien
     quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
 
     res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert res.json()["vm_id"]
     assert res.json()["management_token"] is not None
     # Quote is now consumed and linked to the VM.
@@ -304,7 +304,7 @@ async def test_link_quote_failure_still_starts_provisioning(quote_state, client,
     monkeypatch.setattr("hyrule_cloud.api.routes.link_quote_vm", _boom)
 
     res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     vm_id = res.json()["vm_id"]
     assert vm_id in quote_state.orchestrator.provisioning_started
 
@@ -352,7 +352,7 @@ async def test_link_quote_retries_then_succeeds(quote_state, client, monkeypatch
     monkeypatch.setattr("hyrule_cloud.api.routes.link_quote_vm", _flaky)
 
     res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert calls["n"] == 2  # failed once, retried, succeeded
     row = await quotes_service.get_quote(quote_state.orchestrator.db, quote["quote_id"])
     assert row.vm_id == res.json()["vm_id"]  # linked on retry — rediscoverable
@@ -395,7 +395,7 @@ async def test_create_idempotent_replay_of_consumed_quote(quote_state, client):
     quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
     first = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
     second = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
-    assert first.status_code == 200
+    assert first.status_code == 202
     assert second.status_code == 200
     assert first.json()["vm_id"] == second.json()["vm_id"]
     # The one-shot management token is only revealed on first provision.
@@ -420,9 +420,9 @@ async def test_concurrent_paid_creates_provision_at_most_one_vm(quote_state, cli
     # The invariant: at most one VM regardless of how the two interleave.
     assert len(quote_state.orchestrator.created_vms) == 1
     statuses = {r1.status_code, r2.status_code}
-    # Winner → 200 (vm_id); loser → 200 (idempotent existing VM) or 409 (mid-provision).
-    assert 200 in statuses
-    assert statuses.issubset({200, 409})
+    # Winner → 202 (accepted); loser → 200 (existing VM) or 409 (mid-provision).
+    assert 202 in statuses
+    assert statuses.issubset({200, 202, 409})
 
 
 @pytest.mark.asyncio
@@ -437,7 +437,7 @@ async def test_legacy_create_without_quote_id_still_works(quote_state, client):
     """Backward-compat: the legacy compute-price-from-body path is unchanged."""
     quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
     res = await client.post("/v1/vm/create", json=_order())
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert res.json()["vm_id"]
 
 

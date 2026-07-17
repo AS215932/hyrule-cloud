@@ -196,7 +196,7 @@ async def test_quote_create_then_status_shows_provisioning(lp_state, client):
     quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
 
     res = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     vm_id = res.json()["vm_id"]
 
     status = await client.get(f"/v1/vm/{vm_id}/status")

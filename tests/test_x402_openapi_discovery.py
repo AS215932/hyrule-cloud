@@ -97,6 +97,8 @@ def test_every_catalog_operation_has_complete_x402_openapi_metadata(
         assert challenge["content"]["application/json"]["schema"] == {
             "$ref": "#/components/schemas/X402PaymentRequired"
         }
+        if operation.key == ("POST", "/v1/vm/create"):
+            assert "202" in documented["responses"]
 
         if operation.method == "POST":
             request = documented["requestBody"]["content"]["application/json"]
