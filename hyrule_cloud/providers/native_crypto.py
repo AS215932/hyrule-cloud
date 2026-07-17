@@ -72,12 +72,24 @@ class NativeCryptoProvider:
             self._http = None
 
     async def ready_assets(self) -> list[str]:
-        """Return native assets that are actually usable right now."""
+        """Return enabled assets with locally valid receiving configuration."""
         assets: list[str] = []
-        if self.config.btc_xpub.strip():
-            assets.append("BTC")
-        if await self.xmr_ready():
+        enabled = set(self.config.native_assets_enabled)
+        if "BTC" in enabled and self.config.btc_xpub.strip():
+            try:
+                self._btc_account_ctx()
+                assets.append("BTC")
+            except Exception as exc:
+                log.error("btc_xpub_invalid", error=str(exc))
+        if "XMR" in enabled and await self.xmr_ready():
             assets.append("XMR")
+        return assets
+
+    async def healthy_assets(self) -> list[str]:
+        """Return locally configured assets whose scanning backend is reachable."""
+        assets = await self.ready_assets()
+        if "BTC" in assets and not await self.btc_ready():
+            assets.remove("BTC")
         return assets
 
     # ---------------- BTC ----------------
@@ -103,6 +115,24 @@ class NativeCryptoProvider:
     def derive_btc_address(self, bip32_index: int) -> str:
         """m/84'/0'/0'/0/<bip32_index> → bc1q... (P2WPKH bech32)."""
         return self._btc_account_ctx().AddressIndex(bip32_index).PublicKey().ToAddress()
+
+    async def btc_ready(self) -> bool:
+        """Validate the receive-only key and reach at least one Esplora tip."""
+        if self._http is None:
+            return False
+        try:
+            self._btc_account_ctx()
+        except Exception as exc:
+            log.error("btc_xpub_invalid", error=str(exc))
+            return False
+        for base in (_ESPLORA_PRIMARY, _ESPLORA_FALLBACK):
+            try:
+                response = await self._http.get(f"{base}/blocks/tip/height")
+                if response.status_code == 200 and int(response.text.strip()) > 0:
+                    return True
+            except Exception as exc:
+                log.warning("esplora_readiness_failed", endpoint=base, error=str(exc))
+        return False
 
     async def scan_btc_address(self, address: str) -> AddressScanResult:
         """Returns the total received + confirmation count for `address`.

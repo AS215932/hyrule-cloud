@@ -252,10 +252,22 @@ class QuoteEvmMethod(BaseModel):
     chain_id: int | None = None
 
 
-class AcceptedPaymentMethods(BaseModel):
-    """Single source of truth, derived from live backend config: enabled EVM
-    chains + whether the native (BTC/XMR) intent rail is wired."""
+class QuoteX402Method(BaseModel):
+    key: str
+    caip2: str
+    family: str
+    asset: str
+    chain_id: int | None = None
 
+
+class AcceptedPaymentMethods(BaseModel):
+    """Live x402 networks plus ready native intent rails.
+
+    ``evm`` is retained for one compatibility release and contains only EVM
+    entries. New clients should consume ``x402``.
+    """
+
+    x402: list[QuoteX402Method] = Field(default_factory=list)
     evm: list[QuoteEvmMethod] = Field(default_factory=list)
     native: list[str] = Field(default_factory=list)
 

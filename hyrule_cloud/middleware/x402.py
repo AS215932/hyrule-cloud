@@ -5,7 +5,7 @@ The official PaymentMiddlewareASGI works for static per-route pricing,
 but our endpoints have dynamic pricing (VM size * duration). So we use
 the SDK's lower-level primitives:
 
-- x402ResourceServer + ExactEvmServerScheme for verify/settle
+- x402ResourceServer + exact EVM/SVM schemes for verify/settle
 - HTTPFacilitatorClient for facilitator communication
 - PaymentRequirements / PaymentRequired models for response formatting
 
@@ -44,6 +44,7 @@ from x402.http import (
     encode_payment_response_header,
 )
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
+from x402.mechanisms.svm.exact import ExactSvmServerScheme
 from x402.schemas import PaymentPayload, PaymentRequirements, ResourceConfig, ResourceInfo
 from x402.server import x402ResourceServer
 
@@ -187,10 +188,14 @@ class PaymentGate:
         # Bazaar discovery: enriches declared extensions with the HTTP method
         # so CDP can index the endpoint at settlement time.
         self.server.register_extension(bazaar_resource_server_extension)
-        for net_cfg in self.config.networks:
-            # We assume ExactEvmServerScheme works out of the box for these during Phase 1
-            # (In production, Solana would use an ExactSolanaServerScheme)
-            self.server.register(net_cfg["network"], ExactEvmServerScheme())
+        for network in self.config.enabled_networks():
+            if network.family == "evm":
+                scheme = ExactEvmServerScheme()
+            elif network.family == "svm":
+                scheme = ExactSvmServerScheme()
+            else:  # PaymentConfig rejects this; keep the gate fail-closed too.
+                raise ValueError(f"Unsupported payment network family: {network.family}")
+            self.server.register(network.caip2, scheme)
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
@@ -210,7 +215,9 @@ class PaymentGate:
             return True
 
     @staticmethod
-    def _json_response(status_code: int, body: dict[str, Any], headers: dict[str, str] | None = None) -> Response:
+    def _json_response(
+        status_code: int, body: dict[str, Any], headers: dict[str, str] | None = None
+    ) -> Response:
         response_headers = {"Content-Type": "application/json"}
         if headers:
             response_headers.update(headers)
@@ -220,21 +227,50 @@ class PaymentGate:
             headers=response_headers,
         )
 
+    def _supported_networks(self) -> list[Any]:
+        """Configured networks the initialized facilitator can actually settle."""
+        get_supported = getattr(self.server, "get_supported_kind", None)
+        if get_supported is None:
+            # Compatibility for deterministic SDK test doubles.
+            return self.config.enabled_networks()
+
+        supported = []
+        for network in self.config.enabled_networks():
+            if not self.config.receiver_for(network):
+                log.error("payment_receiver_missing", network=network.caip2)
+                continue
+            kind = get_supported(2, network.caip2, "exact")
+            if kind is None:
+                continue
+            if network.family == "svm" and not (getattr(kind, "extra", None) or {}).get("feePayer"):
+                log.error("svm_facilitator_missing_fee_payer", network=network.caip2)
+                continue
+            supported.append(network)
+        return supported
+
+    async def supported_network_keys(self) -> set[str]:
+        """Return only networks safe to advertise to clients."""
+        if not await self._ensure_initialized():
+            return set()
+        return {network.key for network in self._supported_networks()}
+
     def _resource_configs(self, amount: Decimal) -> list[ResourceConfig]:
         return [
             ResourceConfig(
-                scheme=net_cfg["scheme"],
-                network=net_cfg["network"],
-                pay_to=self.config.receiver_address,
+                scheme="exact",
+                network=network.caip2,
+                pay_to=self.config.receiver_for(network),
                 price=f"${amount}",
             )
-            for net_cfg in self.config.networks
+            for network in self._supported_networks()
         ]
 
     def _build_requirements(self, amount: Decimal) -> list[PaymentRequirements]:
         requirements: list[PaymentRequirements] = []
         for resource_cfg in self._resource_configs(amount):
             requirements.extend(self.server.build_payment_requirements(resource_cfg))
+        if not requirements:
+            raise RuntimeError("No configured payment network is supported by the facilitator")
         return requirements
 
     def _discovery_extensions(
@@ -285,9 +321,7 @@ class PaymentGate:
             mime_type="application/json",
             service_name="Hyrule Cloud",
             tags=list(operation.tags),
-            icon_url=(
-                f"{self.public_base_url}/icon-192.png" if self.public_base_url else None
-            ),
+            icon_url=(f"{self.public_base_url}/icon-192.png" if self.public_base_url else None),
         )
 
     async def _payment_required_response(
@@ -322,7 +356,7 @@ class PaymentGate:
                 "payment_required": True,
                 "amount": str(amount),
                 "description": description,
-                "networks": self.config.networks,
+                "networks": [requirement.network for requirement in requirements],
             }
         )
 
@@ -350,11 +384,13 @@ class PaymentGate:
         The response includes the standard x402 v2 header (`PAYMENT-REQUIRED`)
         plus Hyrule's legacy compatibility header (`X-PAYMENT-REQUIRED`).
         """
-        if not self.config.networks or not self.config.receiver_address:
+        configured = self.config.enabled_networks()
+        has_receiver = any(self.config.receiver_for(network) for network in configured)
+        if not configured or not has_receiver:
             log.error(
                 "payment_config_unavailable",
-                has_receiver=bool(self.config.receiver_address),
-                networks=len(self.config.networks),
+                has_receiver=has_receiver,
+                networks=len(configured),
             )
             return self._json_response(503, {"error": "Payment facilitator unavailable"})
 
@@ -379,7 +415,9 @@ class PaymentGate:
 
     @staticmethod
     def _payment_header(request: Request) -> str | None:
-        return request.headers.get(PAYMENT_SIGNATURE_HEADER) or request.headers.get(X_PAYMENT_HEADER)
+        return request.headers.get(PAYMENT_SIGNATURE_HEADER) or request.headers.get(
+            X_PAYMENT_HEADER
+        )
 
     def has_payment_credentials(self, request: Request) -> bool:
         """True when this request will actually be charged if valid — a
@@ -398,7 +436,9 @@ class PaymentGate:
     # bound are dropped with a warning.
     _LEDGER_WRITE_TIMEOUT_SECONDS = 2.0
 
-    async def _record(self, event_type: str, request: Request, amount: Decimal, **kwargs: Any) -> None:
+    async def _record(
+        self, event_type: str, request: Request, amount: Decimal, **kwargs: Any
+    ) -> None:
         """Bounded ledger write; no-op without a ledger, never raises."""
         if self.ledger is None:
             return
@@ -675,9 +715,7 @@ class PaymentGate:
             bypass = request.headers.get("X-DEV-BYPASS")
             if bypass == self.config.dev_bypass_secret:
                 log.warning("dev_bypass_payment", amount=str(amount))
-                return VerifiedPayment(
-                    payer="0xDEV_TEST_WALLET", amount=amount, dev_bypass=True
-                )
+                return VerifiedPayment(payer="0xDEV_TEST_WALLET", amount=amount, dev_bypass=True)
 
         extensions = self._discovery_extensions(request)
         payment_header = self._payment_header(request)

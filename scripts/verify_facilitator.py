@@ -17,10 +17,8 @@ Network failure (facilitator unreachable, DNS broken, etc) exits 2 so the
 CI step distinguishes "facilitator is down — retry later" from "facilitator
 doesn't support this chain — fix the config."
 
-In Wave 3 (Block C) this script gets extended to also smoke-test the EIP-712
-domain shape for each EVM chain and to register Solana support. For now it
-covers the Wave 2 minimum — the single Base entry — so the CI gate is real
-and not a no-op.
+For Solana, support is incomplete unless the exact-v2 kind also carries the
+facilitator `feePayer` used by the SVM exact scheme.
 """
 
 from __future__ import annotations
@@ -94,13 +92,30 @@ def _normalise_supported_entries(payload: Any) -> set[str]:
     return out
 
 
+def _kind_for(payload: Any, network: str) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    for item in payload.get("kinds", []):
+        if not isinstance(item, dict):
+            continue
+        version = item.get("x402Version", item.get("x402_version"))
+        if (
+            item.get("network") == network
+            and item.get("scheme") == "exact"
+            and version == 2
+        ):
+            return item
+    return None
+
+
 def main() -> int:
     cfg = PaymentConfig()
     facilitator = cfg.facilitator_url.rstrip("/")
     is_cdp = (urlparse(facilitator).hostname or "") == _CDP_FACILITATOR_HOST
     auth_headers = _cdp_auth_headers(facilitator)
     print(f"facilitator: {facilitator}")
-    print(f"configured chains: {len(cfg.networks)}")
+    networks = cfg.enabled_networks()
+    print(f"configured chains: {len(networks)}")
     if is_cdp:
         print(f"cdp auth: {'yes' if auth_headers else 'NO (unauthenticated probe)'}")
 
@@ -151,9 +166,16 @@ def main() -> int:
     }
 
     failures: list[str] = []
-    for entry in cfg.networks:
-        network = entry.get("network", "")
+    for entry in networks:
+        network = entry.caip2
         if network in supported:
+            if entry.family == "svm":
+                kind = _kind_for(payload, network)
+                fee_payer = (kind or {}).get("extra", {}).get("feePayer")
+                if not fee_payer:
+                    print(f"  FAIL {network} — exact v2 kind has no facilitator feePayer")
+                    failures.append(network)
+                    continue
             print(f"  OK   {network}")
             continue
         if is_cdp:
@@ -189,7 +211,7 @@ def main() -> int:
         print(f"Facilitator advertises: {sorted(supported)}", file=sys.stderr)
         return 1
 
-    print(f"\nOK — all {len(cfg.networks)} configured chain(s) supported.")
+    print(f"\nOK — all {len(networks)} configured chain(s) supported.")
     return 0
 
 

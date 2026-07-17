@@ -558,6 +558,18 @@ class PaymentEventRow(Base):
     )
 
 
+class ServiceHeartbeatRow(Base):
+    """Cross-process readiness signal for durable background consumers."""
+
+    __tablename__ = "service_heartbeats"
+
+    service_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    worker_id: Mapped[str] = mapped_column(String(128))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
 class VMQuoteRow(Base):
     """Durable order quote (issue #14).
 

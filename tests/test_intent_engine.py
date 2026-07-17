@@ -42,6 +42,7 @@ from hyrule_cloud.services.intents import (
     IntentExistsError,
     create_intent,
     poll_one_intent,
+    scan_pending_intents,
 )
 
 
@@ -420,6 +421,23 @@ async def test_poll_overpay_settles_and_provisions(intent_state):
     )
     assert updated.vm_id is not None
     assert updated.anon_token_cleartext is not None
+
+
+@pytest.mark.asyncio
+async def test_scan_pass_fails_when_any_pending_intent_cannot_be_scanned(intent_state):
+    await _seed_intent(intent_state, asset="BTC")
+
+    async def fail_scan(_address: str):
+        raise RuntimeError("Esplora unavailable")
+
+    intent_state.native_crypto.scan_btc_address = fail_scan
+    with pytest.raises(RuntimeError, match="1 native payment intent scan"):
+        await scan_pending_intents(
+            session_factory=intent_state.orchestrator.db,
+            provider=intent_state.native_crypto,
+            rates=intent_state.rate_provider,
+            orch=intent_state.orchestrator,
+        )
 
 
 @pytest.mark.asyncio
@@ -1451,6 +1469,11 @@ async def test_esplora_falls_back_to_blockstream_on_mempool_failure(monkeypatch)
     # Verify primary was tried first AND failed (so we hit secondary at least once)
     assert any(c.startswith(nc._ESPLORA_PRIMARY) for c in calls)
     assert any(c.startswith(nc._ESPLORA_FALLBACK) for c in calls)
+
+    p.config.btc_xpub = "test-public-key"
+    p.config.native_assets_enabled = ["BTC"]
+    monkeypatch.setattr(p, "_btc_account_ctx", lambda: object())
+    assert await p.healthy_assets() == ["BTC"]
 
 
 # --- QR URI builder ---

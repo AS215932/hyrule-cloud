@@ -14,13 +14,20 @@ slot, mirroring the pattern in tests/test_api.py.
 from __future__ import annotations
 
 import dataclasses
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.app import app
 from hyrule_cloud.config import HyruleConfig, PaymentConfig, PaymentNetwork
+from hyrule_cloud.db import Base
+from hyrule_cloud.services.worker_health import record_payment_worker_heartbeat
 from hyrule_cloud.state import AppState
+
+EVM_RECEIVER = "0xFf4555af30A1066A889324a3Fe88c76796159f15"
+SOLANA_RECEIVER = "9xQeWvG816bUx9EPfEZRzHLrqvRQmkmSBmGE4kc9x9C"
 
 
 @pytest.fixture
@@ -121,6 +128,96 @@ async def test_payments_networks_native_lists_btc_xmr_when_rail_wired(
 
 
 @pytest.mark.asyncio
+async def test_native_rail_requires_a_fresh_successful_worker_heartbeat(
+    real_payment_state,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    real_payment_state.session_factory = sessions
+    real_payment_state.native_payment_assets = ["BTC"]
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            missing = (await c.get("/v1/payments/networks")).json()
+            assert missing["native"] == []
+            assert missing["native_worker"]["ready"] is False
+
+            await record_payment_worker_heartbeat(
+                sessions,
+                worker_id="worker-test",
+                scan_succeeded=True,
+                now=datetime.now(UTC) - timedelta(minutes=5),
+            )
+            stale = (await c.get("/v1/payments/networks")).json()
+            assert stale["native"] == []
+            assert stale["native_worker"]["ready"] is False
+
+            await record_payment_worker_heartbeat(
+                sessions,
+                worker_id="worker-test",
+                scan_succeeded=True,
+            )
+            ready = (await c.get("/v1/payments/networks")).json()
+            assert ready["native"] == ["BTC"]
+            assert ready["native_worker"]["ready"] is True
+
+            await record_payment_worker_heartbeat(
+                sessions,
+                worker_id="worker-test",
+                scan_succeeded=False,
+                error="esplora unavailable",
+            )
+            failed = (await c.get("/v1/payments/networks")).json()
+            assert failed["native"] == []
+            assert failed["native_worker"]["ready"] is False
+            assert failed["native_worker"]["last_error"] == "esplora unavailable"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_solana_catalog_carries_wallet_receiver_and_caip_metadata(
+    real_payment_state,
+) -> None:
+    networks = [
+        dataclasses.replace(network, enabled=(network.key in {"base", "solana"}))
+        for network in real_payment_state.config.payment.payment_networks
+    ]
+    real_payment_state.config.payment = PaymentConfig(
+        receiver_address=EVM_RECEIVER,
+        receiver_addresses={"solana": SOLANA_RECEIVER},
+        payment_networks=networks,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        body = (await c.get("/v1/payments/networks")).json()
+
+    solana = next(network for network in body["networks"] if network["key"] == "solana")
+    assert solana["family"] == "svm"
+    assert solana["chain_id"] is None
+    assert solana["caip2"] == "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+    assert solana["wallet_chain"] == "solana:mainnet"
+    assert solana["token_address"] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    assert solana["pay_to"] == SOLANA_RECEIVER
+
+
+@pytest.mark.asyncio
+async def test_catalog_omits_networks_the_facilitator_does_not_support(
+    real_payment_state,
+) -> None:
+    class Gate:
+        async def supported_network_keys(self) -> set[str]:
+            return {"base"}
+
+    real_payment_state.payment_gate = Gate()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        body = (await c.get("/v1/payments/networks")).json()
+
+    assert [network["key"] for network in body["networks"]] == ["base"]
+
+
+@pytest.mark.asyncio
 async def test_payments_networks_omits_explicitly_disabled_chains(
     real_payment_state,
 ) -> None:
@@ -150,17 +247,27 @@ def test_disabled_chain_drops_off_the_wire() -> None:
     cfg = PaymentConfig(
         payment_networks=[
             PaymentNetwork(
-                key="base", display_name="Base", caip2="eip155:8453", family="evm",
-                chain_id=8453, asset="USDC",
+                key="base",
+                display_name="Base",
+                caip2="eip155:8453",
+                family="evm",
+                chain_id=8453,
+                asset="USDC",
                 token_address="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-                token_decimals=6, eip712_domain={"name": "USD Coin", "version": "2"},
+                token_decimals=6,
+                eip712_domain={"name": "USD Coin", "version": "2"},
                 enabled=True,
             ),
             PaymentNetwork(
-                key="polygon", display_name="Polygon", caip2="eip155:137", family="evm",
-                chain_id=137, asset="USDC",
+                key="polygon",
+                display_name="Polygon",
+                caip2="eip155:137",
+                family="evm",
+                chain_id=137,
+                asset="USDC",
                 token_address="0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
-                token_decimals=6, eip712_domain={"name": "USD Coin", "version": "2"},
+                token_decimals=6,
+                eip712_domain={"name": "USD Coin", "version": "2"},
                 enabled=False,  # disabled
             ),
         ]
@@ -179,3 +286,9 @@ def test_polygon_native_currency_is_pol_not_eth() -> None:
     assert polygon.native_currency["symbol"] == "POL"
     base = next(n for n in cfg.payment_networks if n.key == "base")
     assert base.native_currency["symbol"] == "ETH"
+
+
+def test_native_asset_allowlist_is_normalized_and_rejects_unknown_assets() -> None:
+    assert PaymentConfig(native_assets_enabled=["btc", "BTC"]).native_assets_enabled == ["BTC"]
+    with pytest.raises(ValueError, match="unsupported native payment assets"):
+        PaymentConfig(native_assets_enabled=["DOGE"])

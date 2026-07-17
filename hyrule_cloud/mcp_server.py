@@ -371,8 +371,7 @@ async def list_payment_networks() -> str:
         nets = data.get("networks", [])
         if not nets:
             return "No payment networks enabled."
-        lines = [f"Receiver: {data.get('receiver_address', '')}"]
-        lines.append(f"Facilitator: {data.get('facilitator_url', '')}")
+        lines = [f"Facilitator: {data.get('facilitator_url', '')}"]
         for n in nets:
             # .get() throughout so an older/partially-populated networks payload
             # degrades to "?" rather than KeyError-ing the whole tool.
@@ -380,7 +379,7 @@ async def list_payment_networks() -> str:
                 f"  {n.get('key', '?'):>12s} ({n.get('family', '?')}) "
                 f"{n.get('display_name', '?'):<18s} "
                 f"caip2={n.get('caip2', '?')} mint={n.get('token_address', '?')} "
-                f"dec={n.get('token_decimals', '?')}"
+                f"receiver={n.get('pay_to', '?')} dec={n.get('token_decimals', '?')}"
             )
         return "\n".join(lines)
     except HyruleError as e:

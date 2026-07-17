@@ -36,6 +36,7 @@ def _now() -> datetime:
 class _StubNetwork:
     key = "base"
     caip2 = "eip155:8453"
+    family = "evm"
     asset = "USDC"
     chain_id = 8453
 
@@ -136,9 +137,7 @@ class _StubOrchestrator:
         async with self.db() as session:
             from sqlalchemy import select
 
-            result = await session.execute(
-                select(VMQuoteRow).where(VMQuoteRow.vm_id == vm_id)
-            )
+            result = await session.execute(select(VMQuoteRow).where(VMQuoteRow.vm_id == vm_id))
             return result.scalar_one_or_none()
 
 
@@ -152,6 +151,7 @@ async def lp_state():
     factory = async_sessionmaker(engine, expire_on_commit=False)
     orch = _StubOrchestrator(factory)
     gate = AsyncMock()
+    gate.supported_network_keys.return_value = {"base"}
 
     state = AppState(
         config=_StubCfg(),

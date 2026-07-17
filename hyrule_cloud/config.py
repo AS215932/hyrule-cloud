@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -47,6 +47,9 @@ class PaymentNetwork:
     )
     rpc_url: str = ""
     block_explorer_url: str = ""
+    # Wallet Standard uses a human-readable chain identifier while x402 uses
+    # the CAIP-2 Solana genesis hash. Empty for EVM networks.
+    wallet_chain: str = ""
     testnet: bool = False
     enabled: bool = True
 
@@ -56,9 +59,6 @@ class PaymentNetwork:
 # per chain (`scripts/x402_canary.py dns --network <caip2>`) per
 # [[feedback_verified_payment_chains]] — we only advertise what verifies.
 #
-# World and Solana are intentionally omitted until Wave 5 (Block H) wires
-# the SVM scheme; adding them here without the JS adapter shipping would
-# mislead the frontend's chain selector.
 _DEFAULT_NETWORKS: list[PaymentNetwork] = [
     PaymentNetwork(
         key="base",
@@ -105,6 +105,25 @@ _DEFAULT_NETWORKS: list[PaymentNetwork] = [
         block_explorer_url="https://arbiscan.io",
         testnet=False,
         enabled=True,
+    ),
+    # Mainnet-only launch. Kept disabled in application defaults so merely
+    # upgrading the API cannot advertise Solana before the receiver, CDP
+    # capability check, browser bundle, and paid canary are all in place.
+    PaymentNetwork(
+        key="solana",
+        display_name="Solana",
+        caip2="solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+        family="svm",
+        chain_id=None,
+        asset="USDC",
+        token_address="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        token_decimals=6,
+        native_currency={"name": "Solana", "symbol": "SOL", "decimals": 9},
+        rpc_url="https://api.mainnet-beta.solana.com",
+        block_explorer_url="https://explorer.solana.com",
+        wallet_chain="solana:mainnet",
+        testnet=False,
+        enabled=False,
     ),
 ]
 
@@ -207,6 +226,10 @@ class PaymentConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PAYMENT_", env_file=".env", extra="ignore")
 
     receiver_address: str = ""
+    # Network-specific public receiving addresses. Keys may be the stable
+    # network key ("base", "solana") or CAIP-2 identifier. The legacy single
+    # address remains an EVM-only compatibility fallback for one release.
+    receiver_addresses: dict[str, str] = Field(default_factory=dict)
     facilitator_url: str = "https://facilitator.payai.network"
 
     # Block C (Wave 3): the rich PaymentNetwork list. Keyed list rather than a
@@ -221,6 +244,36 @@ class PaymentConfig(BaseSettings):
         off via Vault without redeploying — the frontend's chain selector
         picks up the change on the next /v1/payments/networks poll."""
         return [n for n in self.payment_networks if n.enabled]
+
+    def receiver_for(self, network: PaymentNetwork) -> str:
+        configured = (
+            self.receiver_addresses.get(network.key, "").strip()
+            or self.receiver_addresses.get(network.caip2, "").strip()
+        )
+        if configured:
+            return configured
+        if network.family == "evm":
+            return self.receiver_address.strip()
+        return ""
+
+    @model_validator(mode="after")
+    def validate_enabled_networks(self) -> PaymentConfig:
+        for network in self.enabled_networks():
+            if network.family not in {"evm", "svm"}:
+                raise ValueError(f"unsupported payment network family: {network.family}")
+            if network.family == "evm" and network.chain_id is None:
+                raise ValueError(f"EVM network {network.key} requires chain_id")
+            if network.family == "svm" and not self.receiver_for(network):
+                raise ValueError(f"SVM network {network.key} requires an explicit receiver address")
+        normalized_assets = [asset.upper() for asset in self.native_assets_enabled]
+        unsupported_assets = set(normalized_assets) - {"BTC", "XMR"}
+        if unsupported_assets:
+            raise ValueError(
+                "unsupported native payment assets: "
+                + ", ".join(sorted(unsupported_assets))
+            )
+        self.native_assets_enabled = list(dict.fromkeys(normalized_assets))
+        return self
 
     @property
     def networks(self) -> list[dict[str, str]]:
@@ -238,14 +291,16 @@ class PaymentConfig(BaseSettings):
     btc_xpub: str = ""
     xmr_viewkey: str = ""
     xmr_rpc_url: str = "http://127.0.0.1:18088/json_rpc"
+    native_assets_enabled: list[str] = Field(default_factory=lambda: ["BTC", "XMR"])
     require_native: bool = False
+    worker_heartbeat_max_age_seconds: int = Field(default=45, ge=15, le=300)
 
     price_vm_xs: Decimal = Decimal("0.05")
     price_vm_sm: Decimal = Decimal("0.10")
     price_vm_md: Decimal = Decimal("0.20")
     price_vm_lg: Decimal = Decimal("0.40")
     price_domain_markup: Decimal = Decimal("1.00")
-    
+
     price_proxy_direct: Decimal = Decimal("0.01")
     price_proxy_tor: Decimal = Decimal("0.05")
     price_proxy_i2p: Decimal = Decimal("0.05")
