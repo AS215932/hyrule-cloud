@@ -14,7 +14,7 @@ from pathlib import Path
 import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from x402.http import PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER
 
@@ -344,6 +344,17 @@ install_metrics(app)
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "hyrule-cloud"}
+
+
+@app.get("/.well-known/agent-seo-verification", include_in_schema=False)
+async def agent_seo_verification() -> PlainTextResponse:
+    """Optional static ownership proof; no Agent SEO runtime integration."""
+
+    state = getattr(app.state, "_typed_state", None)
+    config = state.config if state is not None else HyruleConfig()
+    if not config.agent_seo_verification_token:
+        return PlainTextResponse("Agent SEO verification is not configured", status_code=404)
+    return PlainTextResponse(config.agent_seo_verification_token)
 
 
 @app.get("/.well-known/x402.json", include_in_schema=False)

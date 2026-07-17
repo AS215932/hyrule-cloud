@@ -307,6 +307,7 @@ class HyruleConfig(BaseSettings):
     # Behind the Caddy TLS proxy the raw request URL is http://<backend>, which
     # is the wrong canonical resource identity for Bazaar/x402scan indexing.
     public_base_url: str = "https://cloud.hyrule.host"
+    agent_seo_verification_token: str = ""
 
     # Launch guard: when true, the app refuses to start unless real XCP-NG
     # provisioning is enabled (HCP_LAUNCH_PROOF_REAL_XCPNG=1) and the payment
