@@ -17,7 +17,7 @@ import pytest
 import pytest_asyncio
 from fastapi import Response
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.app import app
@@ -57,6 +57,7 @@ class _StubCfg:
     payment = _StubPayment()
     blocked_ports = [25]
     deploy_domain = "deploy.hyrule.host"
+    xcpng = type("XCPNG", (), {"templates": {"debian-13": "template-debian-13"}})()
 
 
 class _StubOrchestrator:
@@ -68,10 +69,15 @@ class _StubOrchestrator:
         self.provisioning_started: list[str] = []
         self.charged_amounts: dict[str, Decimal] = {}
         self.create_failure_refunds: list[tuple[str | None, str | None]] = []
+        self.capacity_error: Exception | None = None
 
     def compute_price(self, request):
         total = Decimal("0.20") * request.duration_days
         return total, CostBreakdown(vm_cost=f"${total}", domain_cost="$0.00", total=f"${total}")
+
+    async def ensure_vm_capacity(self, _request) -> None:
+        if self.capacity_error is not None:
+            raise self.capacity_error
 
     def start_provisioning(self, vm_id: str) -> None:
         self.provisioning_started.append(vm_id)
@@ -310,6 +316,25 @@ async def test_real_mode_quote_rejects_unsupported_os(quote_state, client, monke
     )
     assert res.status_code == 400
     assert "not supported" in res.text
+
+
+@pytest.mark.asyncio
+async def test_real_mode_quote_returns_503_when_live_capacity_is_exhausted(
+    quote_state, client, monkeypatch
+):
+    from hyrule_cloud.orchestrator import VMCapacityError
+    from hyrule_cloud.services import launch_proof
+
+    monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", True)
+    quote_state.orchestrator.capacity_error = VMCapacityError("insufficient RAM capacity")
+
+    res = await client.post("/v1/vm/quote", json={"order_payload": _order()})
+
+    assert res.status_code == 503
+    assert res.json()["detail"] == "The requested VM does not fit current host capacity"
+    async with quote_state.orchestrator.db() as session:
+        quotes = list((await session.scalars(select(VMQuoteRow))).all())
+    assert quotes == []
 
 
 # --- Idempotency ---

@@ -16,7 +16,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy import update as _sql_update
 
 from hyrule_cloud.db import VMQuoteRow, VMRow
@@ -58,6 +58,7 @@ from hyrule_cloud.models import (
     VMStatus,
     VMStatusResponse,
 )
+from hyrule_cloud.orchestrator import VMCapacityError
 from hyrule_cloud.providers.network_config import (
     RESERVED_PREFIX_INDEXES,
     customer_prefix_count,
@@ -94,8 +95,6 @@ router = APIRouter(prefix="/v1")
 # flight. In-process (one uvicorn worker) — cross-worker reuse still fails at
 # settle, where only one submission of an authorization can succeed.
 _proxy_inflight_auth: set[str] = set()
-_vm_capacity_reservation_lock = asyncio.Lock()
-_VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable "HYRV"-style PostgreSQL lock key
 
 
 @asynccontextmanager
@@ -112,29 +111,6 @@ async def _proxy_authorization_guard(request: Request):
         yield
     finally:
         _proxy_inflight_auth.discard(key)
-
-
-@asynccontextmanager
-async def _serialized_vm_capacity_reservation(orch):
-    """Serialize live-capacity check plus durable reservation across workers."""
-    async with _vm_capacity_reservation_lock:
-        async with orch.db() as session:
-            dialect = session.get_bind().dialect.name
-            locked = False
-            if dialect == "postgresql":
-                await session.execute(
-                    text("SELECT pg_advisory_lock(:lock_key)"),
-                    {"lock_key": _VM_CAPACITY_ADVISORY_LOCK},
-                )
-                locked = True
-            try:
-                yield
-            finally:
-                if locked:
-                    await session.execute(
-                        text("SELECT pg_advisory_unlock(:lock_key)"),
-                        {"lock_key": _VM_CAPACITY_ADVISORY_LOCK},
-                    )
 
 
 async def get_orch(app_state: AppState = Depends(get_app_state)):
@@ -374,66 +350,24 @@ async def _enforce_prefix_capacity(orch, cfg) -> None:
         raise HTTPException(503, "No customer IPv6 capacity available right now")
 
 
-async def _enforce_compute_capacity(orch, cfg, order: VMCreateRequest) -> None:
-    """Fail closed when the live single host cannot fit the exact VM.
-
-    XO reports resources already consumed by running guests. Database rows that
-    are reserved/provisioning but do not yet have an XO UUID are added so the
-    admission decision also accounts for concurrent payment handoffs.
-    """
+async def _enforce_compute_capacity(orch, order: VMCreateRequest) -> None:
+    """Delegate live capacity admission to the orchestrator and fail closed."""
     if not _real_provisioning_enabled():
         return
-    if hasattr(orch, "ensure_vm_capacity"):
-        try:
-            await orch.ensure_vm_capacity(order)
-            return
-        except Exception as exc:
-            log.error("vm_capacity_check_failed", error=str(exc), exc_info=True)
-            raise HTTPException(503, "The requested VM does not fit current host capacity") from exc
-    resources = order.resources or resources_for_profile(order.size)
+    ensure_capacity = getattr(orch, "ensure_vm_capacity", None)
+    if not callable(ensure_capacity):
+        log.error("vm_capacity_check_unavailable")
+        raise HTTPException(503, "VM capacity is temporarily unavailable")
     try:
-        capacity = await orch.xcpng.capacity()
-        async with orch.db() as session:
-            pending = (
-                await session.execute(
-                    select(
-                        func.coalesce(func.sum(VMRow.vcpu), 0),
-                        func.coalesce(func.sum(VMRow.memory_mb), 0),
-                        func.coalesce(func.sum(VMRow.disk_gb), 0),
-                    ).where(
-                        VMRow.status == VMStatus.PROVISIONING,
-                        VMRow.xcpng_uuid.is_(None),
-                    )
-                )
-            ).one()
-    except HTTPException:
-        raise
+        await ensure_capacity(order)
+    except VMCapacityError as exc:
+        log.info("vm_capacity_rejected", error=str(exc))
+        raise HTTPException(
+            503, "The requested VM does not fit current host capacity"
+        ) from exc
     except Exception as exc:
         log.error("vm_capacity_check_failed", error=str(exc), exc_info=True)
         raise HTTPException(503, "VM capacity is temporarily unavailable") from exc
-
-    pending_vcpu, pending_memory_mb, pending_disk_gb = (int(value or 0) for value in pending)
-    cpu_limit = int(
-        Decimal(capacity.physical_vcpu)
-        * Decimal(str(getattr(cfg.xcpng, "vcpu_overcommit_ratio", "2.0")))
-    )
-    memory_headroom = int(getattr(cfg.xcpng, "memory_headroom_mb", 2048)) * 1024 * 1024
-    storage_headroom = int(getattr(cfg.xcpng, "storage_headroom_gb", 20)) * 1024**3
-    enough_cpu = capacity.allocated_vcpu + pending_vcpu + resources.vcpu <= cpu_limit
-    enough_memory = (
-        capacity.free_memory_bytes
-        - pending_memory_mb * 1024 * 1024
-        - resources.ram_mb * 1024 * 1024
-        >= memory_headroom
-    )
-    enough_storage = (
-        capacity.free_storage_bytes
-        - pending_disk_gb * 1024**3
-        - resources.disk_gb * 1024**3
-        >= storage_headroom
-    )
-    if not (enough_cpu and enough_memory and enough_storage):
-        raise HTTPException(503, "The requested VM does not fit current host capacity")
 
 
 # --- Block B (Wave 2): runtime metrics ---
@@ -961,18 +895,18 @@ async def create_vm(
     # allocate-after-payment path.
     if isinstance(gate, PaymentGate) and gate.has_payment_credentials(request):
         try:
-            # A PostgreSQL advisory lock (plus the local lock in tests/SQLite)
-            # closes the live-capacity check → durable DB reservation race.
-            async with _serialized_vm_capacity_reservation(orch):
-                await _enforce_compute_capacity(orch, cfg, order)
-                reservation_row, reservation_token = await orch.reserve_vm(
-                    order,
-                    owner_account_id=account.account_id if account else None,
-                    pricing_snapshot=pricing_snapshot,
-                    legacy_billing=(
-                        quote_row is not None and quote_row.pricing_snapshot is None
-                    ),
-                )
+            reservation_row, reservation_token = await orch.reserve_vm_with_capacity(
+                order,
+                owner_account_id=account.account_id if account else None,
+                pricing_snapshot=pricing_snapshot,
+                legacy_billing=(
+                    quote_row is not None and quote_row.pricing_snapshot is None
+                ),
+            )
+        except VMCapacityError as exc:
+            raise HTTPException(
+                503, "The requested VM does not fit current host capacity"
+            ) from exc
         except RuntimeError:
             raise HTTPException(503, "No customer IPv6 capacity available right now")
         if order.domain_mode == DomainMode.CUSTOM and order.domain:
@@ -997,7 +931,7 @@ async def create_vm(
         # Unpaid discovery and test doubles do not create a reservation, but
         # real deployments still refuse a 402 for a configuration that cannot
         # currently fit.
-        await _enforce_compute_capacity(orch, cfg, order)
+        await _enforce_compute_capacity(orch, order)
 
     result = await gate.check_payment(
         request,
@@ -1190,7 +1124,7 @@ async def create_vm_quote(
     _validate_vm_order(order, cfg)
     await _enforce_paid_vm_cap(orch, cfg)
     await _enforce_prefix_capacity(orch, cfg)
-    await _enforce_compute_capacity(orch, cfg, order)
+    await _enforce_compute_capacity(orch, order)
 
     total = priced.total
     app_state = await get_app_state(request)
@@ -1594,7 +1528,7 @@ async def create_crypto_intent(
 
     await _enforce_paid_vm_cap(orch, cfg)
     await _enforce_prefix_capacity(orch, cfg)
-    await _enforce_compute_capacity(orch, cfg, order)
+    await _enforce_compute_capacity(orch, order)
     # Re-run validation that depends on mutable external state (notably custom
     # domain availability), while retaining the durable quote's locked amount.
     if quote_row is not None and quote_row.pricing_snapshot is None:

@@ -1883,7 +1883,7 @@ async def test_worker_recovers_only_domain_bundle_vm_provisioning(domain_service
 
 
 @pytest.mark.asyncio
-async def test_bundle_claims_domain_before_creating_vm(domain_service):
+async def test_bundle_claims_domain_before_reserving_vm(domain_service):
     service, _provider, sessions = domain_service
     fqdn = "claimed-bundle.dev"
     quote = await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890")
@@ -1935,19 +1935,27 @@ async def test_bundle_claims_domain_before_creating_vm(domain_service):
 
     observed_claim: list[str] = []
 
-    async def create_vm(_spec, **kwargs):
+    async def reserve_vm_with_capacity(_spec, **kwargs):
         async with sessions() as session:
             domain = (
                 await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
             ).scalar_one()
         assert domain.vm_id == kwargs["vm_id"]
         observed_claim.append(domain.vm_id)
-        return SimpleNamespace(vm_id=kwargs["vm_id"], status=VMStatus.READY.value), False
+        return SimpleNamespace(vm_id=kwargs["vm_id"]), "token"
+
+    async def activate_vm_reservation(vm_id, **_kwargs):
+        return SimpleNamespace(vm_id=vm_id, status=VMStatus.READY.value)
+
+    async def release_vm_reservation(_vm_id):
+        return None
 
     async def persist_charged_amount(_vm_id: str, _amount: Decimal) -> None:
         return None
 
-    service.orchestrator.create_vm = create_vm
+    service.orchestrator.reserve_vm_with_capacity = reserve_vm_with_capacity
+    service.orchestrator.activate_vm_reservation = activate_vm_reservation
+    service.orchestrator.release_vm_reservation = release_vm_reservation
     service.orchestrator.persist_charged_amount = persist_charged_amount
     await service._provision_bundle(order.order_id)
 

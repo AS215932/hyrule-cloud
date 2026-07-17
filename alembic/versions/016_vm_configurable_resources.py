@@ -54,10 +54,20 @@ def upgrade() -> None:
     # marks all historical add-on quantities as zero.
     dialect = op.get_bind().dialect.name
     if dialect == "postgresql":
-        for table in ("vm_quotes", "crypto_intents"):
-            op.execute(
-                sa.text(
-                    f"UPDATE {table} SET order_payload = jsonb_set("
+        for statement in (
+            sa.text(
+                "UPDATE vm_quotes SET order_payload = jsonb_set("
+                "order_payload, '{resources}', "
+                "CASE order_payload->>'size' "
+                "WHEN 'xs' THEN jsonb_build_object('vcpu',1,'ram_mb',1024,'disk_gb',10) "
+                "WHEN 'sm' THEN jsonb_build_object('vcpu',1,'ram_mb',1024,'disk_gb',20) "
+                "WHEN 'md' THEN jsonb_build_object('vcpu',2,'ram_mb',2048,'disk_gb',40) "
+                "WHEN 'lg' THEN jsonb_build_object('vcpu',4,'ram_mb',4096,'disk_gb',80) "
+                "END, true) "
+                "WHERE order_payload IS NOT NULL AND NOT (order_payload ? 'resources')"
+            ),
+            sa.text(
+                "UPDATE crypto_intents SET order_payload = jsonb_set("
                     "order_payload, '{resources}', "
                     "CASE order_payload->>'size' "
                     "WHEN 'xs' THEN jsonb_build_object('vcpu',1,'ram_mb',1024,'disk_gb',10) "
@@ -66,13 +76,24 @@ def upgrade() -> None:
                     "WHEN 'lg' THEN jsonb_build_object('vcpu',4,'ram_mb',4096,'disk_gb',80) "
                     "END, true) "
                     "WHERE order_payload IS NOT NULL AND NOT (order_payload ? 'resources')"
-                )
-            )
+            ),
+        ):
+            op.execute(statement)
     elif dialect == "sqlite":
-        for table in ("vm_quotes", "crypto_intents"):
-            op.execute(
-                sa.text(
-                    f"UPDATE {table} SET order_payload = json_set("
+        for statement in (
+            sa.text(
+                "UPDATE vm_quotes SET order_payload = json_set("
+                "order_payload, '$.resources', "
+                "CASE json_extract(order_payload, '$.size') "
+                "WHEN 'xs' THEN json_object('vcpu',1,'ram_mb',1024,'disk_gb',10) "
+                "WHEN 'sm' THEN json_object('vcpu',1,'ram_mb',1024,'disk_gb',20) "
+                "WHEN 'md' THEN json_object('vcpu',2,'ram_mb',2048,'disk_gb',40) "
+                "WHEN 'lg' THEN json_object('vcpu',4,'ram_mb',4096,'disk_gb',80) "
+                "END) WHERE order_payload IS NOT NULL "
+                "AND json_type(order_payload, '$.resources') IS NULL"
+            ),
+            sa.text(
+                "UPDATE crypto_intents SET order_payload = json_set("
                     "order_payload, '$.resources', "
                     "CASE json_extract(order_payload, '$.size') "
                     "WHEN 'xs' THEN json_object('vcpu',1,'ram_mb',1024,'disk_gb',10) "
@@ -81,8 +102,9 @@ def upgrade() -> None:
                     "WHEN 'lg' THEN json_object('vcpu',4,'ram_mb',4096,'disk_gb',80) "
                     "END) WHERE order_payload IS NOT NULL "
                     "AND json_type(order_payload, '$.resources') IS NULL"
-                )
-            )
+            ),
+        ):
+            op.execute(statement)
 
 
 def downgrade() -> None:

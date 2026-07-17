@@ -155,11 +155,12 @@ class XCPNGProvider(Provider):
         control must fail closed before accepting a payment when XO cannot
         prove that CPU, RAM, and disk are available.
         """
-        hosts, vms, srs = await asyncio.gather(
-            self._xo_objects(type="host"),
-            self._xo_objects(type="VM"),
-            self._xo_objects(type="SR"),
-        )
+        # XO uses one JSON-RPC WebSocket. Concurrent recv() calls on that
+        # socket are unsupported and can consume each other's responses, so
+        # keep these cache reads serialized until the client has a dispatcher.
+        hosts = await self._xo_objects(type="host")
+        vms = await self._xo_objects(type="VM")
+        srs = await self._xo_objects(type="SR")
         if not hosts:
             raise XOError("capacity", {"message": "XO returned no hosts"})
 

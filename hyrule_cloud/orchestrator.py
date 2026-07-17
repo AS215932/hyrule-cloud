@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -69,6 +69,12 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger()
 
+_VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable cross-worker PostgreSQL lock key
+
+
+class VMCapacityError(RuntimeError):
+    """The requested VM cannot fit within the configured live headroom."""
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -109,6 +115,7 @@ class Orchestrator:
 
         self._tasks: set[asyncio.Task] = set()
         self._provisioning_vm_ids: set[str] = set()
+        self._vm_capacity_reservation_lock = asyncio.Lock()
 
     async def startup(self) -> None:
         # Fail fast on malformed customer-network settings: an operator typo
@@ -188,21 +195,21 @@ class Orchestrator:
         memory_headroom = self.config.xcpng.memory_headroom_mb * 1024**2
         storage_headroom = self.config.xcpng.storage_headroom_gb * 1024**3
         if capacity.allocated_vcpu + pending_vcpu + resources.vcpu > cpu_limit:
-            raise RuntimeError("insufficient vCPU capacity")
+            raise VMCapacityError("insufficient vCPU capacity")
         if (
             capacity.free_memory_bytes
             - pending_memory_mb * 1024**2
             - resources.ram_mb * 1024**2
             < memory_headroom
         ):
-            raise RuntimeError("insufficient RAM capacity")
+            raise VMCapacityError("insufficient RAM capacity")
         if (
             capacity.free_storage_bytes
             - pending_disk_gb * 1024**3
             - resources.disk_gb * 1024**3
             < storage_headroom
         ):
-            raise RuntimeError("insufficient default-SR capacity")
+            raise VMCapacityError("insufficient default-SR capacity")
 
     # --- VM Lifecycle ---
 
@@ -434,6 +441,7 @@ class Orchestrator:
         self,
         request: VMCreateRequest,
         owner_account_id: str | None = None,
+        vm_id: str | None = None,
         pricing_snapshot: dict | None = None,
         legacy_billing: bool = False,
     ) -> tuple[VMRow, str]:
@@ -451,9 +459,64 @@ class Orchestrator:
             request,
             owner_wallet="",
             owner_account_id=owner_account_id,
+            vm_id=vm_id,
             pricing_snapshot=pricing_snapshot,
             legacy_billing=legacy_billing,
         )
+
+    async def reserve_vm_with_capacity(
+        self,
+        request: VMCreateRequest,
+        owner_account_id: str | None = None,
+        vm_id: str | None = None,
+        pricing_snapshot: dict | None = None,
+        legacy_billing: bool = False,
+    ) -> tuple[VMRow, str]:
+        """Check live capacity and durably reserve the VM as one operation.
+
+        A process-local lock covers SQLite/tests and a PostgreSQL advisory lock
+        serializes the check→insert boundary across production workers. Planned
+        VM IDs are replay-safe: an existing matching row represents no new
+        capacity and is returned without charging admission a second time.
+        """
+        if vm_id is not None:
+            async with self.db() as session:
+                existing = await session.get(VMRow, vm_id)
+            if existing is not None:
+                self._validate_replayed_vm(existing, request, owner_account_id)
+                return existing, ""
+
+        from hyrule_cloud.services.launch_proof import use_real_provisioning
+
+        async with self._vm_capacity_reservation_lock:
+            async with self.db() as lock_session:
+                postgres = lock_session.get_bind().dialect.name == "postgresql"
+                if postgres:
+                    await lock_session.execute(
+                        text("SELECT pg_advisory_lock(:lock_key)"),
+                        {"lock_key": _VM_CAPACITY_ADVISORY_LOCK},
+                    )
+                try:
+                    if vm_id is not None:
+                        existing = await lock_session.get(VMRow, vm_id)
+                        if existing is not None:
+                            self._validate_replayed_vm(existing, request, owner_account_id)
+                            return existing, ""
+                    if use_real_provisioning():
+                        await self.ensure_vm_capacity(request)
+                    return await self.reserve_vm(
+                        request,
+                        owner_account_id=owner_account_id,
+                        vm_id=vm_id,
+                        pricing_snapshot=pricing_snapshot,
+                        legacy_billing=legacy_billing,
+                    )
+                finally:
+                    if postgres:
+                        await lock_session.execute(
+                            text("SELECT pg_advisory_unlock(:lock_key)"),
+                            {"lock_key": _VM_CAPACITY_ADVISORY_LOCK},
+                        )
 
     async def activate_vm_reservation(
         self,
