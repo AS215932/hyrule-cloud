@@ -45,6 +45,7 @@ def test_migration_016_backfills_retired_resources_without_repricing() -> None:
     metadata.create_all(engine)
 
     order = {"duration_days": 1, "size": "lg", "ssh_pubkey": "ssh-ed25519 AAA"}
+    domain_order = {"domain_order_id": "dom_legacy"}
     with engine.begin() as connection:
         connection.execute(
             sa.text("INSERT INTO vms (vm_id, size) VALUES ('vm_legacy', 'lg')")
@@ -63,6 +64,13 @@ def test_migration_016_backfills_retired_resources_without_repricing() -> None:
             ),
             {"payload": json.dumps(order)},
         )
+        connection.execute(
+            sa.text(
+                "INSERT INTO crypto_intents (intent_id, order_payload) "
+                "VALUES ('i_domain', :payload)"
+            ),
+            {"payload": json.dumps(domain_order)},
+        )
         module = _migration_module()
         module.op = Operations(MigrationContext.configure(connection))
         module.upgrade()
@@ -79,9 +87,13 @@ def test_migration_016_backfills_retired_resources_without_repricing() -> None:
         intent_payload = connection.execute(
             sa.text("SELECT order_payload FROM crypto_intents WHERE intent_id = 'i_legacy'")
         ).scalar_one()
+        domain_intent_payload = connection.execute(
+            sa.text("SELECT order_payload FROM crypto_intents WHERE intent_id = 'i_domain'")
+        ).scalar_one()
 
     assert vm == (4, 4096, 80, 0)
     assert json.loads(quote_payload)["resources"]["disk_gb"] == 80
     assert json.loads(intent_payload)["resources"]["disk_gb"] == 80
+    assert json.loads(domain_intent_payload) == domain_order
     assert module.revision == "016"
     assert module.down_revision == "015"

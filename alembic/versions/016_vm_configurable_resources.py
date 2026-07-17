@@ -64,18 +64,20 @@ def upgrade() -> None:
                 "WHEN 'md' THEN jsonb_build_object('vcpu',2,'ram_mb',2048,'disk_gb',40) "
                 "WHEN 'lg' THEN jsonb_build_object('vcpu',4,'ram_mb',4096,'disk_gb',80) "
                 "END, true) "
-                "WHERE order_payload IS NOT NULL AND NOT (order_payload ? 'resources')"
+                "WHERE order_payload IS NOT NULL AND NOT (order_payload ? 'resources') "
+                "AND order_payload->>'size' IN ('xs','sm','md','lg')"
             ),
             sa.text(
                 "UPDATE crypto_intents SET order_payload = jsonb_set("
-                    "order_payload, '{resources}', "
-                    "CASE order_payload->>'size' "
-                    "WHEN 'xs' THEN jsonb_build_object('vcpu',1,'ram_mb',1024,'disk_gb',10) "
-                    "WHEN 'sm' THEN jsonb_build_object('vcpu',1,'ram_mb',1024,'disk_gb',20) "
-                    "WHEN 'md' THEN jsonb_build_object('vcpu',2,'ram_mb',2048,'disk_gb',40) "
-                    "WHEN 'lg' THEN jsonb_build_object('vcpu',4,'ram_mb',4096,'disk_gb',80) "
-                    "END, true) "
-                    "WHERE order_payload IS NOT NULL AND NOT (order_payload ? 'resources')"
+                "order_payload, '{resources}', "
+                "CASE order_payload->>'size' "
+                "WHEN 'xs' THEN jsonb_build_object('vcpu',1,'ram_mb',1024,'disk_gb',10) "
+                "WHEN 'sm' THEN jsonb_build_object('vcpu',1,'ram_mb',1024,'disk_gb',20) "
+                "WHEN 'md' THEN jsonb_build_object('vcpu',2,'ram_mb',2048,'disk_gb',40) "
+                "WHEN 'lg' THEN jsonb_build_object('vcpu',4,'ram_mb',4096,'disk_gb',80) "
+                "END, true) "
+                "WHERE order_payload IS NOT NULL AND NOT (order_payload ? 'resources') "
+                "AND order_payload->>'size' IN ('xs','sm','md','lg')"
             ),
         ):
             op.execute(statement)
@@ -90,18 +92,20 @@ def upgrade() -> None:
                 "WHEN 'md' THEN json_object('vcpu',2,'ram_mb',2048,'disk_gb',40) "
                 "WHEN 'lg' THEN json_object('vcpu',4,'ram_mb',4096,'disk_gb',80) "
                 "END) WHERE order_payload IS NOT NULL "
-                "AND json_type(order_payload, '$.resources') IS NULL"
+                "AND json_type(order_payload, '$.resources') IS NULL "
+                "AND json_extract(order_payload, '$.size') IN ('xs','sm','md','lg')"
             ),
             sa.text(
                 "UPDATE crypto_intents SET order_payload = json_set("
-                    "order_payload, '$.resources', "
-                    "CASE json_extract(order_payload, '$.size') "
-                    "WHEN 'xs' THEN json_object('vcpu',1,'ram_mb',1024,'disk_gb',10) "
-                    "WHEN 'sm' THEN json_object('vcpu',1,'ram_mb',1024,'disk_gb',20) "
-                    "WHEN 'md' THEN json_object('vcpu',2,'ram_mb',2048,'disk_gb',40) "
-                    "WHEN 'lg' THEN json_object('vcpu',4,'ram_mb',4096,'disk_gb',80) "
-                    "END) WHERE order_payload IS NOT NULL "
-                    "AND json_type(order_payload, '$.resources') IS NULL"
+                "order_payload, '$.resources', "
+                "CASE json_extract(order_payload, '$.size') "
+                "WHEN 'xs' THEN json_object('vcpu',1,'ram_mb',1024,'disk_gb',10) "
+                "WHEN 'sm' THEN json_object('vcpu',1,'ram_mb',1024,'disk_gb',20) "
+                "WHEN 'md' THEN json_object('vcpu',2,'ram_mb',2048,'disk_gb',40) "
+                "WHEN 'lg' THEN json_object('vcpu',4,'ram_mb',4096,'disk_gb',80) "
+                "END) WHERE order_payload IS NOT NULL "
+                "AND json_type(order_payload, '$.resources') IS NULL "
+                "AND json_extract(order_payload, '$.size') IN ('xs','sm','md','lg')"
             ),
         ):
             op.execute(statement)

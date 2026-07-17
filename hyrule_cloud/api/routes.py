@@ -60,6 +60,7 @@ from hyrule_cloud.models import (
     VMStatusResponse,
 )
 from hyrule_cloud.orchestrator import VMCapacityError
+from hyrule_cloud.providers.base import ProviderError
 from hyrule_cloud.providers.network_config import (
     RESERVED_PREFIX_INDEXES,
     customer_prefix_count,
@@ -915,6 +916,9 @@ async def create_vm(
             raise HTTPException(
                 503, "The requested VM does not fit current host capacity"
             ) from exc
+        except ProviderError as exc:
+            log.error("vm_capacity_check_failed", error=str(exc), exc_info=True)
+            raise HTTPException(503, "VM capacity is temporarily unavailable") from exc
         except RuntimeError:
             raise HTTPException(503, "No customer IPv6 capacity available right now")
         if order.domain_mode == DomainMode.CUSTOM and order.domain:
