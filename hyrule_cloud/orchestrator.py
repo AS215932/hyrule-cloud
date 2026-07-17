@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from ipaddress import IPv6Address, IPv6Network
@@ -513,6 +515,30 @@ class Orchestrator:
 
         from hyrule_cloud.services.launch_proof import use_real_provisioning
 
+        async with self._serialize_vm_capacity_transition():
+            if vm_id is not None:
+                async with self.db() as session:
+                    existing = await session.get(VMRow, vm_id)
+                if existing is not None:
+                    self._validate_replayed_vm(existing, request, owner_account_id)
+                    return existing, ""
+            if use_real_provisioning():
+                await self.ensure_vm_capacity(request)
+            return await self.reserve_vm(
+                request,
+                owner_account_id=owner_account_id,
+                vm_id=vm_id,
+                pricing_snapshot=pricing_snapshot,
+                legacy_billing=legacy_billing,
+            )
+
+    @asynccontextmanager
+    async def _serialize_vm_capacity_transition(self) -> AsyncIterator[None]:
+        """Serialize admission and pending→XO capacity ownership changes.
+
+        The process lock covers SQLite/tests. PostgreSQL's session advisory lock
+        extends the same boundary across API and worker processes.
+        """
         async with self._vm_capacity_reservation_lock:
             async with self.db() as lock_session:
                 postgres = lock_session.get_bind().dialect.name == "postgresql"
@@ -522,20 +548,7 @@ class Orchestrator:
                         {"lock_key": _VM_CAPACITY_ADVISORY_LOCK},
                     )
                 try:
-                    if vm_id is not None:
-                        existing = await lock_session.get(VMRow, vm_id)
-                        if existing is not None:
-                            self._validate_replayed_vm(existing, request, owner_account_id)
-                            return existing, ""
-                    if use_real_provisioning():
-                        await self.ensure_vm_capacity(request)
-                    return await self.reserve_vm(
-                        request,
-                        owner_account_id=owner_account_id,
-                        vm_id=vm_id,
-                        pricing_snapshot=pricing_snapshot,
-                        legacy_billing=legacy_billing,
-                    )
+                    yield
                 finally:
                     if postgres:
                         await lock_session.execute(
@@ -657,34 +670,45 @@ class Orchestrator:
             )
 
             if xcpng_uuid is None:
-                name_label = f"hyrule-{vm_id}"
-                # XO may contain a clone whose create call completed before the
-                # process could durably store its UUID. It is not safe to adopt
-                # a possibly half-resized/half-started clone, so delete any
-                # untracked exact-label candidates and recreate cleanly.
-                stale_ids = await self.xcpng.find_vm_ids_by_name_label(name_label)
-                for stale_uuid in stale_ids:
-                    log.warning(
-                        "orphaned_vm_clone_replaced",
-                        vm_id=vm_id,
-                        xcpng_uuid=stale_uuid,
-                    )
-                    await self.xcpng.destroy_vm(stale_uuid)
-                xcpng_uuid = await self.xcpng.create_vm(
-                    template_uuid=template_uuid,
-                    name_label=name_label,
-                    os_name=os_name,
-                    size=VMSize(size),
-                    resources=resources,
-                    cloud_init_config=cloud_config,
-                    network_config=network_config,
-                )
+                # Admission snapshots and the pending→XO handoff share one
+                # cross-process lock. No reservation can observe an XO snapshot
+                # from before this clone while also excluding its now-tracked DB
+                # row from pending capacity.
+                async with self._serialize_vm_capacity_transition():
+                    async with self.db() as session:
+                        current = await session.get(VMRow, vm_id)
+                        if current is None:
+                            return
+                        xcpng_uuid = current.xcpng_uuid
+                    if xcpng_uuid is None:
+                        name_label = f"hyrule-{vm_id}"
+                        # XO may contain a clone whose create call completed before the
+                        # process could durably store its UUID. It is not safe to adopt
+                        # a possibly half-resized/half-started clone, so delete any
+                        # untracked exact-label candidates and recreate cleanly.
+                        stale_ids = await self.xcpng.find_vm_ids_by_name_label(name_label)
+                        for stale_uuid in stale_ids:
+                            log.warning(
+                                "orphaned_vm_clone_replaced",
+                                vm_id=vm_id,
+                                xcpng_uuid=stale_uuid,
+                            )
+                            await self.xcpng.destroy_vm(stale_uuid)
+                        xcpng_uuid = await self.xcpng.create_vm(
+                            template_uuid=template_uuid,
+                            name_label=name_label,
+                            os_name=os_name,
+                            size=VMSize(size),
+                            resources=resources,
+                            cloud_init_config=cloud_config,
+                            network_config=network_config,
+                        )
 
-                async with self.db() as session:
-                    row = await session.get(VMRow, vm_id)
-                    if row:
-                        row.xcpng_uuid = xcpng_uuid
-                        await session.commit()
+                        async with self.db() as session:
+                            row = await session.get(VMRow, vm_id)
+                            if row:
+                                row.xcpng_uuid = xcpng_uuid
+                                await session.commit()
 
             # Wait for IPv6 (outside DB session to avoid long-held connections)
             ipv6 = await self._wait_for_ipv6(

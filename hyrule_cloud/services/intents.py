@@ -68,6 +68,10 @@ EXACT_AMOUNT_TOLERANCE = Decimal("0.001")  # 0.1%
 VM_PROVISIONING_RECOVERY_DELAY = timedelta(minutes=5)
 
 
+class _NativeHandoffFencedError(RuntimeError):
+    """The recovery scanner superseded an in-flight settlement worker."""
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -368,6 +372,7 @@ async def _trigger_provisioning(
     The UPDATE ... WHERE provisioning_triggered_at IS NULL RETURNING
     ensures exactly one caller observes the transition CREATED→PROVISIONING.
     """
+    handoff_started = _now()
     async with session_factory() as db:
         result = await db.execute(
             update(CryptoIntentRow)
@@ -376,7 +381,7 @@ async def _trigger_provisioning(
                 CryptoIntentRow.provisioning_triggered_at.is_(None),
             )
             .values(
-                provisioning_triggered_at=_now(),
+                provisioning_triggered_at=handoff_started,
                 status=CryptoIntentStatus.PROVISIONING,
             )
             .returning(CryptoIntentRow.intent_id)
@@ -387,6 +392,9 @@ async def _trigger_provisioning(
         await db.commit()
         row = await db.get(CryptoIntentRow, intent_id)
         if row is None or row.order_payload is None:
+            return
+        handoff_token = row.provisioning_triggered_at
+        if handoff_token is None:
             return
 
     # Domain purchases reuse the native receive-address and confirmation
@@ -467,6 +475,11 @@ async def _trigger_provisioning(
             session_factory=session_factory,
             existing_vm_id=row.vm_id,
         )
+        await _require_current_vm_handoff(
+            intent_id=intent_id,
+            session_factory=session_factory,
+            handoff_token=handoff_token,
+        )
         quote_id = order.quote_id
         if quote_id is not None:
             quote = await get_quote(session_factory, quote_id)
@@ -530,6 +543,11 @@ async def _trigger_provisioning(
         # boundary as EVM checkout. A standalone ensure_vm_capacity() followed
         # by create_vm() lets two separately paid native intents both pass the
         # check before either row becomes visible to the other.
+        await _require_current_vm_handoff(
+            intent_id=intent_id,
+            session_factory=session_factory,
+            handoff_token=handoff_token,
+        )
         try:
             reservation_row, anon_token = await orch.reserve_vm_with_capacity(
                 order,
@@ -550,6 +568,11 @@ async def _trigger_provisioning(
                 vm_id=planned_vm_id,
             )
             return
+        await _require_current_vm_handoff(
+            intent_id=intent_id,
+            session_factory=session_factory,
+            handoff_token=handoff_token,
+        )
 
         if order.domain_mode == DomainMode.CUSTOM:
             # The route-level check happened when the deposit address was
@@ -585,6 +608,11 @@ async def _trigger_provisioning(
                 )
                 return
             claimed_domain = True
+            await _require_current_vm_handoff(
+                intent_id=intent_id,
+                session_factory=session_factory,
+                handoff_token=handoff_token,
+            )
 
         # Convert the unpaid reservation into a paid VM but DON'T start
         # provisioning yet: link the intent first, so an immediate XO/API
@@ -596,6 +624,11 @@ async def _trigger_provisioning(
         )
         if vm_row is None:
             raise RuntimeError("native VM reservation disappeared before activation")
+        await _require_current_vm_handoff(
+            intent_id=intent_id,
+            session_factory=session_factory,
+            handoff_token=handoff_token,
+        )
         if row.amount_usd is not None:
             amount_persisted = False
             for attempt in range(3):
@@ -650,19 +683,47 @@ async def _trigger_provisioning(
                     vm_id=vm_row.vm_id,
                     quote_id=quote_id,
                 )
+        # Final compare-and-set is the delivery fence. Recovery advances the
+        # handoff token before recording a refund, so a superseded worker can
+        # never overwrite REFUND_MANUAL with PROVISIONED or start the VM.
         async with session_factory() as db:
-            r = await db.get(CryptoIntentRow, intent_id)
-            if r is None:
-                raise RuntimeError("native intent disappeared before VM linkage")
-            r.vm_id = vm_row.vm_id
-            r.status = CryptoIntentStatus.PROVISIONED
-            # One-shot reveal: the next successful GET /v1/intent/{id} returns
-            # this cleartext and immediately nulls the column. Sha256 is on VMRow.
-            r.anon_token_cleartext = anon_token
+            linked = await db.execute(
+                update(CryptoIntentRow)
+                .where(
+                    CryptoIntentRow.intent_id == intent_id,
+                    CryptoIntentRow.status == CryptoIntentStatus.PROVISIONING,
+                    CryptoIntentRow.provisioning_triggered_at == handoff_token,
+                )
+                .values(
+                    vm_id=vm_row.vm_id,
+                    status=CryptoIntentStatus.PROVISIONED,
+                    # One-shot reveal: the next successful GET returns this and
+                    # nulls the column. Sha256 lives on VMRow.
+                    anon_token_cleartext=anon_token,
+                )
+                .returning(CryptoIntentRow.intent_id)
+            )
+            if linked.scalar_one_or_none() is None:
+                await db.rollback()
+                raise _NativeHandoffFencedError
             await db.commit()
         # The intent↔vm link is committed; now it is safe to provision.
         orch.start_provisioning(vm_row.vm_id)
         log.info("intent_provisioned", intent_id=intent_id, vm_id=vm_row.vm_id)
+    except _NativeHandoffFencedError:
+        log.warning(
+            "native_vm_handoff_fenced",
+            intent_id=intent_id,
+            vm_id=planned_vm_id,
+        )
+        await _cleanup_native_vm_candidate(
+            orch=orch,
+            domains=domains,
+            intent_id=intent_id,
+            vm_id=planned_vm_id,
+            claimed_domain=claimed_domain,
+            error="native provisioning superseded by recovery",
+        )
     except Exception:
         log.exception("intent_provisioning_failed", intent_id=intent_id)
         # Funds are already SETTLED. If create_vm raised before a vm_id was
@@ -685,41 +746,14 @@ async def _trigger_provisioning(
                     .values(status=CryptoIntentStatus.FAILED)
                 )
                 await db.commit()
-        if reservation_row is not None and planned_vm_id is not None:
-            # If activation did not commit, release the unpaid reservation. If
-            # it did commit, release is intentionally a no-op and mark_vm_failed
-            # terminally cleans the paid row instead.
-            try:
-                await orch.release_vm_reservation(planned_vm_id)
-            except Exception:
-                log.exception(
-                    "native_vm_reservation_release_failed",
-                    intent_id=intent_id,
-                    vm_id=planned_vm_id,
-                )
-            try:
-                await orch.mark_vm_failed(
-                    planned_vm_id,
-                    "native provisioning failed post-settlement",
-                )
-            except Exception:
-                log.exception(
-                    "native_failed_vm_cleanup_failed",
-                    intent_id=intent_id,
-                    vm_id=planned_vm_id,
-                )
-        if claimed_domain and domains is not None and planned_vm_id is not None:
-            # Real Orchestrator.mark_vm_failed() already performs this release,
-            # but keep it explicit and idempotent for failures before insertion
-            # and for alternative orchestrator implementations.
-            try:
-                await domains.release_vm_attachment_claim(planned_vm_id)
-            except Exception:
-                log.exception(
-                    "native_custom_domain_claim_release_failed",
-                    intent_id=intent_id,
-                    vm_id=planned_vm_id,
-                )
+        await _cleanup_native_vm_candidate(
+            orch=orch,
+            domains=domains,
+            intent_id=intent_id,
+            vm_id=planned_vm_id if reservation_row is not None else None,
+            claimed_domain=claimed_domain,
+            error="native provisioning failed post-settlement",
+        )
 
 
 async def _persist_planned_vm_id(
@@ -746,6 +780,65 @@ async def _persist_planned_vm_id(
         if current is None or current.vm_id is None:
             raise RuntimeError("native intent disappeared before VM id persistence")
         return current.vm_id
+
+
+async def _require_current_vm_handoff(
+    *,
+    intent_id: str,
+    session_factory: async_sessionmaker,
+    handoff_token: datetime,
+) -> None:
+    """Fence a worker whose recovery lease/status has been superseded."""
+    async with session_factory() as db:
+        current = await db.scalar(
+            select(CryptoIntentRow.intent_id).where(
+                CryptoIntentRow.intent_id == intent_id,
+                CryptoIntentRow.status == CryptoIntentStatus.PROVISIONING,
+                CryptoIntentRow.provisioning_triggered_at == handoff_token,
+            )
+        )
+    if current is None:
+        raise _NativeHandoffFencedError
+
+
+async def _cleanup_native_vm_candidate(
+    *,
+    orch: Orchestrator,
+    domains: Any,
+    intent_id: str,
+    vm_id: str | None,
+    claimed_domain: bool,
+    error: str,
+) -> None:
+    """Idempotently remove either an unpaid reservation or activated VM."""
+    if vm_id is not None:
+        try:
+            await orch.release_vm_reservation(vm_id)
+        except Exception:
+            log.exception(
+                "native_vm_reservation_release_failed",
+                intent_id=intent_id,
+                vm_id=vm_id,
+            )
+        try:
+            await orch.mark_vm_failed(vm_id, error)
+        except Exception:
+            log.exception(
+                "native_failed_vm_cleanup_failed",
+                intent_id=intent_id,
+                vm_id=vm_id,
+            )
+    if claimed_domain and domains is not None and vm_id is not None:
+        # Real Orchestrator cleanup already releases an unfulfilled attachment;
+        # keep this explicit and idempotent for alternative implementations.
+        try:
+            await domains.release_vm_attachment_claim(vm_id)
+        except Exception:
+            log.exception(
+                "native_custom_domain_claim_release_failed",
+                intent_id=intent_id,
+                vm_id=vm_id,
+            )
 
 
 async def scan_pending_intents(

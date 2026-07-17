@@ -446,6 +446,32 @@ async def test_create_preserves_quoted_profile_after_catalog_price_change(
 
 
 @pytest.mark.asyncio
+async def test_create_accepts_original_custom_shortcut_after_quote_rebases_profile(
+    quote_state,
+    client,
+):
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    original = _order(
+        size="xs",
+        resources={"vcpu": 1, "ram_mb": 2048, "disk_gb": 20},
+    )
+    quote = (
+        await client.post("/v1/vm/quote", json={"order_payload": original})
+    ).json()
+    assert quote["order_payload"]["size"] == "sm"
+
+    response = await client.post(
+        "/v1/vm/create",
+        json={**original, "quote_id": quote["quote_id"]},
+    )
+
+    assert response.status_code == 202, response.text
+    async with quote_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, response.json()["vm_id"])
+    assert VMSize(vm.size) is VMSize.SM
+
+
+@pytest.mark.asyncio
 async def test_link_quote_failure_still_starts_provisioning(quote_state, client, monkeypatch):
     """A post-charge link_quote_vm failure must NOT strand the paid VM: since
     provisioning is now deferred until after the link, a link exception would

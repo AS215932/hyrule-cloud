@@ -169,16 +169,19 @@ def _price_vm_order(orch, cfg, order: VMCreateRequest):
 def _order_matches_quote(posted: VMCreateRequest, stored: dict) -> bool:
     """Compare a create/intent body to a durable server snapshot.
 
-    Size-only clients remain compatible: if they omit `resources`, the quote's
-    exact server-selected resources are authoritative and ignored only for the
-    comparison. A client that does send resources must match them exactly.
+    Profiles are shortcuts. Canonical quote creation may choose a different
+    cheapest base profile, so compare the exact resource footprint plus every
+    non-resource field instead of comparing the shortcut label itself.
     """
+    stored_order = VMCreateRequest.model_validate(stored)
+    posted_resources = posted.resources or resources_for_profile(posted.size)
+    stored_resources = stored_order.resources or resources_for_profile(stored_order.size)
     posted_payload = posted.model_dump(mode="json", exclude={"quote_id"})
-    stored_payload = dict(stored)
-    if posted.resources is None:
-        posted_payload.pop("resources", None)
-        stored_payload.pop("resources", None)
-    return posted_payload == stored_payload
+    stored_payload = stored_order.model_dump(mode="json", exclude={"quote_id"})
+    for payload in (posted_payload, stored_payload):
+        payload.pop("size", None)
+        payload.pop("resources", None)
+    return posted_payload == stored_payload and posted_resources == stored_resources
 
 
 async def _enforce_paid_vm_cap(orch, cfg) -> None:

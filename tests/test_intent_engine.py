@@ -13,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -905,6 +906,42 @@ async def test_native_intent_preserves_quoted_profile_after_catalog_price_change
 
 
 @pytest.mark.asyncio
+async def test_native_intent_accepts_original_custom_shortcut_after_quote_rebase(
+    intent_state,
+    client,
+):
+    from hyrule_cloud.services.vm_pricing import price_vm_order
+
+    original = _vm_create_request().model_copy(
+        update={
+            "size": VMSize.XS,
+            "resources": VMOrderResources(vcpu=2, ram_mb=4096, disk_gb=20),
+        }
+    )
+    priced = price_vm_order(original, intent_state.config.payment)
+    assert priced.order.size is VMSize.MD
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_shortcut_rebase",
+        amount_usd=priced.total,
+        order=priced.order,
+        pricing_snapshot=priced.pricing_snapshot,
+    )
+    posted = original.model_dump(mode="json")
+    posted["quote_id"] = quote.quote_id
+
+    response = await client.post(
+        "/v1/intent/create",
+        json={"asset": "BTC", "order_payload": posted},
+    )
+
+    assert response.status_code == 200, response.text
+    async with intent_state.orchestrator.db() as db:
+        intent = await db.get(CryptoIntentRow, response.json()["intent_id"])
+    assert intent.order_payload["size"] == VMSize.MD.value
+
+
+@pytest.mark.asyncio
 async def test_native_intent_rejects_cross_account_quote(intent_state, client):
     quote = await _seed_quote(
         intent_state,
@@ -1775,3 +1812,69 @@ async def test_scanner_refunds_interrupted_native_vm_reservation(intent_state):
         intent_state.orchestrator.native_refund_reasons[intent.intent_id]
         == "provisioning_interrupted"
     )
+
+
+@pytest.mark.asyncio
+async def test_recovery_fences_slow_native_worker_before_activation(
+    intent_state,
+    monkeypatch,
+):
+    intent = await _seed_intent(intent_state, asset="BTC")
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+    reserve_entered = asyncio.Event()
+    release_reserve = asyncio.Event()
+    real_reserve = intent_state.orchestrator.reserve_vm_with_capacity
+
+    async def slow_reserve(*args, **kwargs):
+        reserve_entered.set()
+        await release_reserve.wait()
+        return await real_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(
+        intent_state.orchestrator,
+        "reserve_vm_with_capacity",
+        slow_reserve,
+    )
+    original_worker = asyncio.create_task(
+        poll_one_intent(
+            intent_id=intent.intent_id,
+            session_factory=intent_state.orchestrator.db,
+            provider=intent_state.native_crypto,
+            rates=intent_state.rate_provider,
+            orch=intent_state.orchestrator,
+        )
+    )
+    try:
+        await reserve_entered.wait()
+        async with intent_state.orchestrator.db() as db:
+            stored = await db.get(CryptoIntentRow, intent.intent_id)
+            planned_vm_id = stored.vm_id
+            assert planned_vm_id is not None
+        recovery_now = _now() + timedelta(minutes=6)
+        monkeypatch.setattr(
+            "hyrule_cloud.services.intents._now",
+            lambda: recovery_now,
+        )
+
+        touched = await scan_pending_intents(
+            session_factory=intent_state.orchestrator.db,
+            provider=intent_state.native_crypto,
+            rates=intent_state.rate_provider,
+            orch=intent_state.orchestrator,
+        )
+    finally:
+        release_reserve.set()
+        await original_worker
+
+    assert touched == 1
+    async with intent_state.orchestrator.db() as db:
+        recovered = await db.get(CryptoIntentRow, intent.intent_id)
+        vm = await db.get(VMRow, planned_vm_id)
+    assert recovered.status == CryptoIntentStatus.REFUND_MANUAL
+    assert vm is None
+    assert intent_state.orchestrator.created_vms == []
+    assert intent_state.orchestrator.provisioning_started == []

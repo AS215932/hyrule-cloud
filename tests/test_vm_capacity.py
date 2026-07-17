@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, cast
@@ -46,6 +47,7 @@ async def _orchestrator_with_pending(
 
     orchestrator = object.__new__(Orchestrator)
     orchestrator.db = sessions
+    orchestrator._vm_capacity_reservation_lock = asyncio.Lock()
     orchestrator.xcpng = cast(Any, _CapacityProvider(capacity))
     orchestrator.config = cast(
         Any,
@@ -67,6 +69,42 @@ def _order() -> VMCreateRequest:
         resources=VMOrderResources(vcpu=2, ram_mb=4096, disk_gb=20),
         ssh_pubkey="ssh-ed25519 AAAA order",
     )
+
+
+@pytest.mark.asyncio
+async def test_capacity_transition_serializes_provisioning_handoff_and_admission() -> None:
+    orchestrator, engine = await _orchestrator_with_pending(
+        XCPNGCapacity(8, 0, 20 * 1024**3, 100 * 1024**3)
+    )
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    admission_entered = asyncio.Event()
+
+    async def provisioning_handoff() -> None:
+        async with orchestrator._serialize_vm_capacity_transition():
+            first_entered.set()
+            await release_first.wait()
+
+    async def admission_snapshot() -> None:
+        await first_entered.wait()
+        async with orchestrator._serialize_vm_capacity_transition():
+            admission_entered.set()
+
+    first = asyncio.create_task(provisioning_handoff())
+    second = asyncio.create_task(admission_snapshot())
+    try:
+        await first_entered.wait()
+        await asyncio.sleep(0)
+        assert not admission_entered.is_set()
+        release_first.set()
+        await asyncio.gather(first, second)
+        assert admission_entered.is_set()
+    finally:
+        release_first.set()
+        first.cancel()
+        second.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
