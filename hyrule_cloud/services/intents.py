@@ -450,6 +450,7 @@ async def _trigger_provisioning(
     # refund could be recorded. The refund path finds the intent by vm_id and
     # reads the real deposit address from it.
     vm_row = None
+    reservation_row = None
     planned_vm_id: str | None = None
     claimed_domain = False
     domains = getattr(orch, "domains", None)
@@ -506,33 +507,45 @@ async def _trigger_provisioning(
                     reason="quote_already_consumed",
                 )
                 return
-        if hasattr(orch, "ensure_vm_capacity"):
-            try:
-                await orch.ensure_vm_capacity(order)
-            except Exception:
-                log.warning(
-                    "native_vm_capacity_unavailable_at_settlement",
-                    intent_id=intent_id,
-                    exc_info=True,
-                )
-                await orch.record_native_intent_refund(
-                    intent_id,
-                    reason="vm_capacity_unavailable_at_settlement",
-                )
-                return
         if order.domain_mode == DomainMode.CUSTOM:
-            # The route-level check happened when the deposit address was
-            # issued, potentially many confirmations ago. Settlement is the
-            # irreversible trust boundary: reserve the domain for the exact VM
-            # id we are about to create, or refund instead of provisioning a VM
-            # whose requested hostname now belongs to another attachment.
             if domains is None or row.owner_account_id is None or not order.domain:
                 await orch.record_native_intent_refund(
                     intent_id,
                     reason="custom_domain_unavailable_at_settlement",
                 )
                 return
-            planned_vm_id = row.vm_id or generate_vm_id()
+
+        # Settlement admission must use the same serialized check+reservation
+        # boundary as EVM checkout. A standalone ensure_vm_capacity() followed
+        # by create_vm() lets two separately paid native intents both pass the
+        # check before either row becomes visible to the other.
+        planned_vm_id = row.vm_id or generate_vm_id()
+        try:
+            reservation_row, anon_token = await orch.reserve_vm_with_capacity(
+                order,
+                owner_account_id=row.owner_account_id,
+                vm_id=planned_vm_id,
+                pricing_snapshot=row.pricing_snapshot,
+                legacy_billing=row.pricing_snapshot is None,
+            )
+        except RuntimeError:
+            log.warning(
+                "native_vm_capacity_unavailable_at_settlement",
+                intent_id=intent_id,
+                exc_info=True,
+            )
+            await orch.record_native_intent_refund(
+                intent_id,
+                reason="vm_capacity_unavailable_at_settlement",
+                vm_id=planned_vm_id,
+            )
+            return
+
+        if order.domain_mode == DomainMode.CUSTOM:
+            # The route-level check happened when the deposit address was
+            # issued, potentially many confirmations ago. Settlement is the
+            # irreversible trust boundary: claim the domain for the exact VM
+            # reservation or refund and release that reservation.
             try:
                 await domains.claim_vm_attachment(
                     row.owner_account_id,
@@ -547,6 +560,14 @@ async def _trigger_provisioning(
                     vm_id=planned_vm_id,
                     exc_info=True,
                 )
+                try:
+                    await orch.release_vm_reservation(planned_vm_id)
+                except Exception:
+                    log.exception(
+                        "native_vm_reservation_release_failed",
+                        intent_id=intent_id,
+                        vm_id=planned_vm_id,
+                    )
                 await orch.record_native_intent_refund(
                     intent_id,
                     reason="custom_domain_unavailable_at_settlement",
@@ -554,18 +575,17 @@ async def _trigger_provisioning(
                 )
                 return
             claimed_domain = True
-        # Create the VM row but DON'T start provisioning yet: link the intent to
-        # the vm_id first, so a fast provisioning failure (immediate XO/API
-        # error) can always find the paying intent and record its refund.
-        vm_row, anon_token = await orch.create_vm(
-            order,
-            owner_wallet=row.intent_id,
-            owner_account_id=row.owner_account_id,
-            vm_id=planned_vm_id,
+
+        # Convert the unpaid reservation into a paid VM but DON'T start
+        # provisioning yet: link the intent first, so an immediate XO/API
+        # failure can always find the paying record and issue a refund.
+        vm_row = await orch.activate_vm_reservation(
+            reservation_row.vm_id,
+            row.intent_id,
             start_provisioning=False,
-            pricing_snapshot=row.pricing_snapshot,
-            legacy_billing=row.pricing_snapshot is None,
         )
+        if vm_row is None:
+            raise RuntimeError("native VM reservation disappeared before activation")
         if row.amount_usd is not None:
             amount_persisted = False
             for attempt in range(3):
@@ -655,21 +675,28 @@ async def _trigger_provisioning(
                     .values(status=CryptoIntentStatus.FAILED)
                 )
                 await db.commit()
-        if vm_row is not None:
-            # create_vm inserted a row but a later step failed before the
-            # background provisioner was scheduled; fail it terminally so it
-            # doesn't sit in PROVISIONING (owner_wallet=intent_id) pinning a /64
-            # the sweeper (unpaid rows only) won't reclaim.
+        if reservation_row is not None and planned_vm_id is not None:
+            # If activation did not commit, release the unpaid reservation. If
+            # it did commit, release is intentionally a no-op and mark_vm_failed
+            # terminally cleans the paid row instead.
+            try:
+                await orch.release_vm_reservation(planned_vm_id)
+            except Exception:
+                log.exception(
+                    "native_vm_reservation_release_failed",
+                    intent_id=intent_id,
+                    vm_id=planned_vm_id,
+                )
             try:
                 await orch.mark_vm_failed(
-                    vm_row.vm_id,
+                    planned_vm_id,
                     "native provisioning failed post-settlement",
                 )
             except Exception:
                 log.exception(
                     "native_failed_vm_cleanup_failed",
                     intent_id=intent_id,
-                    vm_id=vm_row.vm_id,
+                    vm_id=planned_vm_id,
                 )
         if claimed_domain and domains is not None and planned_vm_id is not None:
             # Real Orchestrator.mark_vm_failed() already performs this release,

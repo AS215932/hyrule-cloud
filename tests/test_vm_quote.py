@@ -407,6 +407,45 @@ async def test_create_with_quote_paid_provisions_and_consumes(quote_state, clien
 
 
 @pytest.mark.asyncio
+async def test_create_preserves_quoted_profile_after_catalog_price_change(
+    quote_state,
+    client,
+    monkeypatch,
+):
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (
+        await client.post(
+            "/v1/vm/quote",
+            json={
+                "order_payload": _order(
+                    size="md",
+                    resources={"vcpu": 2, "ram_mb": 4096, "disk_gb": 20},
+                )
+            },
+        )
+    ).json()
+    assert quote["order_payload"]["size"] == "md"
+
+    # These resources now price cheapest from SM. The durable quote must keep
+    # MD as the VM's billing base so later extensions use the quoted profile.
+    monkeypatch.setattr(quote_state.config.payment, "price_vm_sm", Decimal("0.01"))
+    monkeypatch.setattr(quote_state.config.payment, "price_vm_md", Decimal("5.00"))
+    order = dict(quote["order_payload"])
+    order["quote_id"] = quote["quote_id"]
+    response = await client.post("/v1/vm/create", json=order)
+
+    assert response.status_code == 202, response.text
+    async with quote_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, response.json()["vm_id"])
+    assert VMSize(vm.size) is VMSize.MD
+    assert (
+        vm.billing_addon_vcpu,
+        vm.billing_addon_ram_mb,
+        vm.billing_addon_disk_gb,
+    ) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
 async def test_link_quote_failure_still_starts_provisioning(quote_state, client, monkeypatch):
     """A post-charge link_quote_vm failure must NOT strand the paid VM: since
     provisioning is now deferred until after the link, a link exception would

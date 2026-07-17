@@ -31,6 +31,7 @@ from hyrule_cloud.models import (
     VM_PROFILE_LABELS,
     VM_SPECS,
     AcceptedPaymentMethods,
+    CostBreakdown,
     DomainMode,
     FirewallState,
     GenericActionResponse,
@@ -861,19 +862,23 @@ async def create_vm(
     await _enforce_paid_vm_cap(orch, cfg)
     await _enforce_prefix_capacity(orch, cfg)
 
-    # Price-lock: a quote-bound create charges the amount quoted to the user,
-    # not a recomputation (which could drift). The breakdown is still recomputed
-    # for the 402 body's informational cost_breakdown.
-    if quote_row is not None and quote_row.pricing_snapshot is None:
-        computed, breakdown = await _compute_vm_price(orch, cfg, order.model_copy(update={"resources": None}))
-        pricing_snapshot = None
+    # Price-lock: a quote-bound create keeps the durable profile, resources,
+    # add-ons, and amount. Re-running catalog selection here could silently
+    # rebase the order after an operator changes prices while the quote is
+    # still valid, which would make renewals use a different base profile.
+    if quote_row is not None:
+        computed = Decimal(quote_row.amount_usd)
+        breakdown = CostBreakdown(
+            vm_cost=f"${computed:.2f}",
+            domain_cost="$0.00 (auto subdomain)",
+            total=f"${computed:.2f}",
+        )
+        pricing_snapshot = quote_row.pricing_snapshot
     else:
         priced = _price_vm_order(orch, cfg, order)
         order = priced.order
         computed, breakdown = await _compute_vm_price(orch, cfg, order)
-        pricing_snapshot = (
-            quote_row.pricing_snapshot if quote_row is not None else priced.pricing_snapshot
-        )
+        pricing_snapshot = priced.pricing_snapshot
     total = quote_row.amount_usd if quote_row is not None else computed
     resources = order.resources or resources_for_profile(order.size)
     specs = {
@@ -1529,18 +1534,17 @@ async def create_crypto_intent(
     await _enforce_paid_vm_cap(orch, cfg)
     await _enforce_prefix_capacity(orch, cfg)
     await _enforce_compute_capacity(orch, order)
-    # Re-run validation that depends on mutable external state (notably custom
-    # domain availability), while retaining the durable quote's locked amount.
-    if quote_row is not None and quote_row.pricing_snapshot is None:
-        computed, _ = await _compute_vm_price(orch, cfg, order.model_copy(update={"resources": None}))
-        pricing_snapshot = None
+    # Mutable external state (notably custom-domain availability) was checked
+    # above. A durable quote's profile/resources/snapshot must not be run back
+    # through current catalog selection: prices may change before settlement.
+    if quote_row is not None:
+        computed = Decimal(quote_row.amount_usd)
+        pricing_snapshot = quote_row.pricing_snapshot
     else:
         priced = _price_vm_order(orch, cfg, order)
         order = priced.order
         computed = priced.total
-        pricing_snapshot = (
-            quote_row.pricing_snapshot if quote_row is not None else priced.pricing_snapshot
-        )
+        pricing_snapshot = priced.pricing_snapshot
     total = quote_row.amount_usd if quote_row is not None else computed
 
     app_state: AppState = await get_app_state(request)

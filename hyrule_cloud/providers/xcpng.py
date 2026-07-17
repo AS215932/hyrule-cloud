@@ -62,23 +62,46 @@ class XCPNGProvider(Provider):
         else:
             self._xo_ssl = None
 
+        # A websocket permits only one recv() coroutine at a time. Keep every
+        # JSON-RPC request/response exchange (including login/logout) behind a
+        # provider-level lock so capacity checks and lifecycle calls cannot
+        # consume one another's responses.
+        self._xo_rpc_lock = asyncio.Lock()
         self._openbsd_builder_lock = asyncio.Lock()
 
     # --- XO JSON-RPC ---
 
     async def _xo_connect(self) -> None:
+        async with self._xo_rpc_lock:
+            await self._xo_connect_locked()
+
+    async def _xo_connect_locked(self) -> None:
+        """Connect and authenticate while the caller holds _xo_rpc_lock."""
+        if self._xo_ws is not None:
+            return
         self._xo_ws = await websockets.connect(
             self.config.xo_url, ssl=self._xo_ssl, max_size=50 * 1024 * 1024,
         )
-        result = await self._xo_call(
-            "session.signInWithToken", token=self.config.xo_token
-        )
-        log.info("xo_login_success", user=result.get("email"))
+        try:
+            result = await self._xo_exchange(
+                "session.signInWithToken", token=self.config.xo_token
+            )
+        except Exception:
+            await self._xo_ws.close()
+            self._xo_ws = None
+            raise
+        log.info("xo_login_success", user=(result or {}).get("email"))
 
     async def _xo_call(self, method: str, **params: Any) -> Any:
-        if not self._xo_ws:
-            await self._xo_connect()
+        async with self._xo_rpc_lock:
+            if self._xo_ws is None:
+                await self._xo_connect_locked()
+            return await self._xo_exchange(method, **params)
 
+    async def _xo_exchange(self, method: str, **params: Any) -> Any:
+        """Perform one exchange while the caller holds _xo_rpc_lock."""
+        if self._xo_ws is None:  # Defensive; connect/call own this invariant.
+            raise RuntimeError("XO websocket is not connected")
         req_id = next(_xo_req_id)
         msg = json.dumps({
             "jsonrpc": "2.0",
@@ -104,8 +127,6 @@ class XCPNGProvider(Provider):
     async def health_check(self) -> bool:
         """Check if connection to XO is alive."""
         try:
-            if not self._xo_ws:
-                await self._xo_connect()
             # A simple call to verify it's reachable and working
             await self._xo_call("system.getInfo")
             return True
@@ -222,9 +243,10 @@ class XCPNGProvider(Provider):
         await self._xo_connect()
 
     async def logout(self) -> None:
-        if self._xo_ws:
-            await self._xo_ws.close()
-            self._xo_ws = None
+        async with self._xo_rpc_lock:
+            if self._xo_ws:
+                await self._xo_ws.close()
+                self._xo_ws = None
 
     # --- VM Lifecycle ---
 

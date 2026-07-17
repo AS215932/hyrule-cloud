@@ -1,9 +1,38 @@
+import asyncio
+import json
+from typing import Any, cast
+
 import pytest
 
 from hyrule_cloud.config import XCPNGConfig
 from hyrule_cloud.models import VMOrderResources, VMSize
 from hyrule_cloud.providers.cloudinit import render_cloud_init
 from hyrule_cloud.providers.xcpng import XCPNGProvider
+
+
+class _ConcurrentWebSocket:
+    def __init__(self) -> None:
+        self.pending_ids: list[int] = []
+        self.active_receivers = 0
+        self.max_active_receivers = 0
+
+    async def send(self, raw: str) -> None:
+        self.pending_ids.append(int(json.loads(raw)["id"]))
+
+    async def recv(self) -> str:
+        self.active_receivers += 1
+        self.max_active_receivers = max(
+            self.max_active_receivers,
+            self.active_receivers,
+        )
+        try:
+            await asyncio.sleep(0)
+            request_id = self.pending_ids.pop(0)
+            return json.dumps({"jsonrpc": "2.0", "id": request_id, "result": request_id})
+        finally:
+            self.active_receivers -= 1
+
+    async def close(self) -> None: ...
 
 
 class CreateProvider(XCPNGProvider):
@@ -154,6 +183,21 @@ async def test_exact_name_lookup_supports_crash_recovery(monkeypatch):
         "vm-a",
         "vm-b",
     ]
+
+
+@pytest.mark.asyncio
+async def test_xo_calls_serialize_websocket_request_response_exchanges():
+    provider = XCPNGProvider(XCPNGConfig())
+    websocket = _ConcurrentWebSocket()
+    provider._xo_ws = cast(Any, websocket)
+
+    first, second = await asyncio.gather(
+        provider._xo_call("test.first"),
+        provider._xo_call("test.second"),
+    )
+
+    assert first != second
+    assert websocket.max_active_receivers == 1
 
 
 @pytest.mark.asyncio

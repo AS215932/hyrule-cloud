@@ -36,6 +36,7 @@ from hyrule_cloud.models import (
     SSHSmokeStatus,
     VMCreateRequest,
     VMOrderResources,
+    VMPriceBreakdown,
     VMSize,
     VMStatus,
     generate_anon_management_token,
@@ -270,21 +271,45 @@ class Orchestrator:
                     f"OS template {request.os} is not supported for real VM provisioning yet"
                 )
 
-        # New orders arrive canonicalized by the route, but internal callers
-        # and size-only clients also use this method. Legacy quote snapshots
-        # deliberately bypass current catalog validation so retired 80-GB
-        # disks remain provisionable and are never shrunk.
+        # New unquoted orders arrive canonicalized by the route, but internal
+        # callers and size-only clients also use this method. Durable snapshots
+        # are already canonical and must never be rebound against current
+        # prices: the base profile determines future extension pricing.
+        # Legacy NULL snapshots deliberately bypass current catalog validation
+        # so retired 80-GB disks remain provisionable and are never shrunk.
         if legacy_billing:
             resources = request.resources or resources_for_profile(request.size)
             canonical_request = request.model_copy(update={"resources": resources})
             total = Decimal(
                 str(getattr(self.config.payment, f"price_vm_{request.size.value}", "0"))
             ) * request.duration_days
+        elif pricing_snapshot is not None:
+            snapshot = VMPriceBreakdown.model_validate(pricing_snapshot)
+            resources = request.resources or resources_for_profile(request.size)
+            if (
+                snapshot.base_profile != request.size
+                or snapshot.duration_days != request.duration_days
+            ):
+                raise ValueError("pricing snapshot does not match the VM order")
+            base = resources_for_profile(snapshot.base_profile)
+            expected_addons = (
+                resources.vcpu - base.vcpu,
+                resources.ram_mb - base.ram_mb,
+                resources.disk_gb - base.disk_gb,
+            )
+            if min(expected_addons) < 0 or expected_addons != (
+                snapshot.addon_vcpu,
+                snapshot.addon_ram_mb,
+                snapshot.addon_disk_gb,
+            ):
+                raise ValueError("pricing snapshot add-ons do not match the VM resources")
+            canonical_request = request.model_copy(update={"resources": resources})
+            total = Decimal(snapshot.total_usd)
         else:
             priced = price_vm_order(request, self.config.payment)
             canonical_request = priced.order
             resources = priced.resources
-            pricing_snapshot = pricing_snapshot or priced.pricing_snapshot
+            pricing_snapshot = priced.pricing_snapshot
             total = priced.total
         request = canonical_request
         addon_vcpu, addon_ram_mb, addon_disk_gb = billing_addons_from_snapshot(
