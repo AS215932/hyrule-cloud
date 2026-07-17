@@ -1,7 +1,7 @@
 import pytest
 
 from hyrule_cloud.config import XCPNGConfig
-from hyrule_cloud.models import VMSize
+from hyrule_cloud.models import VMOrderResources, VMSize
 from hyrule_cloud.providers.cloudinit import render_cloud_init
 from hyrule_cloud.providers.xcpng import XCPNGProvider
 
@@ -11,6 +11,7 @@ class CreateProvider(XCPNGProvider):
         super().__init__(XCPNGConfig())
         self.events: list[str] = []
         self.vm_create_params: dict | None = None
+        self.resize_specs: dict | None = None
 
     async def _xo_call(self, method: str, **params):
         self.events.append(method)
@@ -21,6 +22,7 @@ class CreateProvider(XCPNGProvider):
 
     async def _resize_vm(self, vm_uuid: str, specs: dict):
         self.events.append("resize")
+        self.resize_specs = specs
         return "vdi-root", specs["disk_gb"] * 1024 * 1024 * 1024
 
     async def _prepare_openbsd_root_disk(
@@ -168,6 +170,62 @@ async def test_debian_create_passes_network_config_to_xo():
     )
 
     assert provider.vm_create_params["networkConfig"] == "version: 2\n"
+
+
+@pytest.mark.asyncio
+async def test_create_uses_exact_order_resources_instead_of_profile_defaults():
+    provider = CreateProvider()
+
+    await provider.create_vm(
+        template_uuid="template",
+        name_label="test-custom",
+        os_name="debian-13",
+        size=VMSize.MD,
+        resources=VMOrderResources(vcpu=3, ram_mb=6144, disk_gb=30),
+        cloud_init_config="#cloud-config\n{}",
+    )
+
+    assert provider.resize_specs == {"vcpu": 3, "memory_mb": 6144, "disk_gb": 30}
+
+
+@pytest.mark.asyncio
+async def test_capacity_reads_host_running_vm_and_default_sr_state(monkeypatch):
+    provider = XCPNGProvider(XCPNGConfig(default_sr_uuid="sr-default"))
+
+    async def objects(**filters):
+        if filters == {"type": "host"}:
+            return {
+                "host-1": {
+                    "CPUs": {"cores": 16},
+                    "memory": {"size": 64 * 1024**3, "usage": 50 * 1024**3},
+                }
+            }
+        if filters == {"type": "VM"}:
+            return {
+                "running": {"power_state": "Running", "CPUs": {"number": 22}},
+                "halted": {"power_state": "Halted", "CPUs": {"number": 4}},
+                "template": {
+                    "power_state": "Running",
+                    "CPUs": {"number": 8},
+                    "is_a_template": True,
+                },
+            }
+        if filters == {"type": "SR"}:
+            return {
+                "sr-default": {
+                    "physical_size": 400 * 1024**3,
+                    "physical_usage": 200 * 1024**3,
+                }
+            }
+        raise AssertionError(filters)
+
+    monkeypatch.setattr(provider, "_xo_objects", objects)
+    capacity = await provider.capacity()
+
+    assert capacity.physical_vcpu == 16
+    assert capacity.allocated_vcpu == 22
+    assert capacity.free_memory_bytes == 14 * 1024**3
+    assert capacity.free_storage_bytes == 200 * 1024**3
 
 
 @pytest.mark.asyncio

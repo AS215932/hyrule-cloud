@@ -16,7 +16,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy import update as _sql_update
 
 from hyrule_cloud.db import VMQuoteRow, VMRow
@@ -28,6 +28,7 @@ from hyrule_cloud.middleware.anon_token import (
 from hyrule_cloud.middleware.auth import current_account
 from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.models import (
+    VM_PROFILE_LABELS,
     VM_SPECS,
     AcceptedPaymentMethods,
     DomainMode,
@@ -46,11 +47,13 @@ from hyrule_cloud.models import (
     VMExtendRequest,
     VMLogEvent,
     VMLogsResponse,
+    VMPriceBreakdown,
     VMProduct,
     VMProductsResponse,
     VMPublicStatusResponse,
     VMQuoteRequest,
     VMQuoteResponse,
+    VMResourceSpec,
     VMSize,
     VMStatus,
     VMStatusResponse,
@@ -70,6 +73,14 @@ from hyrule_cloud.services.quotes import (
     is_expired,
     link_quote_vm,
 )
+from hyrule_cloud.services.vm_pricing import (
+    VMResourceValidationError,
+    current_daily_price_for_vm,
+    customization_contract,
+    legacy_pricing_snapshot,
+    price_vm_order,
+    resources_for_profile,
+)
 from hyrule_cloud.state import AppState, get_app_state
 
 log = structlog.get_logger()
@@ -83,6 +94,8 @@ router = APIRouter(prefix="/v1")
 # flight. In-process (one uvicorn worker) — cross-worker reuse still fails at
 # settle, where only one submission of an authorization can succeed.
 _proxy_inflight_auth: set[str] = set()
+_vm_capacity_reservation_lock = asyncio.Lock()
+_VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable "HYRV"-style PostgreSQL lock key
 
 
 @asynccontextmanager
@@ -99,6 +112,29 @@ async def _proxy_authorization_guard(request: Request):
         yield
     finally:
         _proxy_inflight_auth.discard(key)
+
+
+@asynccontextmanager
+async def _serialized_vm_capacity_reservation(orch):
+    """Serialize live-capacity check plus durable reservation across workers."""
+    async with _vm_capacity_reservation_lock:
+        async with orch.db() as session:
+            dialect = session.get_bind().dialect.name
+            locked = False
+            if dialect == "postgresql":
+                await session.execute(
+                    text("SELECT pg_advisory_lock(:lock_key)"),
+                    {"lock_key": _VM_CAPACITY_ADVISORY_LOCK},
+                )
+                locked = True
+            try:
+                yield
+            finally:
+                if locked:
+                    await session.execute(
+                        text("SELECT pg_advisory_unlock(:lock_key)"),
+                        {"lock_key": _VM_CAPACITY_ADVISORY_LOCK},
+                    )
 
 
 async def get_orch(app_state: AppState = Depends(get_app_state)):
@@ -144,6 +180,30 @@ async def _compute_vm_price(orch, cfg, order: VMCreateRequest) -> tuple[Decimal,
     return orch.compute_price(order)
 
 
+def _price_vm_order(orch, cfg, order: VMCreateRequest):
+    try:
+        if hasattr(orch, "price_order"):
+            return orch.price_order(order)
+        return price_vm_order(order, cfg.payment)
+    except VMResourceValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _order_matches_quote(posted: VMCreateRequest, stored: dict) -> bool:
+    """Compare a create/intent body to a durable server snapshot.
+
+    Size-only clients remain compatible: if they omit `resources`, the quote's
+    exact server-selected resources are authoritative and ignored only for the
+    comparison. A client that does send resources must match them exactly.
+    """
+    posted_payload = posted.model_dump(mode="json", exclude={"quote_id"})
+    stored_payload = dict(stored)
+    if posted.resources is None:
+        posted_payload.pop("resources", None)
+        stored_payload.pop("resources", None)
+    return posted_payload == stored_payload
+
+
 async def _enforce_paid_vm_cap(orch, cfg) -> None:
     cap = int(getattr(cfg, "max_paid_active_vms", 0) or 0)
     if cap <= 0:
@@ -165,11 +225,20 @@ def _quote_to_response(row: VMQuoteRow, cfg, app_state: AppState) -> VMQuoteResp
     status = QuoteStatus(row.status)
     if status == QuoteStatus.CREATED and is_expired(row):
         status = QuoteStatus.EXPIRED
+    order = VMCreateRequest(**row.order_payload)
+    resources = order.resources or resources_for_profile(order.size)
+    pricing = (
+        VMPriceBreakdown.model_validate(row.pricing_snapshot)
+        if row.pricing_snapshot
+        else legacy_pricing_snapshot(order, Decimal(row.amount_usd))
+    )
     return VMQuoteResponse(
         quote_id=row.quote_id,
         status=status,
-        order_payload=VMCreateRequest(**row.order_payload),
+        order_payload=order,
+        resources=resources,
         amount_usd=str(row.amount_usd),
+        pricing=pricing,
         accepted_payment_methods=_accepted_payment_methods(cfg, app_state),
         created_at=row.created_at,
         expires_at=row.expires_at,
@@ -203,6 +272,16 @@ def _vm_create_response(
         management_url=(
             f"{base_url}/v1/vm/{row.vm_id}?token={management_token}" if management_token else None
         ),
+    )
+
+
+def _vm_row_profile_and_resources(row: Any) -> tuple[VMSize, VMResourceSpec]:
+    profile = VMSize(getattr(row, "size", VMSize.XS))
+    fallback = resources_for_profile(profile)
+    return profile, VMResourceSpec(
+        vcpu=getattr(row, "vcpu", None) or fallback.vcpu,
+        ram_mb=getattr(row, "memory_mb", None) or fallback.ram_mb,
+        disk_gb=getattr(row, "disk_gb", None) or fallback.disk_gb,
     )
 
 
@@ -293,6 +372,68 @@ async def _enforce_prefix_capacity(orch, cfg) -> None:
         )
     if int(result.scalar() or 0) >= usable:
         raise HTTPException(503, "No customer IPv6 capacity available right now")
+
+
+async def _enforce_compute_capacity(orch, cfg, order: VMCreateRequest) -> None:
+    """Fail closed when the live single host cannot fit the exact VM.
+
+    XO reports resources already consumed by running guests. Database rows that
+    are reserved/provisioning but do not yet have an XO UUID are added so the
+    admission decision also accounts for concurrent payment handoffs.
+    """
+    if not _real_provisioning_enabled():
+        return
+    if hasattr(orch, "ensure_vm_capacity"):
+        try:
+            await orch.ensure_vm_capacity(order)
+            return
+        except Exception as exc:
+            log.error("vm_capacity_check_failed", error=str(exc), exc_info=True)
+            raise HTTPException(503, "The requested VM does not fit current host capacity") from exc
+    resources = order.resources or resources_for_profile(order.size)
+    try:
+        capacity = await orch.xcpng.capacity()
+        async with orch.db() as session:
+            pending = (
+                await session.execute(
+                    select(
+                        func.coalesce(func.sum(VMRow.vcpu), 0),
+                        func.coalesce(func.sum(VMRow.memory_mb), 0),
+                        func.coalesce(func.sum(VMRow.disk_gb), 0),
+                    ).where(
+                        VMRow.status == VMStatus.PROVISIONING,
+                        VMRow.xcpng_uuid.is_(None),
+                    )
+                )
+            ).one()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("vm_capacity_check_failed", error=str(exc), exc_info=True)
+        raise HTTPException(503, "VM capacity is temporarily unavailable") from exc
+
+    pending_vcpu, pending_memory_mb, pending_disk_gb = (int(value or 0) for value in pending)
+    cpu_limit = int(
+        Decimal(capacity.physical_vcpu)
+        * Decimal(str(getattr(cfg.xcpng, "vcpu_overcommit_ratio", "2.0")))
+    )
+    memory_headroom = int(getattr(cfg.xcpng, "memory_headroom_mb", 2048)) * 1024 * 1024
+    storage_headroom = int(getattr(cfg.xcpng, "storage_headroom_gb", 20)) * 1024**3
+    enough_cpu = capacity.allocated_vcpu + pending_vcpu + resources.vcpu <= cpu_limit
+    enough_memory = (
+        capacity.free_memory_bytes
+        - pending_memory_mb * 1024 * 1024
+        - resources.ram_mb * 1024 * 1024
+        >= memory_headroom
+    )
+    enough_storage = (
+        capacity.free_storage_bytes
+        - pending_disk_gb * 1024**3
+        - resources.disk_gb * 1024**3
+        >= storage_headroom
+    )
+    if not (enough_cpu and enough_memory and enough_storage):
+        raise HTTPException(503, "The requested VM does not fit current host capacity")
 
 
 # --- Block B (Wave 2): runtime metrics ---
@@ -528,10 +669,10 @@ async def get_payment_networks(
 async def get_pricing(cfg=Depends(get_cfg)) -> PricingResponse:
     return PricingResponse(
         vm_prices={
-            "xs (1vCPU/1GB/10GB)": f"${cfg.payment.price_vm_xs}/day",
-            "sm (1vCPU/1GB/20GB)": f"${cfg.payment.price_vm_sm}/day",
-            "md (2vCPU/2GB/40GB)": f"${cfg.payment.price_vm_md}/day",
-            "lg (4vCPU/4GB/80GB)": f"${cfg.payment.price_vm_lg}/day",
+            f"{size.value} ({VM_PROFILE_LABELS[size]})": (
+                f"${getattr(cfg.payment, f'price_vm_{size.value}')}/day"
+            )
+            for size in VMSize
         },
         domain_auto=f"$0.00 (subdomain under {cfg.deploy_domain})",
         proxy_prices={
@@ -543,14 +684,12 @@ async def get_pricing(cfg=Depends(get_cfg)) -> PricingResponse:
         if hasattr(PricingResponse, "__annotations__")
         and "proxy_prices" in PricingResponse.__annotations__
         else {},
+        vm_customization=customization_contract(cfg.payment),
     )
 
 
 _VM_PRODUCT_NAMES = {
-    VMSize.XS: "Starter",
-    VMSize.SM: "Basic",
-    VMSize.MD: "Standard",
-    VMSize.LG: "Performance",
+    size: label for size, label in VM_PROFILE_LABELS.items()
 }
 
 
@@ -571,7 +710,11 @@ async def get_vm_products(request: Request, cfg=Depends(get_cfg)) -> VMProductsR
         for size in VMSize
     ]
     base_url = str(request.base_url).rstrip("/")
-    return VMProductsResponse(products=products, os_templates_url=f"{base_url}/v1/os/list")
+    return VMProductsResponse(
+        products=products,
+        customization=customization_contract(cfg.payment),
+        os_templates_url=f"{base_url}/v1/os/list",
+    )
 
 
 @router.get("/os/list", response_model=OSListResponse)
@@ -646,6 +789,7 @@ async def get_vm_public_status(
     if hasattr(orch, "get_quote_for_vm"):
         quote = await orch.get_quote_for_vm(vm_id)
     lp = build_launch_proof(row, quote_row=quote)
+    profile, resources = _vm_row_profile_and_resources(row)
     return VMPublicStatusResponse(
         vm_id=row.vm_id,
         status=VMStatus(row.status),
@@ -653,6 +797,8 @@ async def get_vm_public_status(
         ipv6_prefix=getattr(row, "ipv6_prefix", None),
         hostname=row.hostname,
         expires_at=row.expires_at,
+        profile=profile,
+        resources=resources,
         launch_proof_status=lp["launch_proof_status"],
         payment_status=lp["payment_status"],
         dns_aaaa_verified=lp["dns_aaaa_verified"],
@@ -676,6 +822,7 @@ async def get_vm_status(
 
     is_ready = row.hostname and row.status == VMStatus.READY
 
+    profile, resources = _vm_row_profile_and_resources(row)
     return VMStatusResponse(
         vm_id=row.vm_id,
         status=VMStatus(row.status),
@@ -684,6 +831,8 @@ async def get_vm_status(
         hostname=row.hostname,
         ssh=f"ssh root@{row.hostname}" if is_ready else None,
         expires_at=row.expires_at,
+        profile=profile,
+        resources=resources,
         firewall=firewall,
         error=row.error,
     )
@@ -761,9 +910,11 @@ async def create_vm(
         if QuoteStatus(quote_row.status) != QuoteStatus.CREATED:
             raise HTTPException(409, "Quote is not payable")
         # Tamper / price-lock guard: the body must match the stored spec exactly.
-        if body.model_dump(mode="json", exclude={"quote_id"}) != quote_row.order_payload:
+        if not _order_matches_quote(body, quote_row.order_payload):
             raise HTTPException(422, "Order body does not match the quote")
         order = VMCreateRequest(**quote_row.order_payload)
+    else:
+        order = _price_vm_order(orch, cfg, order).order
 
     # Closed until real provisioning is enabled — never charge for a simulated
     # VM. Placed after the consumed-quote replay above so an already-paid,
@@ -779,9 +930,23 @@ async def create_vm(
     # Price-lock: a quote-bound create charges the amount quoted to the user,
     # not a recomputation (which could drift). The breakdown is still recomputed
     # for the 402 body's informational cost_breakdown.
-    computed, breakdown = await _compute_vm_price(orch, cfg, order)
+    if quote_row is not None and quote_row.pricing_snapshot is None:
+        computed, breakdown = await _compute_vm_price(orch, cfg, order.model_copy(update={"resources": None}))
+        pricing_snapshot = None
+    else:
+        priced = _price_vm_order(orch, cfg, order)
+        order = priced.order
+        computed, breakdown = await _compute_vm_price(orch, cfg, order)
+        pricing_snapshot = (
+            quote_row.pricing_snapshot if quote_row is not None else priced.pricing_snapshot
+        )
     total = quote_row.amount_usd if quote_row is not None else computed
-    specs = VM_SPECS[order.size]
+    resources = order.resources or resources_for_profile(order.size)
+    specs = {
+        "vcpu": resources.vcpu,
+        "memory_mb": resources.ram_mb,
+        "disk_gb": resources.disk_gb,
+    }
 
     # Reservation-through-payment: a request that is about to be CHARGED
     # atomically claims its VM row + customer /64 (unique index) BEFORE the
@@ -796,9 +961,18 @@ async def create_vm(
     # allocate-after-payment path.
     if isinstance(gate, PaymentGate) and gate.has_payment_credentials(request):
         try:
-            reservation_row, reservation_token = await orch.reserve_vm(
-                order, owner_account_id=account.account_id if account else None
-            )
+            # A PostgreSQL advisory lock (plus the local lock in tests/SQLite)
+            # closes the live-capacity check → durable DB reservation race.
+            async with _serialized_vm_capacity_reservation(orch):
+                await _enforce_compute_capacity(orch, cfg, order)
+                reservation_row, reservation_token = await orch.reserve_vm(
+                    order,
+                    owner_account_id=account.account_id if account else None,
+                    pricing_snapshot=pricing_snapshot,
+                    legacy_billing=(
+                        quote_row is not None and quote_row.pricing_snapshot is None
+                    ),
+                )
         except RuntimeError:
             raise HTTPException(503, "No customer IPv6 capacity available right now")
         if order.domain_mode == DomainMode.CUSTOM and order.domain:
@@ -819,11 +993,19 @@ async def create_vm(
             except Exception as exc:
                 await orch.release_vm_reservation(reservation_row.vm_id)
                 raise HTTPException(503, "Managed domains are temporarily unavailable") from exc
+    else:
+        # Unpaid discovery and test doubles do not create a reservation, but
+        # real deployments still refuse a 402 for a configuration that cannot
+        # currently fit.
+        await _enforce_compute_capacity(orch, cfg, order)
 
     result = await gate.check_payment(
         request,
         amount=total,
-        description=f"Hyrule Cloud VM ({order.size.value}) for {order.duration_days} days",
+        description=(
+            f"Hyrule Cloud VM ({VM_PROFILE_LABELS[order.size]}) "
+            f"for {order.duration_days} days"
+        ),
         extra_body={
             "cost_breakdown": breakdown.model_dump(),
             "specs": {**specs, "ipv6": True, "ipv4": False, "region": "eu-west"},
@@ -887,6 +1069,8 @@ async def create_vm(
                     owner_wallet=wallet,
                     owner_account_id=account.account_id if account else None,
                     start_provisioning=False,
+                    pricing_snapshot=pricing_snapshot,
+                    legacy_billing=quote_row is not None and quote_row.pricing_snapshot is None,
                 )
                 row.payment_tx = getattr(request.state, "payment_tx", None)
         else:
@@ -895,6 +1079,8 @@ async def create_vm(
                 owner_wallet=wallet,
                 owner_account_id=account.account_id if account else None,
                 start_provisioning=False,
+                pricing_snapshot=pricing_snapshot,
+                legacy_billing=quote_row is not None and quote_row.pricing_snapshot is None,
             )
             row.payment_tx = getattr(request.state, "payment_tx", None)
         if quote_row is not None:
@@ -999,16 +1185,21 @@ async def create_vm_quote(
     # Don't lock a price for a VM that can't be provisioned yet (simulation).
     _require_vm_service_open(gate)
 
-    order = body.order_payload
+    priced = _price_vm_order(orch, cfg, body.order_payload)
+    order = priced.order
     _validate_vm_order(order, cfg)
+    await _enforce_paid_vm_cap(orch, cfg)
+    await _enforce_prefix_capacity(orch, cfg)
+    await _enforce_compute_capacity(orch, cfg, order)
 
-    total, _ = await _compute_vm_price(orch, cfg, order)
+    total = priced.total
     app_state = await get_app_state(request)
     try:
         row = await create_quote(
             session_factory=orch.db,
             order_payload=order,
             amount_usd=total,
+            pricing_snapshot=priced.pricing_snapshot,
             client_order_id=body.client_order_id,
             owner_account_id=(account.account_id if account is not None else None),
         )
@@ -1070,13 +1261,7 @@ async def extend_vm(
     # create/quote/intent. Refuse before check_payment so no money moves.
     _require_vm_service_open(gate)
 
-    price_map = {
-        VMSize.XS: cfg.payment.price_vm_xs,
-        VMSize.SM: cfg.payment.price_vm_sm,
-        VMSize.MD: cfg.payment.price_vm_md,
-        VMSize.LG: cfg.payment.price_vm_lg,
-    }
-    total = price_map[VMSize(row.size)] * body.days
+    total = current_daily_price_for_vm(row, cfg.payment) * body.days
 
     result = await gate.check_payment(
         request,
@@ -1321,7 +1506,7 @@ async def _load_payable_native_quote(
         raise HTTPException(409, "Quote expired; create a new one")
     if QuoteStatus(quote_row.status) != QuoteStatus.CREATED:
         raise HTTPException(409, "Quote is not payable")
-    if order.model_dump(mode="json", exclude={"quote_id"}) != quote_row.order_payload:
+    if not _order_matches_quote(order, quote_row.order_payload):
         raise HTTPException(422, "Order body does not match the quote")
     locked_order = VMCreateRequest(**quote_row.order_payload).model_copy(
         update={"quote_id": quote_row.quote_id}
@@ -1387,7 +1572,6 @@ async def create_crypto_intent(
         )
         if existing_quote is not None:
             _validate_vm_order(existing_order, cfg)
-            await _compute_vm_price(orch, cfg, existing_order)
         return _intent_to_response(existing_intent, request)
 
     # Native BTC/XMR checkout is bound to the same durable quote as EVM. The
@@ -1399,6 +1583,8 @@ async def create_crypto_intent(
         order=order,
         account=account,
     )
+    if quote_row is None:
+        order = _price_vm_order(orch, cfg, order).order
 
     # Same validation as the x402 create path — including the real-mode OS
     # support check, so an unsupported order is rejected BEFORE a deposit
@@ -1408,9 +1594,19 @@ async def create_crypto_intent(
 
     await _enforce_paid_vm_cap(orch, cfg)
     await _enforce_prefix_capacity(orch, cfg)
+    await _enforce_compute_capacity(orch, cfg, order)
     # Re-run validation that depends on mutable external state (notably custom
     # domain availability), while retaining the durable quote's locked amount.
-    computed, _ = await _compute_vm_price(orch, cfg, order)
+    if quote_row is not None and quote_row.pricing_snapshot is None:
+        computed, _ = await _compute_vm_price(orch, cfg, order.model_copy(update={"resources": None}))
+        pricing_snapshot = None
+    else:
+        priced = _price_vm_order(orch, cfg, order)
+        order = priced.order
+        computed = priced.total
+        pricing_snapshot = (
+            quote_row.pricing_snapshot if quote_row is not None else priced.pricing_snapshot
+        )
     total = quote_row.amount_usd if quote_row is not None else computed
 
     app_state: AppState = await get_app_state(request)
@@ -1430,6 +1626,7 @@ async def create_crypto_intent(
             client_order_id=body.client_order_id,
             owner_account_id=(account.account_id if account is not None else None),
             expires_at=(quote_row.expires_at if quote_row is not None else None),
+            pricing_snapshot=pricing_snapshot,
         )
     except IntentExistsError as exc:
         # Idempotent replay: return the existing intent verbatim

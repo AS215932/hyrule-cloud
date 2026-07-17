@@ -84,6 +84,18 @@ class VMRow(Base):
         Enum(VMSize, name="vm_size", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
         default=VMSize.XS,
     )
+    # Exact provisioned resources. Nullable at the ORM level so databases can
+    # roll through the migration safely; migration 016 backfills every legacy
+    # row before new writes begin.
+    vcpu: Mapped[int | None] = mapped_column(Integer)
+    memory_mb: Mapped[int | None] = mapped_column(Integer)
+    disk_gb: Mapped[int | None] = mapped_column(Integer)
+    # Add-on quantities are stored independently from exact resources. This is
+    # what lets extensions use current catalog rates without reinterpreting
+    # legacy machines (including retired 80-GB disks) as newly purchased add-ons.
+    billing_addon_vcpu: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    billing_addon_ram_mb: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    billing_addon_disk_gb: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     os: Mapped[str] = mapped_column(String(64), default="debian-13")
     ipv6: Mapped[str | None] = mapped_column(String(64))
     ipv6_prefix_index: Mapped[int | None] = mapped_column(Integer)
@@ -487,6 +499,9 @@ class CryptoIntentRow(Base):
     client_order_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
     # Full VM creation spec carried through to the orchestrator on settlement.
     order_payload: Mapped[dict | None] = mapped_column(_JSONB)
+    # Server-generated VM pricing snapshot. NULL identifies an intent created
+    # before configurable resources shipped; those rows retain zero add-ons.
+    pricing_snapshot: Mapped[dict | None] = mapped_column(_JSONB)
     # Rate at intent creation; payment must arrive before rate_valid_until OR
     # qualify under the LENIENT re-quote rule (see providers/native_crypto.py).
     rate_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
@@ -575,6 +590,9 @@ class VMQuoteRow(Base):
     order_payload: Mapped[dict] = mapped_column(_JSONB)
     # Price locked at quote creation; the 402 challenge uses this, not a recompute.
     amount_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    # Immutable, server-generated daily/base/add-on breakdown shown on review
+    # pages and copied to native intents. NULL means a migrated legacy quote.
+    pricing_snapshot: Mapped[dict | None] = mapped_column(_JSONB)
     status: Mapped[str] = mapped_column(
         Enum(
             QuoteStatus,

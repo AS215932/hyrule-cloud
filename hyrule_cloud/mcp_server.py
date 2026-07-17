@@ -147,15 +147,29 @@ async def create_vm(
     domain: str | None = None,
     open_ports: str = "80,443",
     setup_script: str | None = None,
+    vcpu: int | None = None,
+    ram_gb: int | None = None,
+    disk_gb: int | None = None,
 ) -> str:
     """
     Provision a bare VM with SSH access.
 
-    Sizes: xs (1vCPU/1GB/10GB), sm (1vCPU/1GB/20GB), md (2vCPU/2GB/40GB), lg (4vCPU/4GB/80GB).
+    Profiles: xs (1C-1G-10G), sm (1C-2G-20G), md (2C-4G-20G), lg (4C-4G-40G).
+    To customize, provide all of vcpu, ram_gb, and disk_gb. Limits: 4/8/40.
     Domain modes: 'auto' (free subdomain), 'custom' (register domain, extra cost).
     Returns 402 with payment instructions if no payment is attached.
     """
     ports = [int(p.strip()) for p in open_ports.split(",") if p.strip()]
+    custom_values = (vcpu, ram_gb, disk_gb)
+    if any(value is not None for value in custom_values) and not all(
+        value is not None for value in custom_values
+    ):
+        return "Error: vcpu, ram_gb, and disk_gb must be provided together"
+    resources = (
+        {"vcpu": vcpu, "ram_mb": ram_gb * 1024, "disk_gb": disk_gb}
+        if all(value is not None for value in custom_values)
+        else None
+    )
     try:
         async with _client() as hc:
             result = await hc.create_vm(
@@ -167,6 +181,7 @@ async def create_vm(
                 domain=domain,
                 open_ports=ports,
                 setup_script=setup_script,
+                resources=resources,
             )
             return (
                 f"VM created!\n"

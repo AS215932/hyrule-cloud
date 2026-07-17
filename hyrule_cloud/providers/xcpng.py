@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import ssl
+from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ import structlog
 import websockets
 
 from hyrule_cloud.config import XCPNGConfig
-from hyrule_cloud.models import VM_SPECS, VMSize
+from hyrule_cloud.models import VM_SPECS, VMOrderResources, VMSize
 from hyrule_cloud.providers.base import Provider, ProviderError
 
 log = structlog.get_logger()
@@ -36,6 +37,14 @@ class XOError(ProviderError):
         self.method = method
         self.error = error
         super().__init__("XCPNG", method, str(error))
+
+
+@dataclass(frozen=True)
+class XCPNGCapacity:
+    physical_vcpu: int
+    allocated_vcpu: int
+    free_memory_bytes: int
+    free_storage_bytes: int
 
 
 class XCPNGProvider(Provider):
@@ -122,6 +131,92 @@ class XCPNGProvider(Provider):
             if record.get("name_label") == name_label
         )
 
+    @staticmethod
+    def _number(record: dict, *paths: tuple[str, ...] | str) -> int | None:
+        for path in paths:
+            keys = (path,) if isinstance(path, str) else path
+            value: Any = record
+            for key in keys:
+                if not isinstance(value, dict) or key not in value:
+                    value = None
+                    break
+                value = value[key]
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    async def capacity(self) -> XCPNGCapacity:
+        """Return live host/default-SR capacity from XO's object cache.
+
+        Missing fields are an error rather than an optimistic zero: admission
+        control must fail closed before accepting a payment when XO cannot
+        prove that CPU, RAM, and disk are available.
+        """
+        hosts, vms, srs = await asyncio.gather(
+            self._xo_objects(type="host"),
+            self._xo_objects(type="VM"),
+            self._xo_objects(type="SR"),
+        )
+        if not hosts:
+            raise XOError("capacity", {"message": "XO returned no hosts"})
+
+        physical_vcpu = 0
+        free_memory = 0
+        for host in hosts.values():
+            cores = self._number(host, ("CPUs", "cores"), "cpu_count", "n_cpus")
+            memory_free = self._number(host, ("memory", "free"), "memory_free")
+            if memory_free is None:
+                memory_size = self._number(host, ("memory", "size"), "memory_size")
+                memory_usage = self._number(host, ("memory", "usage"), "memory_usage")
+                if memory_size is not None and memory_usage is not None:
+                    memory_free = memory_size - memory_usage
+            if cores is None or memory_free is None:
+                raise XOError(
+                    "capacity",
+                    {"message": "XO host capacity fields are incomplete"},
+                )
+            physical_vcpu += cores
+            free_memory += max(0, memory_free)
+
+        allocated_vcpu = 0
+        for vm in vms.values():
+            if vm.get("is_a_template") or vm.get("type") in {"template", "VM-template"}:
+                continue
+            if str(vm.get("power_state", "")).lower() != "running":
+                continue
+            allocated_vcpu += self._number(vm, ("CPUs", "number"), "cpus", "VCPUs_at_startup") or 0
+
+        sr = srs.get(self.config.default_sr_uuid)
+        if sr is None:
+            # Some XO versions key the cache by an opaque id but expose the
+            # XAPI UUID in the record.
+            sr = next(
+                (
+                    value
+                    for key, value in srs.items()
+                    if key == self.config.default_sr_uuid
+                    or value.get("uuid") == self.config.default_sr_uuid
+                    or value.get("id") == self.config.default_sr_uuid
+                ),
+                None,
+            )
+        if sr is None:
+            raise XOError("capacity", {"message": "default SR is missing from XO"})
+        storage_size = self._number(sr, "physical_size", "size")
+        storage_usage = self._number(sr, "physical_usage", "usage")
+        if storage_size is None or storage_usage is None:
+            raise XOError("capacity", {"message": "XO SR capacity fields are incomplete"})
+
+        return XCPNGCapacity(
+            physical_vcpu=physical_vcpu,
+            allocated_vcpu=allocated_vcpu,
+            free_memory_bytes=free_memory,
+            free_storage_bytes=max(0, storage_size - storage_usage),
+        )
+
     async def login(self) -> None:
         await self._xo_connect()
 
@@ -139,6 +234,7 @@ class XCPNGProvider(Provider):
         name_label: str,
         os_name: str = "debian-13",
         size: VMSize,
+        resources: VMOrderResources | None = None,
         cloud_init_config: str,
         network_config: str | None = None,
     ) -> str:
@@ -150,8 +246,22 @@ class XCPNGProvider(Provider):
 
         Returns the new VM's UUID.
         """
-        specs = VM_SPECS[size]
-        log.info("vm_create_start", template=template_uuid, name=name_label, size=size.value)
+        specs = (
+            {
+                "vcpu": resources.vcpu,
+                "memory_mb": resources.ram_mb,
+                "disk_gb": resources.disk_gb,
+            }
+            if resources is not None
+            else VM_SPECS[size]
+        )
+        log.info(
+            "vm_create_start",
+            template=template_uuid,
+            name=name_label,
+            size=size.value,
+            specs=specs,
+        )
 
         create_params = {
             "template": template_uuid,

@@ -30,6 +30,8 @@ from hyrule_cloud.models import (
     CryptoIntentStatus,
     DomainMode,
     QuoteStatus,
+    VMCreateRequest,
+    VMOrderResources,
     VMSize,
     VMStatus,
 )
@@ -103,6 +105,8 @@ class _StubOrchestrator:
     def __init__(self, session_factory: async_sessionmaker) -> None:
         self.db = session_factory
         self.created_vms: list[tuple[str, str | None]] = []
+        self.created_vm_requests: list[VMCreateRequest] = []
+        self.created_vm_options: list[dict[str, object]] = []
         self.provisioning_started: list[str] = []
         self.native_refunds: list[str] = []
         self.native_refund_reasons: dict[str, str] = {}
@@ -146,6 +150,7 @@ class _StubOrchestrator:
         owner_account_id: str | None = None,
         vm_id: str | None = None,
         start_provisioning: bool = True,
+        **kwargs,
     ):
         from hyrule_cloud.middleware.anon_token import hash_anon_token
         from hyrule_cloud.models import (
@@ -154,6 +159,8 @@ class _StubOrchestrator:
         )
 
         vm_id = vm_id or generate_vm_id()
+        self.created_vm_requests.append(request)
+        self.created_vm_options.append(kwargs)
         anon_token = generate_anon_management_token()
         anon_hash = hash_anon_token(anon_token)
         async with self.db() as session:
@@ -420,6 +427,52 @@ async def test_poll_overpay_settles_and_provisions(intent_state):
     )
     assert updated.vm_id is not None
     assert updated.anon_token_cleartext is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_unquoted_intent_preserves_retired_resources_and_amount(intent_state):
+    """NULL pricing snapshots identify pre-customization native orders.
+
+    They may carry the retired 80-GB lg disk and must provision that exact
+    footprint at the already-settled historical amount.
+    """
+    order = VMCreateRequest(
+        duration_days=1,
+        size=VMSize.LG,
+        resources=VMOrderResources(vcpu=4, ram_mb=4096, disk_gb=80),
+        os="debian-13",
+        ssh_pubkey="ssh-ed25519 AAAA test",
+    )
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=Decimal("0.40"),
+        client_order_id=None,
+        owner_account_id=None,
+    )
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+
+    updated = await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    assert updated.status == CryptoIntentStatus.PROVISIONED
+    assert intent_state.orchestrator.created_vm_requests[-1].resources == order.resources
+    assert intent_state.orchestrator.created_vm_options[-1]["legacy_billing"] is True
+    async with intent_state.orchestrator.db() as db:
+        vm = await db.get(VMRow, updated.vm_id)
+    assert vm.cost_total == Decimal("0.40")
 
 
 @pytest.mark.asyncio

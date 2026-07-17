@@ -309,10 +309,10 @@ def _fixed(field: str, default: str) -> PriceSpec:
 _VM_PRICE = PriceSpec(
     "dynamic",
     (
-        ("price_vm_xs", "0.05"),
-        ("price_vm_sm", "0.10"),
-        ("price_vm_md", "0.20"),
-        ("price_vm_lg", "0.40"),
+        ("price_vm_xs", "0.20"),
+        ("price_vm_sm", "0.40"),
+        ("price_vm_md", "0.60"),
+        ("price_vm_lg", "0.80"),
     ),
     # Duration and an optional registrar quote make a truthful upper bound
     # impossible at discovery time.

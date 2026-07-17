@@ -13,7 +13,7 @@ from x402.http import (
 )
 
 from hyrule_cloud.app import app
-from hyrule_cloud.config import HyruleConfig
+from hyrule_cloud.config import HyruleConfig, PaymentConfig
 from hyrule_cloud.services.discovery import (
     DISCOVERY,
     PAID_OPERATIONS,
@@ -186,6 +186,20 @@ def test_flat_subject_discovery_form_preserves_nested_api_contract(
         "subject_type",
         "subject_value",
     ]
+
+
+def test_vm_discovery_minimum_is_a_purchasable_one_day_machine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_all_catalog_gates(monkeypatch)
+    # Ignore a developer's local .env: discovery must expose the shipped
+    # catalog floor, and add-on unit prices are not independently purchasable.
+    config = HyruleConfig(payment=PaymentConfig(_env_file=None))
+    schema = build_curated_openapi(app, config)
+
+    price = schema["paths"]["/v1/vm/create"]["post"]["x-payment-info"]["price"]
+
+    assert price == {"mode": "dynamic", "currency": "USD", "min": "0.20"}
 
 
 def test_manifest_openapi_and_bazaar_share_the_same_enabled_catalog(

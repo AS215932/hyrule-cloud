@@ -2197,6 +2197,8 @@ class DomainService:
             owner_account_id=order.owner_account_id,
             vm_id=planned_vm_id,
             start_provisioning=False,
+            pricing_snapshot=quote.pricing_snapshot,
+            legacy_billing=quote.pricing_snapshot is None,
         )
         await self.orchestrator.persist_charged_amount(vm.vm_id, Decimal(order.vm_amount_usd))
         await link_quote_vm(self.db, quote.quote_id, vm.vm_id)

@@ -104,6 +104,7 @@ async def create_intent(
     resource_id: str | None = None,
     refund_address: str | None = None,
     planned_vm_id: str | None = None,
+    pricing_snapshot: dict[str, Any] | None = None,
 ) -> CryptoIntentRow:
     """Insert a fresh CryptoIntentRow and derive a receive address for it.
 
@@ -169,6 +170,7 @@ async def create_intent(
                 if isinstance(order_payload, BaseModel)
                 else order_payload
             ),
+            pricing_snapshot=pricing_snapshot,
             owner_account_id=owner_account_id,
             resource_type=resource_type,
             resource_id=resource_id,
@@ -504,6 +506,20 @@ async def _trigger_provisioning(
                     reason="quote_already_consumed",
                 )
                 return
+        if hasattr(orch, "ensure_vm_capacity"):
+            try:
+                await orch.ensure_vm_capacity(order)
+            except Exception:
+                log.warning(
+                    "native_vm_capacity_unavailable_at_settlement",
+                    intent_id=intent_id,
+                    exc_info=True,
+                )
+                await orch.record_native_intent_refund(
+                    intent_id,
+                    reason="vm_capacity_unavailable_at_settlement",
+                )
+                return
         if order.domain_mode == DomainMode.CUSTOM:
             # The route-level check happened when the deposit address was
             # issued, potentially many confirmations ago. Settlement is the
@@ -547,34 +563,36 @@ async def _trigger_provisioning(
             owner_account_id=row.owner_account_id,
             vm_id=planned_vm_id,
             start_provisioning=False,
+            pricing_snapshot=row.pricing_snapshot,
+            legacy_billing=row.pricing_snapshot is None,
         )
-        if quote_id is not None:
-            if row.amount_usd is not None:
-                amount_persisted = False
-                for attempt in range(3):
-                    try:
-                        await orch.persist_charged_amount(vm_row.vm_id, row.amount_usd)
-                        amount_persisted = True
-                        break
-                    except Exception:
-                        log.warning(
-                            "native_charged_amount_attempt_failed",
-                            intent_id=intent_id,
-                            vm_id=vm_row.vm_id,
-                            attempt=attempt,
-                            exc_info=True,
-                        )
-                        if attempt < 2:
-                            await asyncio.sleep(0.1 * (attempt + 1))
-                if not amount_persisted:
-                    # The intent itself retains the settled USD/crypto amounts,
-                    # so a later native refund remains accurate. Do not fail a
-                    # paid, provisionable VM over this denormalized copy.
-                    log.error(
-                        "native_charged_amount_failed_post_settlement",
+        if row.amount_usd is not None:
+            amount_persisted = False
+            for attempt in range(3):
+                try:
+                    await orch.persist_charged_amount(vm_row.vm_id, row.amount_usd)
+                    amount_persisted = True
+                    break
+                except Exception:
+                    log.warning(
+                        "native_charged_amount_attempt_failed",
                         intent_id=intent_id,
                         vm_id=vm_row.vm_id,
+                        attempt=attempt,
+                        exc_info=True,
                     )
+                    if attempt < 2:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+            if not amount_persisted:
+                # The intent itself retains the settled USD/crypto amounts,
+                # so a later native refund remains accurate. Do not fail a
+                # paid, provisionable VM over this denormalized copy.
+                log.error(
+                    "native_charged_amount_failed_post_settlement",
+                    intent_id=intent_id,
+                    vm_id=vm_row.vm_id,
+                )
+        if quote_id is not None:
             linked = False
             for attempt in range(3):
                 try:

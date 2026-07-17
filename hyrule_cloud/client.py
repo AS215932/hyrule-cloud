@@ -108,6 +108,26 @@ class HyruleClient:
         """List available OS templates."""
         return await self._request("GET", "/v1/os/list")
 
+    async def vm_products(self) -> dict[str, Any]:
+        """Get technical VM profiles and the customization contract."""
+        return await self._request("GET", "/v1/products/vms")
+
+    async def quote_vm(
+        self,
+        order_payload: dict[str, Any],
+        *,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Lock a canonical VM configuration and USD price for checkout."""
+        body: dict[str, Any] = {"order_payload": order_payload}
+        if client_order_id is not None:
+            body["client_order_id"] = client_order_id
+        return await self._request("POST", "/v1/vm/quote", json=body)
+
+    async def vm_quote(self, quote_id: str) -> dict[str, Any]:
+        """Restore a durable VM quote and its exact resource snapshot."""
+        return await self._request("GET", f"/v1/vm/quote/{quote_id}")
+
     async def vm_status(self, vm_id: str) -> dict[str, Any]:
         """Get VM status, IP, hostname, expiry."""
         return await self._request("GET", f"/v1/vm/{vm_id}")
@@ -159,6 +179,8 @@ class HyruleClient:
         domain: str | None = None,
         open_ports: list[int] | None = None,
         setup_script: str | None = None,
+        resources: dict[str, int] | None = None,
+        quote_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Provision a bare VM.
@@ -179,6 +201,10 @@ class HyruleClient:
             body["open_ports"] = open_ports
         if setup_script is not None:
             body["setup_script"] = setup_script
+        if resources is not None:
+            body["resources"] = resources
+        if quote_id is not None:
+            body["quote_id"] = quote_id
 
         return await self._request("POST", "/v1/vm/create", json=body)
 

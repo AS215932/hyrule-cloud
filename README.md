@@ -42,6 +42,8 @@ Hyrule Cloud API (FastAPI + x402 SDK)
 | Endpoint              | Method | Paid | Description                  |
 |-----------------------|--------|------|------------------------------|
 | `/v1/vm/create`       | POST   | Yes  | Provision a bare VM          |
+| `/v1/vm/quote`        | POST   | No   | Lock exact resources + price |
+| `/v1/products/vms`    | GET    | No   | Profiles + customization     |
 | `/v1/vm/{id}`         | GET    | No   | Status, IP, expiry           |
 | `/v1/vm/{id}/extend`  | POST   | Yes  | Add days to VM               |
 | `/v1/vm/{id}/reboot`  | POST   | No   | Hard reboot                  |
@@ -57,6 +59,11 @@ Hyrule Cloud API (FastAPI + x402 SDK)
 | `/v1/pricing`         | GET    | No   | Current pricing              |
 | `/v1/os/list`         | GET    | No   | Available OS templates       |
 | `/v1/network/request` | POST   | Yes  | One paid network request     |
+
+VM profiles use technical names (`1C-1G-10G` through `4C-4G-40G`) and can be
+customized during ordering up to 4 vCPU, 8 GB RAM, and 40 GB SSD. See
+[Configurable VM Resources](docs/vm-configurable-resources.md) for pricing,
+canonical rebasing, capacity admission, and legacy-machine behavior.
 
 ## Quick Start
 

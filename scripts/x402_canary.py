@@ -193,7 +193,7 @@ TESTS: dict[str, dict] = {
             "domain_mode": "auto",
             "open_ports": [80, 443],
         },
-        "usd": "0.05",
+        "usd": "0.20",
         "group": "vm",
         "spendy": True,
     },
