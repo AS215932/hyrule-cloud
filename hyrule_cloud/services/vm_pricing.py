@@ -44,7 +44,13 @@ class VMResourceValidationError(ValueError):
 
 
 def _money(value: Decimal) -> str:
-    return f"{value.quantize(Decimal('0.01')):.2f}"
+    """Render exact configured prices while keeping cents for normal rates."""
+    rendered = format(value, "f")
+    if "." not in rendered:
+        return f"{rendered}.00"
+    whole, fraction = rendered.split(".", 1)
+    fraction = fraction.rstrip("0")
+    return f"{whole}.{fraction.ljust(2, '0')}"
 
 
 def resources_for_profile(size: VMSize) -> VMOrderResources:

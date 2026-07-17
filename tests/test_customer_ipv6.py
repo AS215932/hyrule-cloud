@@ -676,6 +676,29 @@ async def test_reservation_lifecycle(session_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reservation_persists_exact_sub_cent_snapshot_total(session_factory):
+    from hyrule_cloud.models import VMCreateRequest
+    from hyrule_cloud.services.vm_pricing import price_vm_order
+
+    cfg = HyruleConfig()
+    cfg.payment.price_vm_xs = Decimal("0.005")
+    orch = Orchestrator(cfg, session_factory)
+    order = VMCreateRequest(
+        duration_days=1,
+        size=VMSize.XS,
+        ssh_pubkey="ssh-ed25519 AAAA sub-cent",
+    )
+    priced = price_vm_order(order, cfg.payment)
+
+    reserved, _ = await orch.reserve_vm(
+        priced.order,
+        pricing_snapshot=priced.pricing_snapshot,
+    )
+
+    assert reserved.cost_total == Decimal("0.005")
+
+
+@pytest.mark.asyncio
 async def test_expiry_sweep_purges_abandoned_reservations(session_factory):
     from datetime import UTC, datetime, timedelta
 

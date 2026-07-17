@@ -59,6 +59,22 @@ def test_original_profile_does_not_change_price_or_canonical_result() -> None:
     assert {result.daily_price for result in results} == {Decimal("1.05")}
 
 
+def test_pricing_snapshot_preserves_sub_cent_configured_amounts() -> None:
+    payment = _Payment()
+    payment.price_vm_xs = Decimal("0.005")
+
+    priced = price_vm_order(
+        _order(VMSize.XS, {"vcpu": 1, "ram_mb": 1024, "disk_gb": 10}),
+        payment,
+    )
+
+    assert priced.total == Decimal("0.005")
+    assert priced.breakdown.base_price_usd_day == "0.005"
+    assert priced.breakdown.daily_price_usd == "0.005"
+    assert priced.breakdown.total_usd == "0.005"
+    assert Decimal(priced.pricing_snapshot["total_usd"]) == priced.total
+
+
 @pytest.mark.parametrize(
     "resources",
     [
