@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.app import app
@@ -44,6 +45,7 @@ from hyrule_cloud.services.intents import (
     IntentExistsError,
     create_intent,
     poll_one_intent,
+    scan_pending_intents,
 )
 
 
@@ -217,6 +219,11 @@ class _StubOrchestrator:
         capacity_error = getattr(self, "capacity_error", None)
         if capacity_error is not None:
             raise capacity_error
+        async with self.db() as db:
+            durable_intent = await db.scalar(
+                select(CryptoIntentRow).where(CryptoIntentRow.vm_id == vm_id)
+            )
+        assert durable_intent is not None, "planned VM id must be persisted before reserve"
         return await self._insert_vm(
             request,
             owner_wallet="",
@@ -1713,3 +1720,58 @@ async def test_native_intent_refunds_when_atomic_capacity_reservation_fails(
     async with intent_state.orchestrator.db() as db:
         intent = await db.get(CryptoIntentRow, row.intent_id)
         assert intent.status == CryptoIntentStatus.REFUND_MANUAL
+
+
+@pytest.mark.asyncio
+async def test_scanner_refunds_interrupted_native_vm_reservation(intent_state):
+    """A worker crash after the atomic reservation leaves enough durable state
+    for the scanner to release the exact VM row and record the settled refund."""
+    intent = await _seed_intent(intent_state, asset="BTC")
+    planned_vm_id = "vm_native_recovery"
+    order = VMCreateRequest.model_validate(intent.order_payload)
+    async with intent_state.orchestrator.db() as db:
+        stored = await db.get(CryptoIntentRow, intent.intent_id)
+        stored.status = CryptoIntentStatus.PROVISIONING
+        stored.paid_at = _now()
+        stored.provisioning_triggered_at = _now()
+        stored.vm_id = planned_vm_id
+        await db.commit()
+    await intent_state.orchestrator.reserve_vm_with_capacity(
+        order,
+        vm_id=planned_vm_id,
+    )
+
+    # A healthy in-flight worker keeps its reservation; only a stale handoff is
+    # recoverable, preventing another poller from racing normal activation.
+    assert (
+        await scan_pending_intents(
+            session_factory=intent_state.orchestrator.db,
+            provider=intent_state.native_crypto,
+            rates=intent_state.rate_provider,
+            orch=intent_state.orchestrator,
+        )
+        == 0
+    )
+    async with intent_state.orchestrator.db() as db:
+        assert await db.get(VMRow, planned_vm_id) is not None
+        stored = await db.get(CryptoIntentRow, intent.intent_id)
+        stored.provisioning_triggered_at = _now() - timedelta(minutes=6)
+        await db.commit()
+
+    touched = await scan_pending_intents(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    assert touched == 1
+    async with intent_state.orchestrator.db() as db:
+        recovered = await db.get(CryptoIntentRow, intent.intent_id)
+        reservation = await db.get(VMRow, planned_vm_id)
+    assert recovered.status == CryptoIntentStatus.REFUND_MANUAL
+    assert reservation is None
+    assert (
+        intent_state.orchestrator.native_refund_reasons[intent.intent_id]
+        == "provisioning_interrupted"
+    )

@@ -510,7 +510,8 @@ class CryptoIntentRow(Base):
     # What actually landed on-chain — may differ from amount_crypto (over/under-pay).
     amount_received_crypto: Mapped[Decimal | None] = mapped_column(Numeric(24, 12))
     # Exactly-once provisioning trigger: orchestrator pickup is gated by an
-    # atomic UPDATE ... WHERE provisioning_triggered_at IS NULL RETURNING.
+    # atomic UPDATE ... WHERE provisioning_triggered_at IS NULL RETURNING. A
+    # stale VM handoff also advances this timestamp as its recovery lease.
     provisioning_triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # XMR-specific: subaddress index inside the view-only wallet account.
     xmr_subaddr_index: Mapped[int | None] = mapped_column(Integer, unique=True)
@@ -519,7 +520,8 @@ class CryptoIntentRow(Base):
     owner_account_id: Mapped[str | None] = mapped_column(
         String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
     )
-    # Once provisioned, link back to the VM created on settlement.
+    # Replay-safe planned VM id, persisted before settlement reservation; once
+    # provisioned it remains the link to the created VM.
     vm_id: Mapped[str | None] = mapped_column(String(32), index=True)
     # One-shot reveal: cleartext anon-management token created at provision time.
     # The next successful GET /v1/intent/{id} returns this AND nulls the column,

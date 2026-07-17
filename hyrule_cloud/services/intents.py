@@ -63,6 +63,9 @@ BTC_MIN_CONFIRMATIONS = 1
 XMR_MIN_CONFIRMATIONS = 10
 # Payments must match the quote within this tolerance to count as on-the-nose.
 EXACT_AMOUNT_TOLERANCE = Decimal("0.001")  # 0.1%
+# Give a healthy settlement worker ample time to reserve, link, and schedule a
+# VM before another poller treats PROVISIONING as an interrupted handoff.
+VM_PROVISIONING_RECOVERY_DELAY = timedelta(minutes=5)
 
 
 def _now() -> datetime:
@@ -456,6 +459,14 @@ async def _trigger_provisioning(
     domains = getattr(orch, "domains", None)
     try:
         order = VMCreateRequest.model_validate(row.order_payload)
+        # Durable before any quote claim or capacity reservation. If this
+        # process dies after the reservation commits, the scanner can identify
+        # and clean up that exact row instead of stranding a settled payment.
+        planned_vm_id = await _persist_planned_vm_id(
+            intent_id=intent_id,
+            session_factory=session_factory,
+            existing_vm_id=row.vm_id,
+        )
         quote_id = order.quote_id
         if quote_id is not None:
             quote = await get_quote(session_factory, quote_id)
@@ -519,7 +530,6 @@ async def _trigger_provisioning(
         # boundary as EVM checkout. A standalone ensure_vm_capacity() followed
         # by create_vm() lets two separately paid native intents both pass the
         # check before either row becomes visible to the other.
-        planned_vm_id = row.vm_id or generate_vm_id()
         try:
             reservation_row, anon_token = await orch.reserve_vm_with_capacity(
                 order,
@@ -712,6 +722,32 @@ async def _trigger_provisioning(
                 )
 
 
+async def _persist_planned_vm_id(
+    *,
+    intent_id: str,
+    session_factory: async_sessionmaker,
+    existing_vm_id: str | None,
+) -> str:
+    """Assign a replay-safe VM id to a settled intent before side effects."""
+    if existing_vm_id:
+        return existing_vm_id
+    candidate = generate_vm_id()
+    async with session_factory() as db:
+        await db.execute(
+            update(CryptoIntentRow)
+            .where(
+                CryptoIntentRow.intent_id == intent_id,
+                CryptoIntentRow.vm_id.is_(None),
+            )
+            .values(vm_id=candidate)
+        )
+        await db.commit()
+        current = await db.get(CryptoIntentRow, intent_id)
+        if current is None or current.vm_id is None:
+            raise RuntimeError("native intent disappeared before VM id persistence")
+        return current.vm_id
+
+
 async def scan_pending_intents(
     *,
     session_factory: async_sessionmaker,
@@ -719,7 +755,8 @@ async def scan_pending_intents(
     rates: RateProvider,
     orch: Orchestrator,
 ) -> int:
-    """One polling pass. Returns the number of intents touched."""
+    """One polling/recovery pass. Returns the number of intents touched."""
+    recovery_before = _now() - VM_PROVISIONING_RECOVERY_DELAY
     async with session_factory() as db:
         result = await db.execute(
             select(CryptoIntentRow.intent_id).where(
@@ -744,8 +781,24 @@ async def scan_pending_intents(
                 )
             )
         )
+        vm_recoveries = list(
+            await db.scalars(
+                select(CryptoIntentRow.intent_id).where(
+                    CryptoIntentRow.status == CryptoIntentStatus.PROVISIONING,
+                    CryptoIntentRow.resource_type == "vm",
+                    CryptoIntentRow.provisioning_triggered_at <= recovery_before,
+                )
+            )
+        )
 
     touched = 0
+    for iid in vm_recoveries:
+        if await _recover_interrupted_vm_provisioning(
+            intent_id=iid,
+            session_factory=session_factory,
+            orch=orch,
+        ):
+            touched += 1
     for iid in domain_handoffs:
         if await _resume_domain_handoff(
             intent_id=iid,
@@ -766,6 +819,81 @@ async def scan_pending_intents(
         except Exception:
             log.exception("poll_one_intent_failed", intent_id=iid)
     return touched
+
+
+async def _recover_interrupted_vm_provisioning(
+    *,
+    intent_id: str,
+    session_factory: async_sessionmaker,
+    orch: Orchestrator,
+) -> bool:
+    """Refund a settled VM intent whose handoff worker disappeared.
+
+    Provisioning is only scheduled after the intent becomes PROVISIONED, so a
+    stale PROVISIONING row cannot have a live background provisioner. The
+    durable planned VM id lets recovery delete an unpaid reservation or fail an
+    already-activated row before recording the native refund obligation.
+    """
+    # Atomically acquire a recovery lease by moving the trigger timestamp
+    # forward. Multiple poller processes can select the same stale row, but
+    # only one may clean it up and record the refund. If that worker crashes,
+    # the timestamp becomes eligible again after the same recovery delay.
+    recovery_started = _now()
+    recovery_before = recovery_started - VM_PROVISIONING_RECOVERY_DELAY
+    async with session_factory() as db:
+        result = await db.execute(
+            update(CryptoIntentRow)
+            .where(
+                CryptoIntentRow.intent_id == intent_id,
+                CryptoIntentRow.status == CryptoIntentStatus.PROVISIONING,
+                CryptoIntentRow.resource_type == "vm",
+                CryptoIntentRow.provisioning_triggered_at <= recovery_before,
+            )
+            .values(provisioning_triggered_at=recovery_started)
+            .returning(CryptoIntentRow.intent_id)
+        )
+        if result.scalar_one_or_none() is None:
+            await db.rollback()
+            return False
+        await db.commit()
+        intent = await db.get(CryptoIntentRow, intent_id)
+        if intent is None:
+            return False
+        planned_vm_id = intent.vm_id
+        order_payload = intent.order_payload
+
+    try:
+        if planned_vm_id is not None:
+            await orch.release_vm_reservation(planned_vm_id)
+            await orch.mark_vm_failed(
+                planned_vm_id,
+                "native provisioning interrupted before handoff",
+            )
+            try:
+                order = VMCreateRequest.model_validate(order_payload)
+            except ValueError:
+                order = None
+            domains = getattr(orch, "domains", None)
+            if order is not None and order.domain_mode == DomainMode.CUSTOM and domains is not None:
+                await domains.release_vm_attachment_claim(planned_vm_id)
+        await orch.record_native_intent_refund(
+            intent_id,
+            reason="provisioning_interrupted",
+            vm_id=planned_vm_id,
+        )
+    except Exception:
+        log.exception(
+            "native_vm_provisioning_recovery_failed",
+            intent_id=intent_id,
+            vm_id=planned_vm_id,
+        )
+        return False
+    log.warning(
+        "native_vm_provisioning_interrupted_refund_recorded",
+        intent_id=intent_id,
+        vm_id=planned_vm_id,
+    )
+    return True
 
 
 async def _resume_domain_handoff(
