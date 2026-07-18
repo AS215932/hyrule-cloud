@@ -185,7 +185,7 @@ evidence before treating 3a as complete.
 3. **Gate** (`python scripts/x402_canary.py vm --quote --destroy` automates the
    quote→pay→poll→pause-for-SSH→destroy sequence and only reports success when
    the launch-proof verifies and the DELETE returns 2xx):
-   - `POST /v1/vm/quote` (xs, 1 day = $0.05) → pay via x402/CDP
+   - `POST /v1/vm/quote` (`1C-1G-10G`, 1 day = $0.20) → pay via x402/CDP
    - poll `GET /v1/vm/{id}/status` until `launch_proof_status=provisioned`
      with `ssh_smoke_status=passed` and `dns_aaaa_verified=true` (now
      measured, not inferred)

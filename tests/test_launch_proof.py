@@ -81,6 +81,7 @@ class _StubOrchestrator:
         owner_wallet: str,
         owner_account_id: str | None = None,
         start_provisioning: bool = True,
+        **kwargs,
     ):
         from hyrule_cloud.middleware.anon_token import hash_anon_token
         from hyrule_cloud.models import generate_anon_management_token, generate_vm_id

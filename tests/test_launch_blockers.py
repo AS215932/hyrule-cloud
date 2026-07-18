@@ -372,6 +372,36 @@ async def test_vm_create_refuses_before_charging_while_simulated(launch_state):
 
 
 @pytest.mark.asyncio
+async def test_signed_vm_create_returns_503_when_capacity_provider_is_unavailable(
+    launch_state, monkeypatch
+):
+    from hyrule_cloud.providers.xcpng import XOError
+
+    launch_state.payment_gate = _real_gate()
+    launch_state.config.xcpng = type(
+        "XCPNG", (), {"templates": {"debian-13": "template-debian-13"}}
+    )()
+
+    async def capacity_provider_unavailable(*_args, **_kwargs):
+        raise XOError("host.getAll", {"message": "XO unavailable"})
+
+    launch_state.orchestrator.reserve_vm_with_capacity = capacity_provider_unavailable
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/v1/vm/create",
+            json=_VM_ORDER,
+            headers={"X-PAYMENT": "signed-payment"},
+        )
+
+    assert res.status_code == 503
+    assert res.json()["detail"] == "VM capacity is temporarily unavailable"
+
+
+@pytest.mark.asyncio
 async def test_vm_quote_refused_while_simulated(launch_state):
     launch_state.payment_gate = _real_gate()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

@@ -91,10 +91,10 @@ Returns current prices for all resources.
 ```json
 {
   "vm_prices": {
-    "xs (1vCPU/1GB/10GB)": "$0.05/day",
-    "sm (1vCPU/1GB/20GB)": "$0.10/day",
-    "md (2vCPU/2GB/40GB)": "$0.20/day",
-    "lg (4vCPU/4GB/80GB)": "$0.40/day"
+    "xs (1C-1G-10G)": "$0.20/day",
+    "sm (1C-2G-20G)": "$0.40/day",
+    "md (2C-4G-20G)": "$0.60/day",
+    "lg (4C-4G-40G)": "$0.80/day"
   },
   "domain_auto": "$0.00 (subdomain under deploy.hyrule.host)",
   "proxy_prices": {
@@ -116,11 +116,17 @@ Machine-readable VM catalog — specs + daily price per size (no HTML scraping).
   "currency": "USD",
   "billing": "prepaid-daily",
   "products": [
-    {"size": "xs", "name": "Starter", "vcpu": 1, "ram_mb": 1024, "disk_gb": 10, "price_usd_day": "0.05"},
-    {"size": "sm", "name": "Basic", "vcpu": 1, "ram_mb": 1024, "disk_gb": 20, "price_usd_day": "0.10"},
-    {"size": "md", "name": "Standard", "vcpu": 2, "ram_mb": 2048, "disk_gb": 40, "price_usd_day": "0.20"},
-    {"size": "lg", "name": "Performance", "vcpu": 4, "ram_mb": 4096, "disk_gb": 80, "price_usd_day": "0.40"}
+    {"size": "xs", "name": "1C-1G-10G", "vcpu": 1, "ram_mb": 1024, "disk_gb": 10, "price_usd_day": "0.20"},
+    {"size": "sm", "name": "1C-2G-20G", "vcpu": 1, "ram_mb": 2048, "disk_gb": 20, "price_usd_day": "0.40"},
+    {"size": "md", "name": "2C-4G-20G", "vcpu": 2, "ram_mb": 4096, "disk_gb": 20, "price_usd_day": "0.60"},
+    {"size": "lg", "name": "4C-4G-40G", "vcpu": 4, "ram_mb": 4096, "disk_gb": 40, "price_usd_day": "0.80"}
   ],
+  "customization": {
+    "minimum": {"vcpu": 1, "ram_mb": 1024, "disk_gb": 10},
+    "maximum": {"vcpu": 4, "ram_mb": 8192, "disk_gb": 40},
+    "increments": {"vcpu": 1, "ram_mb": 1024, "disk_gb": 10},
+    "addon_prices": {"vcpu_usd_day": "0.10", "ram_gb_usd_day": "0.15", "disk_10gb_usd_day": "0.05"}
+  },
   "os_templates_url": "https://cloud.hyrule.host/v1/os/list"
 }
 ```
@@ -134,7 +140,9 @@ spec → 409). Body: `{ "order_payload": { …VM spec… }, "client_order_id": "
 {
   "quote_id": "q_8sd1f9…",
   "status": "created",
-  "amount_usd": "0.35",
+  "resources": {"vcpu": 1, "ram_mb": 1024, "disk_gb": 10},
+  "amount_usd": "1.40",
+  "pricing": {"base_profile": "xs", "base_label": "1C-1G-10G", "daily_price_usd": "0.20", "duration_days": 7, "total_usd": "1.40"},
   "currency": "USD",
   "accepted_payment_methods": {"evm": [{"key": "base", "caip2": "eip155:8453", "asset": "USDC"}], "native": ["BTC", "XMR"]},
   "expires_at": "2026-05-31T13:00:00Z"
@@ -207,6 +215,7 @@ Provision a bare VM with SSH access. Returns 202 with a status URL to poll.
 {
   "duration_days": 7,
   "size": "sm",
+  "resources": {"vcpu": 3, "ram_mb": 6144, "disk_gb": 30},
   "os": "debian-13",
   "ssh_pubkey": "ssh-ed25519 AAAA...",
   "domain_mode": "auto",
@@ -225,7 +234,7 @@ Provision a bare VM with SSH access. Returns 202 with a status URL to poll.
 }
 ```
 
-**Sizes:** `xs` (1vCPU/1GB/10GB), `sm` (1vCPU/1GB/20GB), `md` (2vCPU/2GB/40GB), `lg` (4vCPU/4GB/80GB)
+**Profiles:** `xs` (`1C-1G-10G`), `sm` (`1C-2G-20G`), `md` (`2C-4G-20G`), `lg` (`4C-4G-40G`). Optional exact `resources` are order-time only, in 1-vCPU/1-GB/10-GB increments up to 4/8/40; the API automatically selects the cheapest compatible profile.
 
 **Domain modes:**
 - `auto` — free subdomain `<hash>.deploy.hyrule.host` (default)

@@ -65,10 +65,13 @@ def generate_diagnostic_job_access_token() -> str:
 
 
 class VMSize(enum.StrEnum):
-    XS = "xs"  # 1 vCPU, 1 GB, 10 GB
-    SM = "sm"  # 1 vCPU, 1 GB, 20 GB
-    MD = "md"  # 2 vCPU, 2 GB, 40 GB
-    LG = "lg"  # 4 vCPU, 4 GB, 80 GB
+    # Stable API/database identifiers. Public display names are technical and
+    # come from VM_PROFILE_LABELS below; the IDs deliberately do not encode a
+    # spec so catalog changes do not require an enum/database migration.
+    XS = "xs"
+    SM = "sm"
+    MD = "md"
+    LG = "lg"
 
 
 class VMStatus(enum.StrEnum):
@@ -181,10 +184,42 @@ VM_SPECS: dict[VMSize, dict] = {
     # rejects the shrink with MEMORY_CONSTRAINT_VIOLATION_ORDER) and OOMs on
     # cloud-init/apt anyway; 1 GB is the smallest viable Debian tier.
     VMSize.XS: {"vcpu": 1, "memory_mb": 1024, "disk_gb": 10},
-    VMSize.SM: {"vcpu": 1, "memory_mb": 1024, "disk_gb": 20},
-    VMSize.MD: {"vcpu": 2, "memory_mb": 2048, "disk_gb": 40},
-    VMSize.LG: {"vcpu": 4, "memory_mb": 4096, "disk_gb": 80},
+    VMSize.SM: {"vcpu": 1, "memory_mb": 2048, "disk_gb": 20},
+    VMSize.MD: {"vcpu": 2, "memory_mb": 4096, "disk_gb": 20},
+    VMSize.LG: {"vcpu": 4, "memory_mb": 4096, "disk_gb": 40},
 }
+
+VM_PROFILE_LABELS: dict[VMSize, str] = {
+    VMSize.XS: "1C-1G-10G",
+    VMSize.SM: "1C-2G-20G",
+    VMSize.MD: "2C-4G-20G",
+    VMSize.LG: "4C-4G-40G",
+}
+
+
+class VMResourceSpec(BaseModel):
+    """Exact resources assigned to a VM.
+
+    This unbounded positive shape also represents legacy machines (notably the
+    retired 80-GB `lg` profile). New-order limits and increments are enforced by
+    the canonical pricing service, rather than making old snapshots unparseable.
+    """
+
+    vcpu: int = Field(gt=0)
+    ram_mb: int = Field(gt=0)
+    disk_gb: int = Field(gt=0)
+
+
+class VMOrderResources(VMResourceSpec):
+    """Requested final resources; validated against the live catalog server-side."""
+
+    @model_validator(mode="after")
+    def validate_increments(self) -> VMOrderResources:
+        if self.ram_mb % 1024:
+            raise ValueError("ram_mb must be a whole number of GiB")
+        if self.disk_gb % 10:
+            raise ValueError("disk_gb must be in 10-GB increments")
+        return self
 
 
 # --- API Request/Response Models ---
@@ -193,6 +228,14 @@ VM_SPECS: dict[VMSize, dict] = {
 class VMCreateRequest(BaseModel):
     duration_days: int = Field(ge=1, le=365, description="Hosting duration in days")
     size: VMSize = Field(default=VMSize.XS, description="VM size tier")
+    resources: VMOrderResources | None = Field(
+        default=None,
+        description=(
+            "Optional exact final resources. New orders support 1-4 vCPU, "
+            "1-8 GiB RAM, and 10-40 GB SSD. The server selects the cheapest "
+            "compatible base profile."
+        ),
+    )
     os: str = Field(default="debian-13", description="OS template name")
     ssh_pubkey: str = Field(description="SSH public key for root access (ed25519 or rsa)")
     domain_mode: DomainMode = Field(default=DomainMode.AUTO)
@@ -264,7 +307,9 @@ class VMQuoteResponse(BaseModel):
     quote_id: str
     status: QuoteStatus
     order_payload: VMCreateRequest
+    resources: VMResourceSpec
     amount_usd: str
+    pricing: VMPriceBreakdown
     currency: str = "USD"
     accepted_payment_methods: AcceptedPaymentMethods
     created_at: datetime
@@ -279,6 +324,8 @@ class VMStatusResponse(BaseModel):
     hostname: str | None = None
     ssh: str | None = None
     expires_at: datetime | None = None
+    profile: VMSize | None = None
+    resources: VMResourceSpec | None = None
     firewall: FirewallState | None = None
     error: str | None = None
     cost_breakdown: CostBreakdown | None = None
@@ -301,6 +348,8 @@ class VMPublicStatusResponse(BaseModel):
     ipv6_prefix: str | None = None
     hostname: str | None = None
     expires_at: datetime | None = None
+    profile: VMSize | None = None
+    resources: VMResourceSpec | None = None
     # Launch-proof contract fields (issue #28)
     launch_proof_status: LaunchProofStatus | None = None
     payment_status: PaymentStatus | None = None
@@ -331,6 +380,7 @@ class PricingResponse(BaseModel):
     vm_prices: dict[str, str]  # size -> $/day
     domain_auto: str
     proxy_prices: dict[str, str] | None = None
+    vm_customization: VMCustomization | None = None
     currency: str = "USDC"
     network: str = "Base (eip155:8453)"
 
@@ -346,6 +396,40 @@ class VMProduct(BaseModel):
     price_usd_day: str
 
 
+class VMResourceLimits(BaseModel):
+    vcpu: int
+    ram_mb: int
+    disk_gb: int
+
+
+class VMAddonPrices(BaseModel):
+    vcpu_usd_day: str
+    ram_gb_usd_day: str
+    disk_10gb_usd_day: str
+
+
+class VMCustomization(BaseModel):
+    minimum: VMResourceLimits
+    maximum: VMResourceLimits
+    increments: VMResourceLimits
+    addon_prices: VMAddonPrices
+
+
+class VMPriceBreakdown(BaseModel):
+    base_profile: VMSize
+    base_label: str
+    base_price_usd_day: str
+    addon_vcpu: int = 0
+    addon_ram_mb: int = 0
+    addon_disk_gb: int = 0
+    addon_vcpu_usd_day: str = "0.00"
+    addon_ram_usd_day: str = "0.00"
+    addon_disk_usd_day: str = "0.00"
+    daily_price_usd: str
+    duration_days: int
+    total_usd: str
+
+
 class VMProductsResponse(BaseModel):
     """Agent-facing VM catalog so non-browser clients get specs + pricing
     without scraping the /services HTML."""
@@ -353,6 +437,7 @@ class VMProductsResponse(BaseModel):
     currency: str = "USD"
     billing: str = "prepaid-daily"
     products: list[VMProduct]
+    customization: VMCustomization
     os_templates_url: str
 
 
@@ -452,8 +537,11 @@ class VMRecord(BaseModel):
     cost_total: Decimal = Decimal("0")
 
 
-# Forward ref resolution
+# Forward ref resolution for models whose compact public placement precedes
+# one of their nested response types.
+VMQuoteResponse.model_rebuild()
 VMStatusResponse.model_rebuild()
+PricingResponse.model_rebuild()
 
 class GenericActionResponse(BaseModel):
     status: str

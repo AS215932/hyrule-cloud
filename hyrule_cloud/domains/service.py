@@ -2191,13 +2191,27 @@ class DomainService:
                 order.fqdn,
                 planned_vm_id,
             )
-        vm, _ = await self.orchestrator.create_vm(
-            spec,
-            owner_wallet=order.payer or order.order_id,
-            owner_account_id=order.owner_account_id,
-            vm_id=planned_vm_id,
-            start_provisioning=False,
-        )
+        try:
+            reserved, _ = await self.orchestrator.reserve_vm_with_capacity(
+                spec,
+                owner_account_id=order.owner_account_id,
+                vm_id=planned_vm_id,
+                pricing_snapshot=quote.pricing_snapshot,
+                legacy_billing=quote.pricing_snapshot is None,
+            )
+            vm = await self.orchestrator.activate_vm_reservation(
+                reserved.vm_id,
+                owner_wallet=order.payer or order.order_id,
+                payment_tx=order.payment_tx,
+                start_provisioning=False,
+            )
+            if vm is None:
+                raise RuntimeError("the bundle VM reservation disappeared")
+        except Exception:
+            await self.orchestrator.release_vm_reservation(planned_vm_id)
+            if not fallback_auto_domain:
+                await self.release_vm_attachment_claim(planned_vm_id)
+            raise
         await self.orchestrator.persist_charged_amount(vm.vm_id, Decimal(order.vm_amount_usd))
         await link_quote_vm(self.db, quote.quote_id, vm.vm_id)
         async with self.db() as session:

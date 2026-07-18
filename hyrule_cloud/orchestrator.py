@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from ipaddress import IPv6Address, IPv6Network
@@ -15,7 +17,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -35,6 +37,8 @@ from hyrule_cloud.models import (
     DomainMode,
     SSHSmokeStatus,
     VMCreateRequest,
+    VMOrderResources,
+    VMPriceBreakdown,
     VMSize,
     VMStatus,
     generate_anon_management_token,
@@ -57,11 +61,22 @@ from hyrule_cloud.providers.openprovider import OpenproviderClient
 from hyrule_cloud.providers.xcpng import XCPNGProvider
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
+from hyrule_cloud.services.vm_pricing import (
+    billing_addons_from_snapshot,
+    price_vm_order,
+    resources_for_profile,
+)
 
 if TYPE_CHECKING:
     from hyrule_cloud.domains.service import DomainService
 
 log = structlog.get_logger()
+
+_VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable cross-worker PostgreSQL lock key
+
+
+class VMCapacityError(RuntimeError):
+    """The requested VM cannot fit within the configured live headroom."""
 
 
 def _now() -> datetime:
@@ -103,6 +118,7 @@ class Orchestrator:
 
         self._tasks: set[asyncio.Task] = set()
         self._provisioning_vm_ids: set[str] = set()
+        self._vm_capacity_reservation_lock = asyncio.Lock()
 
     async def startup(self) -> None:
         # Fail fast on malformed customer-network settings: an operator typo
@@ -132,15 +148,8 @@ class Orchestrator:
     # --- Pricing ---
 
     def compute_price(self, request: VMCreateRequest) -> tuple[Decimal, CostBreakdown]:
-        price_map = {
-            VMSize.XS: self.config.payment.price_vm_xs,
-            VMSize.SM: self.config.payment.price_vm_sm,
-            VMSize.MD: self.config.payment.price_vm_md,
-            VMSize.LG: self.config.payment.price_vm_lg,
-        }
-
-        vm_daily = price_map[request.size]
-        vm_cost = vm_daily * request.duration_days
+        priced = price_vm_order(request, self.config.payment)
+        vm_cost = priced.total
 
         # Domain registration is a separate durable quote/order. A VM with
         # domain_mode=custom only attaches an already-active managed domain.
@@ -153,6 +162,57 @@ class Orchestrator:
             total=f"${total:.2f}",
         )
         return total, breakdown
+
+    def price_order(self, request: VMCreateRequest):
+        """Return the canonical profile, exact resources, and billing snapshot."""
+        return price_vm_order(request, self.config.payment)
+
+    async def ensure_vm_capacity(self, request: VMCreateRequest) -> None:
+        """Raise before provisioning/payment when the exact VM cannot fit.
+
+        Live XO usage is combined with DB reservations that do not have an XO
+        UUID yet. RAM is not overcommitted; CPU follows the configured 2:1
+        policy; memory and default-SR recovery margins remain untouched.
+        """
+        resources = request.resources or resources_for_profile(request.size)
+        capacity = await self.xcpng.capacity()
+        async with self.db() as session:
+            pending = (
+                await session.execute(
+                    select(
+                        func.coalesce(func.sum(VMRow.vcpu), 0),
+                        func.coalesce(func.sum(VMRow.memory_mb), 0),
+                        func.coalesce(func.sum(VMRow.disk_gb), 0),
+                    ).where(
+                        VMRow.status == VMStatus.PROVISIONING,
+                        VMRow.xcpng_uuid.is_(None),
+                    )
+                )
+            ).one()
+        pending_vcpu, pending_memory_mb, pending_disk_gb = (
+            int(value or 0) for value in pending
+        )
+        cpu_limit = int(
+            Decimal(capacity.physical_vcpu) * self.config.xcpng.vcpu_overcommit_ratio
+        )
+        memory_headroom = self.config.xcpng.memory_headroom_mb * 1024**2
+        storage_headroom = self.config.xcpng.storage_headroom_gb * 1024**3
+        if capacity.allocated_vcpu + pending_vcpu + resources.vcpu > cpu_limit:
+            raise VMCapacityError("insufficient vCPU capacity")
+        if (
+            capacity.free_memory_bytes
+            - pending_memory_mb * 1024**2
+            - resources.ram_mb * 1024**2
+            < memory_headroom
+        ):
+            raise VMCapacityError("insufficient RAM capacity")
+        if (
+            capacity.free_storage_bytes
+            - pending_disk_gb * 1024**3
+            - resources.disk_gb * 1024**3
+            < storage_headroom
+        ):
+            raise VMCapacityError("insufficient default-SR capacity")
 
     # --- VM Lifecycle ---
 
@@ -191,6 +251,8 @@ class Orchestrator:
         owner_wallet: str,
         owner_account_id: str | None = None,
         vm_id: str | None = None,
+        pricing_snapshot: dict | None = None,
+        legacy_billing: bool = False,
     ) -> tuple[VMRow, str]:
         """Persist a VM row and atomically claim a customer /64 (unique index).
 
@@ -211,8 +273,51 @@ class Orchestrator:
                     f"OS template {request.os} is not supported for real VM provisioning yet"
                 )
 
+        # New unquoted orders arrive canonicalized by the route, but internal
+        # callers and size-only clients also use this method. Durable snapshots
+        # are already canonical and must never be rebound against current
+        # prices: the base profile determines future extension pricing.
+        # Legacy NULL snapshots deliberately bypass current catalog validation
+        # so retired 80-GB disks remain provisionable and are never shrunk.
+        if legacy_billing:
+            resources = request.resources or resources_for_profile(request.size)
+            canonical_request = request.model_copy(update={"resources": resources})
+            total = Decimal(
+                str(getattr(self.config.payment, f"price_vm_{request.size.value}", "0"))
+            ) * request.duration_days
+        elif pricing_snapshot is not None:
+            snapshot = VMPriceBreakdown.model_validate(pricing_snapshot)
+            resources = request.resources or resources_for_profile(request.size)
+            if (
+                snapshot.base_profile != request.size
+                or snapshot.duration_days != request.duration_days
+            ):
+                raise ValueError("pricing snapshot does not match the VM order")
+            base = resources_for_profile(snapshot.base_profile)
+            expected_addons = (
+                resources.vcpu - base.vcpu,
+                resources.ram_mb - base.ram_mb,
+                resources.disk_gb - base.disk_gb,
+            )
+            if min(expected_addons) < 0 or expected_addons != (
+                snapshot.addon_vcpu,
+                snapshot.addon_ram_mb,
+                snapshot.addon_disk_gb,
+            ):
+                raise ValueError("pricing snapshot add-ons do not match the VM resources")
+            canonical_request = request.model_copy(update={"resources": resources})
+            total = Decimal(snapshot.total_usd)
+        else:
+            priced = price_vm_order(request, self.config.payment)
+            canonical_request = priced.order
+            resources = priced.resources
+            pricing_snapshot = priced.pricing_snapshot
+            total = priced.total
+        request = canonical_request
+        addon_vcpu, addon_ram_mb, addon_disk_gb = billing_addons_from_snapshot(
+            pricing_snapshot
+        )
         expires_at = _now() + timedelta(days=request.duration_days)
-        total, _ = self.compute_price(request)
         anon_token = generate_anon_management_token()
 
         requested_vm_id = vm_id
@@ -237,6 +342,12 @@ class Orchestrator:
                     status=VMStatus.PROVISIONING,
                     anon_management_token_hash=hash_anon_token(anon_token),
                     size=request.size,
+                    vcpu=resources.vcpu,
+                    memory_mb=resources.ram_mb,
+                    disk_gb=resources.disk_gb,
+                    billing_addon_vcpu=addon_vcpu,
+                    billing_addon_ram_mb=addon_ram_mb,
+                    billing_addon_disk_gb=addon_disk_gb,
                     os=request.os,
                     ipv6=None,
                     ipv6_prefix_index=prefix_index,
@@ -284,6 +395,11 @@ class Orchestrator:
             or row.os != request.os
             or row.domain_mode != request.domain_mode
             or row.domain != request.domain
+            or int(row.vcpu or 0) != (request.resources or resources_for_profile(request.size)).vcpu
+            or int(row.memory_mb or 0)
+            != (request.resources or resources_for_profile(request.size)).ram_mb
+            or int(row.disk_gb or 0)
+            != (request.resources or resources_for_profile(request.size)).disk_gb
         ):
             raise RuntimeError("planned VM id is already bound to another order")
 
@@ -316,6 +432,8 @@ class Orchestrator:
         owner_account_id: str | None = None,
         vm_id: str | None = None,
         start_provisioning: bool = True,
+        pricing_snapshot: dict | None = None,
+        legacy_billing: bool = False,
     ) -> tuple[VMRow, str]:
         """Create a VM record in DB and start background provisioning.
 
@@ -339,6 +457,8 @@ class Orchestrator:
             owner_wallet,
             owner_account_id,
             vm_id=vm_id,
+            pricing_snapshot=pricing_snapshot,
+            legacy_billing=legacy_billing,
         )
         if start_provisioning:
             self._spawn_provisioning(row.vm_id)
@@ -348,6 +468,9 @@ class Orchestrator:
         self,
         request: VMCreateRequest,
         owner_account_id: str | None = None,
+        vm_id: str | None = None,
+        pricing_snapshot: dict | None = None,
+        legacy_billing: bool = False,
     ) -> tuple[VMRow, str]:
         """Reserve a VM row + customer /64 BEFORE payment settles.
 
@@ -360,8 +483,78 @@ class Orchestrator:
         mid-payment) are purged by check_expiries.
         """
         return await self._insert_vm_row(
-            request, owner_wallet="", owner_account_id=owner_account_id
+            request,
+            owner_wallet="",
+            owner_account_id=owner_account_id,
+            vm_id=vm_id,
+            pricing_snapshot=pricing_snapshot,
+            legacy_billing=legacy_billing,
         )
+
+    async def reserve_vm_with_capacity(
+        self,
+        request: VMCreateRequest,
+        owner_account_id: str | None = None,
+        vm_id: str | None = None,
+        pricing_snapshot: dict | None = None,
+        legacy_billing: bool = False,
+    ) -> tuple[VMRow, str]:
+        """Check live capacity and durably reserve the VM as one operation.
+
+        A process-local lock covers SQLite/tests and a PostgreSQL advisory lock
+        serializes the check→insert boundary across production workers. Planned
+        VM IDs are replay-safe: an existing matching row represents no new
+        capacity and is returned without charging admission a second time.
+        """
+        if vm_id is not None:
+            async with self.db() as session:
+                existing = await session.get(VMRow, vm_id)
+            if existing is not None:
+                self._validate_replayed_vm(existing, request, owner_account_id)
+                return existing, ""
+
+        from hyrule_cloud.services.launch_proof import use_real_provisioning
+
+        async with self._serialize_vm_capacity_transition():
+            if vm_id is not None:
+                async with self.db() as session:
+                    existing = await session.get(VMRow, vm_id)
+                if existing is not None:
+                    self._validate_replayed_vm(existing, request, owner_account_id)
+                    return existing, ""
+            if use_real_provisioning():
+                await self.ensure_vm_capacity(request)
+            return await self.reserve_vm(
+                request,
+                owner_account_id=owner_account_id,
+                vm_id=vm_id,
+                pricing_snapshot=pricing_snapshot,
+                legacy_billing=legacy_billing,
+            )
+
+    @asynccontextmanager
+    async def _serialize_vm_capacity_transition(self) -> AsyncIterator[None]:
+        """Serialize admission and pending→XO capacity ownership changes.
+
+        The process lock covers SQLite/tests. PostgreSQL's session advisory lock
+        extends the same boundary across API and worker processes.
+        """
+        async with self._vm_capacity_reservation_lock:
+            async with self.db() as lock_session:
+                postgres = lock_session.get_bind().dialect.name == "postgresql"
+                if postgres:
+                    await lock_session.execute(
+                        text("SELECT pg_advisory_lock(:lock_key)"),
+                        {"lock_key": _VM_CAPACITY_ADVISORY_LOCK},
+                    )
+                try:
+                    yield
+                finally:
+                    if postgres:
+                        await lock_session.execute(
+                            text("SELECT pg_advisory_unlock(:lock_key)"),
+                            {"lock_key": _VM_CAPACITY_ADVISORY_LOCK},
+                        )
 
     async def activate_vm_reservation(
         self,
@@ -438,6 +631,11 @@ class Orchestrator:
                     return
                 os_name = row.os
                 size = row.size
+                resources = VMOrderResources(
+                    vcpu=row.vcpu or resources_for_profile(VMSize(row.size)).vcpu,
+                    ram_mb=row.memory_mb or resources_for_profile(VMSize(row.size)).ram_mb,
+                    disk_gb=row.disk_gb or resources_for_profile(VMSize(row.size)).disk_gb,
+                )
                 ssh_pubkey = row.ssh_pubkey
                 open_ports = list(row.open_ports)
                 setup_script = row.setup_script
@@ -472,33 +670,45 @@ class Orchestrator:
             )
 
             if xcpng_uuid is None:
-                name_label = f"hyrule-{vm_id}"
-                # XO may contain a clone whose create call completed before the
-                # process could durably store its UUID. It is not safe to adopt
-                # a possibly half-resized/half-started clone, so delete any
-                # untracked exact-label candidates and recreate cleanly.
-                stale_ids = await self.xcpng.find_vm_ids_by_name_label(name_label)
-                for stale_uuid in stale_ids:
-                    log.warning(
-                        "orphaned_vm_clone_replaced",
-                        vm_id=vm_id,
-                        xcpng_uuid=stale_uuid,
-                    )
-                    await self.xcpng.destroy_vm(stale_uuid)
-                xcpng_uuid = await self.xcpng.create_vm(
-                    template_uuid=template_uuid,
-                    name_label=name_label,
-                    os_name=os_name,
-                    size=VMSize(size),
-                    cloud_init_config=cloud_config,
-                    network_config=network_config,
-                )
+                # Admission snapshots and the pending→XO handoff share one
+                # cross-process lock. No reservation can observe an XO snapshot
+                # from before this clone while also excluding its now-tracked DB
+                # row from pending capacity.
+                async with self._serialize_vm_capacity_transition():
+                    async with self.db() as session:
+                        current = await session.get(VMRow, vm_id)
+                        if current is None:
+                            return
+                        xcpng_uuid = current.xcpng_uuid
+                    if xcpng_uuid is None:
+                        name_label = f"hyrule-{vm_id}"
+                        # XO may contain a clone whose create call completed before the
+                        # process could durably store its UUID. It is not safe to adopt
+                        # a possibly half-resized/half-started clone, so delete any
+                        # untracked exact-label candidates and recreate cleanly.
+                        stale_ids = await self.xcpng.find_vm_ids_by_name_label(name_label)
+                        for stale_uuid in stale_ids:
+                            log.warning(
+                                "orphaned_vm_clone_replaced",
+                                vm_id=vm_id,
+                                xcpng_uuid=stale_uuid,
+                            )
+                            await self.xcpng.destroy_vm(stale_uuid)
+                        xcpng_uuid = await self.xcpng.create_vm(
+                            template_uuid=template_uuid,
+                            name_label=name_label,
+                            os_name=os_name,
+                            size=VMSize(size),
+                            resources=resources,
+                            cloud_init_config=cloud_config,
+                            network_config=network_config,
+                        )
 
-                async with self.db() as session:
-                    row = await session.get(VMRow, vm_id)
-                    if row:
-                        row.xcpng_uuid = xcpng_uuid
-                        await session.commit()
+                        async with self.db() as session:
+                            row = await session.get(VMRow, vm_id)
+                            if row:
+                                row.xcpng_uuid = xcpng_uuid
+                                await session.commit()
 
             # Wait for IPv6 (outside DB session to avoid long-held connections)
             ipv6 = await self._wait_for_ipv6(

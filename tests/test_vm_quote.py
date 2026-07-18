@@ -17,7 +17,7 @@ import pytest
 import pytest_asyncio
 from fastapi import Response
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.app import app
@@ -41,6 +41,14 @@ class _StubNetwork:
 
 
 class _StubPayment:
+    price_vm_xs = Decimal("0.20")
+    price_vm_sm = Decimal("0.40")
+    price_vm_md = Decimal("0.60")
+    price_vm_lg = Decimal("0.80")
+    price_vm_addon_vcpu = Decimal("0.10")
+    price_vm_addon_ram_gb = Decimal("0.15")
+    price_vm_addon_disk_10gb = Decimal("0.05")
+
     def enabled_networks(self):
         return [_StubNetwork()]
 
@@ -49,6 +57,7 @@ class _StubCfg:
     payment = _StubPayment()
     blocked_ports = [25]
     deploy_domain = "deploy.hyrule.host"
+    xcpng = type("XCPNG", (), {"templates": {"debian-13": "template-debian-13"}})()
 
 
 class _StubOrchestrator:
@@ -60,10 +69,15 @@ class _StubOrchestrator:
         self.provisioning_started: list[str] = []
         self.charged_amounts: dict[str, Decimal] = {}
         self.create_failure_refunds: list[tuple[str | None, str | None]] = []
+        self.capacity_error: Exception | None = None
 
     def compute_price(self, request):
-        total = Decimal("0.05") * request.duration_days
+        total = Decimal("0.20") * request.duration_days
         return total, CostBreakdown(vm_cost=f"${total}", domain_cost="$0.00", total=f"${total}")
+
+    async def ensure_vm_capacity(self, _request) -> None:
+        if self.capacity_error is not None:
+            raise self.capacity_error
 
     def start_provisioning(self, vm_id: str) -> None:
         self.provisioning_started.append(vm_id)
@@ -74,12 +88,14 @@ class _StubOrchestrator:
         owner_wallet: str,
         owner_account_id: str | None = None,
         start_provisioning: bool = True,
+        **kwargs,
     ):
         from hyrule_cloud.middleware.anon_token import hash_anon_token
         from hyrule_cloud.models import generate_anon_management_token, generate_vm_id
 
         vm_id = generate_vm_id()
         anon_token = generate_anon_management_token()
+        snapshot = kwargs.get("pricing_snapshot") or {}
         async with self.db() as session:
             row = VMRow(
                 vm_id=vm_id,
@@ -88,11 +104,17 @@ class _StubOrchestrator:
                 anon_management_token_hash=hash_anon_token(anon_token),
                 status=VMStatus.PROVISIONING,
                 size=VMSize(request.size),
+                vcpu=request.resources.vcpu,
+                memory_mb=request.resources.ram_mb,
+                disk_gb=request.resources.disk_gb,
+                billing_addon_vcpu=snapshot.get("addon_vcpu", 0),
+                billing_addon_ram_mb=snapshot.get("addon_ram_mb", 0),
+                billing_addon_disk_gb=snapshot.get("addon_disk_gb", 0),
                 os=request.os,
                 ssh_pubkey=request.ssh_pubkey,
                 open_ports=[22, 80, 443],
                 expires_at=_now() + timedelta(days=request.duration_days),
-                cost_total=Decimal("0.05"),
+                cost_total=Decimal("0.20"),
             )
             session.add(row)
             await session.commit()
@@ -176,7 +198,9 @@ async def test_create_quote_returns_quote(quote_state, client):
     body = res.json()
     assert body["quote_id"].startswith("q_")
     assert body["status"] == "created"
-    assert body["amount_usd"] == "0.050000"  # Numeric(12,6) round-trip
+    assert body["amount_usd"] == "0.200000"  # Numeric(12,6) round-trip
+    assert body["resources"] == {"vcpu": 1, "ram_mb": 1024, "disk_gb": 10}
+    assert body["pricing"]["daily_price_usd"] == "0.20"
     assert body["accepted_payment_methods"]["evm"][0]["caip2"] == "eip155:8453"
     assert body["accepted_payment_methods"]["native"] == []  # no native rail wired
     assert body["order_payload"]["size"] == "xs"
@@ -187,8 +211,82 @@ async def test_create_quote_returns_quote(quote_state, client):
 async def test_create_quote_price_matches_compute_price(quote_state, client):
     res = await client.post("/v1/vm/quote", json={"order_payload": _order(duration_days=7)})
     assert res.status_code == 201
-    # 0.05/day * 7 days
-    assert Decimal(res.json()["amount_usd"]) == Decimal("0.35")
+    # 0.20/day * 7 days
+    assert Decimal(res.json()["amount_usd"]) == Decimal("1.40")
+
+
+@pytest.mark.asyncio
+async def test_custom_quote_rebases_to_cheapest_exact_profile(quote_state, client):
+    res = await client.post(
+        "/v1/vm/quote",
+        json={
+            "order_payload": _order(
+                size="xs",
+                resources={"vcpu": 1, "ram_mb": 2048, "disk_gb": 20},
+            )
+        },
+    )
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["order_payload"]["size"] == "sm"
+    assert body["resources"] == {"vcpu": 1, "ram_mb": 2048, "disk_gb": 20}
+    assert Decimal(body["amount_usd"]) == Decimal("0.40")
+    assert body["pricing"]["base_profile"] == "sm"
+    assert body["pricing"]["addon_ram_mb"] == 0
+
+
+@pytest.mark.asyncio
+async def test_maximum_custom_quote_has_locked_addon_breakdown(quote_state, client):
+    res = await client.post(
+        "/v1/vm/quote",
+        json={
+            "order_payload": _order(
+                resources={"vcpu": 4, "ram_mb": 8192, "disk_gb": 40}
+            )
+        },
+    )
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["order_payload"]["size"] == "lg"
+    assert Decimal(body["amount_usd"]) == Decimal("1.40")
+    assert body["pricing"]["addon_ram_mb"] == 4096
+    assert body["pricing"]["addon_ram_usd_day"] == "0.60"
+
+
+@pytest.mark.asyncio
+async def test_custom_quote_rejects_resources_above_order_cap(quote_state, client):
+    res = await client.post(
+        "/v1/vm/quote",
+        json={
+            "order_payload": _order(
+                resources={"vcpu": 4, "ram_mb": 8192, "disk_gb": 50}
+            )
+        },
+    )
+    assert res.status_code == 422
+    assert "disk_gb must be between 10 and 40" in res.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_idempotency_canonicalizes_original_profile_choice(quote_state, client):
+    resources = {"vcpu": 3, "ram_mb": 6144, "disk_gb": 30}
+    first = await client.post(
+        "/v1/vm/quote",
+        json={
+            "order_payload": _order(size="xs", resources=resources),
+            "client_order_id": "same-resources",
+        },
+    )
+    replay = await client.post(
+        "/v1/vm/quote",
+        json={
+            "order_payload": _order(size="lg", resources=resources),
+            "client_order_id": "same-resources",
+        },
+    )
+    assert first.status_code == 201
+    assert replay.status_code == 200
+    assert replay.json()["quote_id"] == first.json()["quote_id"]
 
 
 @pytest.mark.asyncio
@@ -218,6 +316,25 @@ async def test_real_mode_quote_rejects_unsupported_os(quote_state, client, monke
     )
     assert res.status_code == 400
     assert "not supported" in res.text
+
+
+@pytest.mark.asyncio
+async def test_real_mode_quote_returns_503_when_live_capacity_is_exhausted(
+    quote_state, client, monkeypatch
+):
+    from hyrule_cloud.orchestrator import VMCapacityError
+    from hyrule_cloud.services import launch_proof
+
+    monkeypatch.setattr(launch_proof, "_LAUNCH_PROOF_REAL", True)
+    quote_state.orchestrator.capacity_error = VMCapacityError("insufficient RAM capacity")
+
+    res = await client.post("/v1/vm/quote", json={"order_payload": _order()})
+
+    assert res.status_code == 503
+    assert res.json()["detail"] == "The requested VM does not fit current host capacity"
+    async with quote_state.orchestrator.db() as session:
+        quotes = list((await session.scalars(select(VMQuoteRow))).all())
+    assert quotes == []
 
 
 # --- Idempotency ---
@@ -287,6 +404,71 @@ async def test_create_with_quote_paid_provisions_and_consumes(quote_state, clien
     row = await quotes_service.get_quote(quote_state.orchestrator.db, quote["quote_id"])
     assert QuoteStatus(row.status) == QuoteStatus.CONSUMED
     assert row.vm_id == res.json()["vm_id"]
+
+
+@pytest.mark.asyncio
+async def test_create_preserves_quoted_profile_after_catalog_price_change(
+    quote_state,
+    client,
+    monkeypatch,
+):
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (
+        await client.post(
+            "/v1/vm/quote",
+            json={
+                "order_payload": _order(
+                    size="md",
+                    resources={"vcpu": 2, "ram_mb": 4096, "disk_gb": 20},
+                )
+            },
+        )
+    ).json()
+    assert quote["order_payload"]["size"] == "md"
+
+    # These resources now price cheapest from SM. The durable quote must keep
+    # MD as the VM's billing base so later extensions use the quoted profile.
+    monkeypatch.setattr(quote_state.config.payment, "price_vm_sm", Decimal("0.01"))
+    monkeypatch.setattr(quote_state.config.payment, "price_vm_md", Decimal("5.00"))
+    order = dict(quote["order_payload"])
+    order["quote_id"] = quote["quote_id"]
+    response = await client.post("/v1/vm/create", json=order)
+
+    assert response.status_code == 202, response.text
+    async with quote_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, response.json()["vm_id"])
+    assert VMSize(vm.size) is VMSize.MD
+    assert (
+        vm.billing_addon_vcpu,
+        vm.billing_addon_ram_mb,
+        vm.billing_addon_disk_gb,
+    ) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_create_accepts_original_custom_shortcut_after_quote_rebases_profile(
+    quote_state,
+    client,
+):
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    original = _order(
+        size="xs",
+        resources={"vcpu": 1, "ram_mb": 2048, "disk_gb": 20},
+    )
+    quote = (
+        await client.post("/v1/vm/quote", json={"order_payload": original})
+    ).json()
+    assert quote["order_payload"]["size"] == "sm"
+
+    response = await client.post(
+        "/v1/vm/create",
+        json={**original, "quote_id": quote["quote_id"]},
+    )
+
+    assert response.status_code == 202, response.text
+    async with quote_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, response.json()["vm_id"])
+    assert VMSize(vm.size) is VMSize.SM
 
 
 @pytest.mark.asyncio
@@ -387,6 +569,48 @@ async def test_create_with_mismatched_body_422(quote_state, client):
         "/v1/vm/create", json=_order(duration_days=30, quote_id=quote["quote_id"])
     )
     assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_resource_tampering_against_quote(quote_state, client):
+    quoted_order = _order(resources={"vcpu": 3, "ram_mb": 6144, "disk_gb": 30})
+    quote = (
+        await client.post("/v1/vm/quote", json={"order_payload": quoted_order})
+    ).json()
+    tampered = dict(quote["order_payload"])
+    tampered["quote_id"] = quote["quote_id"]
+    tampered["resources"] = {"vcpu": 4, "ram_mb": 6144, "disk_gb": 30}
+
+    res = await client.post("/v1/vm/create", json=tampered)
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_custom_create_persists_exact_resources_and_billing_addons(quote_state, client):
+    quote_state.payment_gate.check_payment = AsyncMock(return_value="0xWALLET")
+    quote = (
+        await client.post(
+            "/v1/vm/quote",
+            json={
+                "order_payload": _order(
+                    resources={"vcpu": 4, "ram_mb": 8192, "disk_gb": 40}
+                )
+            },
+        )
+    ).json()
+    order = dict(quote["order_payload"])
+    order["quote_id"] = quote["quote_id"]
+
+    created = await client.post("/v1/vm/create", json=order)
+    assert created.status_code == 202, created.text
+    async with quote_state.orchestrator.db() as session:
+        row = await session.get(VMRow, created.json()["vm_id"])
+    assert (row.vcpu, row.memory_mb, row.disk_gb) == (4, 8192, 40)
+    assert (row.billing_addon_vcpu, row.billing_addon_ram_mb, row.billing_addon_disk_gb) == (
+        0,
+        4096,
+        0,
+    )
 
 
 @pytest.mark.asyncio

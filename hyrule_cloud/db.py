@@ -84,6 +84,18 @@ class VMRow(Base):
         Enum(VMSize, name="vm_size", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
         default=VMSize.XS,
     )
+    # Exact provisioned resources. Nullable at the ORM level so databases can
+    # roll through the migration safely; migration 016 backfills every legacy
+    # row before new writes begin.
+    vcpu: Mapped[int | None] = mapped_column(Integer)
+    memory_mb: Mapped[int | None] = mapped_column(Integer)
+    disk_gb: Mapped[int | None] = mapped_column(Integer)
+    # Add-on quantities are stored independently from exact resources. This is
+    # what lets extensions use current catalog rates without reinterpreting
+    # legacy machines (including retired 80-GB disks) as newly purchased add-ons.
+    billing_addon_vcpu: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    billing_addon_ram_mb: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    billing_addon_disk_gb: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     os: Mapped[str] = mapped_column(String(64), default="debian-13")
     ipv6: Mapped[str | None] = mapped_column(String(64))
     ipv6_prefix_index: Mapped[int | None] = mapped_column(Integer)
@@ -487,6 +499,9 @@ class CryptoIntentRow(Base):
     client_order_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
     # Full VM creation spec carried through to the orchestrator on settlement.
     order_payload: Mapped[dict | None] = mapped_column(_JSONB)
+    # Server-generated VM pricing snapshot. NULL identifies an intent created
+    # before configurable resources shipped; those rows retain zero add-ons.
+    pricing_snapshot: Mapped[dict | None] = mapped_column(_JSONB)
     # Rate at intent creation; payment must arrive before rate_valid_until OR
     # qualify under the LENIENT re-quote rule (see providers/native_crypto.py).
     rate_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
@@ -495,7 +510,8 @@ class CryptoIntentRow(Base):
     # What actually landed on-chain — may differ from amount_crypto (over/under-pay).
     amount_received_crypto: Mapped[Decimal | None] = mapped_column(Numeric(24, 12))
     # Exactly-once provisioning trigger: orchestrator pickup is gated by an
-    # atomic UPDATE ... WHERE provisioning_triggered_at IS NULL RETURNING.
+    # atomic UPDATE ... WHERE provisioning_triggered_at IS NULL RETURNING. A
+    # stale VM handoff also advances this timestamp as its recovery lease.
     provisioning_triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # XMR-specific: subaddress index inside the view-only wallet account.
     xmr_subaddr_index: Mapped[int | None] = mapped_column(Integer, unique=True)
@@ -504,7 +520,8 @@ class CryptoIntentRow(Base):
     owner_account_id: Mapped[str | None] = mapped_column(
         String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
     )
-    # Once provisioned, link back to the VM created on settlement.
+    # Replay-safe planned VM id, persisted before settlement reservation; once
+    # provisioned it remains the link to the created VM.
     vm_id: Mapped[str | None] = mapped_column(String(32), index=True)
     # One-shot reveal: cleartext anon-management token created at provision time.
     # The next successful GET /v1/intent/{id} returns this AND nulls the column,
@@ -575,6 +592,9 @@ class VMQuoteRow(Base):
     order_payload: Mapped[dict] = mapped_column(_JSONB)
     # Price locked at quote creation; the 402 challenge uses this, not a recompute.
     amount_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    # Immutable, server-generated daily/base/add-on breakdown shown on review
+    # pages and copied to native intents. NULL means a migrated legacy quote.
+    pricing_snapshot: Mapped[dict | None] = mapped_column(_JSONB)
     status: Mapped[str] = mapped_column(
         Enum(
             QuoteStatus,

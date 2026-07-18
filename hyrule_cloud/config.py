@@ -133,6 +133,13 @@ class XCPNGConfig(BaseSettings):
     openbsd_builder_attach_position: str = "1"
     openbsd_builder_ssh_timeout_seconds: int = 120
 
+    # Admission control mirrors the current single-host operating policy: CPU
+    # may be committed 2:1, RAM is never overcommitted, and a small recovery
+    # margin stays free on both host memory and the default SR.
+    vcpu_overcommit_ratio: Decimal = Field(default=Decimal("2.0"), ge=Decimal("1"))
+    memory_headroom_mb: int = Field(default=2048, ge=0)
+    storage_headroom_gb: int = Field(default=20, ge=0)
+
 
 class OpenproviderConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENPROVIDER_", env_file=".env", extra="ignore")
@@ -240,10 +247,13 @@ class PaymentConfig(BaseSettings):
     xmr_rpc_url: str = "http://127.0.0.1:18088/json_rpc"
     require_native: bool = False
 
-    price_vm_xs: Decimal = Decimal("0.05")
-    price_vm_sm: Decimal = Decimal("0.10")
-    price_vm_md: Decimal = Decimal("0.20")
-    price_vm_lg: Decimal = Decimal("0.40")
+    price_vm_xs: Decimal = Decimal("0.20")
+    price_vm_sm: Decimal = Decimal("0.40")
+    price_vm_md: Decimal = Decimal("0.60")
+    price_vm_lg: Decimal = Decimal("0.80")
+    price_vm_addon_vcpu: Decimal = Decimal("0.10")
+    price_vm_addon_ram_gb: Decimal = Decimal("0.15")
+    price_vm_addon_disk_10gb: Decimal = Decimal("0.05")
     price_domain_markup: Decimal = Decimal("1.00")
     
     price_proxy_direct: Decimal = Decimal("0.01")

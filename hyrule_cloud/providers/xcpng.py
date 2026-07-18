@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import ssl
+from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ import structlog
 import websockets
 
 from hyrule_cloud.config import XCPNGConfig
-from hyrule_cloud.models import VM_SPECS, VMSize
+from hyrule_cloud.models import VM_SPECS, VMOrderResources, VMSize
 from hyrule_cloud.providers.base import Provider, ProviderError
 
 log = structlog.get_logger()
@@ -36,6 +37,14 @@ class XOError(ProviderError):
         self.method = method
         self.error = error
         super().__init__("XCPNG", method, str(error))
+
+
+@dataclass(frozen=True)
+class XCPNGCapacity:
+    physical_vcpu: int
+    allocated_vcpu: int
+    free_memory_bytes: int
+    free_storage_bytes: int
 
 
 class XCPNGProvider(Provider):
@@ -53,23 +62,46 @@ class XCPNGProvider(Provider):
         else:
             self._xo_ssl = None
 
+        # A websocket permits only one recv() coroutine at a time. Keep every
+        # JSON-RPC request/response exchange (including login/logout) behind a
+        # provider-level lock so capacity checks and lifecycle calls cannot
+        # consume one another's responses.
+        self._xo_rpc_lock = asyncio.Lock()
         self._openbsd_builder_lock = asyncio.Lock()
 
     # --- XO JSON-RPC ---
 
     async def _xo_connect(self) -> None:
+        async with self._xo_rpc_lock:
+            await self._xo_connect_locked()
+
+    async def _xo_connect_locked(self) -> None:
+        """Connect and authenticate while the caller holds _xo_rpc_lock."""
+        if self._xo_ws is not None:
+            return
         self._xo_ws = await websockets.connect(
             self.config.xo_url, ssl=self._xo_ssl, max_size=50 * 1024 * 1024,
         )
-        result = await self._xo_call(
-            "session.signInWithToken", token=self.config.xo_token
-        )
-        log.info("xo_login_success", user=result.get("email"))
+        try:
+            result = await self._xo_exchange(
+                "session.signInWithToken", token=self.config.xo_token
+            )
+        except Exception:
+            await self._xo_ws.close()
+            self._xo_ws = None
+            raise
+        log.info("xo_login_success", user=(result or {}).get("email"))
 
     async def _xo_call(self, method: str, **params: Any) -> Any:
-        if not self._xo_ws:
-            await self._xo_connect()
+        async with self._xo_rpc_lock:
+            if self._xo_ws is None:
+                await self._xo_connect_locked()
+            return await self._xo_exchange(method, **params)
 
+    async def _xo_exchange(self, method: str, **params: Any) -> Any:
+        """Perform one exchange while the caller holds _xo_rpc_lock."""
+        if self._xo_ws is None:  # Defensive; connect/call own this invariant.
+            raise RuntimeError("XO websocket is not connected")
         req_id = next(_xo_req_id)
         msg = json.dumps({
             "jsonrpc": "2.0",
@@ -95,8 +127,6 @@ class XCPNGProvider(Provider):
     async def health_check(self) -> bool:
         """Check if connection to XO is alive."""
         try:
-            if not self._xo_ws:
-                await self._xo_connect()
             # A simple call to verify it's reachable and working
             await self._xo_call("system.getInfo")
             return True
@@ -122,13 +152,101 @@ class XCPNGProvider(Provider):
             if record.get("name_label") == name_label
         )
 
+    @staticmethod
+    def _number(record: dict, *paths: tuple[str, ...] | str) -> int | None:
+        for path in paths:
+            keys = (path,) if isinstance(path, str) else path
+            value: Any = record
+            for key in keys:
+                if not isinstance(value, dict) or key not in value:
+                    value = None
+                    break
+                value = value[key]
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    async def capacity(self) -> XCPNGCapacity:
+        """Return live host/default-SR capacity from XO's object cache.
+
+        Missing fields are an error rather than an optimistic zero: admission
+        control must fail closed before accepting a payment when XO cannot
+        prove that CPU, RAM, and disk are available.
+        """
+        # XO uses one JSON-RPC WebSocket. Concurrent recv() calls on that
+        # socket are unsupported and can consume each other's responses, so
+        # keep these cache reads serialized until the client has a dispatcher.
+        hosts = await self._xo_objects(type="host")
+        vms = await self._xo_objects(type="VM")
+        srs = await self._xo_objects(type="SR")
+        if not hosts:
+            raise XOError("capacity", {"message": "XO returned no hosts"})
+
+        physical_vcpu = 0
+        free_memory = 0
+        for host in hosts.values():
+            cores = self._number(host, ("CPUs", "cores"), "cpu_count", "n_cpus")
+            memory_free = self._number(host, ("memory", "free"), "memory_free")
+            if memory_free is None:
+                memory_size = self._number(host, ("memory", "size"), "memory_size")
+                memory_usage = self._number(host, ("memory", "usage"), "memory_usage")
+                if memory_size is not None and memory_usage is not None:
+                    memory_free = memory_size - memory_usage
+            if cores is None or memory_free is None:
+                raise XOError(
+                    "capacity",
+                    {"message": "XO host capacity fields are incomplete"},
+                )
+            physical_vcpu += cores
+            free_memory += max(0, memory_free)
+
+        allocated_vcpu = 0
+        for vm in vms.values():
+            if vm.get("is_a_template") or vm.get("type") in {"template", "VM-template"}:
+                continue
+            if str(vm.get("power_state", "")).lower() != "running":
+                continue
+            allocated_vcpu += self._number(vm, ("CPUs", "number"), "cpus", "VCPUs_at_startup") or 0
+
+        sr = srs.get(self.config.default_sr_uuid)
+        if sr is None:
+            # Some XO versions key the cache by an opaque id but expose the
+            # XAPI UUID in the record.
+            sr = next(
+                (
+                    value
+                    for key, value in srs.items()
+                    if key == self.config.default_sr_uuid
+                    or value.get("uuid") == self.config.default_sr_uuid
+                    or value.get("id") == self.config.default_sr_uuid
+                ),
+                None,
+            )
+        if sr is None:
+            raise XOError("capacity", {"message": "default SR is missing from XO"})
+        storage_size = self._number(sr, "physical_size", "size")
+        storage_usage = self._number(sr, "physical_usage", "usage")
+        if storage_size is None or storage_usage is None:
+            raise XOError("capacity", {"message": "XO SR capacity fields are incomplete"})
+
+        return XCPNGCapacity(
+            physical_vcpu=physical_vcpu,
+            allocated_vcpu=allocated_vcpu,
+            free_memory_bytes=free_memory,
+            free_storage_bytes=max(0, storage_size - storage_usage),
+        )
+
     async def login(self) -> None:
         await self._xo_connect()
 
     async def logout(self) -> None:
-        if self._xo_ws:
-            await self._xo_ws.close()
-            self._xo_ws = None
+        async with self._xo_rpc_lock:
+            if self._xo_ws:
+                await self._xo_ws.close()
+                self._xo_ws = None
 
     # --- VM Lifecycle ---
 
@@ -139,6 +257,7 @@ class XCPNGProvider(Provider):
         name_label: str,
         os_name: str = "debian-13",
         size: VMSize,
+        resources: VMOrderResources | None = None,
         cloud_init_config: str,
         network_config: str | None = None,
     ) -> str:
@@ -150,8 +269,22 @@ class XCPNGProvider(Provider):
 
         Returns the new VM's UUID.
         """
-        specs = VM_SPECS[size]
-        log.info("vm_create_start", template=template_uuid, name=name_label, size=size.value)
+        specs = (
+            {
+                "vcpu": resources.vcpu,
+                "memory_mb": resources.ram_mb,
+                "disk_gb": resources.disk_gb,
+            }
+            if resources is not None
+            else VM_SPECS[size]
+        )
+        log.info(
+            "vm_create_start",
+            template=template_uuid,
+            name=name_label,
+            size=size.value,
+            specs=specs,
+        )
 
         create_params = {
             "template": template_uuid,

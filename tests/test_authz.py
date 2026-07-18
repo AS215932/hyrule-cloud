@@ -389,7 +389,14 @@ class _OrchForCreate:
         self.provisioning_started = getattr(self, "provisioning_started", [])
         self.provisioning_started.append(vm_id)
 
-    async def create_vm(self, request, owner_wallet, owner_account_id=None, start_provisioning=True):
+    async def create_vm(
+        self,
+        request,
+        owner_wallet,
+        owner_account_id=None,
+        start_provisioning=True,
+        **kwargs,
+    ):
         from hyrule_cloud.models import generate_anon_management_token, generate_vm_id
 
         class _Row:
