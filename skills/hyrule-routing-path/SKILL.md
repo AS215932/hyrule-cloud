@@ -40,10 +40,13 @@ curl https://cloud.hyrule.host/v1/path/pricing
 
 ## Paid report
 
+These curl examples show request shapes and receive the initial 402. Use an
+official x402 v2 client for `Payment-Required` handling and the paid retry; see
+`../hyrule-cloud/references/payments.md`.
+
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/path/report \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{
     "target":"example.com",
     "address_family":"auto",
@@ -57,7 +60,6 @@ curl -X POST https://cloud.hyrule.host/v1/path/report \
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/path/trace \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"target":"example.com","vantages":["extmon"]}'
 ```
 
@@ -69,3 +71,6 @@ when BGP origin, RPKI, route visibility, or AS path is the likely issue.
 
 Active probes are abuse-controlled: private/reserved/link-local/loopback targets
 are blocked and Hyrule does not offer general-purpose scanning.
+
+An official x402 v2 client reads `Payment-Required`, enforces the operator's
+spend policy, creates the payment, and retries with `Payment-Signature`.

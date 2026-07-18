@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hyrule-cloud-mcp"
+version = "0.1.0"
+description = "Spend-controlled x402 buyer MCP server for Hyrule Cloud"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "eth-account>=0.13",
+    "httpx>=0.28",
+    "mcp>=1.26,<2",
+    "x402[evm]>=2.10,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[project.scripts]
+hyrule-cloud-mcp = "hyrule_cloud_mcp.server:main"
+
+[project.urls]
+Homepage = "https://cloud.hyrule.host"
+Repository = "https://github.com/AS215932/hyrule-cloud"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hyrule_cloud_mcp"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "strict"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["x402", "x402.*"]
+ignore_missing_imports = true

@@ -27,6 +27,10 @@ Use Hyrule Cloud for paid, agent-friendly network intelligence primitives.
 
 ## Examples
 
+The curl examples show request shapes and receive the initial 402. Use an
+official x402 v2 client for `Payment-Required` handling and the paid retry; see
+`../hyrule-cloud/references/payments.md`.
+
 ```bash
 curl https://cloud.hyrule.host/v1/dns/capabilities
 ```
@@ -34,19 +38,16 @@ curl https://cloud.hyrule.host/v1/dns/capabilities
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/dns/lookup \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"name":"example.com","type":"MX","dnssec":true}'
 ```
 
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/ip/lookup \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"address":"8.8.8.8","views":["asn","rdns","rdap","whois"]}'
 ```
 
 ## x402
 
-Call a paid endpoint without `X-PAYMENT` to receive a `402 Payment Required`
-challenge. Pay through an x402 facilitator and retry with the `X-PAYMENT`
-header.
+An official x402 v2 client reads `Payment-Required`, enforces the operator's
+spend policy, creates the payment, and retries with `Payment-Signature`.

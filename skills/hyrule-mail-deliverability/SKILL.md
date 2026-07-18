@@ -25,10 +25,13 @@ curl https://cloud.hyrule.host/v1/mx/pricing
 
 ## Single paid check
 
+The curl examples show request shapes and receive the initial 402. Use an
+official x402 v2 client for `Payment-Required` handling and the paid retry; see
+`../hyrule-cloud/references/payments.md`.
+
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/mx/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"tool":"dmarc","target":"example.com"}'
 ```
 
@@ -37,7 +40,6 @@ curl -X POST https://cloud.hyrule.host/v1/mx/check \
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/mx/reports/mail-delivery \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"target":"example.com","profile":"mail_delivery"}'
 ```
 
@@ -46,7 +48,6 @@ curl -X POST https://cloud.hyrule.host/v1/mx/reports/mail-delivery \
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/mx/bounce/parse \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{
     "message":"550 5.7.26 Unauthenticated email from example.com is not accepted",
     "context":{"sender_domain":"example.com","recipient_domain":"gmail.com"}

@@ -20,10 +20,13 @@ curl https://cloud.hyrule.host/v1/ports/pricing
 
 ## Paid check
 
+The curl example shows the request shape and receives the initial 402. Use an
+official x402 v2 client for `Payment-Required` handling and the paid retry; see
+`../hyrule-cloud/references/payments.md`.
+
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/ports/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"target":"example.com","port":443,"protocol":"tcp","profile":"https","vantage":"extmon"}'
 ```
 

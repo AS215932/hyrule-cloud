@@ -1,0 +1,51 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.AS215932/hyrule-cloud",
+  "title": "Hyrule Cloud buyer",
+  "description": "Discover and buy Hyrule Cloud x402 network diagnostics with wallet allowlists and durable spend caps.",
+  "repository": {
+    "url": "https://github.com/AS215932/hyrule-cloud",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "hyrule-cloud-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "EVM_PRIVATE_KEY",
+          "description": "EVM wallet private key used only by the local official x402 client.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "HYRULE_MCP_MAX_PAYMENT_USD",
+          "description": "Hard USD maximum for one payment; defaults to 0.10.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "HYRULE_MCP_DAILY_BUDGET_USD",
+          "description": "UTC-day aggregate USD reservation cap; defaults to 1.00.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "HYRULE_MCP_CAPABILITIES",
+          "description": "Optional comma-separated exact capability allowlist.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

@@ -3,14 +3,15 @@
 The catalog in this module is the single source of truth for everything Hyrule
 advertises as a payable agent resource:
 
-* ``/openapi.json`` (x402scan's canonical discovery source)
+* x402 annotations on payable operations in the complete ``/openapi.json``
 * ``/.well-known/x402.json`` (Hyrule compatibility manifest)
 * Bazaar declarations attached to runtime 402 challenges
 * the pre-validation unpaid challenge middleware
 
-Only launch-ready, independently payable operations belong here. Callable
-management, identity, internal, convenience, and contract-only routes remain
-outside the catalog and therefore outside the curated OpenAPI document.
+Only launch-ready, independently payable operations belong in this catalog.
+The canonical OpenAPI document still describes every public, authenticated,
+management, and worker operation; the catalog controls only which operations
+receive x402 metadata and appear in the x402 manifest.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi.openapi.utils import get_openapi
-from fastapi.routing import APIRoute
 from pydantic import BaseModel, ValidationError
 from starlette.routing import compile_path
 from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
@@ -45,8 +45,7 @@ class PriceSpec:
 
     def values(self, payment: PaymentConfig) -> tuple[Decimal, ...]:
         return tuple(
-            Decimal(str(getattr(payment, field, default)))
-            for field, default in self.fields
+            Decimal(str(getattr(payment, field, default))) for field, default in self.fields
         )
 
     def minimum(self, payment: PaymentConfig) -> Decimal:
@@ -93,12 +92,120 @@ _TAG_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/voip", ("network-intel", "voip")),
 )
 
+_INTENT_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "/v1/vm",
+        (
+            "deploy an IPv6-native VPS",
+            "provision a virtual machine for an AI agent",
+        ),
+    ),
+    (
+        "/v1/network",
+        (
+            "make an HTTP request through Tor, I2P, or Yggdrasil",
+            "fetch a URL through a privacy network",
+        ),
+    ),
+    (
+        "/v1/bgp",
+        (
+            "investigate BGP routes and ASNs",
+            "check route origin and RPKI status",
+        ),
+    ),
+    (
+        "/v1/ip",
+        ("look up an IP address, ASN, reverse DNS, RDAP, or WHOIS",),
+    ),
+    (
+        "/v1/dns",
+        ("query DNS and DNSSEC", "check DNS propagation"),
+    ),
+    (
+        "/v1/rdap",
+        ("look up structured RDAP data for a domain, IP, prefix, or ASN",),
+    ),
+    (
+        "/v1/whois",
+        ("look up WHOIS data for a domain, IP, prefix, or ASN",),
+    ),
+    (
+        "/v1/web",
+        (
+            "check whether a website is down",
+            "inspect a website TLS certificate and security headers",
+        ),
+    ),
+    (
+        "/v1/mx",
+        (
+            "check MX configuration and mail deliverability",
+            "diagnose an SMTP rejection or mail bounce",
+        ),
+    ),
+    (
+        "/v1/path",
+        ("trace a network path and collect routing evidence",),
+    ),
+    (
+        "/v1/ports",
+        ("test whether a public TCP or UDP port is reachable",),
+    ),
+    (
+        "/v1/nat",
+        ("diagnose NAT, CGNAT, or port-forward reachability",),
+    ),
+    (
+        "/v1/threat",
+        ("check public threat and reputation evidence",),
+    ),
+    (
+        "/v1/voip",
+        ("diagnose SIP, SIP TLS, STUN, or TURN connectivity",),
+    ),
+)
+
+_CAPABILITY_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("/v1/vm", ("compute.ipv6", "vps.provision")),
+    ("/v1/network", ("http.proxy", "privacy.networks")),
+    ("/v1/bgp", ("network.bgp", "network.rpki")),
+    ("/v1/ip", ("network.ip-intelligence",)),
+    ("/v1/dns", ("dns.lookup", "dns.diagnostics")),
+    ("/v1/rdap", ("registry.rdap",)),
+    ("/v1/whois", ("registry.whois",)),
+    ("/v1/web", ("web.reachability", "web.tls")),
+    ("/v1/mx", ("mail.deliverability",)),
+    ("/v1/path", ("network.path",)),
+    ("/v1/ports", ("network.port-reachability",)),
+    ("/v1/nat", ("network.nat-cgnat",)),
+    ("/v1/threat", ("security.reputation",)),
+    ("/v1/voip", ("network.voip-sip",)),
+)
+
 
 def _default_tags(path: str) -> tuple[str, ...]:
     for prefix, tags in _TAG_PREFIXES:
         if path == prefix or path.startswith(prefix + "/"):
             return tags
     return ()
+
+
+def _prefixed_values(
+    path: str,
+    table: tuple[tuple[str, tuple[str, ...]], ...],
+) -> tuple[str, ...]:
+    for prefix, values in table:
+        if path == prefix or path.startswith(prefix + "/"):
+            return values
+    return ()
+
+
+def _capability_id(path: str) -> str:
+    return "hyrule." + ".".join(
+        segment.replace("{", "").replace("}", "")
+        for segment in path.removeprefix("/v1/").split("/")
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +222,9 @@ class PaidOperation:
     path_examples: dict[str, Any]
     gate: str = "always"
     tags: tuple[str, ...] = ()
+    capability_id: str = ""
+    intents: tuple[str, ...] = ()
+    capabilities: tuple[str, ...] = ()
 
     @property
     def key(self) -> tuple[str, str]:
@@ -258,6 +368,9 @@ def _body_operation(
         path_examples={},
         gate=gate,
         tags=_default_tags(path),
+        capability_id=_capability_id(path),
+        intents=_prefixed_values(path, _INTENT_PREFIXES),
+        capabilities=_prefixed_values(path, _CAPABILITY_PREFIXES),
     )
 
 
@@ -299,6 +412,9 @@ def _download_operation(
         path_examples=path_examples,
         gate=gate,
         tags=_default_tags(path),
+        capability_id=_capability_id(path),
+        intents=_prefixed_values(path, _INTENT_PREFIXES),
+        capabilities=_prefixed_values(path, _CAPABILITY_PREFIXES),
     )
 
 
@@ -359,9 +475,7 @@ def _diagnostic_output(
             "normalized": target,
             "type": target_type,
         },
-        "findings": [
-            {"severity": "ok", "code": "example", "message": "No issue found"}
-        ],
+        "findings": [{"severity": "ok", "code": "example", "message": "No issue found"}],
         "sources": {},
         "partial": False,
         "generated_at": _GENERATED_AT,
@@ -447,7 +561,7 @@ _MX_JOB_OUTPUT = {
 PAID_OPERATIONS: tuple[PaidOperation, ...] = (
     _body_operation(
         "/v1/vm/create",
-        "Provision a bare VM with SSH access",
+        "Provision an IPv6-native bare VM with SSH access",
         _VM_PRICE,
         models.VMCreateRequest,
         {
@@ -978,15 +1092,23 @@ def marketplace_resource_description(operation: PaidOperation) -> str:
 
 
 def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
+    public_base_url = str(getattr(config, "public_base_url", "https://cloud.hyrule.host")).rstrip(
+        "/"
+    )
     resources: list[dict[str, Any]] = []
     for operation in enabled_paid_operations():
         resource: dict[str, Any] = {
+            "id": operation.capability_id,
             "path": operation.path,
             "method": operation.method,
             "description": operation.description,
             "minPrice": str(operation.price.minimum(config.payment)),
+            "price": operation.price.openapi(config.payment),
             "networks": getattr(config.payment, "networks", []),
             "discoverable": True,
+            "intents": list(operation.intents),
+            "capabilities": list(operation.capabilities),
+            "documentationUrl": f"{public_base_url}/openapi.json",
         }
         maximum = operation.price.maximum(config.payment)
         if maximum is not None:
@@ -996,6 +1118,16 @@ def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
         "x402Version": 2,
         "name": "Hyrule Cloud",
         "description": catalog_description(),
+        "intents": sorted(
+            {intent for operation in enabled_paid_operations() for intent in operation.intents}
+        ),
+        "capabilities": sorted(
+            {
+                capability
+                for operation in enabled_paid_operations()
+                for capability in operation.capabilities
+            }
+        ),
         "resources": resources,
         "facilitator": getattr(config.payment, "facilitator_url", ""),
         "contact": "https://github.com/AS215932",
@@ -1030,7 +1162,11 @@ def _annotate_operation(
         "price": operation.price.openapi(payment),
         "protocols": [{"x402": {}}],
     }
+    openapi_operation["x-hyrule-capability-id"] = operation.capability_id
+    openapi_operation["x-hyrule-intents"] = list(operation.intents)
+    openapi_operation["x-hyrule-capabilities"] = list(operation.capabilities)
     openapi_operation.setdefault("summary", operation.description)
+    openapi_operation.setdefault("description", operation.description)
 
     request_body = openapi_operation.get("requestBody")
     if operation.input_example is not None and isinstance(request_body, dict):
@@ -1058,9 +1194,7 @@ def _annotate_operation(
             }
         },
         "content": {
-            "application/json": {
-                "schema": {"$ref": "#/components/schemas/X402PaymentRequired"}
-            }
+            "application/json": {"schema": {"$ref": "#/components/schemas/X402PaymentRequired"}}
         },
     }
 
@@ -1075,27 +1209,17 @@ def _annotate_operation(
                 media.setdefault("example", operation.output_example)
 
 
-def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[str, Any]:
-    """Generate the sole OpenAPI document from enabled launch operations."""
+def build_full_openapi(application: FastAPI, config: HyruleConfig) -> dict[str, Any]:
+    """Generate the complete API contract and annotate its payable subset."""
 
     enabled = enabled_paid_operations()
-    enabled_keys = {operation.key for operation in enabled}
-    selected_routes = [
-        route
-        for route in application.routes
-        if isinstance(route, APIRoute)
-        and any((method.upper(), route.path) in enabled_keys for method in route.methods)
-    ]
     schema = get_openapi(
         title=application.title,
         version=application.version,
         openapi_version=application.openapi_version,
         summary=application.summary,
-        description=(
-            f"{catalog_description()} This OpenAPI document intentionally contains only "
-            "the launch-ready, independently payable agent surface."
-        ),
-        routes=selected_routes,
+        description=application.description,
+        routes=application.routes,
         tags=application.openapi_tags,
         servers=application.servers,
         terms_of_service=application.terms_of_service,
@@ -1107,26 +1231,18 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
         external_docs=application.openapi_external_docs,
     )
     schema["info"]["x-guidance"] = (
-        "Every operation in this document is an independently payable x402 v2 "
-        "resource. Call it without payment to receive the Payment-Required "
-        "challenge, then retry the same method, URL, and input with a valid "
-        "payment signature. Routes omitted from this document are not part of "
-        "the agent launch catalog."
+        "This is the complete Hyrule Cloud API contract. Operations carrying "
+        "x-payment-info are independently payable x402 v2 resources; call one "
+        "without payment to receive Payment-Required, then retry the same "
+        "request with Payment-Signature. Operations without x-payment-info may "
+        "be free, authenticated, account-scoped, or readiness-gated."
     )
-    schema.setdefault("components", {}).setdefault("schemas", {})[
-        "X402PaymentRequired"
-    ] = _PAYMENT_REQUIRED_SCHEMA
+    schema["info"]["x-hyrule-x402-manifest"] = "/.well-known/x402.json"
+    schema.setdefault("components", {}).setdefault("schemas", {})["X402PaymentRequired"] = (
+        _PAYMENT_REQUIRED_SCHEMA
+    )
 
     for operation in enabled:
         _annotate_operation(schema, operation, config.payment)
-
-    # Be exact even if a future APIRoute gains more than one method.
-    for path, path_item in list(schema.get("paths", {}).items()):
-        for method in list(path_item):
-            if method.upper() in {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"}:
-                if (method.upper(), path) not in enabled_keys:
-                    del path_item[method]
-        if not any((method.upper(), path) in enabled_keys for method in path_item):
-            del schema["paths"][path]
 
     return schema
