@@ -18,6 +18,7 @@ from hyrule_cloud.logging_config import SAFE_DICT_TRACEBACKS
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.services.dns.blocklists import BlocklistService
 from hyrule_cloud.services.intents import scan_pending_intents
 
 structlog.configure(
@@ -33,6 +34,20 @@ structlog.configure(
 )
 
 log = structlog.get_logger().bind(service="hyrule-cloud-worker")
+
+
+async def _refresh_dns_blocklists(service: BlocklistService) -> None:
+    try:
+        refreshed = await service.refresh()
+        log.info(
+            "dns_blocklist_refresh_completed",
+            ready=refreshed.ready,
+            snapshot_id=refreshed.snapshot_id,
+            usable_sources=refreshed.usable_source_count,
+            required_sources=refreshed.required_source_count,
+        )
+    except Exception:
+        log.exception("dns_blocklist_refresh_failed")
 
 
 async def run_worker() -> None:
@@ -55,6 +70,7 @@ async def run_worker() -> None:
         orchestrator,
     )
     orchestrator.domains = domains
+    dns_blocklists = BlocklistService(config.dns_blocklists)
     recovered_bundles = await domains.recover_bundle_provisioning()
 
     stop = asyncio.Event()
@@ -74,6 +90,8 @@ async def run_worker() -> None:
     next_catalog = now
     next_reconcile = now
     next_renewal_state = now
+    next_dns_blocklists = now
+    dns_blocklist_task: asyncio.Task[None] | None = None
     worker_id = f"{socket.gethostname()}:{id(stop)}"
     log.info(
         "worker_started",
@@ -137,11 +155,28 @@ async def run_worker() -> None:
                 except Exception:
                     log.exception("domain_renewal_state_refresh_failed")
                 next_renewal_state = now + timedelta(hours=1)
+            if now >= next_dns_blocklists:
+                if config.dns_blocklists.enabled and (
+                    dns_blocklist_task is None or dns_blocklist_task.done()
+                ):
+                    # Downloads and compilation can take longer than the
+                    # one-second lifecycle scheduler tick. Keep domain jobs,
+                    # intent scans, and expiry handling responsive while the
+                    # independent catalog refresh runs.
+                    dns_blocklist_task = asyncio.create_task(
+                        _refresh_dns_blocklists(dns_blocklists)
+                    )
+                next_dns_blocklists = now + timedelta(
+                    seconds=config.dns_blocklists.refresh_seconds
+                )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=1.0)
             except TimeoutError:
                 pass
     finally:
+        if dns_blocklist_task is not None and not dns_blocklist_task.done():
+            dns_blocklist_task.cancel()
+            await asyncio.gather(dns_blocklist_task, return_exceptions=True)
         await domains.close()
         await native.close()
         await rates.close()

@@ -18,7 +18,7 @@ Usage
 
   python x402_canary.py list                 # show tests + prices, no spend
   python x402_canary.py dns                  # cheapest first live spend ($0.001)
-  python x402_canary.py intel                # every network-intel probe (~$0.06)
+  python x402_canary.py intel                # every network-intel probe
   python x402_canary.py proxy                # direct + tor network requests
   python x402_canary.py domain --name mytest12345   # REAL account-owned registration
   python x402_canary.py vm                   # provision a real VM + print SSH target
@@ -63,6 +63,18 @@ TESTS: dict[str, dict] = {
         "path": "/v1/dns/lookup",
         "body": {"name": "example.com", "type": "AAAA"},
         "usd": "0.001",
+        "group": "intel",
+    },
+    "dns-blocklists": {
+        "path": "/v1/dns/blocklists/check",
+        "body": {"domain": "example.com"},
+        "usd": "0.003",
+        "group": "intel",
+    },
+    "dns-filtering": {
+        "path": "/v1/dns/filtering/check",
+        "body": {"domain": "example.com"},
+        "usd": "0.01",
         "group": "intel",
     },
     "ip": {
@@ -329,6 +341,34 @@ async def _run_one(
         # not actually charged — a broken gate, not a passing canary.
         print("    !! paid 2xx with no successful settlement — route not charged; FAILING.")
         return False
+
+    if name == "dns-blocklists":
+        try:
+            payload = r.json()
+        except ValueError:
+            print("    !! blocklist canary returned non-JSON evidence; FAILING.")
+            return False
+        if (
+            not payload.get("snapshot_id")
+            or payload.get("checked_source_count", 0) < 12
+            or payload.get("verdict") not in {"listed", "not_listed", "inconclusive"}
+        ):
+            print("    !! blocklist canary omitted catalog/coverage evidence; FAILING.")
+            return False
+
+    if name == "dns-filtering":
+        try:
+            payload = r.json()
+        except ValueError:
+            print("    !! DNS filtering canary returned non-JSON evidence; FAILING.")
+            return False
+        if (
+            payload.get("conclusive_profile_count", 0) < 6
+            or payload.get("total_profile_count") != 8
+            or payload.get("overall") not in {"blocked", "allowed", "mixed"}
+        ):
+            print("    !! DNS filtering canary did not meet the paid evidence floor; FAILING.")
+            return False
 
     if name == "vm":
         if r.status_code != 202:
