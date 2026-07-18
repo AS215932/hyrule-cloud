@@ -188,7 +188,13 @@ class XCPNGProvider(Provider):
         physical_vcpu = 0
         free_memory = 0
         for host in hosts.values():
-            cores = self._number(host, ("CPUs", "cores"), "cpu_count", "n_cpus")
+            cores = self._number(
+                host,
+                ("CPUs", "cores"),
+                ("CPUs", "cpu_count"),
+                "cpu_count",
+                "n_cpus",
+            )
             memory_free = self._number(host, ("memory", "free"), "memory_free")
             if memory_free is None:
                 memory_size = self._number(host, ("memory", "size"), "memory_size")
