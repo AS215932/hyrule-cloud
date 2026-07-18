@@ -233,14 +233,23 @@ async def test_create_uses_exact_order_resources_instead_of_profile_defaults():
 
 
 @pytest.mark.asyncio
-async def test_capacity_reads_host_running_vm_and_default_sr_state(monkeypatch):
+@pytest.mark.parametrize(
+    "cpu_fields",
+    [
+        pytest.param({"cores": 16}, id="cores"),
+        pytest.param({"cpu_count": "16"}, id="xo-cpu-count"),
+    ],
+)
+async def test_capacity_reads_host_running_vm_and_default_sr_state(
+    monkeypatch, cpu_fields: dict[str, int | str]
+):
     provider = XCPNGProvider(XCPNGConfig(default_sr_uuid="sr-default"))
 
     async def objects(**filters):
         if filters == {"type": "host"}:
             return {
                 "host-1": {
-                    "CPUs": {"cores": 16},
+                    "CPUs": cpu_fields,
                     "memory": {"size": 64 * 1024**3, "usage": 50 * 1024**3},
                 }
             }
