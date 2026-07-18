@@ -49,6 +49,9 @@ services:
     environment:
       # Override DB URL to point at compose Postgres
       HYRULE_DATABASE_URL: postgresql+asyncpg://hyrule:hyrule@postgres/hyrule
+      DNS_BLOCKLIST_DATA_DIR: /var/lib/hyrule-cloud/blocklists
+    volumes:
+      - blocklist_data:/var/lib/hyrule-cloud/blocklists:ro
     command: "uvicorn hyrule_cloud.app:app --host :: --port 8402"
 
   worker:
@@ -63,7 +66,11 @@ services:
     env_file: .env
     environment:
       HYRULE_DATABASE_URL: postgresql+asyncpg://hyrule:hyrule@postgres/hyrule
+      DNS_BLOCKLIST_DATA_DIR: /var/lib/hyrule-cloud/blocklists
+    volumes:
+      - blocklist_data:/var/lib/hyrule-cloud/blocklists
     restart: unless-stopped
 
 volumes:
   pgdata:
+  blocklist_data:

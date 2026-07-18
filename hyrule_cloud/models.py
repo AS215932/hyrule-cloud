@@ -1311,6 +1311,161 @@ class DNSLookupResponse(BaseModel):
 
 class DNSPricingResponse(BaseModel):
     lookup_usd: str
+    blocklist_check_usd: str
+    filtering_check_usd: str
+
+
+class DNSDomainCheckRequest(BaseModel):
+    domain: str = Field(min_length=1, max_length=253)
+
+
+class DNSBlocklistCategory(enum.StrEnum):
+    ADS = "ads"
+    TRACKERS = "trackers"
+    TELEMETRY = "telemetry"
+    PHISHING = "phishing"
+    MALWARE = "malware"
+    SCAM = "scam"
+    C2 = "c2"
+
+
+class DNSBlocklistVerdict(enum.StrEnum):
+    LISTED = "listed"
+    NOT_LISTED = "not_listed"
+    INCONCLUSIVE = "inconclusive"
+
+
+class DNSBlocklistSourceOutcome(enum.StrEnum):
+    LISTED = "listed"
+    NOT_LISTED = "not_listed"
+    EXCEPTED = "excepted"
+    UNAVAILABLE = "unavailable"
+
+
+class DNSBlocklistSourceResult(BaseModel):
+    source_id: str
+    source_name: str
+    categories: list[DNSBlocklistCategory]
+    outcome: DNSBlocklistSourceOutcome
+    matched_domain: str | None = None
+    match_kind: str | None = None
+    source_status: SourceStatus | str
+    source_age_seconds: int | None = None
+
+
+class DNSBlocklistSourceInfo(BaseModel):
+    source_id: str
+    name: str
+    categories: list[DNSBlocklistCategory]
+    license: str
+    license_url: str
+    source_url: str
+    format: str
+    status: SourceStatus | str
+    content_updated_at: datetime | None = None
+    last_checked_at: datetime | None = None
+    age_seconds: int | None = None
+    rule_count: int = 0
+    rejected_rule_count: int = 0
+    error: str | None = None
+
+
+class DNSBlocklistSourcesResponse(BaseModel):
+    ready: bool
+    catalog_version: str
+    snapshot_id: str | None = None
+    required_source_count: int
+    usable_source_count: int
+    minimum_usable_source_count: int
+    sources: list[DNSBlocklistSourceInfo]
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class DNSBlocklistCheckResponse(BaseModel):
+    request_id: str = Field(default_factory=generate_diagnostic_request_id)
+    input_domain: str
+    normalized_domain: str
+    verdict: DNSBlocklistVerdict
+    categories: list[DNSBlocklistCategory] = Field(default_factory=list)
+    checked_source_count: int
+    matched_source_count: int
+    required_source_count: int
+    results: list[DNSBlocklistSourceResult]
+    catalog_version: str
+    snapshot_id: str
+    partial: bool = False
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class DNSFilteringProfileStatus(enum.StrEnum):
+    BLOCKED = "blocked"
+    ALLOWED = "allowed"
+    INCONCLUSIVE = "inconclusive"
+    UNAVAILABLE = "unavailable"
+
+
+class DNSFilteringOverallStatus(enum.StrEnum):
+    BLOCKED = "blocked"
+    ALLOWED = "allowed"
+    MIXED = "mixed"
+    INCONCLUSIVE = "inconclusive"
+
+
+class DNSFilteringObservation(BaseModel):
+    record_type: str
+    rcode: str | None = None
+    answers: list[str] = Field(default_factory=list)
+    cname_chain: list[str] = Field(default_factory=list)
+    ede_codes: list[int] = Field(default_factory=list)
+    authority_count: int = 0
+    latency_ms: float | None = None
+    error: str | None = None
+
+
+class DNSFilteringProfileResult(BaseModel):
+    profile_id: str
+    name: str
+    provider: str
+    categories: list[DNSBlocklistCategory]
+    status: DNSFilteringProfileStatus
+    reason: str
+    filtered: list[DNSFilteringObservation]
+    control: list[DNSFilteringObservation]
+    observed_at: datetime
+
+
+class DNSFilteringResolverInfo(BaseModel):
+    profile_id: str
+    name: str
+    provider: str
+    categories: list[DNSBlocklistCategory]
+    filtered_endpoint: str
+    control_endpoint: str
+    blocking_signals: list[str]
+    status: str = "configured"
+
+
+class DNSFilteringResolversResponse(BaseModel):
+    enabled: bool
+    profiles: list[DNSFilteringResolverInfo]
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class DNSFilteringCheckResponse(BaseModel):
+    request_id: str = Field(default_factory=generate_diagnostic_request_id)
+    input_domain: str
+    normalized_domain: str
+    vantage: str = "hyrule"
+    overall: DNSFilteringOverallStatus
+    blocked_profile_count: int
+    allowed_profile_count: int
+    conclusive_profile_count: int
+    total_profile_count: int
+    profiles: list[DNSFilteringProfileResult]
+    partial: bool = False
+    observed_at: datetime
+    cache_age_seconds: int = 0
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class DNSPropagationRequest(BaseModel):

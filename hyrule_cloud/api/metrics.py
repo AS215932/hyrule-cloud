@@ -39,7 +39,119 @@ def _metric(lines: list[str], name: str, help_text: str, kind: str) -> None:
     lines.append(f"# TYPE {name} {kind}")
 
 
-async def _render(session_factory: Any) -> str:
+def _render_dns_product_metrics(lines: list[str], state: Any | None) -> None:
+    blocklists = getattr(state, "dns_blocklists", None)
+    if blocklists is not None and hasattr(blocklists, "metrics_snapshot"):
+        snapshot = blocklists.metrics_snapshot()
+        catalog = snapshot["catalog"]
+        _metric(
+            lines,
+            "hyrule_dns_blocklist_ready",
+            "Whether the compiled blocklist snapshot meets the paid-product evidence floor.",
+            "gauge",
+        )
+        lines.append(f"hyrule_dns_blocklist_ready {1 if catalog.ready else 0}")
+        _metric(
+            lines,
+            "hyrule_dns_blocklist_usable_sources",
+            "Usable blocklist sources in the current catalog snapshot.",
+            "gauge",
+        )
+        lines.append(
+            f"hyrule_dns_blocklist_usable_sources {catalog.usable_source_count}"
+        )
+        _metric(
+            lines,
+            "hyrule_dns_blocklist_source_age_seconds",
+            "Age of the last successful source validation.",
+            "gauge",
+        )
+        _metric(
+            lines,
+            "hyrule_dns_blocklist_source_rules",
+            "Compiled rules by blocklist source.",
+            "gauge",
+        )
+        for source in catalog.sources:
+            status = getattr(source.status, "value", source.status)
+            if source.age_seconds is not None:
+                lines.append(
+                    f'hyrule_dns_blocklist_source_age_seconds{{source_id="{_esc(source.source_id)}",'
+                    f'status="{_esc(status)}"}} {source.age_seconds}'
+                )
+            lines.append(
+                f'hyrule_dns_blocklist_source_rules{{source_id="{_esc(source.source_id)}"}} '
+                f"{source.rule_count}"
+            )
+        _metric(
+            lines,
+            "hyrule_dns_blocklist_checks_total",
+            "Delivered blocklist checks by verdict.",
+            "counter",
+        )
+        for verdict, count in snapshot["checks"].items():
+            lines.append(
+                f'hyrule_dns_blocklist_checks_total{{verdict="{_esc(verdict)}"}} {count}'
+            )
+        _metric(
+            lines,
+            "hyrule_dns_blocklist_lookup_latency_ms",
+            "Cumulative local blocklist lookup latency and sample count.",
+            "summary",
+        )
+        lines.append(
+            "hyrule_dns_blocklist_lookup_latency_ms_sum "
+            f'{snapshot["lookup_latency_ms_total"]}'
+        )
+        lines.append(
+            f'hyrule_dns_blocklist_lookup_latency_ms_count {snapshot["lookup_samples"]}'
+        )
+
+    filtering = getattr(state, "dns_filtering", None)
+    if filtering is not None and hasattr(filtering, "metrics_snapshot"):
+        snapshot = filtering.metrics_snapshot()
+        _metric(
+            lines,
+            "hyrule_dns_filtering_checks_total",
+            "Delivered live DNS filtering checks by aggregate result.",
+            "counter",
+        )
+        for result, count in snapshot["overall"].items():
+            lines.append(
+                f'hyrule_dns_filtering_checks_total{{result="{_esc(result)}"}} {count}'
+            )
+        _metric(
+            lines,
+            "hyrule_dns_filtering_profile_results_total",
+            "DNS filtering profile outcomes.",
+            "counter",
+        )
+        for key, count in snapshot["profiles"].items():
+            profile_id, status = key.split("|", 1)
+            lines.append(
+                f'hyrule_dns_filtering_profile_results_total{{profile_id="{_esc(profile_id)}",'
+                f'status="{_esc(status)}"}} {count}'
+            )
+        _metric(
+            lines,
+            "hyrule_dns_filtering_profile_latency_ms",
+            "Cumulative filtered DoH latency and sample count by profile.",
+            "summary",
+        )
+        totals = snapshot["profile_latency_ms_total"]
+        samples = snapshot["profile_latency_samples"]
+        for profile_id, total in totals.items():
+            lines.append(
+                f'hyrule_dns_filtering_profile_latency_ms_sum{{profile_id="{_esc(profile_id)}"}} '
+                f"{total}"
+            )
+            lines.append(
+                f'hyrule_dns_filtering_profile_latency_ms_count{{profile_id="{_esc(profile_id)}"}} '
+                f"{samples.get(profile_id, 0)}"
+            )
+
+
+async def _render(session_factory: Any, state: Any | None = None) -> str:
     lines: list[str] = []
     now = datetime.now(UTC)
     async with session_factory() as session:
@@ -173,6 +285,8 @@ async def _render(session_factory: Any) -> str:
             value = getattr(status, "value", status)
             lines.append(f'hyrule_domains_total{{status="{_esc(value)}"}} {count}')
 
+    _render_dns_product_metrics(lines, state)
+
     return "\n".join(lines) + "\n"
 
 
@@ -193,6 +307,6 @@ async def metrics(request: Request) -> Response:
     if cached is not None and now - cached[0] < _CACHE_TTL_SECONDS:
         body = cached[1]
     else:
-        body = await _render(session_factory)
+        body = await _render(session_factory, state)
         _cache["body"] = (now, body)
     return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")

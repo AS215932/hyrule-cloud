@@ -660,6 +660,26 @@ async def dns_lookup(name: str, record_type: str = "A", dnssec: bool = False, tr
 
 
 @mcp.tool()
+async def dns_blocklist_check(domain: str) -> str:
+    """Paid domain check across common DNS-capable ad, privacy, and security lists."""
+    try:
+        async with _client() as hc:
+            return str(await hc.dns_blocklist_check(domain))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def dns_filtering_check(domain: str) -> str:
+    """Paid live public DNS filtering check from Hyrule's network vantage."""
+    try:
+        async with _client() as hc:
+            return str(await hc.dns_filtering_check(domain))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
 async def rdap_lookup(subject_type: str, value: str, include_raw: bool = False) -> str:
     """Paid RDAP lookup for domain, IP, prefix, ASN, or entity."""
     try:

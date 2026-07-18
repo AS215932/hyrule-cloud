@@ -351,6 +351,26 @@ class HyruleClient:
             json={"name": name, "type": record_type, "dnssec": dnssec, "trace": trace},
         )
 
+    async def dns_blocklist_sources(self) -> dict[str, Any]:
+        """Free blocklist catalog, licensing, freshness, and readiness metadata."""
+        return await self._request("GET", "/v1/dns/blocklists/sources")
+
+    async def dns_filtering_resolvers(self) -> dict[str, Any]:
+        """Free description of the fixed public DNS filtering matrix."""
+        return await self._request("GET", "/v1/dns/filtering/resolvers")
+
+    async def dns_blocklist_check(self, domain: str) -> dict[str, Any]:
+        """Paid domain check across the maintained DNS-capable blocklist catalog."""
+        return await self._request(
+            "POST", "/v1/dns/blocklists/check", json={"domain": domain}
+        )
+
+    async def dns_filtering_check(self, domain: str) -> dict[str, Any]:
+        """Paid live check across curated public DNS filtering profiles."""
+        return await self._request(
+            "POST", "/v1/dns/filtering/check", json={"domain": domain}
+        )
+
     async def dns_propagation(
         self,
         name: str,

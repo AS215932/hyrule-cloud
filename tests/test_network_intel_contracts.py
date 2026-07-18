@@ -32,6 +32,7 @@ def test_openapi_exposes_only_enabled_paid_launch_contracts():
         "/v1/bgp/lookup",
         "/v1/ip/lookup",
         "/v1/dns/lookup",
+        "/v1/dns/filtering/check",
         "/v1/dns/propagation",
         "/v1/rdap/lookup",
         "/v1/whois/lookup",
@@ -67,6 +68,12 @@ async def test_dns_capabilities_state_read_only_separation():
     assert body["service"] == "dns"
     assert "never registers domains" in body["separation_of_concerns"]
     assert "never mutates authoritative zone records" in body["separation_of_concerns"]
+    free = {endpoint["path"] for endpoint in body["free_endpoints"]}
+    paid = {endpoint["path"] for endpoint in body["paid_endpoints"]}
+    assert "/v1/dns/blocklists/sources" in free
+    assert "/v1/dns/filtering/resolvers" in free
+    assert "/v1/dns/filtering/check" in paid
+    assert "/v1/dns/blocklists/check" not in paid
 
 
 @pytest.mark.asyncio
@@ -345,6 +352,8 @@ async def test_x402_manifest_lists_network_intel_resources():
     assert "/v1/bgp/lookup" in paths
     assert "/v1/ip/lookup" in paths
     assert "/v1/dns/lookup" in paths
+    assert "/v1/dns/filtering/check" in paths
+    assert "/v1/dns/blocklists/check" not in paths
     assert "/v1/dns/propagation" in paths
     assert "/v1/rdap/lookup" in paths
     assert "/v1/whois/lookup" in paths
@@ -675,6 +684,8 @@ def test_bazaar_discovery_hides_gated_diagnostics_by_default():
     assert discovery_for("POST", "/v1/bgp/jobs") is None
     # Ungated diagnostics are still advertised.
     assert discovery_for("POST", "/v1/dns/lookup") is not None
+    assert discovery_for("POST", "/v1/dns/filtering/check") is not None
+    assert discovery_for("POST", "/v1/dns/blocklists/check") is None
     assert discovery_for("POST", "/v1/mx/check") is not None
 
 
