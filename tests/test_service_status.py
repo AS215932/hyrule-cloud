@@ -134,7 +134,10 @@ async def status_state():
     _STATUS_CACHE.update(value=None, expires_at=0.0, successful_at=0.0)
     previous = getattr(app.state, "_typed_state", None)
     app.state._typed_state = AppState(
-        config=SimpleNamespace(prometheus_url="http://prom.test:9090"),
+        config=SimpleNamespace(
+            prometheus_url="http://prom.test:9090",
+            require_real_provisioning=False,
+        ),
         orchestrator=None,
         payment_gate=None,
         network_provider=None,
@@ -178,6 +181,106 @@ async def test_no_public_alerts_is_operational(status_state, client):
     ]
     assert {component["status"] for component in body["components"]} == {"operational"}
     assert body["incidents"] == []
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_live_capacity_failure_degrades_vm_checkout_without_leaking_error(
+    status_state,
+    client,
+):
+    class CapacityProvider:
+        calls = 0
+
+        async def capacity(self):
+            self.calls += 1
+            raise RuntimeError("private XO schema details")
+
+    provider = CapacityProvider()
+    app.state._typed_state.config.require_real_provisioning = True
+    app.state._typed_state.orchestrator = SimpleNamespace(xcpng=provider)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    response = await client.get("/v1/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "degraded"
+    assert body["stale"] is False
+    components = {component["id"]: component for component in body["components"]}
+    assert components["api_checkout"]["status"] == "degraded"
+    assert components["compute"]["status"] == "degraded"
+    assert components["intelligence"]["status"] == "operational"
+    assert components["domains_dns"]["status"] == "operational"
+    assert components["network_proxy"]["status"] == "operational"
+    assert len(body["incidents"]) == 1
+    assert body["incidents"][0]["title"] == "New VM orders temporarily unavailable"
+    assert body["incidents"][0]["component_ids"] == ["api_checkout", "compute"]
+    assert "private XO" not in response.text
+    assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_live_capacity_success_is_cached_with_monitoring_snapshot(status_state, client):
+    class CapacityProvider:
+        calls = 0
+
+        async def capacity(self):
+            self.calls += 1
+            return SimpleNamespace(
+                physical_vcpu=8,
+                allocated_vcpu=2,
+                free_memory_bytes=8 * 1024**3,
+                free_storage_bytes=100 * 1024**3,
+            )
+
+    provider = CapacityProvider()
+    app.state._typed_state.config.require_real_provisioning = True
+    app.state._typed_state.orchestrator = SimpleNamespace(xcpng=provider)
+    rules_route = _mock_loaded_rules()
+    alerts_route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    first = await client.get("/v1/status")
+    second = await client.get("/v1/status")
+
+    assert first.json()["status"] == "operational"
+    assert second.json()["status"] == "operational"
+    assert provider.calls == 1
+    assert rules_route.call_count == 1
+    assert alerts_route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_live_capacity_probe_timeout_degrades_instead_of_hanging(
+    status_state,
+    client,
+    monkeypatch,
+):
+    from hyrule_cloud.api import status as status_api
+
+    class CapacityProvider:
+        async def capacity(self):
+            await asyncio.Event().wait()
+
+    app.state._typed_state.config.require_real_provisioning = True
+    app.state._typed_state.orchestrator = SimpleNamespace(xcpng=CapacityProvider())
+    monkeypatch.setattr(status_api, "_CAPACITY_PROBE_TIMEOUT_SECONDS", 0.01)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "degraded"
+    assert body["incidents"][0]["component_ids"] == ["api_checkout", "compute"]
 
 
 @pytest.mark.asyncio
