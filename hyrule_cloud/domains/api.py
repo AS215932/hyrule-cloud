@@ -10,6 +10,7 @@ import re
 from typing import Annotated, Any
 
 import structlog
+from cachetools import TTLCache
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
@@ -31,6 +32,10 @@ from hyrule_cloud.domains.models import (
     DomainOrderResponse,
     DomainQuoteRequest,
     DomainQuoteResponse,
+    DomainRegistrationRequest,
+    DomainRegistrationResponse,
+    DomainRegistrationStatusResponse,
+    DomainSalesStatusResponse,
     DomainTLDListResponse,
     DomainTransferOutRequest,
     LegacyDomainClaimRequest,
@@ -44,12 +49,20 @@ from hyrule_cloud.domains.wallet_auth import (
     WalletChallengeRequest,
     WalletChallengeResponse,
 )
-from hyrule_cloud.middleware.auth import current_account, require_account, require_scope
+from hyrule_cloud.middleware.auth import (
+    _client_ip,
+    current_account,
+    derive_ip_prefix_hash,
+    require_account,
+    require_scope,
+)
 from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.state import AppState, get_app_state
 
 router = APIRouter(prefix="/v1/domains", tags=["domains"])
 log = structlog.get_logger()
+
+_REGISTRATION_PREFLIGHTS: TTLCache[str, int] = TTLCache(maxsize=50_000, ttl=3600)
 
 
 async def get_domains(state: AppState = Depends(get_app_state)) -> DomainService:
@@ -74,6 +87,37 @@ def _idempotency(value: str | None) -> str:
     if not value or len(value) > 128:
         raise DomainProblem(400, "idempotency_key_required", "A valid Idempotency-Key header is required.")
     return value
+
+
+def _check_registration_preflight(request: Request, limit: int) -> None:
+    key = derive_ip_prefix_hash(_client_ip(request))
+    if not key:
+        return
+    current = _REGISTRATION_PREFLIGHTS.get(key, 0)
+    if current >= limit:
+        raise DomainProblem(
+            429,
+            "registration_preflight_limit",
+            "Too many domain checkout attempts; try again later.",
+            headers={"Retry-After": "3600"},
+        )
+    _REGISTRATION_PREFLIGHTS[key] = current + 1
+
+
+def _payment_chain_id(verified: Any, gate: PaymentGate) -> int:
+    if getattr(verified, "dev_bypass", False):
+        return 8453
+    requirements = getattr(verified, "matching_requirements", None)
+    network = str(getattr(requirements, "network", ""))
+    for configured in gate.config.enabled_networks():
+        if configured.caip2 == network and configured.chain_id is not None:
+            return configured.chain_id
+    if network.startswith("eip155:"):
+        try:
+            return int(network.split(":", 1)[1])
+        except ValueError:
+            pass
+    raise DomainProblem(422, "unsupported_chain", "The payment network is not supported.")
 
 
 @router.get("/tlds", response_model=DomainTLDListResponse)
@@ -146,6 +190,213 @@ async def get_quote(
     service: DomainService = Depends(get_domains),
 ) -> DomainQuoteResponse:
     return await service.get_quote(quote_id)
+
+
+@router.get("/sales/status", response_model=DomainSalesStatusResponse)
+async def domain_sales_status(
+    service: DomainService = Depends(get_domains),
+) -> DomainSalesStatusResponse:
+    return await service.sales_status()
+
+
+@router.get(
+    "/registrations/status/{status_id}",
+    response_model=DomainRegistrationStatusResponse,
+)
+async def domain_registration_status(
+    status_id: str,
+    service: DomainService = Depends(get_domains),
+) -> DomainRegistrationStatusResponse:
+    return await service.get_registration_status(status_id)
+
+
+@router.post(
+    "/registrations",
+    response_model=DomainRegistrationResponse,
+    status_code=202,
+)
+async def register_domain_x402(
+    body: DomainRegistrationRequest,
+    request: Request,
+    response: Response,
+    account: AccountRow | None = Depends(current_account),
+    service: DomainService = Depends(get_domains),
+    wallet_auth: WalletAuthService = Depends(get_wallet_auth),
+    gate: PaymentGate = Depends(get_gate),
+) -> DomainRegistrationResponse | Response:
+    """Register one domain for the verified x402 payer wallet."""
+
+    _check_registration_preflight(
+        request, service.domain_config.marketplace_preflights_per_hour
+    )
+    is_api_key = bool(getattr(request.state, "is_api_key", False))
+    intent, quote, prepared_order = await service.prepare_registration(
+        body,
+        request_account_id=account.account_id if account else None,
+    )
+    challenge = {
+        "registration_id": intent.registration_id,
+        "domain": intent.fqdn,
+        "quote_id": quote.quote_id,
+        "amount_usd": f"{quote.total_usd:.2f}",
+        "quote_expires_at": quote.expires_at.isoformat(),
+        "terms_version": quote.terms_version,
+        "registration_period_years": 1,
+        "status_url": f"/v1/domains/registrations/status/{intent.public_status_id}",
+    }
+    authorization_hash = gate.payment_authorization_hash(request)
+
+    # A settled EIP-3009 authorization may no longer pass facilitator verify
+    # after its nonce has been consumed. Possession of the exact authorization
+    # previously verified and bound to this durable order is sufficient for an
+    # idempotent response, but only once the order itself records payment.
+    if (
+        prepared_order is not None
+        and prepared_order.paid_at is not None
+        and authorization_hash is not None
+        and intent.payment_authorization_hash is not None
+        and hmac.compare_digest(
+            authorization_hash,
+            intent.payment_authorization_hash,
+        )
+    ):
+        if account is not None and intent.owner_account_id != account.account_id:
+            raise DomainProblem(
+                409,
+                "registration_owner_mismatch",
+                "This registration is bound to another account.",
+            )
+        if intent.owner_account_id is None:
+            raise DomainProblem(
+                503,
+                "registration_owner_unavailable",
+                "The registration owner is unavailable.",
+            )
+        if not is_api_key:
+            await wallet_auth.issue_session(
+                intent.owner_account_id,
+                request=request,
+                response=response,
+            )
+        response.status_code = 200
+        return await service.registration_response(intent.registration_id)
+
+    verified = await gate.verify_only(
+        request,
+        amount=quote.total_usd,
+        description=f"One-year Hyrule domain registration for {intent.fqdn}",
+        extra_body=challenge,
+    )
+    if isinstance(verified, Response):
+        return verified
+
+    payer = str(getattr(verified, "payer", ""))
+    if getattr(verified, "dev_bypass", False):
+        payer = "0x" + "d" * 40
+    if re.fullmatch(r"0x[0-9A-Fa-f]{40}", payer) is None:
+        raise DomainProblem(
+            502, "payer_unavailable", "The facilitator did not return a valid payer wallet."
+        )
+    service.require_marketplace_payer(payer)
+    owner, wallet, _ = await wallet_auth.resolve_x402_owner(
+        address=payer,
+        chain_id=_payment_chain_id(verified, gate),
+        account=account,
+        allow_link=not is_api_key,
+    )
+    if authorization_hash is None:
+        raise DomainProblem(400, "payment_authorization_missing", "Payment authorization missing.")
+    intent, order, created = await service.create_marketplace_order(
+        intent.registration_id,
+        owner_account_id=owner.account_id,
+        payer_address=wallet.address,
+        payment_authorization_hash=authorization_hash,
+    )
+
+    # A worker may already have replayed the durable settlement ledger after a
+    # prior response was lost. Reconcile before attempting the same signed
+    # authorization again.
+    if not created and intent.settlement_state in {
+        "settlement_pending",
+        "settlement_uncertain",
+    }:
+        await service.recover_x402_handoffs(limit=50)
+        intent, _, recovered_order = await service._load_registration(
+            intent.registration_id
+        )
+        if recovered_order is not None:
+            order = recovered_order
+
+    if order.status != "awaiting_payment":
+        if not is_api_key:
+            await wallet_auth.issue_session(
+                owner.account_id, request=request, response=response
+            )
+        response.status_code = 200
+        return await service.registration_response(intent.registration_id)
+
+    await service.assert_x402_payable(order.order_id)
+    settlement_extra = {
+        **challenge,
+        "order_id": order.order_id,
+    }
+    settled = await gate.settle_verified(request, verified, settlement_extra)
+    if not settled:
+        ambiguous = bool(
+            getattr(request.state, "payment_settlement_ambiguous", False)
+        )
+        await service.mark_registration_settlement(
+            intent.registration_id,
+            "settlement_uncertain" if ambiguous else "settlement_failed",
+            clear_authorization=not ambiguous,
+        )
+        if ambiguous:
+            raise DomainProblem(
+                503,
+                "payment_reconciliation_pending",
+                "Payment settlement is being reconciled; retry this exact order shortly.",
+                headers={"Retry-After": "15"},
+            )
+        raise DomainProblem(
+            502,
+            "payment_settlement_failed",
+            "The payment could not be settled; no registration was submitted.",
+        )
+
+    handoff_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            order = await service.mark_registration_paid(
+                intent.registration_id,
+                payer=wallet.address,
+                tx_hash=getattr(request.state, "payment_tx", None),
+                payment_network=getattr(request.state, "payment_network", None),
+                payment_asset=getattr(request.state, "payment_asset", None),
+            )
+            handoff_error = None
+            break
+        except Exception as exc:
+            handoff_error = exc
+            log.warning(
+                "domain_registration_handoff_attempt_failed",
+                registration_id=intent.registration_id,
+                order_id=order.order_id,
+                attempt=attempt + 1,
+                exc_info=True,
+            )
+            if attempt < 2:
+                await asyncio.sleep(0.1 * (attempt + 1))
+    if handoff_error is not None:
+        raise DomainProblem(
+            503,
+            "payment_handoff_pending",
+            "Payment settled, but the registration handoff is pending recovery.",
+            headers={"Retry-After": "15"},
+        ) from handoff_error
+    if not is_api_key:
+        await wallet_auth.issue_session(owner.account_id, request=request, response=response)
+    response.status_code = 202
+    return await service.registration_response(intent.registration_id)
 
 
 @router.post("/orders", response_model=DomainOrderResponse)

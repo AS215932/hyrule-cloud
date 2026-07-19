@@ -25,6 +25,23 @@ from tests.test_payment_gate_x402 import _FakeServer, _gate, _request
 
 
 def _enable_all_catalog_gates(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key, value in {
+        "DOMAIN_PURCHASES_ENABLED": "true",
+        "DOMAIN_MARKETPLACE_SALES_ENABLED": "true",
+        "DOMAIN_LEGAL_APPROVED": "true",
+        "DOMAIN_TAX_APPROVED": "true",
+        "DOMAIN_ALLOW_ALL_ELIGIBLE_TLDS": "true",
+        "DOMAIN_MARKETPLACE_PAYER_ALLOWLIST": "[]",
+        "DOMAIN_DNS_CONTROL_URL": "http://[2001:db8::53]:8453",
+        "DOMAIN_DNS_CONTROL_SECRET": "d" * 32,
+        "OPENPROVIDER_USERNAME": "catalog-test",
+        "OPENPROVIDER_PASSWORD": "catalog-test",
+        "OPENPROVIDER_OWNER_HANDLE": "owner",
+        "OPENPROVIDER_ADMIN_HANDLE": "admin",
+        "OPENPROVIDER_TECH_HANDLE": "tech",
+        "OPENPROVIDER_BILLING_HANDLE": "billing",
+    }.items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setattr(
         "hyrule_cloud.services.launch_proof.use_real_provisioning",
         lambda: True,
@@ -218,6 +235,29 @@ def test_manifest_openapi_and_bazaar_share_the_same_enabled_catalog(
     assert catalog_keys == manifest_keys == _schema_operations(schema) == set(DISCOVERY)
     assert all(resource["discoverable"] is True for resource in manifest["resources"])
     assert ("POST", "/v1/domain/register") not in catalog_keys
+
+
+def test_domain_registration_discovery_waits_for_public_cohort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_all_catalog_gates(monkeypatch)
+    config = HyruleConfig()
+    config.domain.marketplace_payer_allowlist = ["0x" + "1" * 40]
+
+    canary = build_x402_manifest(config)
+    assert "/v1/domains/registrations" not in {
+        resource["path"] for resource in canary["resources"]
+    }
+
+    config.domain.marketplace_payer_allowlist = []
+    public = build_x402_manifest(config)
+    registration = next(
+        resource
+        for resource in public["resources"]
+        if resource["path"] == "/v1/domains/registrations"
+    )
+    assert registration["minPrice"] == "3.00"
+    assert "maxPrice" not in registration
 
 
 @pytest.mark.asyncio

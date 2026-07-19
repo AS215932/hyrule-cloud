@@ -91,6 +91,7 @@ async def lifespan(app: FastAPI):
         config.payment,
         public_base_url=config.public_base_url,
         ledger=payment_ledger,
+        catalog_config=config,
     )
 
     # Network proxy sidecar client. x402 stays in Hyrule Cloud; the sidecar
@@ -261,7 +262,7 @@ async def llms_txt(request: Request) -> PlainTextResponse:
     lines = [
         "# Hyrule Cloud — x402-payable network services for AI agents",
         "",
-        catalog_description(),
+        catalog_description(config),
         "",
         f"Machine-readable catalog: {base}/.well-known/x402.json",
         f"OpenAPI (payable surface only): {base}/openapi.json",
@@ -275,7 +276,7 @@ async def llms_txt(request: Request) -> PlainTextResponse:
         "",
         "Paid operations (method path — min USD — description):",
     ]
-    for operation in enabled_paid_operations():
+    for operation in enabled_paid_operations(config):
         price = operation.price.minimum(config.payment)
         lines.append(
             f"  {operation.method} {operation.path} — ${price} — {operation.description}"
@@ -321,7 +322,8 @@ async def challenge_curated_x402_requests(request: Request, call_next) -> Respon
 
     from hyrule_cloud.services.discovery import match_enabled_operation
 
-    operation = match_enabled_operation(request.method, request.url.path)
+    config = getattr(state, "config", None)
+    operation = match_enabled_operation(request.method, request.url.path, config)
     if operation is None:
         return await call_next(request)
 

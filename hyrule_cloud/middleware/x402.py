@@ -16,6 +16,7 @@ back either a 402 Response or the verified payment details.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -47,7 +48,7 @@ from x402.mechanisms.evm.exact import ExactEvmServerScheme
 from x402.schemas import PaymentPayload, PaymentRequirements, ResourceConfig, ResourceInfo
 from x402.server import x402ResourceServer
 
-from hyrule_cloud.config import PaymentConfig
+from hyrule_cloud.config import HyruleConfig, PaymentConfig
 
 if TYPE_CHECKING:
     from hyrule_cloud.services.payments_ledger import PaymentLedger
@@ -177,10 +178,12 @@ class PaymentGate:
         config: PaymentConfig,
         public_base_url: str = "",
         ledger: PaymentLedger | None = None,
+        catalog_config: HyruleConfig | None = None,
     ) -> None:
         self.config = config
         self.public_base_url = public_base_url.rstrip("/")
         self.ledger = ledger
+        self.catalog_config = catalog_config
         self._facilitator_host = urlparse(config.facilitator_url).hostname or ""
         self.facilitator = HTTPFacilitatorClient(_facilitator_config(config))
         self.server = x402ResourceServer(self.facilitator)
@@ -248,7 +251,7 @@ class PaymentGate:
 
         route = request.scope.get("route")
         path = route_path or getattr(route, "path", None) or request.url.path
-        declared = discovery_for(request.method, path)
+        declared = discovery_for(request.method, path, self.catalog_config)
         if not declared:
             return None
         enrich = getattr(self.server, "enrich_extensions", None)
@@ -276,12 +279,14 @@ class PaymentGate:
 
         operation = None
         if request_url:
-            operation = match_enabled_operation_any_method(urlsplit(request_url).path)
+            operation = match_enabled_operation_any_method(
+                urlsplit(request_url).path, self.catalog_config
+            )
         if operation is None:
             return ResourceInfo(url=request_url or "", description=description or None)
         return ResourceInfo(
             url=request_url or "",
-            description=marketplace_resource_description(operation),
+            description=marketplace_resource_description(operation, self.catalog_config),
             mime_type="application/json",
             service_name="Hyrule Cloud",
             tags=list(operation.tags),
@@ -392,6 +397,20 @@ class PaymentGate:
             self.config.dev_bypass_secret
             and request.headers.get("X-DEV-BYPASS") == self.config.dev_bypass_secret
         )
+
+    def payment_authorization_hash(self, request: Request) -> str | None:
+        """Stable identifier for one signed authorization, without storing it."""
+
+        header = self._payment_header(request)
+        if header:
+            return hashlib.sha256(header.encode("utf-8")).hexdigest()
+        if (
+            self.config.dev_bypass_secret
+            and request.headers.get("X-DEV-BYPASS") == self.config.dev_bypass_secret
+        ):
+            marker = f"dev-bypass:{request.method}:{request.url.path}"
+            return hashlib.sha256(marker.encode("utf-8")).hexdigest()
+        return None
 
     # Ledger writes are best-effort observability: a slow/exhausted payments
     # DB must never hold a settled response hostage. Writes that exceed this
@@ -783,7 +802,12 @@ class PaymentGate:
             log.error("payment_processing_error", exc_info=True)
             return self._json_response(502, {"error": "Payment processing error"})
 
-    async def settle_verified(self, request: Request, verified: VerifiedPayment) -> bool:
+    async def settle_verified(
+        self,
+        request: Request,
+        verified: VerifiedPayment,
+        extra_body: dict[str, Any] | None = None,
+    ) -> bool:
         """Settle a payment already verified by ``verify_only``.
 
         Call ONLY after the paid resource has been delivered. Attaches the
@@ -794,15 +818,23 @@ class PaymentGate:
         """
         if verified.dev_bypass:
             request.state.payment_tx = "dev_bypass_0x0"
+            request.state.payment_network = "dev"
+            request.state.payment_asset = "USDC"
+            request.state.payment_payer = verified.payer
+            request.state.payment_settlement_ambiguous = False
             await self._record(
                 "dev_bypass",
                 request,
                 verified.amount,
                 payer="0xDEV_TEST_WALLET",
                 tx_hash="dev_bypass_0x0",
+                extra=extra_body,
             )
             return True
 
+        request.state.payment_network = verified.matching_requirements.network
+        request.state.payment_asset = verified.matching_requirements.asset
+        request.state.payment_payer = verified.payer
         try:
             settlement = await self.server.settle_payment(
                 verified.payment_payload,
@@ -812,6 +844,7 @@ class PaymentGate:
             # A facilitator error must not become an unhandled 500 in the route;
             # report failed settlement so the caller withholds the paid result.
             log.error("payment_settlement_error", exc_info=True)
+            request.state.payment_settlement_ambiguous = True
             await self._record(
                 "settle_failed",
                 request,
@@ -820,6 +853,7 @@ class PaymentGate:
                 asset=verified.matching_requirements.asset,
                 payer=verified.payer,
                 error="Payment settlement error",
+                extra=extra_body,
             )
             return False
         settlement_header = encode_payment_response_header(settlement)
@@ -829,6 +863,7 @@ class PaymentGate:
         }
 
         if not settlement.success:
+            request.state.payment_settlement_ambiguous = False
             log.warning(
                 "payment_settlement_failed",
                 error_reason=settlement.error_reason,
@@ -842,6 +877,7 @@ class PaymentGate:
                 asset=verified.matching_requirements.asset,
                 payer=settlement.payer or verified.payer,
                 error=settlement.error_reason or "Payment settlement failed",
+                extra=extra_body,
             )
             return False
 
@@ -856,8 +892,11 @@ class PaymentGate:
             asset=verified.matching_requirements.asset,
             payer=wallet,
             tx_hash=tx_hash,
+            extra=extra_body,
         )
         request.state.payment_tx = tx_hash
+        request.state.payment_payer = wallet
+        request.state.payment_settlement_ambiguous = False
         return True
 
     @staticmethod

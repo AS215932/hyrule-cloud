@@ -315,6 +315,40 @@ class DomainOrderRow(Base):
     )
 
 
+class DomainRegistrationIntentRow(Base):
+    """Durable public x402 checkout state keyed by a client-generated id."""
+
+    __tablename__ = "domain_registration_intents"
+
+    registration_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    client_order_id: Mapped[str] = mapped_column(String(128), unique=True)
+    fqdn: Mapped[str] = mapped_column(String(253), index=True)
+    quote_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("domain_quotes.quote_id", ondelete="RESTRICT"), index=True
+    )
+    order_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("domain_orders.order_id", ondelete="SET NULL"),
+        unique=True,
+    )
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+    payer_address: Mapped[str | None] = mapped_column(String(42), index=True)
+    public_status_id: Mapped[str] = mapped_column(String(32), unique=True)
+    payment_authorization_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    settlement_state: Mapped[str] = mapped_column(
+        String(24), default="awaiting_payment", server_default="awaiting_payment", index=True
+    )
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class DomainOperationRow(Base):
     __tablename__ = "domain_operations"
 

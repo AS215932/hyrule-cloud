@@ -16,12 +16,14 @@ import dns.rdatatype
 import structlog
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
+    AccountRow,
     CryptoIntentRow,
     DomainDNSRecordRow,
     DomainIdempotencyRow,
@@ -29,7 +31,9 @@ from hyrule_cloud.db import (
     DomainOperationRow,
     DomainOrderRow,
     DomainQuoteRow,
+    DomainRegistrationIntentRow,
     DomainRow,
+    DomainTLDRow,
     OpenproviderWebhookRow,
     PaymentEventRow,
     VMQuoteRow,
@@ -57,6 +61,10 @@ from hyrule_cloud.domains.models import (
     DomainOrderStatus,
     DomainPaymentMethod,
     DomainQuoteResponse,
+    DomainRegistrationRequest,
+    DomainRegistrationResponse,
+    DomainRegistrationStatusResponse,
+    DomainSalesStatusResponse,
     DomainSummary,
     DomainTLDListResponse,
     DomainTLDSummary,
@@ -68,6 +76,8 @@ from hyrule_cloud.domains.models import (
     generate_domain_operation_id,
     generate_domain_order_id,
     generate_domain_quote_id,
+    generate_domain_registration_id,
+    generate_domain_status_id,
 )
 from hyrule_cloud.domains.pricing import money_breakdown, price_domain
 from hyrule_cloud.domains.validation import (
@@ -139,7 +149,7 @@ class DomainService:
     async def close(self) -> None:
         await self.dns.close()
 
-    def require_purchase_launch(self, account_id: str) -> None:
+    def _require_purchase_readiness(self) -> None:
         cfg = self.domain_config
         if not cfg.enabled or not cfg.purchases_enabled:
             raise DomainProblem(
@@ -178,9 +188,39 @@ class DomainService:
                 "registrar_not_ready",
                 "Domain checkout is unavailable until registrar contacts are configured.",
             )
+
+    def require_purchase_launch(self, account_id: str) -> None:
+        self._require_purchase_readiness()
+        cfg = self.domain_config
         if cfg.account_allowlist and account_id not in cfg.account_allowlist:
             raise DomainProblem(
                 403, "account_not_allowlisted", "This account is not in the launch cohort."
+            )
+
+    def require_marketplace_launch(self) -> None:
+        self._require_purchase_readiness()
+        cfg = self.domain_config
+        if not cfg.marketplace_sales_enabled:
+            raise DomainProblem(
+                503,
+                "marketplace_sales_disabled",
+                "Public domain registration is not enabled yet.",
+                headers={"Retry-After": "3600"},
+            )
+        if not cfg.tld_allowlist and not cfg.allow_all_eligible_tlds:
+            raise DomainProblem(
+                503,
+                "marketplace_tld_scope_missing",
+                "Public domain registration has no approved TLD scope.",
+                headers={"Retry-After": "3600"},
+            )
+
+    def require_marketplace_payer(self, payer_address: str) -> None:
+        payer = payer_address.lower()
+        allowed = {value.lower() for value in self.domain_config.marketplace_payer_allowlist}
+        if allowed and payer not in allowed:
+            raise DomainProblem(
+                403, "payer_not_allowlisted", "This payment wallet is not in the launch cohort."
             )
 
     async def list_tlds(self) -> DomainTLDListResponse:
@@ -355,6 +395,503 @@ class DomainService:
         if row is None:
             raise DomainProblem(404, "quote_not_found", "Domain quote not found.")
         return self._quote_response(row)
+
+    async def prepare_registration(
+        self,
+        body: DomainRegistrationRequest,
+        *,
+        request_account_id: str | None,
+    ) -> tuple[DomainRegistrationIntentRow, DomainQuoteRow, DomainOrderRow | None]:
+        """Create or replay the uncharged half of a marketplace checkout."""
+
+        self.require_marketplace_launch()
+        _, _, fqdn = normalize_registrable_domain(body.domain)
+        async with self.db() as session:
+            existing = (
+                await session.execute(
+                    select(DomainRegistrationIntentRow).where(
+                        DomainRegistrationIntentRow.client_order_id == body.client_order_id
+                    )
+                )
+            ).scalar_one_or_none()
+        if existing is not None:
+            if existing.fqdn != fqdn:
+                raise DomainProblem(
+                    409,
+                    "client_order_id_conflict",
+                    "This client_order_id is already bound to another domain.",
+                )
+            if body.quote_id and body.quote_id != existing.quote_id:
+                raise DomainProblem(
+                    409,
+                    "client_order_id_conflict",
+                    "This client_order_id is already bound to another quote.",
+                )
+            intent, quote, order = await self._load_registration(existing.registration_id)
+            if order is None and self._registration_quote_needs_refresh(quote):
+                if body.quote_id:
+                    self._validate_registration_quote(
+                        quote,
+                        fqdn=fqdn,
+                        request_account_id=request_account_id,
+                        max_price_usd=body.max_price_usd,
+                    )
+                replacement = await self._create_marketplace_quote(fqdn)
+                async with self.db() as session:
+                    current = (
+                        await session.execute(
+                            select(DomainRegistrationIntentRow)
+                            .where(
+                                DomainRegistrationIntentRow.registration_id
+                                == existing.registration_id
+                            )
+                            .with_for_update()
+                        )
+                    ).scalar_one()
+                    if current.order_id is None and current.quote_id == quote.quote_id:
+                        current.quote_id = replacement.quote_id
+                        current.updated_at = _now()
+                        await session.commit()
+                intent, quote, order = await self._load_registration(existing.registration_id)
+            self._validate_registration_quote(
+                quote,
+                fqdn=fqdn,
+                request_account_id=request_account_id,
+                max_price_usd=body.max_price_usd,
+                reserved=order is not None,
+                paid=order is not None and order.paid_at is not None,
+            )
+            return intent, quote, order
+
+        if body.quote_id:
+            async with self.db() as session:
+                requested_quote = await session.get(DomainQuoteRow, body.quote_id)
+            if requested_quote is None:
+                raise DomainProblem(404, "quote_not_found", "Domain quote not found.")
+            quote = requested_quote
+            self._validate_registration_quote(
+                quote,
+                fqdn=fqdn,
+                request_account_id=request_account_id,
+                max_price_usd=body.max_price_usd,
+            )
+        else:
+            quote = await self._create_marketplace_quote(fqdn)
+            self._validate_registration_quote(
+                quote,
+                fqdn=fqdn,
+                request_account_id=request_account_id,
+                max_price_usd=body.max_price_usd,
+            )
+        now = _now()
+        intent = DomainRegistrationIntentRow(
+            registration_id=generate_domain_registration_id(),
+            client_order_id=body.client_order_id,
+            fqdn=fqdn,
+            quote_id=quote.quote_id,
+            public_status_id=generate_domain_status_id(),
+            settlement_state="awaiting_payment",
+            created_at=now,
+            updated_at=now,
+        )
+        async with self.db() as session:
+            session.add(intent)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                winner = (
+                    await session.execute(
+                        select(DomainRegistrationIntentRow).where(
+                            DomainRegistrationIntentRow.client_order_id
+                            == body.client_order_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if winner is None:
+                    raise DomainProblem(
+                        409, "registration_conflict", "This registration already exists."
+                    )
+                if winner.fqdn != fqdn:
+                    raise DomainProblem(
+                        409,
+                        "client_order_id_conflict",
+                        "This client_order_id is already bound to another domain.",
+                    )
+                # Apply the full replay contract to the concurrent winner. In
+                # particular, never bypass an explicit quote binding or the
+                # caller's max_price_usd merely because two first requests
+                # raced on the unique client_order_id.
+                return await self.prepare_registration(
+                    body,
+                    request_account_id=request_account_id,
+                )
+        return intent, quote, None
+
+    async def _create_marketplace_quote(self, fqdn: str) -> DomainQuoteRow:
+        created = await self.create_quote(fqdn, DomainAction.REGISTER, None)
+        async with self.db() as session:
+            row = await session.get(DomainQuoteRow, created.quote_id)
+        if row is None:  # pragma: no cover - a committed quote must be readable
+            raise DomainProblem(503, "quote_unavailable", "The domain quote is unavailable.")
+        return row
+
+    def _registration_quote_needs_refresh(self, quote: DomainQuoteRow) -> bool:
+        return (
+            quote.status != "active"
+            or _aware(quote.expires_at) <= _now()
+            or quote.terms_version != self.domain_config.terms_version
+        )
+
+    def _validate_registration_quote(
+        self,
+        quote: DomainQuoteRow,
+        *,
+        fqdn: str,
+        request_account_id: str | None,
+        max_price_usd: Decimal | None,
+        reserved: bool = False,
+        paid: bool = False,
+    ) -> None:
+        if quote.fqdn != fqdn or quote.action != DomainAction.REGISTER.value:
+            raise DomainProblem(409, "quote_mismatch", "The quote does not match this registration.")
+        if quote.owner_account_id and quote.owner_account_id != request_account_id:
+            raise DomainProblem(404, "quote_not_found", "Domain quote not found.")
+        if not paid:
+            if quote.premium or not quote.available:
+                raise DomainProblem(409, "domain_unavailable", "This domain is not available.")
+            if quote.terms_version != self.domain_config.terms_version:
+                raise DomainProblem(
+                    409, "terms_changed", "The domain terms changed; request a new quote."
+                )
+            allowed_statuses = {"reserved", "consumed"} if reserved else {"active"}
+            if quote.status not in allowed_statuses:
+                raise DomainProblem(409, "quote_unavailable", "This domain quote is unavailable.")
+            if not reserved and _aware(quote.expires_at) <= _now():
+                raise DomainProblem(409, "quote_expired", "This domain quote has expired.")
+        if max_price_usd is not None and Decimal(quote.total_usd) > max_price_usd:
+            raise DomainProblem(
+                409,
+                "price_above_maximum",
+                "The current registration price exceeds max_price_usd.",
+            )
+
+    async def _load_registration(
+        self, registration_id: str
+    ) -> tuple[DomainRegistrationIntentRow, DomainQuoteRow, DomainOrderRow | None]:
+        async with self.db() as session:
+            intent = await session.get(DomainRegistrationIntentRow, registration_id)
+            if intent is None:
+                raise DomainProblem(404, "registration_not_found", "Registration not found.")
+            quote = await session.get(DomainQuoteRow, intent.quote_id)
+            order = await session.get(DomainOrderRow, intent.order_id) if intent.order_id else None
+        if quote is None:
+            raise DomainProblem(503, "quote_unavailable", "The domain quote is unavailable.")
+        return intent, quote, order
+
+    async def create_marketplace_order(
+        self,
+        registration_id: str,
+        *,
+        owner_account_id: str,
+        payer_address: str,
+        payment_authorization_hash: str,
+    ) -> tuple[DomainRegistrationIntentRow, DomainOrderRow, bool]:
+        """Bind a verified payer and reserve one quote before settlement."""
+
+        self.require_marketplace_launch()
+        payer = payer_address.lower()
+        self.require_marketplace_payer(payer)
+        if len(payment_authorization_hash) != 64:
+            raise DomainProblem(400, "payment_authorization_missing", "Payment authorization missing.")
+        now = _now()
+        async with self.db() as session:
+            intent = (
+                await session.execute(
+                    select(DomainRegistrationIntentRow)
+                    .where(DomainRegistrationIntentRow.registration_id == registration_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if intent is None:
+                raise DomainProblem(404, "registration_not_found", "Registration not found.")
+            if intent.payer_address and intent.payer_address != payer:
+                raise DomainProblem(
+                    409,
+                    "registration_payer_mismatch",
+                    "This registration is bound to another payment wallet.",
+                )
+            if intent.owner_account_id and intent.owner_account_id != owner_account_id:
+                raise DomainProblem(
+                    409,
+                    "registration_owner_mismatch",
+                    "This registration is bound to another account.",
+                )
+            # Every verified payer maps one-to-one to an account. Locking that
+            # owner row serializes the rolling-window count across distinct
+            # client_order_ids, so concurrent authorizations cannot all see
+            # the same remaining slot.
+            owner = (
+                await session.execute(
+                    select(AccountRow)
+                    .where(AccountRow.account_id == owner_account_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if owner is None:
+                raise DomainProblem(401, "authentication_required", "The owner account is unavailable.")
+            if intent.order_id:
+                order = await session.get(DomainOrderRow, intent.order_id)
+                if order is None:
+                    raise DomainProblem(503, "order_unavailable", "The domain order is unavailable.")
+                if (
+                    intent.payment_authorization_hash
+                    and intent.payment_authorization_hash != payment_authorization_hash
+                    and intent.settlement_state
+                    in {"settlement_pending", "settlement_uncertain"}
+                ):
+                    raise DomainProblem(
+                        409,
+                        "payment_in_progress",
+                        "A different payment authorization is already being reconciled.",
+                    )
+                if intent.settlement_state in {"awaiting_payment", "settlement_failed"}:
+                    intent.payment_authorization_hash = payment_authorization_hash
+                    intent.settlement_state = "settlement_pending"
+                    intent.updated_at = now
+                    await session.commit()
+                return intent, order, False
+
+            quote = (
+                await session.execute(
+                    select(DomainQuoteRow)
+                    .where(DomainQuoteRow.quote_id == intent.quote_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if quote is None:
+                raise DomainProblem(503, "quote_unavailable", "The domain quote is unavailable.")
+            self._validate_registration_quote(
+                quote,
+                fqdn=intent.fqdn,
+                request_account_id=owner_account_id,
+                max_price_usd=None,
+            )
+            cutoff = now - timedelta(hours=24)
+            rolling_window = or_(
+                and_(
+                    DomainRegistrationIntentRow.settlement_state.in_(
+                        ("settlement_pending", "settlement_uncertain")
+                    ),
+                    DomainRegistrationIntentRow.updated_at >= cutoff,
+                ),
+                and_(
+                    DomainRegistrationIntentRow.settlement_state == "settled",
+                    DomainRegistrationIntentRow.settled_at >= cutoff,
+                ),
+            )
+            payer_count = await session.scalar(
+                select(func.count())
+                .select_from(DomainRegistrationIntentRow)
+                .where(
+                    DomainRegistrationIntentRow.payer_address == payer,
+                    rolling_window,
+                )
+            )
+            owner_count = await session.scalar(
+                select(func.count())
+                .select_from(DomainRegistrationIntentRow)
+                .where(
+                    DomainRegistrationIntentRow.owner_account_id == owner_account_id,
+                    rolling_window,
+                )
+            )
+            limit = self.domain_config.registration_limit_per_24h
+            if int(payer_count or 0) >= limit or int(owner_count or 0) >= limit:
+                raise DomainProblem(
+                    429,
+                    "registration_limit_reached",
+                    "The 24-hour domain registration limit has been reached.",
+                    headers={"Retry-After": "3600"},
+                )
+            reserved = await session.execute(
+                update(DomainQuoteRow)
+                .where(
+                    DomainQuoteRow.quote_id == quote.quote_id,
+                    DomainQuoteRow.status == "active",
+                    DomainQuoteRow.expires_at > now,
+                )
+                .values(status="reserved")
+                .execution_options(synchronize_session=False)
+            )
+            if int(getattr(reserved, "rowcount", 0) or 0) != 1:
+                raise DomainProblem(
+                    409, "quote_unavailable", "This domain quote is already bound to another order."
+                )
+            order = DomainOrderRow(
+                order_id=generate_domain_order_id(),
+                quote_id=quote.quote_id,
+                fqdn=quote.fqdn,
+                action=DomainAction.REGISTER.value,
+                owner_account_id=owner_account_id,
+                idempotency_key=intent.client_order_id,
+                status=DomainOrderStatus.AWAITING_PAYMENT.value,
+                amount_usd=quote.total_usd,
+                domain_amount_usd=quote.total_usd,
+                vm_amount_usd=Decimal("0"),
+                payment_method=DomainPaymentMethod.USDC.value,
+                refund_address=None,
+                on_domain_failure=DomainFailurePolicy.KEEP_VM.value,
+                terms_version=self.domain_config.terms_version,
+                terms_accepted_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(order)
+            intent.order_id = order.order_id
+            intent.owner_account_id = owner_account_id
+            intent.payer_address = payer
+            intent.payment_authorization_hash = payment_authorization_hash
+            intent.settlement_state = "settlement_pending"
+            intent.updated_at = now
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise DomainProblem(
+                    409, "registration_conflict", "This registration already has an order."
+                ) from exc
+            return intent, order, True
+
+    async def mark_registration_paid(
+        self,
+        registration_id: str,
+        *,
+        payer: str,
+        tx_hash: str | None,
+        payment_network: str | None,
+        payment_asset: str | None,
+    ) -> DomainOrderRow:
+        intent, _, order = await self._load_registration(registration_id)
+        if order is None:
+            raise DomainProblem(404, "order_not_found", "Domain order not found.")
+        current = await self.mark_x402_paid(
+            order.order_id,
+            payer=payer,
+            tx_hash=tx_hash,
+            payment_network=payment_network,
+            payment_asset=payment_asset,
+        )
+        async with self.db() as session:
+            stored = await session.get(DomainRegistrationIntentRow, intent.registration_id)
+            if stored is not None:
+                stored.settlement_state = "settled"
+                stored.settled_at = stored.settled_at or _now()
+                stored.updated_at = _now()
+                await session.commit()
+        return current
+
+    async def mark_registration_settlement(
+        self,
+        registration_id: str,
+        state: str,
+        *,
+        clear_authorization: bool = False,
+    ) -> None:
+        if state not in {"settlement_failed", "settlement_uncertain"}:
+            raise ValueError("unsupported registration settlement state")
+        async with self.db() as session:
+            intent = await session.get(DomainRegistrationIntentRow, registration_id)
+            if intent is None:
+                return
+            intent.settlement_state = state
+            if clear_authorization:
+                intent.payment_authorization_hash = None
+            intent.updated_at = _now()
+            await session.commit()
+
+    async def registration_response(
+        self, registration_id: str
+    ) -> DomainRegistrationResponse:
+        intent, _, order = await self._load_registration(registration_id)
+        if order is None or intent.payer_address is None:
+            raise DomainProblem(409, "registration_unpaid", "The registration is not paid.")
+        return DomainRegistrationResponse(
+            registration_id=intent.registration_id,
+            order_id=order.order_id,
+            domain=intent.fqdn,
+            status=self._public_registration_status(intent, order),
+            amount_usd=f"{Decimal(order.amount_usd):.2f}",
+            owner_wallet=intent.payer_address,
+            terms_version=order.terms_version,
+            status_url=f"/v1/domains/registrations/status/{intent.public_status_id}",
+            management_url=f"/v1/domains/{intent.fqdn}",
+            operation_id=order.operation_id,
+            created_at=_aware(intent.created_at),
+            updated_at=_aware(intent.updated_at),
+        )
+
+    async def get_registration_status(
+        self, status_id: str
+    ) -> DomainRegistrationStatusResponse:
+        async with self.db() as session:
+            intent = (
+                await session.execute(
+                    select(DomainRegistrationIntentRow).where(
+                        DomainRegistrationIntentRow.public_status_id == status_id
+                    )
+                )
+            ).scalar_one_or_none()
+            order = (
+                await session.get(DomainOrderRow, intent.order_id)
+                if intent is not None and intent.order_id
+                else None
+            )
+        if intent is None:
+            raise DomainProblem(404, "registration_not_found", "Registration not found.")
+        return DomainRegistrationStatusResponse(
+            registration_id=intent.registration_id,
+            domain=intent.fqdn,
+            status=self._public_registration_status(intent, order),
+            operation_id=order.operation_id if order else None,
+            created_at=_aware(intent.created_at),
+            updated_at=_aware(intent.updated_at),
+        )
+
+    async def sales_status(self) -> DomainSalesStatusResponse:
+        try:
+            self.require_marketplace_launch()
+            eligible_rows = await self.catalog.list_eligible()
+            eligible = len(eligible_rows)
+            enabled = eligible > 0
+        except DomainProblem:
+            enabled = False
+            async with self.db() as session:
+                eligible = int(
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(DomainTLDRow)
+                        .where(DomainTLDRow.eligible.is_(True))
+                    )
+                    or 0
+                )
+        return DomainSalesStatusResponse(
+            enabled=enabled,
+            terms_version=self.domain_config.terms_version,
+            minimum_hyrule_fee_usd=f"{self.domain_config.markup_min_usd:.2f}",
+            eligible_tld_count=eligible,
+            max_registrations_per_wallet_24h=self.domain_config.registration_limit_per_24h,
+        )
+
+    @staticmethod
+    def _public_registration_status(
+        intent: DomainRegistrationIntentRow, order: DomainOrderRow | None
+    ) -> str:
+        if order is not None and order.status != DomainOrderStatus.AWAITING_PAYMENT.value:
+            return order.status
+        if intent.settlement_state in {"settlement_pending", "settlement_uncertain"}:
+            return "payment_pending"
+        return "awaiting_payment"
 
     async def create_order(
         self,
@@ -704,6 +1241,21 @@ class DomainService:
             ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            if order.status == DomainOrderStatus.EXPIRED.value:
+                # The quote sweeper can win the race with an in-flight
+                # facilitator settlement. Funds that arrive after expiry must
+                # become an explicit refund obligation, never remain attached
+                # to an apparently unpaid expired order.
+                order.paid_at = _now()
+                order.payer = payer[:128]
+                order.payment_tx = tx_hash
+                order.payment_network = payment_network
+                order.payment_asset = payment_asset
+                order.status = DomainOrderStatus.REFUND_DUE.value
+                order.error_code = "payment_after_expiry"
+                session.add(self._build_refund_event(order, "payment_after_expiry"))
+                await session.commit()
+                return order
             if order.status not in {
                 DomainOrderStatus.AWAITING_PAYMENT.value,
                 DomainOrderStatus.PAID.value,
@@ -1235,9 +1787,11 @@ class DomainService:
         seen: set[str] = set()
         cursor: tuple[datetime, str] | None = None
         while True:
-            filters = [
+            filters: list[ColumnElement[bool]] = [
                 PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
-                PaymentEventRow.resource_path == "/v1/domains/orders",
+                PaymentEventRow.resource_path.in_(
+                    ["/v1/domains/orders", "/v1/domains/registrations"]
+                ),
             ]
             if cursor is not None:
                 created_at, event_id = cursor
@@ -1272,11 +1826,29 @@ class DomainService:
                 seen.add(order_id)
                 async with self.db() as session:
                     order = await session.get(DomainOrderRow, order_id)
+                    registration = (
+                        await session.execute(
+                            select(DomainRegistrationIntentRow).where(
+                                DomainRegistrationIntentRow.order_id == order_id
+                            )
+                        )
+                    ).scalar_one_or_none()
                     awaiting = bool(
                         order is not None
                         and order.status == DomainOrderStatus.AWAITING_PAYMENT.value
                     )
                 if not awaiting:
+                    if registration is not None and order is not None:
+                        async with self.db() as session:
+                            stored = await session.get(
+                                DomainRegistrationIntentRow,
+                                registration.registration_id,
+                            )
+                            if stored is not None and stored.settlement_state != "settled":
+                                stored.settlement_state = "settled"
+                                stored.settled_at = stored.settled_at or _now()
+                                stored.updated_at = _now()
+                                await session.commit()
                     continue
                 await self._mark_paid(
                     order_id,
@@ -1285,6 +1857,17 @@ class DomainService:
                     payment_network=event.network,
                     payment_asset=event.asset,
                 )
+                if registration is not None:
+                    async with self.db() as session:
+                        stored = await session.get(
+                            DomainRegistrationIntentRow,
+                            registration.registration_id,
+                        )
+                        if stored is not None:
+                            stored.settlement_state = "settled"
+                            stored.settled_at = stored.settled_at or _now()
+                            stored.updated_at = _now()
+                            await session.commit()
                 recovered += 1
             if len(events) < limit:
                 break

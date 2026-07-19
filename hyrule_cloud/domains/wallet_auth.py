@@ -107,6 +107,126 @@ class WalletAuthService:
                 )
             ).scalar_one_or_none()
 
+    async def resolve_x402_owner(
+        self,
+        *,
+        address: str,
+        chain_id: int,
+        account: AccountRow | None,
+        allow_link: bool,
+    ) -> tuple[AccountRow, AccountWalletRow, bool]:
+        """Resolve a verified x402 payer to the account that owns the sale.
+
+        A browser session may link its first wallet. API keys may use an
+        already-linked matching wallet but can never mutate account identity.
+        Anonymous payers receive a wallet-only account.  All mismatch checks
+        happen before the caller settles the authorization.
+        """
+
+        normalized = _normalize_address(address)
+        for _attempt in range(2):
+            async with self.db() as session:
+                wallet = (
+                    await session.execute(
+                        select(AccountWalletRow)
+                        .where(AccountWalletRow.address == normalized)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if wallet is not None:
+                    if account is not None and wallet.account_id != account.account_id:
+                        raise DomainProblem(
+                            409,
+                            "wallet_account_mismatch",
+                            "The payment wallet belongs to a different account.",
+                        )
+                    owner = await session.get(AccountRow, wallet.account_id)
+                    if owner is None:
+                        raise DomainProblem(
+                            409, "wallet_account_unavailable", "The wallet account is unavailable."
+                        )
+                    return owner, wallet, False
+
+                created = False
+                if account is not None:
+                    if not allow_link:
+                        raise DomainProblem(
+                            403,
+                            "browser_session_required",
+                            "Link this payment wallet from a browser session before using an API key.",
+                        )
+                    linked = (
+                        await session.execute(
+                            select(AccountWalletRow)
+                            .where(AccountWalletRow.account_id == account.account_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if linked is not None:
+                        raise DomainProblem(
+                            409,
+                            "wallet_account_mismatch",
+                            "This account is linked to a different payment wallet.",
+                        )
+                    owner = await session.get(AccountRow, account.account_id)
+                    if owner is None:
+                        raise DomainProblem(401, "authentication_required", "The account is unavailable.")
+                else:
+                    owner = AccountRow(
+                        account_id=generate_account_id(),
+                        password_hash=hash_password(secrets.token_urlsafe(48)),
+                        recovery_code_hash=None,
+                        password_changed_at=_now(),
+                    )
+                    session.add(owner)
+                    await session.flush()
+                    created = True
+
+                wallet = AccountWalletRow(
+                    wallet_id=str(uuid.uuid4()),
+                    account_id=owner.account_id,
+                    address=normalized,
+                    chain_id=chain_id,
+                )
+                session.add(wallet)
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    await session.rollback()
+                    # Another request may have claimed the wallet or linked an
+                    # account concurrently. Re-read once and apply the normal
+                    # ownership checks instead of guessing the winner.
+                    continue
+                return owner, wallet, created
+        raise DomainProblem(
+            409,
+            "wallet_link_conflict",
+            "The payment wallet changed concurrently; retry the checkout.",
+        )
+
+    async def issue_session(
+        self,
+        account_id: str,
+        *,
+        request: Request,
+        response: Response,
+    ) -> None:
+        """Create the management session only after checkout settlement."""
+
+        async with self.db() as session:
+            token = await create_session(
+                session,
+                account_id,
+                user_agent=request.headers.get("user-agent"),
+                ip_prefix_hash=derive_ip_prefix_hash(_client_ip(request)),
+            )
+        secure = request.url.scheme == "https" or request.url.hostname not in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }
+        response.set_cookie(value=token, **cookie_kwargs_for_set(secure=secure))
+
     async def create_challenge(
         self,
         body: WalletChallengeRequest,
