@@ -265,13 +265,9 @@ async def test_unbuilt_paid_endpoints_return_501_before_charging():
 
 @pytest.mark.asyncio
 async def test_removed_dead_products_return_404():
-    """Agent Mail, speedtest, the two zero-I/O recommend templaters, and the
-    paid NAT range-check were removed from the API surface entirely (not just
-    gated) — their routes must 404, and nothing may advertise them."""
+    """Retired zero-I/O and unbuilt products stay absent from the API."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         removed = {
-            "/v1/mail/accounts": await client.post("/v1/mail/accounts", json={}),
-            "/v1/mail/products": await client.get("/v1/mail/products"),
             "/v1/speedtest": await client.post("/v1/speedtest", json={"target": "hyrule"}),
             "/v1/speedtest/jobs": await client.post("/v1/speedtest/jobs", json={}),
             "/v1/dns/recommend-records": await client.post(
@@ -286,6 +282,13 @@ async def test_removed_dead_products_return_404():
         }
     for endpoint, res in removed.items():
         assert res.status_code == 404, f"{endpoint} returned {res.status_code}, expected 404"
+
+
+def test_agent_mail_routes_are_real_but_launch_gated():
+    paths = {getattr(route, "path", "") for route in app.routes}
+    assert "/v1/mail/products" in paths
+    assert "/v1/mail/accounts" in paths
+    assert "/v1/mail/messages/send" in paths
 
 
 @pytest.mark.asyncio

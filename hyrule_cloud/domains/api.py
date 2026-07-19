@@ -20,6 +20,8 @@ from pydantic import BaseModel, Field
 from hyrule_cloud.db import AccountRow, DomainQuoteRow
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.domains.models import (
+    AgentDomainOrderRequest,
+    AgentDomainOrderResponse,
     DNSChangesetRequest,
     DNSSECUpdateRequest,
     DNSZoneResponse,
@@ -72,7 +74,9 @@ async def get_gate(state: AppState = Depends(get_app_state)) -> PaymentGate:
 
 def _idempotency(value: str | None) -> str:
     if not value or len(value) > 128:
-        raise DomainProblem(400, "idempotency_key_required", "A valid Idempotency-Key header is required.")
+        raise DomainProblem(
+            400, "idempotency_key_required", "A valid Idempotency-Key header is required."
+        )
     return value
 
 
@@ -87,10 +91,7 @@ async def domain_openapi(request: Request) -> dict[str, Any]:
         route
         for route in request.app.routes
         if isinstance(route, APIRoute)
-        and (
-            route.path.startswith("/v1/domains")
-            or route.path.startswith("/v1/auth/wallet")
-        )
+        and (route.path.startswith("/v1/domains") or route.path.startswith("/v1/auth/wallet"))
         and route.include_in_schema
     ]
     return get_openapi(
@@ -162,7 +163,9 @@ async def create_order(
         held: set[str] = getattr(request.state, "api_key_scopes", set())
         async with service.db() as session:
             quote = await session.get(DomainQuoteRow, body.quote_id)
-        needed = "domain:renew" if quote is not None and quote.action == "renew" else "domain:purchase"
+        needed = (
+            "domain:renew" if quote is not None and quote.action == "renew" else "domain:purchase"
+        )
         if needed not in held:
             raise DomainProblem(403, "missing_scope", f"API key missing required scope: {needed}.")
     order, created = await service.create_order(
@@ -223,6 +226,92 @@ async def create_order(
     else:
         response.status_code = 200
     return await service.order_response(order)
+
+
+def _agent_token(request: Request) -> str:
+    scheme, _, token = (request.headers.get("authorization") or "").strip().partition(" ")
+    if scheme.lower() != "bearer" or not token.startswith(("hyr_dom_", "hyr_identity_")):
+        raise DomainProblem(
+            401, "management_token_required", "A domain management token is required."
+        )
+    return token
+
+
+@router.post("/agent/orders", response_model=AgentDomainOrderResponse)
+async def create_agent_order(
+    body: AgentDomainOrderRequest,
+    request: Request,
+    response: Response,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    service: DomainService = Depends(get_domains),
+    gate: PaymentGate = Depends(get_gate),
+) -> AgentDomainOrderResponse | Response:
+    response.headers["Cache-Control"] = "no-store"
+    order, token, created = await service.create_agent_order(
+        quote_id=body.quote_id,
+        terms_version=body.terms_version,
+        idempotency_key=_idempotency(idempotency_key),
+    )
+    if order.status == "awaiting_payment":
+        await service.assert_x402_payable(order.order_id)
+        payment_metadata = {
+            "order_id": order.order_id,
+            "domain": order.fqdn,
+            "status_url": f"/v1/domains/agent/orders/{order.order_id}",
+        }
+        challenge_metadata = dict(payment_metadata)
+        if not isinstance(gate, PaymentGate) or not gate.has_payment_credentials(request):
+            challenge_metadata["management_token"] = token
+        paid = await gate.check_payment(
+            request,
+            amount=order.amount_usd,
+            description=f"Hyrule wallet-native domain order for {order.fqdn}",
+            extra_body=challenge_metadata,
+        )
+        if isinstance(paid, Response):
+            paid.headers["Cache-Control"] = "no-store"
+            return paid
+        handoff_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                order = await service.mark_x402_paid(
+                    order.order_id,
+                    payer=paid,
+                    tx_hash=getattr(request.state, "payment_tx", None),
+                    payment_network=getattr(request.state, "payment_network", None),
+                    payment_asset=getattr(request.state, "payment_asset", None),
+                )
+                handoff_error = None
+                break
+            except Exception as exc:
+                handoff_error = exc
+                log.warning(
+                    "agent_domain_payment_handoff_attempt_failed",
+                    order_id=order.order_id,
+                    attempt=attempt + 1,
+                    exc_info=True,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.1 * (attempt + 1))
+        if handoff_error is not None:
+            raise DomainProblem(
+                503,
+                "agent_domain_payment_handoff_pending",
+                "Payment settled, but the domain order is pending durable recovery.",
+            ) from handoff_error
+        response.status_code = 202
+    else:
+        response.status_code = 201 if created else 200
+    return await service.agent_order_response(order, management_token=token)
+
+
+@router.get("/agent/orders/{order_id}", response_model=AgentDomainOrderResponse)
+async def get_agent_order(
+    order_id: str,
+    request: Request,
+    service: DomainService = Depends(get_domains),
+) -> AgentDomainOrderResponse:
+    return await service.get_agent_order(order_id, _agent_token(request))
 
 
 @router.get("/orders/{order_id}", response_model=DomainOrderResponse)

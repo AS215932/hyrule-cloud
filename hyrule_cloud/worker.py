@@ -15,6 +15,7 @@ from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
 from hyrule_cloud.domains.service import DomainService
 from hyrule_cloud.logging_config import SAFE_DICT_TRACEBACKS
+from hyrule_cloud.mail.service import MailService
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
@@ -55,6 +56,7 @@ async def run_worker() -> None:
         orchestrator,
     )
     orchestrator.domains = domains
+    mail = MailService(config, sessions, domains, orchestrator.refunds)
     recovered_bundles = await domains.recover_bundle_provisioning()
 
     stop = asyncio.Event()
@@ -74,6 +76,9 @@ async def run_worker() -> None:
     next_catalog = now
     next_reconcile = now
     next_renewal_state = now
+    next_mail = now
+    next_mail_retention = now
+    next_mail_webhooks = now
     worker_id = f"{socket.gethostname()}:{id(stop)}"
     log.info(
         "worker_started",
@@ -99,6 +104,10 @@ async def run_worker() -> None:
                     await domains.recover_x402_handoffs()
                 except Exception:
                     log.exception("domain_payment_handoff_recovery_failed")
+                try:
+                    await mail.recover_x402_handoffs()
+                except Exception:
+                    log.exception("mail_payment_handoff_recovery_failed")
                 next_payment_handoffs = now + timedelta(seconds=15)
             if now >= next_jobs:
                 try:
@@ -137,11 +146,32 @@ async def run_worker() -> None:
                 except Exception:
                     log.exception("domain_renewal_state_refresh_failed")
                 next_renewal_state = now + timedelta(hours=1)
+            if now >= next_mail:
+                try:
+                    await mail.provision_pending(limit=10)
+                    await mail.process_lifecycle()
+                    await mail.expire_quotes()
+                except Exception:
+                    log.exception("agent_mail_lifecycle_failed")
+                next_mail = now + timedelta(seconds=config.mail.worker_poll_seconds)
+            if now >= next_mail_retention:
+                try:
+                    await mail.sweep_retention()
+                except Exception:
+                    log.exception("agent_mail_retention_sweep_failed")
+                next_mail_retention = now + timedelta(days=1)
+            if now >= next_mail_webhooks:
+                try:
+                    await mail.deliver_webhooks(limit=20)
+                except Exception:
+                    log.exception("agent_mail_webhook_delivery_failed")
+                next_mail_webhooks = now + timedelta(seconds=5)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=1.0)
             except TimeoutError:
                 pass
     finally:
+        await mail.close()
         await domains.close()
         await native.close()
         await rates.close()

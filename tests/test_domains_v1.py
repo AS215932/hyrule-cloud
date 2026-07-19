@@ -209,8 +209,10 @@ async def domain_service(tmp_path):
     sessions = create_session_factory(engine)
     config = HyruleConfig(database_url=f"sqlite+aiosqlite:///{tmp_path / 'domains.db'}")
     config.domain.purchases_enabled = True
+    config.domain.agent_purchases_enabled = True
     config.domain.legal_approved = True
     config.domain.tax_approved = True
+    config.domain.agent_order_fernet_key = Fernet.generate_key().decode()
     config.openprovider.username = "user"
     config.openprovider.password = "password"
     config.openprovider.owner_handle = "owner"
@@ -327,6 +329,50 @@ async def test_domain_purchase_launch_requires_every_approval(domain_service):
     with pytest.raises(DomainProblem) as tax:
         service.require_purchase_launch("H1234567890")
     assert tax.value.code == "launch_approval_pending"
+
+
+@pytest.mark.asyncio
+async def test_wallet_native_agent_can_buy_and_poll_domain_without_account(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote("autonomous-agent.dev", DomainAction.REGISTER, None)
+    order, token, created = await service.create_agent_order(
+        quote_id=quote.quote_id,
+        terms_version=service.domain_config.terms_version,
+        idempotency_key="autonomous-agent-domain-idempotency-0001",
+    )
+    replay, replay_token, replay_created = await service.create_agent_order(
+        quote_id=quote.quote_id,
+        terms_version=service.domain_config.terms_version,
+        idempotency_key="autonomous-agent-domain-idempotency-0001",
+    )
+    assert created is True
+    assert replay_created is False
+    assert replay.order_id == order.order_id
+    assert replay_token == token
+    assert token.startswith("hyr_dom_")
+    assert order.owner_account_id is None
+    with pytest.raises(DomainProblem) as hidden:
+        await service.get_agent_order(order.order_id, "hyr_dom_" + "x" * 43)
+    assert hidden.value.code == "order_not_found"
+
+    await service.mark_x402_paid(
+        order.order_id,
+        payer="0x" + "5" * 40,
+        tx_hash="0xagent-domain",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+    assert await service.process_jobs(worker_id="agent-domain-test") == 1
+    polled = await service.get_agent_order(order.order_id, token)
+    assert polled.status.value == "active"
+    assert polled.management_token is None
+    async with sessions() as session:
+        domain = await session.scalar(
+            select(DomainRow).where(DomainRow.fqdn == "autonomous-agent.dev")
+        )
+    assert domain is not None
+    assert domain.owner_account_id is None
+    assert domain.anon_management_token_hash
 
 
 @pytest.mark.asyncio
@@ -774,9 +820,7 @@ async def test_renewal_service_passes_domain_identity_to_registrar(domain_servic
     async with sessions() as session:
         active_order = await session.get(DomainOrderRow, "do_renew_payload")
         renewed_domain = (
-            await session.execute(
-                select(DomainRow).where(DomainRow.fqdn == "renew-payload.dev")
-            )
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == "renew-payload.dev"))
         ).scalar_one()
     assert active_order is not None and active_order.status == "active"
     assert renewed_domain.expires_at.replace(tzinfo=UTC) == renewed_expiry
@@ -818,9 +862,7 @@ async def test_terminal_pending_renewal_creates_refund_obligation(domain_service
             )
         )
         await session.commit()
-    quote = await service.create_quote(
-        "terminal-renewal.dev", DomainAction.RENEW, "H1234567890"
-    )
+    quote = await service.create_quote("terminal-renewal.dev", DomainAction.RENEW, "H1234567890")
     order, _ = await service.create_order(
         DomainOrderRequest(
             quote_id=quote.quote_id,
@@ -856,9 +898,7 @@ async def test_terminal_pending_renewal_creates_refund_obligation(domain_service
         assert failed_order is not None
         operation = await session.get(DomainOperationRow, failed_order.operation_id)
         domain = (
-            await session.execute(
-                select(DomainRow).where(DomainRow.fqdn == "terminal-renewal.dev")
-            )
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == "terminal-renewal.dev"))
         ).scalar_one()
         refunds = list(
             await session.scalars(
@@ -1270,9 +1310,7 @@ async def test_vm_attachment_claim_is_atomic_and_detach_preserves_customer_edit(
         await service.claim_vm_attachment("H1234567890", "attached.dev", "vm_claim_two")
     assert conflict.value.code == "domain_already_attached"
 
-    await service.attach_vm(
-        "H1234567890", "attached.dev", "vm_claim_one", "2001:db8::20"
-    )
+    await service.attach_vm("H1234567890", "attached.dev", "vm_claim_one", "2001:db8::20")
     protected_changes = [
         DNSChange(
             action=DNSChangeAction.UPSERT,
@@ -1386,7 +1424,11 @@ async def test_expired_native_intent_is_not_rendered_as_payable(domain_service):
 
 
 @pytest.mark.asyncio
-async def test_settlement_ledger_recovers_lost_x402_order_handoff(domain_service):
+@pytest.mark.parametrize(
+    "resource_path",
+    ["/v1/domains/orders", "/v1/domains/agent/orders"],
+)
+async def test_settlement_ledger_recovers_lost_x402_order_handoff(domain_service, resource_path):
     service, _provider, sessions = domain_service
     quote = await service.create_quote("recover-payment.dev", DomainAction.REGISTER, "H1234567890")
     order, _ = await service.create_order(
@@ -1401,7 +1443,7 @@ async def test_settlement_ledger_recovers_lost_x402_order_handoff(domain_service
     ledger = PaymentLedger(sessions)
     event = ledger.build_event(
         event_type="settled",
-        resource_path="/v1/domains/orders",
+        resource_path=resource_path,
         method="POST",
         amount=Decimal("13"),
         network="eip155:8453",
@@ -1416,7 +1458,7 @@ async def test_settlement_ledger_recovers_lost_x402_order_handoff(domain_service
     for index in range(3):
         newer = ledger.build_event(
             event_type="settled",
-            resource_path="/v1/domains/orders",
+            resource_path=resource_path,
             method="POST",
             amount=Decimal("13"),
             network="eip155:8453",
@@ -1730,9 +1772,7 @@ async def test_reconciliation_preserves_dnssec_off_and_managed_enable_installs_k
 
     async with sessions() as session:
         domain = (
-            await session.execute(
-                select(DomainRow).where(DomainRow.fqdn == "dnssec-off.dev")
-            )
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == "dnssec-off.dev"))
         ).scalar_one()
     assert domain.dnssec_mode == "off"
     assert domain.dnssec_status == "off"
@@ -1755,9 +1795,7 @@ async def test_reconciliation_preserves_dnssec_off_and_managed_enable_installs_k
 
     async with sessions() as session:
         domain = (
-            await session.execute(
-                select(DomainRow).where(DomainRow.fqdn == "dnssec-off.dev")
-            )
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == "dnssec-off.dev"))
         ).scalar_one()
         completed = await session.get(DomainOperationRow, operation.operation_id)
     assert domain.dnssec_mode == "managed"
@@ -1972,8 +2010,7 @@ async def test_bundle_vm_quote_is_claimed_by_only_one_domain_order(domain_servic
     service, _provider, sessions = domain_service
     fqdn = "contended-bundle.dev"
     domain_quotes = [
-        await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890")
-        for _ in range(2)
+        await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890") for _ in range(2)
     ]
     vm_quote_id = "vmq_contended_bundle"
     async with sessions() as session:
@@ -2041,9 +2078,7 @@ async def test_bundle_vm_quote_is_claimed_by_only_one_domain_order(domain_servic
 async def test_expiring_unpaid_bundle_order_releases_unlinked_vm_quote(domain_service):
     service, _provider, sessions = domain_service
     fqdn = "abandoned-bundle.dev"
-    domain_quote = await service.create_quote(
-        fqdn, DomainAction.REGISTER, "H1234567890"
-    )
+    domain_quote = await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890")
     vm_quote_id = "vmq_abandoned_bundle"
     async with sessions() as session:
         session.add(
@@ -2085,9 +2120,7 @@ async def test_expiring_unpaid_bundle_order_releases_unlinked_vm_quote(domain_se
     assert released_vm_quote.status == QuoteStatus.CREATED
     assert released_vm_quote.vm_id is None
 
-    replacement_quote = await service.create_quote(
-        fqdn, DomainAction.REGISTER, "H1234567890"
-    )
+    replacement_quote = await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890")
     replacement_order, created = await service.create_order(
         DomainOrderRequest(
             quote_id=replacement_quote.quote_id,

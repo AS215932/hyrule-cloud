@@ -61,9 +61,10 @@ Sign an EIP-3009 `TransferWithAuthorization` for the `accepts[].price`, base64-
 encode the x402 payment payload, and resend the same request with
 `X-PAYMENT: <base64>`.
 
-Domain orders also support native BTC and XMR payment intents. Domain purchase,
-renewal, and management require an account session or scoped API key; public
-availability checks and quotes do not.
+Domain orders also support native BTC and XMR payment intents. Account-owned
+purchase, renewal, and management use a session or scoped API key. Autonomous
+agents can use the separately gated USDC-only `/v1/domains/agent/orders` flow;
+it returns a one-time capability token and requires no human signup.
 
 **Durable quotes (recommended):** call `POST /v1/vm/quote` first to lock a price
 and get a `quote_id`, then pass `quote_id` to `POST /v1/vm/create`. The server

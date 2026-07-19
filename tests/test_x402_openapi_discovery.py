@@ -26,6 +26,10 @@ from tests.test_payment_gate_x402 import _FakeServer, _gate, _request
 
 def _enable_all_catalog_gates(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
+        "hyrule_cloud.services.discovery._gate_enabled",
+        lambda _gate: True,
+    )
+    monkeypatch.setattr(
         "hyrule_cloud.services.launch_proof.use_real_provisioning",
         lambda: True,
     )

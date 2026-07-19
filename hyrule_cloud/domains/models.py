@@ -245,6 +245,18 @@ class DomainOrderResponse(BaseModel):
     updated_at: datetime
 
 
+class AgentDomainOrderRequest(BaseModel):
+    """Account-free, x402-only domain checkout for autonomous agents."""
+
+    quote_id: str = Field(min_length=8, max_length=40)
+    terms_version: str = Field(min_length=1, max_length=64)
+
+
+class AgentDomainOrderResponse(DomainOrderResponse):
+    management_token: str | None = None
+    status_url: str
+
+
 class DomainSummary(BaseModel):
     domain: str
     status: str

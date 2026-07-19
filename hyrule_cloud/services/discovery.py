@@ -27,6 +27,13 @@ from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 
 from hyrule_cloud import models
 from hyrule_cloud.config import HyruleConfig, PaymentConfig
+from hyrule_cloud.domains.models import AgentDomainOrderRequest, AgentDomainOrderResponse
+from hyrule_cloud.mail.models import (
+    MailAccountCreateRequest,
+    MailAccountResponse,
+    MailSendRequest,
+    MailSendResponse,
+)
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -86,6 +93,8 @@ _TAG_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/whois", ("network-intel", "registry")),
     ("/v1/web", ("network-intel", "tls")),
     ("/v1/mx", ("network-intel", "email")),
+    ("/v1/mail", ("email", "agent-mail")),
+    ("/v1/domains/agent", ("domains", "identity")),
     ("/v1/path", ("network-intel", "looking-glass")),
     ("/v1/ports", ("network-intel", "reachability")),
     ("/v1/nat", ("network-intel", "reachability")),
@@ -318,6 +327,17 @@ _VM_PRICE = PriceSpec(
     # impossible at discovery time.
     bounded=False,
 )
+_MAIL_ACTIVATION_PRICE = PriceSpec(
+    "dynamic",
+    (("price_mail_activation", "1.00"),),
+    # A combined domain + mailbox checkout includes a live registrar quote.
+    bounded=False,
+)
+_AGENT_DOMAIN_PRICE = PriceSpec(
+    "dynamic",
+    (("price_domain_markup", "1.00"),),
+    bounded=False,
+)
 _PROXY_PRICE = PriceSpec(
     "dynamic",
     (
@@ -466,8 +486,72 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         },
         gate="real_vm",
     ),
-    # Domain registration is intentionally absent. Its provider/readiness fix
-    # is deferred to a separate PR and will opt the operation back in here.
+    _body_operation(
+        "/v1/domains/agent/orders",
+        "Buy a managed domain without creating a Hyrule account",
+        _AGENT_DOMAIN_PRICE,
+        AgentDomainOrderRequest,
+        {
+            "quote_id": "dq_a1b2c3d4",
+            "terms_version": "2026-07-15",
+        },
+        AgentDomainOrderResponse,
+        {
+            "order_id": "do_a1b2c3d4",
+            "domain": "prompttoproof.dev",
+            "action": "register",
+            "status": "queued",
+            "amount_usd": "13.00",
+            "payment_method": "usdc",
+            "management_token": "hyr_dom_…",
+            "status_url": "/v1/domains/agent/orders/do_a1b2c3d4",
+            "created_at": _GENERATED_AT,
+            "updated_at": _GENERATED_AT,
+        },
+        gate="agent_domains",
+    ),
+    _body_operation(
+        "/v1/mail/accounts",
+        "Activate an API-only agent mailbox for 30 days, optionally with a new domain",
+        _MAIL_ACTIVATION_PRICE,
+        MailAccountCreateRequest,
+        {"quote_id": "mailq_a1b2c3d4"},
+        MailAccountResponse,
+        {
+            "mailbox_id": "mbx_a1b2c3d4",
+            "address": "agent@prompttoproof.dev",
+            "mode": "domain_and_mailbox",
+            "status": "pending_domain",
+            "management_token": "hyr_identity_…",
+            "status_url": "/v1/mail/accounts/mbx_a1b2c3d4",
+            "messages_url": "/v1/mail/accounts/mbx_a1b2c3d4/messages",
+            "send_quote_url": "/v1/mail/messages/send/quote",
+            "domain_order_id": "do_a1b2c3d4",
+            "domain_status_url": "/v1/domains/agent/orders/do_a1b2c3d4",
+            "charged_amount_usd": "14.00",
+            "auto_renew": False,
+        },
+        gate="mail",
+    ),
+    _body_operation(
+        "/v1/mail/messages/send",
+        "Send one conversation-safe Agent Mail message to one recipient",
+        _fixed("price_mail_send", "0.01"),
+        MailSendRequest,
+        {"quote_id": "mailq_send_a1b2c3d4"},
+        MailSendResponse,
+        {
+            "send_id": "send_a1b2c3d4",
+            "mailbox_id": "mbx_a1b2c3d4",
+            "message_id": "jmap_message_id",
+            "status": "accepted",
+            "recipient": "proof-recipient@example.net",
+            "accepted_at": _GENERATED_AT,
+            "charged_amount_usd": "0.01",
+            "delivery_is_final": False,
+        },
+        gate="mail",
+    ),
     _body_operation(
         "/v1/network/request",
         "Make a micro-proxy network request over Direct, Tor, I2P, or Yggdrasil",
@@ -850,6 +934,26 @@ def _gate_enabled(gate: str) -> bool:
         from hyrule_cloud.services.launch_proof import use_real_provisioning
 
         return use_real_provisioning()
+    if gate == "mail":
+        return HyruleConfig().mail.public_ready
+    if gate == "agent_domains":
+        config = HyruleConfig()
+        provider = config.openprovider
+        return bool(
+            config.domain.enabled
+            and config.domain.agent_purchases_enabled
+            and config.domain.legal_approved
+            and config.domain.tax_approved
+            and config.domain.dns_control_url
+            and config.domain.dns_control_secret
+            and config.domain.agent_order_fernet_key
+            and provider.username
+            and provider.password
+            and provider.owner_handle
+            and provider.admin_handle
+            and provider.tech_handle
+            and provider.billing_handle
+        )
     if gate in {"path_probe", "path_report"}:
         from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
 
@@ -929,6 +1033,8 @@ _CATALOG_PHRASES: tuple[tuple[str, str], ...] = (
     ("/v1/whois", "RDAP/WHOIS registry lookups"),
     ("/v1/web", "web and deep TLS checks"),
     ("/v1/mx", "mail deliverability"),
+    ("/v1/mail", "API-only email accounts for agents"),
+    ("/v1/domains/agent", "wallet-native managed domains"),
     ("/v1/path", "multi-vantage path evidence"),
     ("/v1/ports", "outside-in port reachability"),
     ("/v1/nat", "NAT port-forward checks"),
@@ -961,7 +1067,7 @@ def service_overview() -> str:
 def catalog_description() -> str:
     """Public catalog description plus current launch-scope caveats."""
 
-    return f"{service_overview()} Domain registration is deferred from this launch catalog."
+    return service_overview()
 
 
 def marketplace_resource_description(operation: PaidOperation) -> str:

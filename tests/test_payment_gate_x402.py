@@ -498,8 +498,11 @@ def test_discovery_registry_only_declares_real_endpoints() -> None:
     from hyrule_cloud.services.discovery import DISCOVERY
 
     declared_paths = {path for _, path in DISCOVERY}
-    for dead in ("/v1/mail/accounts", "/v1/mail/messages/send", "/v1/speedtest", "/v1/web/reports", "/v1/voip/report", "/v1/path/jobs"):
+    for dead in ("/v1/speedtest", "/v1/web/reports", "/v1/voip/report", "/v1/path/jobs"):
         assert dead not in declared_paths
+    assert "/v1/mail/accounts" in declared_paths
+    assert "/v1/mail/messages/send" in declared_paths
+    assert "/v1/domains/agent/orders" in declared_paths
 
 
 def test_discovery_schemas_contain_no_unresolved_refs() -> None:

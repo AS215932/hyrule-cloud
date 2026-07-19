@@ -23,6 +23,8 @@ from hyrule_cloud.api.bgp import router as bgp_router
 from hyrule_cloud.api.dns import router as dns_router
 from hyrule_cloud.api.internal_bgp import router as internal_bgp_router
 from hyrule_cloud.api.ip import router as ip_router
+from hyrule_cloud.api.mail import internal_router as internal_mail_router
+from hyrule_cloud.api.mail import router as mail_router
 from hyrule_cloud.api.metrics import router as metrics_router
 from hyrule_cloud.api.mx import router as mx_router
 from hyrule_cloud.api.nat import router as nat_router
@@ -130,6 +132,14 @@ async def lifespan(app: FastAPI):
     )
     wallet_auth = WalletAuthService(config, session_factory)
     orchestrator.domains = domains
+    from hyrule_cloud.mail.service import MailService
+
+    mail = MailService(
+        config,
+        session_factory,
+        domains,
+        orchestrator.refunds,
+    )
 
     # Wire up app state
     app.state._typed_state = AppState(
@@ -143,6 +153,7 @@ async def lifespan(app: FastAPI):
         session_factory=session_factory,
         domains=domains,
         wallet_auth=wallet_auth,
+        mail=mail,
     )
 
     log.info(
@@ -153,6 +164,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    await mail.close()
     await domains.close()
     await orchestrator.shutdown()
     await network_provider.close()
@@ -190,7 +202,7 @@ async def handle_domain_problem(request: Request, exc: DomainProblem):
 
 @app.exception_handler(RequestValidationError)
 async def handle_domain_validation(request: Request, exc: RequestValidationError):
-    if request.url.path.startswith(("/v1/domains", "/v1/auth/wallet")):
+    if request.url.path.startswith(("/v1/domains", "/v1/auth/wallet", "/v1/mail")):
         return problem_response(
             request,
             DomainProblem(
@@ -207,7 +219,7 @@ async def handle_domain_validation(request: Request, exc: RequestValidationError
 
 @app.exception_handler(StarletteHTTPException)
 async def handle_domain_http_exception(request: Request, exc: StarletteHTTPException):
-    if request.url.path.startswith(("/v1/domains", "/v1/auth/wallet")):
+    if request.url.path.startswith(("/v1/domains", "/v1/auth/wallet", "/v1/mail")):
         code = {
             401: "authentication_required",
             403: "not_permitted",
@@ -367,6 +379,8 @@ app.include_router(status_router)
 app.include_router(auth_router)
 app.include_router(wallet_auth_router)
 app.include_router(domains_router)
+app.include_router(mail_router)
+app.include_router(internal_mail_router)
 # Payments/fleet Prometheus exporter (bearer-token gated, off by default).
 app.include_router(metrics_router)
 
