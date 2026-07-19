@@ -13,7 +13,9 @@ import structlog
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
+from hyrule_cloud.models import VMCreateRequest, VMSize
 from hyrule_cloud.providers.prometheus import PrometheusClient
+from hyrule_cloud.services.launch_proof import use_real_provisioning
 
 router = APIRouter(prefix="/v1/status", tags=["Service status"])
 log = structlog.get_logger()
@@ -306,29 +308,30 @@ def _build_response(alerts: list[dict[str, Any]]) -> ServiceStatusResponse:
     )
 
 
-async def _probe_vm_capacity(app_state: Any) -> bool | None:
-    """Exercise the same live XO capacity path that gates paid VM checkout.
-
-    Local and test deployments can intentionally run in simulation mode. Only
-    installations guarded by ``HYRULE_REQUIRE_REAL_PROVISIONING`` should
-    advertise the real checkout path, so only those installations are probed.
-    """
-    config = getattr(app_state, "config", None)
-    if not bool(getattr(config, "require_real_provisioning", False)):
+async def _probe_vm_admission(app_state: Any) -> bool | None:
+    """Prove that checkout could admit at least the smallest sellable VM."""
+    if not use_real_provisioning():
         return None
 
     orchestrator = getattr(app_state, "orchestrator", None)
-    provider = getattr(orchestrator, "xcpng", None)
-    capacity = getattr(provider, "capacity", None)
-    if not callable(capacity):
-        log.warning("status_vm_capacity_probe_unavailable")
+    ensure_capacity = getattr(orchestrator, "ensure_vm_capacity", None)
+    if not callable(ensure_capacity):
+        log.warning("status_vm_admission_probe_unavailable")
         return False
 
+    minimum_order = VMCreateRequest(
+        duration_days=1,
+        size=VMSize.XS,
+        ssh_pubkey="ssh-ed25519 AAAA status-probe",
+    )
     try:
-        await asyncio.wait_for(capacity(), timeout=_CAPACITY_PROBE_TIMEOUT_SECONDS)
+        await asyncio.wait_for(
+            ensure_capacity(minimum_order),
+            timeout=_CAPACITY_PROBE_TIMEOUT_SECONDS,
+        )
     except TimeoutError:
         log.warning(
-            "status_vm_capacity_probe_timed_out",
+            "status_vm_admission_probe_timed_out",
             timeout_seconds=_CAPACITY_PROBE_TIMEOUT_SECONDS,
         )
         return False
@@ -336,7 +339,7 @@ async def _probe_vm_capacity(app_state: Any) -> bool | None:
         # The public response remains deliberately generic. The exception type
         # is enough to distinguish transport/schema failures in private logs
         # without risking provider payloads crossing the status boundary.
-        log.warning("status_vm_capacity_probe_failed", error_type=type(exc).__name__)
+        log.warning("status_vm_admission_probe_failed", error_type=type(exc).__name__)
         return False
     return True
 
@@ -365,10 +368,14 @@ def _apply_vm_capacity_health(
     response: ServiceStatusResponse,
     capacity_available: bool | None,
 ) -> ServiceStatusResponse:
-    if capacity_available is not False:
+    if capacity_available is None:
         return response
 
-    updated = response.model_copy(deep=True)
+    updated = _clear_vm_capacity_health(response)
+    if capacity_available:
+        return updated
+
+    updated = updated.model_copy(deep=True)
     incident = ServiceIncident(
         id=_CAPACITY_INCIDENT_ID,
         title=_CAPACITY_INCIDENT_TITLE,
@@ -404,6 +411,41 @@ def _apply_vm_capacity_health(
     return updated
 
 
+def _clear_vm_capacity_health(response: ServiceStatusResponse) -> ServiceStatusResponse:
+    remaining_incidents = [
+        incident for incident in response.incidents if incident.id != _CAPACITY_INCIDENT_ID
+    ]
+    if len(remaining_incidents) == len(response.incidents):
+        return response
+
+    # Alert-backed snapshots never emit UNKNOWN component states. If any
+    # component is unknown, this response originated from the fail-closed
+    # monitoring path and that must remain its baseline after admission
+    # recovers. Otherwise rebuild from operational plus the remaining alerts.
+    baseline = (
+        ServiceState.UNKNOWN
+        if any(component.status == ServiceState.UNKNOWN for component in response.components)
+        else ServiceState.OPERATIONAL
+    )
+    components = {component.id: component for component in _component_rows(baseline)}
+    for incident in remaining_incidents:
+        for component_id in incident.component_ids:
+            component = components[component_id]
+            if _RANK[incident.status] > _RANK[component.status]:
+                component.status = incident.status
+                component.message = incident.message
+
+    updated = response.model_copy(deep=True)
+    updated.incidents = remaining_incidents
+    updated.components = list(components.values())
+    updated.status = max(
+        (component.status for component in updated.components),
+        key=lambda state: _RANK[state],
+        default=ServiceState.OPERATIONAL,
+    )
+    return updated
+
+
 @router.get("", response_model=ServiceStatusResponse)
 async def get_service_status(request: Request) -> ServiceStatusResponse:
     """Return current customer impact without exposing monitoring internals."""
@@ -427,7 +469,7 @@ async def get_service_status(request: Request) -> ServiceStatusResponse:
         prometheus_url = getattr(config, "prometheus_url", "") or ""
         (alerts, rules_unready), capacity_available = await asyncio.gather(
             _load_public_monitoring(prometheus_url),
-            _probe_vm_capacity(app_state),
+            _probe_vm_admission(app_state),
         )
 
         if alerts is not None:
