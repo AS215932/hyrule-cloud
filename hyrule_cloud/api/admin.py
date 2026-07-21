@@ -10,11 +10,13 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, exists, func, or_, select, update
+from sqlalchemy.engine import CursorResult
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.db import (
     AccountRow,
@@ -65,14 +67,14 @@ def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
-def _factory(state: AppState):
+def _factory(state: AppState) -> async_sessionmaker[AsyncSession]:
     if state.session_factory is None:
         raise HTTPException(503, "Database not available")
-    return state.session_factory
+    return cast(async_sessionmaker[AsyncSession], state.session_factory)
 
 
 def _audit(
-    session: Any,
+    session: AsyncSession,
     request: Request,
     actor: AccountRow,
     action: str,
@@ -517,7 +519,7 @@ async def list_jobs(
     async with _factory(state)() as session:
         domain_rows = list(await session.scalars(domain_stmt))
         diagnostic_rows = list(await session.scalars(diagnostic_stmt))
-    items = [
+    items: list[dict[str, Any]] = [
         {
             "job_id": row.job_id,
             "source": "domain",
@@ -616,7 +618,7 @@ async def list_operations(
     }
 
 
-async def _enabled_admin_count(session: Any, *, lock: bool = False) -> int:
+async def _enabled_admin_count(session: AsyncSession, *, lock: bool = False) -> int:
     predicate = (AccountRow.is_admin.is_(True), AccountRow.disabled_at.is_(None))
     if lock:
         # Serialize the last-Admin invariant across concurrent disable/demote
@@ -769,8 +771,9 @@ async def revoke_account_sessions(
     async with _factory(state)() as session:
         if await session.get(AccountRow, account_id) is None:
             raise HTTPException(404, "Account not found")
-        result = await session.execute(
-            delete(SessionRow).where(SessionRow.account_id == account_id)
+        result = cast(
+            CursorResult[Any],
+            await session.execute(delete(SessionRow).where(SessionRow.account_id == account_id)),
         )
         _audit(
             session,
@@ -797,10 +800,16 @@ async def revoke_account_keys(
     async with _factory(state)() as session:
         if await session.get(AccountRow, account_id) is None:
             raise HTTPException(404, "Account not found")
-        result = await session.execute(
-            update(ApiKeyRow)
-            .where(ApiKeyRow.account_id == account_id, ApiKeyRow.revoked_at.is_(None))
-            .values(revoked_at=now)
+        result = cast(
+            CursorResult[Any],
+            await session.execute(
+                update(ApiKeyRow)
+                .where(
+                    ApiKeyRow.account_id == account_id,
+                    ApiKeyRow.revoked_at.is_(None),
+                )
+                .values(revoked_at=now)
+            ),
         )
         _audit(
             session,
@@ -868,14 +877,14 @@ async def vm_action(
     return {"vm_id": vm_id, "action": action, "status": "accepted"}
 
 
-async def _assert_transfer_target(session: Any, account_id: str) -> AccountRow:
+async def _assert_transfer_target(session: AsyncSession, account_id: str) -> AccountRow:
     target = await session.get(AccountRow, account_id)
     if target is None or target.disabled_at is not None:
         raise HTTPException(409, "Target account is missing or disabled")
     return target
 
 
-async def _pending_domain_operation(session: Any, fqdn: str) -> bool:
+async def _pending_domain_operation(session: AsyncSession, fqdn: str) -> bool:
     return (
         await session.scalar(
             select(DomainOperationRow.operation_id)

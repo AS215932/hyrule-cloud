@@ -183,11 +183,11 @@ async def _apply_account_operation(
                     vm_count += 1
         async with session_factory() as session:
             for mailbox in mailboxes:
-                current = await session.get(MailAccountRow, mailbox.mailbox_id)
-                if current is not None and current.status != "suspended":
-                    current.status = "suspended"
-                    current.suspension_reason = "account_disabled"
-                    current.suspended_by_account_id = actor_id
+                mailbox_row = await session.get(MailAccountRow, mailbox.mailbox_id)
+                if mailbox_row is not None and mailbox_row.status != "suspended":
+                    mailbox_row.status = "suspended"
+                    mailbox_row.suspension_reason = "account_disabled"
+                    mailbox_row.suspended_by_account_id = actor_id
                     mail_count += 1
             await session.commit()
     else:
@@ -214,11 +214,11 @@ async def _apply_account_operation(
                     vm_count += 1
         async with session_factory() as session:
             for mailbox in mailboxes:
-                current = await session.get(MailAccountRow, mailbox.mailbox_id)
-                if current is not None and current.suspension_reason == "account_disabled":
-                    current.status = "active"
-                    current.suspension_reason = None
-                    current.suspended_by_account_id = None
+                mailbox_row = await session.get(MailAccountRow, mailbox.mailbox_id)
+                if mailbox_row is not None and mailbox_row.suspension_reason == "account_disabled":
+                    mailbox_row.status = "active"
+                    mailbox_row.suspension_reason = None
+                    mailbox_row.suspended_by_account_id = None
                     mail_count += 1
             await session.commit()
     return {"vms": vm_count, "mailboxes": mail_count}
