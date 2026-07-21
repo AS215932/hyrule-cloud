@@ -208,6 +208,23 @@ class _AuthorizationChainOutcome:
     tx_hash: str | None = None
 
 
+def mail_payment_resource_key(
+    quote_id: str,
+    *,
+    domain_order_id: str | None = None,
+    send: bool = False,
+) -> str:
+    """Return the global binding key for one mail quote or intentional bundle."""
+
+    if domain_order_id:
+        return f"domain_mail_bundle:{quote_id}:{domain_order_id}"
+    return f"mail_send:{quote_id}" if send else f"mail_activation:{quote_id}"
+
+
+def domain_payment_resource_key(order_id: str) -> str:
+    return f"domain_order:{order_id}"
+
+
 def canonical_payment_authorization(header: str) -> CanonicalPaymentAuthorization:
     """Decode one EIP-3009 authorization independently of header transport."""
 
@@ -289,6 +306,74 @@ class PaymentGate:
             self.server.register(net_cfg["network"], ExactEvmServerScheme())
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._local_authorization_bindings: dict[str, str] = {}
+        self._authorization_lock = asyncio.Lock()
+
+    @staticmethod
+    def _request_resource_key(
+        request: Request,
+        amount: Decimal,
+        extra_body: dict[str, Any] | None,
+    ) -> str:
+        extra = extra_body or {}
+        quote_id = str(extra.get("quote_id") or "")
+        domain_order_id = str(extra.get("domain_order_id") or "") or None
+        if request.url.path == "/v1/mail/accounts" and quote_id:
+            return mail_payment_resource_key(
+                quote_id,
+                domain_order_id=domain_order_id,
+            )
+        if request.url.path == "/v1/mail/messages/send" and quote_id:
+            return mail_payment_resource_key(quote_id, send=True)
+        order_id = str(extra.get("order_id") or "")
+        if order_id and request.url.path.startswith("/v1/domains"):
+            return domain_payment_resource_key(order_id)
+        canonical = json.dumps(
+            {
+                "method": request.method.upper(),
+                "path": request.url.path,
+                "amount": format(amount, "f"),
+                "extra": extra,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+        return "http:" + hashlib.sha256(canonical).hexdigest()
+
+    async def _claim_authorization_fingerprint(
+        self,
+        fingerprint: str,
+        resource_key: str,
+        resource_path: str,
+    ) -> bool:
+        if self.ledger is not None:
+            return await self.ledger.claim_authorization(
+                fingerprint=fingerprint,
+                resource_key=resource_key,
+                resource_path=resource_path,
+            )
+        async with self._authorization_lock:
+            existing = self._local_authorization_bindings.get(fingerprint)
+            if existing is None:
+                self._local_authorization_bindings[fingerprint] = resource_key
+                return True
+            return existing == resource_key
+
+    async def _claim_request_authorization(
+        self,
+        request: Request,
+        payment_header: str,
+        amount: Decimal,
+        extra_body: dict[str, Any] | None,
+    ) -> bool:
+        authorization = canonical_payment_authorization(payment_header)
+        return await self._claim_authorization_fingerprint(
+            authorization.fingerprint,
+            self._request_resource_key(request, amount, extra_body),
+            request.url.path,
+        )
 
     async def _ensure_initialized(self) -> bool:
         """Lazily fetch facilitator support once for SDK requirement building."""
@@ -693,6 +778,25 @@ class PaymentGate:
                     extensions=extensions,
                 )
 
+            if not await self._claim_request_authorization(
+                request,
+                payment_header,
+                amount,
+                extra_body,
+            ):
+                await self._record(
+                    "verify_failed",
+                    request,
+                    amount,
+                    network=matching_requirements.network,
+                    payer=verification.payer,
+                    error="Payment authorization already bound to another resource",
+                )
+                return self._json_response(
+                    409,
+                    {"error": "Payment authorization is already bound to another resource"},
+                )
+
             settlement = await self.server.settle_payment(
                 payment_payload,
                 matching_requirements,
@@ -871,6 +975,25 @@ class PaymentGate:
                     extensions=extensions,
                 )
 
+            if not await self._claim_request_authorization(
+                request,
+                payment_header,
+                amount,
+                extra_body,
+            ):
+                await self._record(
+                    "verify_failed",
+                    request,
+                    amount,
+                    network=matching_requirements.network,
+                    payer=verification.payer,
+                    error="Payment authorization already bound to another resource",
+                )
+                return self._json_response(
+                    409,
+                    {"error": "Payment authorization is already bound to another resource"},
+                )
+
             return VerifiedPayment(
                 payer=verification.payer or "",
                 amount=amount,
@@ -980,6 +1103,7 @@ class PaymentGate:
         amount: Decimal,
         *,
         pending_since: datetime | None = None,
+        resource_key: str | None = None,
     ) -> PaymentReconciliation:
         """Replay a stored authorization, then prove its outcome on-chain.
 
@@ -997,6 +1121,16 @@ class PaymentGate:
         except (TypeError, ValueError):
             log.warning("payment_reconciliation_payload_invalid", exc_info=True)
             return PaymentReconciliation()
+
+        if resource_key is not None and not await self._claim_authorization_fingerprint(
+            authorization.fingerprint,
+            resource_key,
+            "x402-recovery",
+        ):
+            return PaymentReconciliation(
+                terminal_unsettled=True,
+                reason="bound_elsewhere",
+            )
 
         # x402 2.10 requires initialization before requirement construction.
         # The worker owns a fresh gate after every restart, so doing this first

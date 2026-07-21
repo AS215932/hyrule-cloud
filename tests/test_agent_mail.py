@@ -30,6 +30,7 @@ from hyrule_cloud.api.mail import (
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
     Base,
+    DomainOrderRow,
     DomainRow,
     MailAccountRow,
     MailEventRow,
@@ -44,6 +45,7 @@ from hyrule_cloud.db import (
     create_db_engine,
     create_session_factory,
 )
+from hyrule_cloud.domains.models import DomainOrderStatus
 from hyrule_cloud.mail.backend import (
     MailAttachmentTooLargeError,
     MailBackendError,
@@ -1236,6 +1238,76 @@ async def test_incomplete_mail_dns_keeps_provisioning_retryable(mail_service):
 
 
 @pytest.mark.asyncio
+async def test_unready_domain_orders_do_not_starve_ready_mailboxes(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+
+    async def awaiting_provision(local_part: str, key: str):
+        quote = await service.create_account_quote(
+            MailAccountQuoteRequest(
+                local_part=local_part,
+                mode=MailboxMode.HOSTED,
+                terms_version=service.mail_config.terms_version,
+            )
+        )
+        account, _token, _created = await service.prepare_activation(
+            quote.quote_id,
+            idempotency_key=key,
+        )
+        return await service.mark_activation_paid(
+            account.mailbox_id,
+            quote.quote_id,
+            payer="0x" + "8" * 40,
+            tx_hash=f"0x{local_part}",
+            payment_network="eip155:8453",
+            payment_asset="USDC",
+        )
+
+    blocked = await awaiting_provision(
+        "blocked-domain-order",
+        "blocked-domain-order-idempotency-0001",
+    )
+    ready = await awaiting_provision(
+        "ready-hosted-mailbox",
+        "ready-hosted-mailbox-idempotency-0001",
+    )
+    now = datetime.now(UTC)
+    async with sessions() as session:
+        blocked_row = await session.get(MailAccountRow, blocked.mailbox_id)
+        ready_row = await session.get(MailAccountRow, ready.mailbox_id)
+        blocked_row.status = MailboxStatus.PENDING_DOMAIN.value
+        blocked_row.domain_order_id = "do_blocked_domain_order"
+        blocked_row.created_at = now - timedelta(hours=2)
+        ready_row.created_at = now - timedelta(hours=1)
+        session.add(
+            DomainOrderRow(
+                order_id="do_blocked_domain_order",
+                quote_id="dq_blocked_domain_order",
+                fqdn="blocked-domain-order.dev",
+                action="register",
+                owner_account_id=None,
+                idempotency_key="blocked-domain-order",
+                status=DomainOrderStatus.PROVIDER_PENDING.value,
+                amount_usd=Decimal("1"),
+                domain_amount_usd=Decimal("1"),
+                vm_amount_usd=Decimal("0"),
+                service_amount_usd=Decimal("0"),
+                payment_method="usdc",
+                on_domain_failure="keep_vm",
+                terms_version=service.config.domain.terms_version,
+                terms_accepted_at=now,
+            )
+        )
+        await session.commit()
+
+    assert await service.provision_pending(limit=1) == 1
+    async with sessions() as session:
+        still_blocked = await session.get(MailAccountRow, blocked.mailbox_id)
+        provisioned = await session.get(MailAccountRow, ready.mailbox_id)
+    assert still_blocked.status == MailboxStatus.PENDING_DOMAIN.value
+    assert provisioned.status == MailboxStatus.ACTIVE.value
+
+
+@pytest.mark.asyncio
 async def test_incomplete_mail_dns_eventually_fails_and_refunds(mail_service):
     service, sessions, backend, _domains, _refunds = mail_service
     service.mail_config.provision_dns_max_attempts = 2
@@ -1599,10 +1671,11 @@ async def test_stored_authorization_recovers_mail_payment_without_metrics_ledger
     )
 
     class _RecoveryGate:
-        async def reconcile_settlement(self, header, amount, *, pending_since):
+        async def reconcile_settlement(self, header, amount, *, pending_since, resource_key):
             assert header == "stored-eip3009-authorization"
             assert amount == Decimal(quote.amount_usd)
             assert pending_since is not None
+            assert resource_key == f"mail_activation:{quote.quote_id}"
             return PaymentReconciliation(
                 payment=RecoveredPayment(
                     payer="0x" + "4" * 40,
@@ -1669,10 +1742,11 @@ async def test_terminal_authorization_releases_mail_capacity(mail_service):
     )
 
     class _ExpiredGate:
-        async def reconcile_settlement(self, header, amount, *, pending_since):
+        async def reconcile_settlement(self, header, amount, *, pending_since, resource_key):
             assert header == "expired-authorization"
             assert amount == Decimal(quote.amount_usd)
             assert pending_since is not None
+            assert resource_key == f"mail_activation:{quote.quote_id}"
             return PaymentReconciliation(
                 terminal_unsettled=True,
                 reason="expired",
@@ -2269,6 +2343,8 @@ async def test_send_intent_reconciles_after_acceptance_without_duplicate_submiss
         assert intent.status == "submitting"
         assert intent.submission_started_at is not None
         assert intent.amount_usd == Decimal(quote.amount_usd)
+        intent.submission_started_at = datetime.now(UTC) - timedelta(minutes=6)
+        await session.commit()
 
     monkeypatch.setattr(service, "_finalize_send", original_finalize)
     assert await service.reconcile_send_intents() == 1
@@ -2276,6 +2352,64 @@ async def test_send_intent_reconciles_after_acceptance_without_duplicate_submiss
     assert replay.status == "accepted"
     assert replay.charged_amount_usd == "0.00"
     assert len(backend.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_reconciliation_advances_past_stale_missing_submission(mail_service):
+    service, sessions, backend, _domains, _refunds = mail_service
+    service.mail_config.mailbox_send_limit_per_day = 10
+    service.mail_config.global_send_limit_per_day = 10
+    mailbox_id, token = await _active_hosted(
+        service,
+        local_part="send-reconciliation-pagination",
+        idempotency_key="send-reconciliation-pagination-idempotency-0001",
+    )
+    first_quote = await service.create_send_quote(
+        MailSendQuoteRequest(
+            mailbox_id=mailbox_id,
+            to="missing@example.net",
+            subject="Missing submission",
+            text="This stale intent should become retryable.",
+        ),
+        token,
+    )
+    second_quote = await service.create_send_quote(
+        MailSendQuoteRequest(
+            mailbox_id=mailbox_id,
+            to="recovered@example.net",
+            subject="Recovered submission",
+            text="This later intent must not starve.",
+        ),
+        token,
+    )
+    first = await service._reserve_send_intent(first_quote.quote_id)
+    second = await service._reserve_send_intent(second_quote.quote_id)
+    stale = datetime.now(UTC) - timedelta(minutes=6)
+    async with sessions() as session:
+        first_row = await session.get(MailSendRow, first.send_id)
+        second_row = await session.get(MailSendRow, second.send_id)
+        first_row.status = "submitting"
+        first_row.submission_started_at = stale
+        first_row.created_at = stale - timedelta(minutes=1)
+        second_row.status = "submitting"
+        second_row.submission_started_at = stale
+        second_row.created_at = stale
+        await session.commit()
+    backend.messages_by_send_id[second.send_id] = "message-recovered-after-stale"
+
+    assert await service.reconcile_send_intents(limit=1) == 1
+    async with sessions() as session:
+        retryable = await session.get(MailSendRow, first.send_id)
+        waiting = await session.get(MailSendRow, second.send_id)
+    assert retryable.status == "pending"
+    assert retryable.error == "submission_not_found_after_lease"
+    assert waiting.status == "submitting"
+
+    assert await service.reconcile_send_intents(limit=1) == 1
+    async with sessions() as session:
+        recovered = await session.get(MailSendRow, second.send_id)
+    assert recovered.status == "accepted"
+    assert recovered.message_id == "message-recovered-after-stale"
 
 
 @pytest.mark.asyncio
@@ -2436,10 +2570,11 @@ async def test_stored_authorization_recovers_send_payment_without_metrics_ledger
     assert pending.value.code == "mail_payment_settlement_pending"
 
     class _RecoveryGate:
-        async def reconcile_settlement(self, header, amount, *, pending_since):
+        async def reconcile_settlement(self, header, amount, *, pending_since, resource_key):
             assert header == "stored-send-authorization"
             assert amount == Decimal(quote.amount_usd)
             assert pending_since is not None
+            assert resource_key == f"mail_send:{quote.quote_id}"
             return PaymentReconciliation(
                 payment=RecoveredPayment(
                     payer="0x" + "4" * 40,
@@ -2483,6 +2618,40 @@ async def test_payment_authorization_is_durably_bound_to_one_send_quote(mail_ser
     assert [(row.fingerprint, row.quote_id) for row in bindings] == [
         (fingerprint, "mailq_first_send")
     ]
+
+
+@pytest.mark.asyncio
+async def test_definitive_activation_failure_releases_quote_authorization(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="replacement-authorization",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    account, _token, _created = await service.prepare_activation(
+        quote.quote_id,
+        idempotency_key="replacement-authorization-idempotency-0001",
+    )
+    first = hashlib.sha256(b"definitively-failed-authorization").hexdigest()
+    replacement = hashlib.sha256(b"replacement-authorization").hexdigest()
+    await service.bind_payment_authorization(first, quote.quote_id)
+    await service.begin_activation_settlement(
+        account.mailbox_id,
+        quote.quote_id,
+        payer="0x" + "1" * 40,
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+        payment_authorization="failed-authorization-header",
+    )
+
+    await service.clear_activation_settlement(account.mailbox_id, quote.quote_id)
+    await service.bind_payment_authorization(replacement, quote.quote_id)
+
+    async with sessions() as session:
+        bindings = list(await session.scalars(select(MailPaymentAuthorizationRow)))
+    assert [(row.fingerprint, row.quote_id) for row in bindings] == [(replacement, quote.quote_id)]
 
 
 @pytest.mark.asyncio

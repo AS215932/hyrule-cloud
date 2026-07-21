@@ -79,7 +79,11 @@ from hyrule_cloud.domains.validation import (
     validate_rrset,
 )
 from hyrule_cloud.middleware.anon_token import hash_anon_token
-from hyrule_cloud.middleware.x402 import PaymentReconciliation
+from hyrule_cloud.middleware.x402 import (
+    PaymentReconciliation,
+    domain_payment_resource_key,
+    mail_payment_resource_key,
+)
 from hyrule_cloud.models import (
     CryptoIntentStatus,
     DomainMode,
@@ -1264,10 +1268,13 @@ class DomainService:
                     select(DomainRow).where(DomainRow.fqdn == fqdn).with_for_update()
                 )
             ).scalar_one_or_none()
-            if domain is None or str(domain.status) not in {
+            if domain is None:
+                raise DomainProblem(404, "domain_not_found", "The managed domain was not found.")
+            active = str(domain.status) in {
                 DomainStatus.ACTIVE.value,
                 DomainStatus.RENEWAL_DUE.value,
-            }:
+            }
+            if normalized and not active:
                 raise DomainProblem(409, "domain_not_active", "The managed domain is not active.")
             owned_keys = {(row.name, row.type.value) for row in normalized}
             conflicts = list(
@@ -1308,11 +1315,12 @@ class DomainService:
                     select(DomainDNSRecordRow).where(DomainDNSRecordRow.fqdn == fqdn)
                 )
             )
-            await self.dns.apply_zone(
-                fqdn,
-                revision=domain.zone_revision,
-                records=[self._record_payload(row) for row in all_records],
-            )
+            if domain.nameserver_mode == NameserverMode.MANAGED.value:
+                await self.dns.apply_zone(
+                    fqdn,
+                    revision=domain.zone_revision,
+                    records=[self._record_payload(row) for row in all_records],
+                )
             await session.commit()
 
     async def remove_service_records(self, fqdn: str, *, managed_by: str) -> None:
@@ -1524,7 +1532,7 @@ class DomainService:
             "nameservers",
             {"mode": body.mode.value, "nameservers": nameservers},
             idempotency_key,
-            reject_vm_attachment=body.mode is NameserverMode.EXTERNAL,
+            reject_external_delegation=body.mode is NameserverMode.EXTERNAL,
         )
 
     async def enqueue_dnssec_update(
@@ -1564,6 +1572,7 @@ class DomainService:
             "transfer_out",
             {},
             idempotency_key,
+            reject_external_delegation=True,
         )
 
     async def find_existing_operation(
@@ -1744,14 +1753,37 @@ class DomainService:
                         .limit(limit)
                     )
                 )
+                pending_ids = [row.order_id for row in pending]
+                bundle_quotes = {
+                    order_id: quote_id
+                    for order_id, quote_id in (
+                        await session.execute(
+                            select(
+                                MailAccountRow.domain_order_id,
+                                MailAccountRow.quote_id,
+                            ).where(MailAccountRow.domain_order_id.in_(pending_ids))
+                        )
+                    ).all()
+                    if order_id is not None and quote_id is not None
+                }
             for pending_order in pending:
                 if not pending_order.payment_authorization_header:
                     continue
                 try:
+                    bundle_quote_id = bundle_quotes.get(pending_order.order_id)
+                    resource_key = (
+                        mail_payment_resource_key(
+                            bundle_quote_id,
+                            domain_order_id=pending_order.order_id,
+                        )
+                        if bundle_quote_id
+                        else domain_payment_resource_key(pending_order.order_id)
+                    )
                     reconciliation: PaymentReconciliation = await gate.reconcile_settlement(
                         pending_order.payment_authorization_header,
                         Decimal(pending_order.amount_usd),
                         pending_since=_aware(pending_order.payment_settlement_pending_at),
+                        resource_key=resource_key,
                     )
                     if reconciliation.terminal_unsettled:
                         await self.fail_x402_settlement(
@@ -2879,7 +2911,7 @@ class DomainService:
         mode = NameserverMode(payload["mode"])
         nameservers = list(payload.get("nameservers") or [])
         if mode is NameserverMode.EXTERNAL:
-            self._assert_external_delegation_allowed(domain)
+            await self._assert_external_delegation_allowed(domain)
         if domain.openprovider_id is None:
             raise RuntimeError("domain has no registrar id")
         incompatible_dnssec = (
@@ -2963,6 +2995,7 @@ class DomainService:
 
     async def _transfer_out(self, operation_id: str) -> None:
         _operation, domain = await self._operation_and_domain(operation_id)
+        await self._assert_external_delegation_allowed(domain)
         if domain.openprovider_id is None:
             raise RuntimeError("domain has no registrar id")
         await self.provider.unlock_domain(domain.openprovider_id)
@@ -3266,7 +3299,7 @@ class DomainService:
         payload: dict[str, Any],
         idempotency_key: str,
         *,
-        reject_vm_attachment: bool = False,
+        reject_external_delegation: bool = False,
     ) -> DomainOperationResponse:
         if not idempotency_key or len(idempotency_key) > 128:
             raise DomainProblem(
@@ -3284,7 +3317,7 @@ class DomainService:
                 if operation is not None:
                     self._validate_operation_replay(operation, fqdn, kind, payload)
                     return self._operation_response(operation)
-            if reject_vm_attachment:
+            if reject_external_delegation:
                 domain = (
                     await session.execute(
                         select(DomainRow)
@@ -3297,7 +3330,7 @@ class DomainService:
                 ).scalar_one_or_none()
                 if domain is None:
                     raise DomainProblem(404, "domain_not_found", "Domain not found.")
-                self._assert_external_delegation_allowed(domain)
+                await self._assert_external_delegation_allowed(domain, session=session)
             operation = DomainOperationRow(
                 operation_id=generate_domain_operation_id(),
                 fqdn=fqdn,
@@ -3343,13 +3376,50 @@ class DomainService:
             + hashlib.sha256(f"{owner_account_id}:{kind}:{idempotency_key}".encode()).hexdigest()
         )
 
-    @staticmethod
-    def _assert_external_delegation_allowed(domain: DomainRow) -> None:
+    async def _assert_external_delegation_allowed(
+        self,
+        domain: DomainRow,
+        *,
+        session: AsyncSession | None = None,
+    ) -> None:
         if domain.vm_id is not None or domain.vm_ipv6 is not None:
             raise DomainProblem(
                 409,
                 "domain_attached_to_vm",
                 "Detach the VM before switching this domain to external nameservers.",
+            )
+        occupancy = or_(
+            MailAccountRow.status.in_(
+                ["pending_domain", "provisioning", "active", "suspended", "grace"]
+            ),
+            and_(
+                MailAccountRow.status == "awaiting_payment",
+                MailAccountRow.capacity_reserved_at.is_not(None),
+            ),
+            MailAccountRow.dns_cleanup_pending.is_(True),
+        )
+
+        async def occupied(db: AsyncSession) -> bool:
+            mailbox_id = await db.scalar(
+                select(MailAccountRow.mailbox_id)
+                .where(
+                    MailAccountRow.domain == domain.fqdn,
+                    occupancy,
+                )
+                .limit(1)
+            )
+            return mailbox_id is not None
+
+        if session is not None:
+            has_mailbox = await occupied(session)
+        else:
+            async with self.db() as current_session:
+                has_mailbox = await occupied(current_session)
+        if has_mailbox:
+            raise DomainProblem(
+                409,
+                "domain_attached_to_mailbox",
+                "Delete the Agent Mail mailbox before changing domain delegation.",
             )
 
     @staticmethod

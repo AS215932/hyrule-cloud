@@ -616,6 +616,19 @@ class PaymentEventRow(Base):
     __table_args__ = (Index("ix_payment_events_type_created", "event_type", "created_at"),)
 
 
+class PaymentAuthorizationRow(Base):
+    """Service-wide ownership of one canonical x402 authorization."""
+
+    __tablename__ = "payment_authorizations"
+
+    fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    resource_key: Mapped[str] = mapped_column(String(256), index=True)
+    resource_path: Mapped[str] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
 class VMQuoteRow(Base):
     """Durable order quote (issue #14).
 

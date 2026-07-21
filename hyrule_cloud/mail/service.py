@@ -69,7 +69,7 @@ from hyrule_cloud.mail.models import (
     generate_mail_id,
 )
 from hyrule_cloud.mail.security import hash_token, sanitize_html, validate_webhook_url
-from hyrule_cloud.middleware.x402 import PaymentReconciliation
+from hyrule_cloud.middleware.x402 import PaymentReconciliation, mail_payment_resource_key
 from hyrule_cloud.models import DomainStatus
 from hyrule_cloud.services.refunds import RefundService
 
@@ -726,6 +726,11 @@ class MailService:
                 row.payment_asset = None
                 row.payment_authorization_header = None
                 row.payment_settlement_pending_at = None
+                await session.execute(
+                    delete(MailPaymentAuthorizationRow).where(
+                        MailPaymentAuthorizationRow.quote_id == quote_id
+                    )
+                )
                 await session.commit()
 
     async def fail_activation_settlement(
@@ -1359,35 +1364,76 @@ class MailService:
 
         if limit < 1:
             return 0
-        async with self.db() as session:
-            send_ids = list(
-                await session.scalars(
-                    select(MailSendRow.send_id)
-                    .where(MailSendRow.status == "submitting")
-                    .order_by(MailSendRow.created_at)
-                    .limit(limit)
+        stale_before = _now() - _SEND_SUBMISSION_LEASE
+        changed = 0
+        cursor: tuple[datetime, str] | None = None
+        while changed < limit:
+            filters = [
+                MailSendRow.status == "submitting",
+                or_(
+                    MailSendRow.submission_started_at.is_(None),
+                    MailSendRow.submission_started_at <= stale_before,
+                ),
+            ]
+            if cursor is not None:
+                created_at, send_id = cursor
+                filters.append(
+                    or_(
+                        MailSendRow.created_at > created_at,
+                        and_(
+                            MailSendRow.created_at == created_at,
+                            MailSendRow.send_id > send_id,
+                        ),
+                    )
                 )
-            )
-        reconciled = 0
-        for send_id in send_ids:
-            try:
-                async with self.db() as session:
-                    send = await session.get(MailSendRow, send_id)
-                    account = await session.get(MailAccountRow, send.mailbox_id) if send else None
-                if send is None or account is None or not account.backend_credential_ciphertext:
-                    continue
-                password = self._decrypt(self._fernet(), account.backend_credential_ciphertext)
-                message_id = await self.backend.find_message_by_send_id(
-                    address=account.address,
-                    password=password,
-                    send_id=send_id,
+            async with self.db() as session:
+                candidates = list(
+                    await session.scalars(
+                        select(MailSendRow)
+                        .where(*filters)
+                        .order_by(MailSendRow.created_at, MailSendRow.send_id)
+                        .limit(limit)
+                    )
                 )
-                if message_id:
-                    await self._finalize_send(send_id, message_id)
-                    reconciled += 1
-            except Exception:
-                log.exception("mail_send_intent_reconciliation_failed", send_id=send_id)
-        return reconciled
+            if not candidates:
+                break
+            for send in candidates:
+                cursor = (send.created_at, send.send_id)
+                try:
+                    async with self.db() as session:
+                        account = await session.get(MailAccountRow, send.mailbox_id)
+                    if account is None or not account.backend_credential_ciphertext:
+                        continue
+                    password = self._decrypt(self._fernet(), account.backend_credential_ciphertext)
+                    message_id = await self.backend.find_message_by_send_id(
+                        address=account.address,
+                        password=password,
+                        send_id=send.send_id,
+                    )
+                    if message_id:
+                        await self._finalize_send(send.send_id, message_id)
+                    else:
+                        async with self.db() as session:
+                            current = await session.get(MailSendRow, send.send_id)
+                            if current is None or current.status != "submitting":
+                                continue
+                            current.status = "pending"
+                            current.submission_started_at = None
+                            current.error = "submission_not_found_after_lease"
+                            await session.commit()
+                    changed += 1
+                    if changed >= limit:
+                        break
+                except Exception:
+                    # Cursor pagination ensures one unavailable mailbox cannot
+                    # starve later recoverable submissions in this pass.
+                    log.exception(
+                        "mail_send_intent_reconciliation_failed",
+                        send_id=send.send_id,
+                    )
+            if len(candidates) < limit:
+                break
+        return changed
 
     async def begin_send_settlement(
         self,
@@ -1442,6 +1488,11 @@ class MailService:
                 row.payment_asset = None
                 row.payment_authorization_header = None
                 row.payment_settlement_pending_at = None
+                await session.execute(
+                    delete(MailPaymentAuthorizationRow).where(
+                        MailPaymentAuthorizationRow.quote_id == quote_id
+                    )
+                )
                 await session.commit()
 
     async def fail_send_settlement(self, send_id: str, quote_id: str, *, reason: str) -> None:
@@ -1907,17 +1958,18 @@ class MailService:
         return accepted
 
     async def provision_pending(self, *, limit: int = 10) -> int:
+        if limit < 1:
+            return 0
+        now = _now()
         async with self.db() as session:
-            rows = list(
+            pending_domains = list(
                 await session.scalars(
                     select(MailAccountRow)
                     .where(
-                        MailAccountRow.status.in_(
-                            [MailboxStatus.PENDING_DOMAIN.value, MailboxStatus.PROVISIONING.value]
-                        ),
+                        MailAccountRow.status == MailboxStatus.PENDING_DOMAIN.value,
                         or_(
                             MailAccountRow.provision_next_attempt_at.is_(None),
-                            MailAccountRow.provision_next_attempt_at <= _now(),
+                            MailAccountRow.provision_next_attempt_at <= now,
                         ),
                     )
                     .order_by(MailAccountRow.created_at)
@@ -1925,37 +1977,63 @@ class MailService:
                 )
             )
         changed = 0
-        for row in rows:
-            if row.status == MailboxStatus.PENDING_DOMAIN.value and row.domain_order_id:
+        for row in pending_domains:
+            if not row.domain_order_id:
+                if await self._fail_activation(
+                    row.mailbox_id,
+                    "domain_order_missing",
+                    refund=False,
+                ):
+                    changed += 1
+                continue
+            async with self.db() as session:
+                domain_order = await session.get(DomainOrderRow, row.domain_order_id)
+            if domain_order is None:
+                if await self._fail_activation(
+                    row.mailbox_id,
+                    "domain_order_missing",
+                    refund=False,
+                ):
+                    changed += 1
+                continue
+            if domain_order.status == DomainOrderStatus.ACTIVE.value:
                 async with self.db() as session:
-                    domain_order = await session.get(DomainOrderRow, row.domain_order_id)
-                if domain_order is None:
-                    await self._fail_activation(
-                        row.mailbox_id, "domain_order_missing", refund=False
-                    )
+                    current = await session.get(MailAccountRow, row.mailbox_id)
+                    if current is not None and current.status == MailboxStatus.PENDING_DOMAIN.value:
+                        current.status = MailboxStatus.PROVISIONING.value
+                        await session.commit()
+            elif domain_order.status in {
+                DomainOrderStatus.FAILED.value,
+                DomainOrderStatus.REFUND_DUE.value,
+                DomainOrderStatus.CANCELLED.value,
+                DomainOrderStatus.EXPIRED.value,
+            }:
+                # The domain lifecycle records the full combined refund.
+                if await self._fail_activation(
+                    row.mailbox_id,
+                    "domain_registration_failed",
+                    refund=False,
+                ):
                     changed += 1
-                    continue
-                if domain_order.status == DomainOrderStatus.ACTIVE.value:
-                    async with self.db() as session:
-                        current = await session.get(MailAccountRow, row.mailbox_id)
-                        if current is not None:
-                            current.status = MailboxStatus.PROVISIONING.value
-                            await session.commit()
-                    row.status = MailboxStatus.PROVISIONING.value
-                elif domain_order.status in {
-                    DomainOrderStatus.FAILED.value,
-                    DomainOrderStatus.REFUND_DUE.value,
-                    DomainOrderStatus.CANCELLED.value,
-                    DomainOrderStatus.EXPIRED.value,
-                }:
-                    # The domain lifecycle records the full combined refund.
-                    await self._fail_activation(
-                        row.mailbox_id, "domain_registration_failed", refund=False
+
+        # Unready registrations never consume the provisioning batch. Query
+        # ready rows independently after promoting any newly active domains.
+        async with self.db() as session:
+            ready = list(
+                await session.scalars(
+                    select(MailAccountRow)
+                    .where(
+                        MailAccountRow.status == MailboxStatus.PROVISIONING.value,
+                        or_(
+                            MailAccountRow.provision_next_attempt_at.is_(None),
+                            MailAccountRow.provision_next_attempt_at <= now,
+                        ),
                     )
-                    changed += 1
-                    continue
-                else:
-                    continue
+                    .order_by(MailAccountRow.created_at)
+                    .limit(limit)
+                )
+            )
+        for row in ready:
             try:
                 changed += int(await self._provision_one(row.mailbox_id))
             except Exception:
@@ -2252,6 +2330,10 @@ class MailService:
                         pending_send.payment_authorization_header,
                         Decimal(pending_send.amount_usd),
                         pending_since=_aware(pending_send.payment_settlement_pending_at),
+                        resource_key=mail_payment_resource_key(
+                            pending_send.quote_id,
+                            send=True,
+                        ),
                     )
                     if send_reconciliation.terminal_unsettled:
                         await self.fail_send_settlement(
@@ -2304,6 +2386,10 @@ class MailService:
                         pending_account.payment_authorization_header,
                         Decimal(pending_account.total_amount_usd),
                         pending_since=_aware(pending_account.payment_settlement_pending_at),
+                        resource_key=mail_payment_resource_key(
+                            pending_account.quote_id,
+                            domain_order_id=pending_account.domain_order_id,
+                        ),
                     )
                     if reconciliation.terminal_unsettled:
                         await self.fail_activation_settlement(

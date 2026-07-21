@@ -1355,6 +1355,53 @@ async def test_dns_changeset_cannot_modify_service_owned_rrsets(domain_service):
     assert service.dns.zones == {}
 
 
+@pytest.mark.asyncio
+async def test_service_records_can_be_removed_after_domain_expiration(domain_service):
+    service, _provider, sessions = domain_service
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="expired-mail-cleanup",
+                extension="dev",
+                fqdn="expired-mail-cleanup.dev",
+                owner_wallet="0x" + "1" * 40,
+                owner_account_id="H1234567890",
+                status="expired",
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+            )
+        )
+        session.add(
+            DomainDNSRecordRow(
+                fqdn="expired-mail-cleanup.dev",
+                name="@",
+                type="MX",
+                ttl=300,
+                values=["10 mail.hyrule.host."],
+                managed_by="agent_mail",
+            )
+        )
+        await session.commit()
+
+    await service.remove_service_records(
+        "expired-mail-cleanup.dev",
+        managed_by="agent_mail",
+    )
+
+    async with sessions() as session:
+        remaining = list(
+            await session.scalars(
+                select(DomainDNSRecordRow).where(
+                    DomainDNSRecordRow.fqdn == "expired-mail-cleanup.dev"
+                )
+            )
+        )
+    assert remaining == []
+    assert "expired-mail-cleanup.dev" in service.dns.zones
+
+
 def test_domain_order_payment_asset_accepts_evm_token_addresses():
     assert DomainOrderRow.__table__.c.payment_asset.type.length == 66
 
@@ -1756,10 +1803,11 @@ async def test_stored_authorization_recovers_domain_payment_without_metrics_ledg
     )
 
     class _RecoveryGate:
-        async def reconcile_settlement(self, header, amount, *, pending_since):
+        async def reconcile_settlement(self, header, amount, *, pending_since, resource_key):
             assert header == "stored-eip3009-authorization"
             assert amount == Decimal(order.amount_usd)
             assert pending_since is not None
+            assert resource_key == f"domain_order:{order.order_id}"
             return PaymentReconciliation(
                 payment=RecoveredPayment(
                     payer="0x" + "4" * 40,
@@ -1808,10 +1856,11 @@ async def test_terminal_authorization_closes_domain_order(domain_service):
     )
 
     class _ExpiredGate:
-        async def reconcile_settlement(self, header, amount, *, pending_since):
+        async def reconcile_settlement(self, header, amount, *, pending_since, resource_key):
             assert header == "expired-authorization"
             assert amount == Decimal(order.amount_usd)
             assert pending_since is not None
+            assert resource_key == f"domain_order:{order.order_id}"
             return PaymentReconciliation(
                 terminal_unsettled=True,
                 reason="expired",
@@ -2112,6 +2161,91 @@ async def test_external_nameservers_are_blocked_for_vm_attachment_and_worker_rac
     assert failed_operation.error_code == "domain_attached_to_vm"
     assert domain.nameserver_mode == "managed"
     assert domain.vm_id == "vm_attached_delegation"
+    provider.update_nameservers.assert_not_awaited()
+    provider.set_dnssec_keys.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_external_delegation_is_blocked_while_agent_mail_owns_domain(
+    domain_service,
+):
+    service, provider, sessions = domain_service
+    service.domain_config.authcode_fernet_key = Fernet.generate_key().decode()
+    provider.update_nameservers = AsyncMock(return_value={})
+    provider.set_dnssec_keys = AsyncMock(return_value={})
+    fqdn = "mail-delegation.dev"
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="mail-delegation",
+                extension="dev",
+                fqdn=fqdn,
+                owner_wallet="0x" + "1" * 40,
+                owner_account_id="H1234567890",
+                status="active",
+                openprovider_id=8456,
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+            )
+        )
+        session.add(
+            MailAccountRow(
+                mailbox_id="mbx_mail_delegation",
+                address=f"agent@{fqdn}",
+                plan="custom",
+                status="active",
+                domain=fqdn,
+                expires_at=datetime.now(UTC) + timedelta(days=30),
+            )
+        )
+        await session.commit()
+    body = NameserverUpdateRequest(
+        mode=NameserverMode.EXTERNAL,
+        nameservers=["ns1.example.net", "ns2.example.net"],
+    )
+
+    with pytest.raises(DomainProblem) as nameservers:
+        await service.enqueue_nameserver_update(
+            "H1234567890",
+            fqdn,
+            body,
+            "mail-delegation-nameservers",
+        )
+    with pytest.raises(DomainProblem) as transfer:
+        await service.enqueue_transfer_out(
+            "H1234567890",
+            fqdn,
+            "mail-delegation-transfer",
+        )
+    assert nameservers.value.code == "domain_attached_to_mailbox"
+    assert transfer.value.code == "domain_attached_to_mailbox"
+
+    async with sessions() as session:
+        mailbox = await session.get(MailAccountRow, "mbx_mail_delegation")
+        mailbox.status = "deleted"
+        await session.commit()
+    operation = await service.enqueue_nameserver_update(
+        "H1234567890",
+        fqdn,
+        body,
+        "mail-delegation-worker-race",
+    )
+    async with sessions() as session:
+        mailbox = await session.get(MailAccountRow, "mbx_mail_delegation")
+        mailbox.status = "active"
+        await session.commit()
+
+    assert await service.process_jobs(worker_id="test", limit=1) == 1
+    async with sessions() as session:
+        failed = await session.get(DomainOperationRow, operation.operation_id)
+        domain = (
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
+        ).scalar_one()
+    assert failed is not None and failed.status == "failed"
+    assert failed.error_code == "domain_attached_to_mailbox"
+    assert domain.nameserver_mode == "managed"
     provider.update_nameservers.assert_not_awaited()
     provider.set_dnssec_keys.assert_not_awaited()
 
