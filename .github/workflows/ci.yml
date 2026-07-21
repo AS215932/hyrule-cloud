@@ -39,7 +39,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock', 'packages/hyrule-cloud-mcp/uv.lock') }}
           restore-keys: |
             uv-${{ runner.os }}-
 
@@ -59,6 +59,15 @@ jobs:
       - name: Pytest
         run: |
           ~/.local/bin/uv run pytest -q
+
+      - name: Verify buyer MCP package
+        working-directory: packages/hyrule-cloud-mcp
+        run: |
+          ~/.local/bin/uv sync --frozen --extra dev
+          ~/.local/bin/uv run ruff check .
+          ~/.local/bin/uv run mypy src
+          ~/.local/bin/uv run pytest -q
+          ~/.local/bin/uv build
 
       # verify_facilitator.py is the CI gate per feedback_verified_payment_chains.md.
       # Triggers only when the payment stack itself changes (PaymentConfig or

@@ -44,19 +44,22 @@ curl https://cloud.hyrule.host/v1/threat/pricing
 
 ## Paid lookup
 
+These curl examples show request shapes and receive the initial 402. Use an
+official x402 v2 client for `Payment-Required` handling and the paid retry; see
+<https://github.com/AS215932/hyrule-cloud/blob/main/skills/hyrule-cloud/references/payments.md>.
+
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/threat/lookup \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"subject":{"type":"domain","value":"example.com"},"views":["rbl","ct","rdap","whois","dns","reputation"]}'
 ```
 
 ## Shortcuts
 
 ```bash
-curl -H 'X-PAYMENT: <x402-payment>' https://cloud.hyrule.host/v1/threat/domain/example.com
-curl -H 'X-PAYMENT: <x402-payment>' https://cloud.hyrule.host/v1/threat/rbl?target=203.0.113.10
-curl -H 'X-PAYMENT: <x402-payment>' https://cloud.hyrule.host/v1/threat/ct?domain=example.com
+curl https://cloud.hyrule.host/v1/threat/domain/example.com
+curl 'https://cloud.hyrule.host/v1/threat/rbl?target=203.0.113.10'
+curl 'https://cloud.hyrule.host/v1/threat/ct?domain=example.com'
 ```
 
 ## Agent guidance
@@ -64,3 +67,6 @@ curl -H 'X-PAYMENT: <x402-payment>' https://cloud.hyrule.host/v1/threat/ct?domai
 Use this Skill to add reputation context to mail, web, abuse, phishing, or
 blocklist investigations. For mail-specific deliverability, call `/v1/mx` first
 and use `/v1/threat` for supplemental reputation evidence.
+
+An official x402 v2 client reads `Payment-Required`, enforces the operator's
+spend policy, creates the payment, and retries with `Payment-Signature`.

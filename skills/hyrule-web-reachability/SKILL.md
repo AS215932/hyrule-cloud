@@ -34,10 +34,13 @@ curl https://cloud.hyrule.host/v1/web/pricing
 
 ## Paid quick check
 
+The curl examples show request shapes and receive the initial 402. Use an
+official x402 v2 client for `Payment-Required` handling and the paid retry; see
+<https://github.com/AS215932/hyrule-cloud/blob/main/skills/hyrule-cloud/references/payments.md>.
+
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/web/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{
     "target":"https://example.com",
     "checks":["dns","http","tls","cert","headers","cdn_waf"],
@@ -53,7 +56,6 @@ SSL Labs output and do not imply affiliation.
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/web/tls/deep \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"host":"example.com","port":443,"scan_profile":"ssl_labs_style"}'
 ```
 

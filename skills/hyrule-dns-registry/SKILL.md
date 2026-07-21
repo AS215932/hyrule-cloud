@@ -20,12 +20,15 @@ This Skill must not mutate zones or register domains.
 
 ## Common workflows
 
+These curl examples show request shapes and receive the initial 402. Use an
+official x402 v2 client for `Payment-Required` handling and the paid retry; see
+<https://github.com/AS215932/hyrule-cloud/blob/main/skills/hyrule-cloud/references/payments.md>.
+
 ### Propagation check
 
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/dns/propagation \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"name":"www.example.com","type":"A","expected":["203.0.113.10"],"resolvers":["cloudflare","google","quad9","system"]}'
 ```
 
@@ -34,15 +37,13 @@ curl -X POST https://cloud.hyrule.host/v1/dns/propagation \
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/dns/authority-vs-recursive \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"name":"example.com","type":"MX","recursive_resolvers":["1.1.1.1","8.8.8.8","9.9.9.9"]}'
 ```
 
 ### DNSSEC report
 
 ```bash
-curl -X POST 'https://cloud.hyrule.host/v1/dns/dnssec/report?name=example.com' \
-  -H 'X-PAYMENT: <x402-payment>'
+curl -X POST 'https://cloud.hyrule.host/v1/dns/dnssec/report?name=example.com'
 ```
 
 ### Registry context
@@ -50,12 +51,10 @@ curl -X POST 'https://cloud.hyrule.host/v1/dns/dnssec/report?name=example.com' \
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/rdap/lookup \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"subject":{"type":"domain","value":"example.com"}}'
 
 curl -X POST https://cloud.hyrule.host/v1/whois/lookup \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"subject":{"type":"domain","value":"example.com"}}'
 ```
 

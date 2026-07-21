@@ -1141,6 +1141,7 @@ class BGPSnapshotSummary(BaseModel):
     formats: list[str] = Field(default_factory=lambda: ["normalized_jsonl.gz"])
     size_bytes: int | None = None
     sha256: str | None = None
+    download_available: bool
 
 
 class BGPSnapshotListResponse(BaseModel):

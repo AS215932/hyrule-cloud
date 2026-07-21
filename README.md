@@ -2,7 +2,7 @@
 
 Full-stack network infrastructure for AI agents on Hyrule Networks (AS215932), paid per request via x402.
 
-Agents discover the curated paid surface via `/openapi.json`, the x402 Bazaar,
+Agents discover the complete API via `/openapi.json` and the paid subset via the x402 Bazaar,
 or `/.well-known/x402.json` and pay with USDC on Base. Four service groups:
 
 - **Compute** — bare IPv6-native VMs with SSH, automatic HTTPS subdomains, and optional custom domains.
@@ -16,11 +16,11 @@ or `/.well-known/x402.json` and pay with USDC on Base. Four service groups:
 ```
 Agent (OpenClaw, Claude MCP, x402-aware client)
   |
-  |-- discovers via /openapi.json, /.well-known/x402.json, or Bazaar
+  |-- discovers the API via /openapi.json and paid operations via /.well-known/x402.json or Bazaar
   |
   |-- POST /v1/vm/create  (no payment) --> 402 + pricing + specs
   |-- pays via x402 facilitator (USDC on Base)
-  |-- POST /v1/vm/create  (with X-PAYMENT header) --> 202 + status_url
+  |-- POST /v1/vm/create  (with Payment-Signature) --> 202 + status_url
   |-- GET  /v1/vm/{id}    (poll) --> { ipv6, hostname, ssh }
   |
   |-- ssh root@<hostname>  --> agent owns the VM from here
@@ -163,6 +163,28 @@ VMs are suspended at expiry, destroyed after a 48h grace period.
 payment, checks sidecar mode availability, and then delegates execution to the
 internal `hyrule-network-proxy` Go sidecar. Supported modes are `direct`, `tor`,
 `i2p`, and `yggdrasil`; residential proxying is intentionally not offered.
+
+The canonical `/openapi.json` documents the complete API: free discovery,
+authenticated/account operations, management APIs, and paid operations. Only
+operations with `x-payment-info` are independently payable. The live
+`/.well-known/x402.json` manifest is the authoritative paid subset.
+
+## Agent distribution
+
+The `skills/` directory contains the umbrella Hyrule Cloud skill plus nine
+launch-ready focused skills for ClawHub and the skills.sh ecosystem. Install
+from the public repository with:
+
+```bash
+npx skills add AS215932/hyrule-cloud --skill hyrule-cloud
+```
+
+`packages/hyrule-cloud-mcp` is the buyer-facing MCP package intended for the
+official MCP Registry. It automatically handles x402 v2 payments for live
+manifest capabilities while enforcing an exact origin/path, a capability
+allowlist, a per-payment cap, and a durable daily SQLite budget. It does not
+enable VM or generic proxy purchases unless the operator supplies both
+explicit infrastructure and capability opt-ins.
 
 ## Database
 

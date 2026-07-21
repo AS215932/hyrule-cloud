@@ -29,6 +29,10 @@ Supported SuperTool-style tools:
 
 ## Examples
 
+The curl examples show request shapes and receive the initial 402. Use an
+official x402 v2 client for `Payment-Required` handling and the paid retry; see
+<https://github.com/AS215932/hyrule-cloud/blob/main/skills/hyrule-cloud/references/payments.md>.
+
 ```bash
 curl https://cloud.hyrule.host/v1/mx/tools
 ```
@@ -36,7 +40,6 @@ curl https://cloud.hyrule.host/v1/mx/tools
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/mx/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"tool":"spf","target":"example.com"}'
 ```
 
@@ -45,7 +48,6 @@ SuperTool-compatible command form:
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/mx/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"command":"mx:example.com"}'
 ```
 
@@ -54,7 +56,6 @@ Full mail-delivery report:
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/mx/jobs \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"profile":"mail_delivery","target":"example.com"}'
 ```
 

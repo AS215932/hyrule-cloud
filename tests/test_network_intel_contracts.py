@@ -15,19 +15,21 @@ def test_bgp_prefix_lookup_contract_does_not_require_asn():
     assert req.assertions.expected_origin_asns == []
 
 
-def test_openapi_exposes_only_enabled_paid_launch_contracts():
+def test_openapi_documents_the_full_api_and_marks_only_enabled_paid_contracts():
     from hyrule_cloud.services.discovery import enabled_paid_operations
 
     paths = app.openapi()["paths"]
-    actual = {
+    paid_actual = {
         (method.upper(), path)
         for path, path_item in paths.items()
-        for method in path_item
+        for method, operation in path_item.items()
         if method.lower() in {"get", "post", "put", "delete", "patch"}
+        and isinstance(operation, dict)
+        and isinstance(operation.get("x-payment-info"), dict)
     }
     expected = {operation.key for operation in enabled_paid_operations()}
 
-    assert actual == expected
+    assert paid_actual == expected
     for required in {
         "/v1/bgp/lookup",
         "/v1/ip/lookup",
@@ -45,17 +47,21 @@ def test_openapi_exposes_only_enabled_paid_launch_contracts():
     }:
         assert required in paths
 
-    for hidden in {
+    for free_or_authenticated in {
         "/health",
         "/.well-known/x402.json",
-        "/v1/domain/register",
         "/v1/auth/login",
         "/v1/internal/bgp/jobs/claim",
         "/v1/me",
-        "/v1/mail/accounts",
-        "/v1/speedtest",
+        "/v1/pricing",
+        "/v1/domains/tlds",
     }:
-        assert hidden not in paths
+        assert free_or_authenticated in paths
+        assert all(
+            "x-payment-info" not in operation
+            for operation in paths[free_or_authenticated].values()
+            if isinstance(operation, dict)
+        )
 
 
 @pytest.mark.asyncio
@@ -146,21 +152,15 @@ async def test_paid_mx_job_survives_one_diagnostic_failure(monkeypatch):
 
     class PaidGate:
         async def check_payment(self, request, amount, description, extra_body):
-            request.state.payment_response_headers = {
-                "PAYMENT-RESPONSE": "settled-test"
-            }
+            request.state.payment_response_headers = {"PAYMENT-RESPONSE": "settled-test"}
             return "0xwallet"
 
     monkeypatch.setattr("hyrule_cloud.api.mx.run_check", fake_run_check)
     old_state = getattr(app.state, "_typed_state", None)
     had_state = hasattr(app.state, "_typed_state")
-    app.state._typed_state = SimpleNamespace(
-        config=HyruleConfig(), payment_gate=PaidGate()
-    )
+    app.state._typed_state = SimpleNamespace(config=HyruleConfig(), payment_gate=PaidGate())
     try:
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post(
                 "/v1/mx/jobs",
                 json={"profile": "mail_delivery", "target": "example.com"},
@@ -189,14 +189,23 @@ async def test_paid_network_intel_endpoints_fail_closed_without_payment():
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             dns = await client.post("/v1/dns/lookup", json={"name": "example.com", "type": "A"})
-            dns_prop = await client.post("/v1/dns/propagation", json={"name": "example.com", "type": "A"})
+            dns_prop = await client.post(
+                "/v1/dns/propagation", json={"name": "example.com", "type": "A"}
+            )
             web = await client.post("/v1/web/check", json={"target": "https://example.com"})
             mx = await client.post("/v1/mx/check", json={"tool": "mx", "target": "example.com"})
-            bounce = await client.post("/v1/mx/bounce/parse", json={"message": "550 5.7.26 auth failed"})
+            bounce = await client.post(
+                "/v1/mx/bounce/parse", json={"message": "550 5.7.26 auth failed"}
+            )
             port = await client.post("/v1/ports/check", json={"target": "example.com", "port": 443})
-            nat = await client.post("/v1/nat/port-forward/check", json={"target": "example.com", "port": 443})
+            nat = await client.post(
+                "/v1/nat/port-forward/check", json={"target": "example.com", "port": 443}
+            )
             voip = await client.post("/v1/voip/check", json={"target": "example.com"})
-            bgp = await client.post("/v1/bgp/lookup", json={"subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"}})
+            bgp = await client.post(
+                "/v1/bgp/lookup",
+                json={"subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"}},
+            )
     finally:
         if old_state is not None:
             app.state._typed_state = old_state
@@ -221,20 +230,27 @@ async def test_unbuilt_paid_endpoints_return_501_before_charging():
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             responses = {
-                "/v1/web/reports": await client.post("/v1/web/reports", json={"target": "https://example.com"}),
+                "/v1/web/reports": await client.post(
+                    "/v1/web/reports", json={"target": "https://example.com"}
+                ),
                 "/v1/path/jobs": await client.post("/v1/path/jobs", json={"target": "example.com"}),
-                "/v1/voip/report": await client.post("/v1/voip/report", json={"target": "example.com"}),
+                "/v1/voip/report": await client.post(
+                    "/v1/voip/report", json={"target": "example.com"}
+                ),
                 "/v1/voip/jobs": await client.post("/v1/voip/jobs", json={"target": "example.com"}),
                 # Diagnostics whose real data source isn't configured must also
                 # refuse before charging (contract-only responses otherwise).
                 "/v1/threat/lookup": await client.post(
-                    "/v1/threat/lookup", json={"subject": {"type": "domain", "value": "example.com"}}
+                    "/v1/threat/lookup",
+                    json={"subject": {"type": "domain", "value": "example.com"}},
                 ),
                 "/v1/voip/number/lookup": await client.post(
                     "/v1/voip/number/lookup", json={"number": "+31201234567"}
                 ),
                 "/v1/path/ping": await client.post("/v1/path/ping", json={"target": "example.com"}),
-                "/v1/path/report": await client.post("/v1/path/report", json={"target": "example.com"}),
+                "/v1/path/report": await client.post(
+                    "/v1/path/report", json={"target": "example.com"}
+                ),
                 # BGPStream jobs are queue-only until a worker is deployed —
                 # charging would sell a job that never completes.
                 "/v1/bgp/jobs": await client.post(
@@ -259,7 +275,9 @@ async def test_unbuilt_paid_endpoints_return_501_before_charging():
         if old_state is not None:
             app.state._typed_state = old_state
     for endpoint, res in responses.items():
-        assert res.status_code == 501, f"{endpoint} returned {res.status_code}, expected 501 before any charge"
+        assert res.status_code == 501, (
+            f"{endpoint} returned {res.status_code}, expected 501 before any charge"
+        )
         assert res.json()["error"] == "not_implemented", endpoint
 
 
@@ -313,13 +331,25 @@ async def test_voip_check_stub_only_checks_501_before_charge():
         delattr(app.state, "_typed_state")
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            options_only = await client.post("/v1/voip/check", json={"target": "example.com", "checks": ["sip_options"]})
-            stun_only = await client.post("/v1/voip/check", json={"target": "example.com", "checks": ["stun_turn"]})
-            both_stub = await client.post("/v1/voip/check", json={"target": "example.com", "checks": ["sip_options", "stun_turn"]})
-            quote_stub = await client.post("/v1/voip/check/quote", json={"target": "example.com", "checks": ["stun_turn"]})
+            options_only = await client.post(
+                "/v1/voip/check", json={"target": "example.com", "checks": ["sip_options"]}
+            )
+            stun_only = await client.post(
+                "/v1/voip/check", json={"target": "example.com", "checks": ["stun_turn"]}
+            )
+            both_stub = await client.post(
+                "/v1/voip/check",
+                json={"target": "example.com", "checks": ["sip_options", "stun_turn"]},
+            )
+            quote_stub = await client.post(
+                "/v1/voip/check/quote", json={"target": "example.com", "checks": ["stun_turn"]}
+            )
             # Default (SIP_DNS + SIP_TLS) and mixed requests keep real work → charge.
             default_checks = await client.post("/v1/voip/check", json={"target": "example.com"})
-            mixed = await client.post("/v1/voip/check", json={"target": "example.com", "checks": ["sip_dns", "sip_options"]})
+            mixed = await client.post(
+                "/v1/voip/check",
+                json={"target": "example.com", "checks": ["sip_dns", "sip_options"]},
+            )
     finally:
         if old_state is not None:
             app.state._typed_state = old_state
@@ -736,12 +766,8 @@ def test_manifest_description_generated_from_enabled_catalog(monkeypatch):
     ):
         assert present in default_copy, present
 
-    monkeypatch.setattr(
-        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
-    )
-    monkeypatch.setattr(
-        "hyrule_cloud.services.threat.lookup.threat_intel_enabled", lambda: True
-    )
+    monkeypatch.setattr("hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True)
+    monkeypatch.setattr("hyrule_cloud.services.threat.lookup.threat_intel_enabled", lambda: True)
     enabled_copy = catalog_description()
     assert "IPv6-native compute" in enabled_copy
     assert "threat/reputation lookups" in enabled_copy

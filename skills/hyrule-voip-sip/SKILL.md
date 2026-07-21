@@ -25,10 +25,13 @@ curl https://cloud.hyrule.host/v1/voip/pricing
 
 ## Paid SIP check
 
+The curl example shows the request shape and receives the initial 402. Use an
+official x402 v2 client for `Payment-Required` handling and the paid retry; see
+<https://github.com/AS215932/hyrule-cloud/blob/main/skills/hyrule-cloud/references/payments.md>.
+
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/voip/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"target":"example.com","checks":["sip_dns","sip_tls"],"sip_port":5061}'
 ```
 

@@ -17,7 +17,7 @@ from hyrule_cloud.config import HyruleConfig, PaymentConfig
 from hyrule_cloud.services.discovery import (
     DISCOVERY,
     PAID_OPERATIONS,
-    build_curated_openapi,
+    build_full_openapi,
     build_x402_manifest,
     enabled_paid_operations,
 )
@@ -64,20 +64,47 @@ def _schema_operations(schema: dict) -> set[tuple[str, str]]:
     }
 
 
+def _paid_schema_operations(schema: dict) -> set[tuple[str, str]]:
+    return {
+        (method.upper(), path)
+        for path, path_item in schema["paths"].items()
+        for method, operation in path_item.items()
+        if method.lower() in {"get", "post", "put", "delete", "patch", "head"}
+        and isinstance(operation, dict)
+        and "x-payment-info" in operation
+    }
+
+
 def test_every_catalog_operation_has_complete_x402_openapi_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_all_catalog_gates(monkeypatch)
     config = HyruleConfig()
-    schema = build_curated_openapi(app, config)
+    schema = build_full_openapi(app, config)
 
-    assert _schema_operations(schema) == {operation.key for operation in PAID_OPERATIONS}
+    assert _paid_schema_operations(schema) == {operation.key for operation in PAID_OPERATIONS}
+    assert {operation.key for operation in PAID_OPERATIONS} < _schema_operations(schema)
+    assert schema["info"]["x-hyrule-x402-manifest"] == "/.well-known/x402.json"
+    for method, path in {
+        ("GET", "/health"),
+        ("GET", "/v1/pricing"),
+        ("POST", "/v1/auth/login"),
+        ("GET", "/v1/domains/tlds"),
+    }:
+        assert (method, path) in _schema_operations(schema)
+        assert "x-payment-info" not in schema["paths"][path][method.lower()]
     assert "/v1/domain/register" not in schema["paths"]
 
     for operation in PAID_OPERATIONS:
         documented = schema["paths"][operation.path][operation.method.lower()]
         assert documented["security"] == [], operation.key
         assert documented["x-payment-info"]["protocols"] == [{"x402": {}}]
+        assert documented["x-hyrule-capability-id"] == operation.capability_id
+        assert documented["x-hyrule-intents"] == list(operation.intents)
+        assert documented["x-hyrule-capabilities"] == list(operation.capabilities)
+        assert operation.capability_id.startswith("hyrule.")
+        assert operation.intents
+        assert operation.capabilities
         price = documented["x-payment-info"]["price"]
         assert price["currency"] == "USD"
         if operation.price.mode == "fixed":
@@ -106,9 +133,7 @@ def test_every_catalog_operation_has_complete_x402_openapi_metadata(
             assert request["example"] == operation.input_example
         else:
             path_parameters = [
-                parameter
-                for parameter in documented["parameters"]
-                if parameter["in"] == "path"
+                parameter for parameter in documented["parameters"] if parameter["in"] == "path"
             ]
             assert path_parameters
             assert all(parameter["required"] is True for parameter in path_parameters)
@@ -119,15 +144,102 @@ def test_every_catalog_operation_has_complete_x402_openapi_metadata(
             if str(status).startswith("2")
         ]
         assert any(
-            media.get("schema")
-            for content in success_content
-            for media in content.values()
+            media.get("schema") for content in success_content for media in content.values()
         ), operation.key
         assert all(
             media.get("example") == operation.output_example
             for content in success_content
             for media in content.values()
         ), operation.key
+
+
+def test_full_openapi_documents_account_and_worker_authentication() -> None:
+    schema = build_full_openapi(app, HyruleConfig())
+    schemes = schema["components"]["securitySchemes"]
+
+    assert schemes["HyruleApiKey"]["scheme"] == "bearer"
+    assert schemes["HyruleSession"] == {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "hyr_sess",
+        "description": "Opaque Hyrule browser session cookie.",
+    }
+    assert schemes["HyruleBGPIngestToken"]["name"] == "X-Hyrule-BGP-Ingest-Token"
+    assert schemes["HyruleVmManagementToken"]["bearerFormat"] == "hyr_vm_<secret>"
+    assert schemes["HyruleVmManagementQueryToken"] == {
+        "type": "apiKey",
+        "in": "query",
+        "name": "token",
+        "description": (
+            "VM management token accepted in management URLs. Prefer the bearer form for agents."
+        ),
+    }
+    assert schema["paths"]["/v1/me"]["get"]["security"] == [
+        {"HyruleApiKey": []},
+        {"HyruleSession": []},
+    ]
+    assert schema["paths"]["/v1/me/password"]["post"]["security"] == [{"HyruleSession": []}]
+    assert schema["paths"]["/v1/internal/bgp/jobs/claim"]["post"]["security"] == [
+        {"HyruleBGPIngestToken": []}
+    ]
+    vm_management_security = [
+        {"HyruleVmManagementToken": []},
+        {"HyruleVmManagementQueryToken": []},
+        {"HyruleApiKey": []},
+        {"HyruleSession": []},
+    ]
+    for method, path in (
+        ("get", "/v1/vm/{vm_id}"),
+        ("get", "/v1/vm/{vm_id}/logs"),
+        ("post", "/v1/vm/{vm_id}/extend"),
+        ("post", "/v1/vm/{vm_id}/reboot"),
+        ("delete", "/v1/vm/{vm_id}"),
+    ):
+        assert schema["paths"][path][method]["security"] == vm_management_security
+    assert schema["paths"]["/v1/domains/{domain}/dns"]["get"][
+        "x-hyrule-required-api-key-scopes"
+    ] == ["domain:dns"]
+    assert schema["paths"]["/v1/domains/{domain}/nameservers"]["put"][
+        "x-hyrule-required-api-key-scopes"
+    ] == ["domain:nameservers"]
+    assert schema["paths"]["/v1/me/api-keys"]["get"]["x-hyrule-required-api-key-scopes"] == [
+        "api_keys:read"
+    ]
+    assert schema["paths"]["/v1/me/api-keys"]["post"]["x-hyrule-required-api-key-scopes"] == [
+        "api_keys:write"
+    ]
+    assert schema["paths"]["/v1/me/api-keys/{key_id}"]["delete"][
+        "x-hyrule-required-api-key-scopes"
+    ] == ["api_keys:write"]
+    assert "security" not in schema["paths"]["/v1/auth/login"]["post"]
+
+
+def test_full_openapi_publishes_the_x402_manifest_response_schema() -> None:
+    schema = build_full_openapi(app, HyruleConfig())
+    response = schema["paths"]["/.well-known/x402.json"]["get"]["responses"]["200"]
+    manifest_ref = response["content"]["application/json"]["schema"]["$ref"]
+    manifest = schema["components"]["schemas"][manifest_ref.rsplit("/", 1)[-1]]
+
+    assert set(manifest["required"]) >= {"x402Version", "resources", "intents", "capabilities"}
+    resource_ref = manifest["properties"]["resources"]["items"]["$ref"]
+    resource = schema["components"]["schemas"][resource_ref.rsplit("/", 1)[-1]]
+    assert set(resource["required"]) >= {
+        "path",
+        "method",
+        "price",
+        "networks",
+        "inputSchema",
+        "inputExample",
+    }
+
+
+def test_app_openapi_reuses_the_cached_schema() -> None:
+    app.openapi_schema = None
+    first = app.openapi()
+    second = app.openapi()
+
+    assert first is second
+    app.openapi_schema = None
 
 
 def test_post_examples_are_executable_and_marketplace_renderable() -> None:
@@ -195,7 +307,7 @@ def test_vm_discovery_minimum_is_a_purchasable_one_day_machine(
     # Ignore a developer's local .env: discovery must expose the shipped
     # catalog floor, and add-on unit prices are not independently purchasable.
     config = HyruleConfig(payment=PaymentConfig(_env_file=None))
-    schema = build_curated_openapi(app, config)
+    schema = build_full_openapi(app, config)
 
     price = schema["paths"]["/v1/vm/create"]["post"]["x-payment-info"]["price"]
 
@@ -208,15 +320,29 @@ def test_manifest_openapi_and_bazaar_share_the_same_enabled_catalog(
     _enable_all_catalog_gates(monkeypatch)
     config = HyruleConfig()
     manifest = build_x402_manifest(config)
-    schema = build_curated_openapi(app, config)
+    schema = build_full_openapi(app, config)
 
     catalog_keys = {operation.key for operation in enabled_paid_operations()}
-    manifest_keys = {
-        (resource["method"], resource["path"])
-        for resource in manifest["resources"]
-    }
-    assert catalog_keys == manifest_keys == _schema_operations(schema) == set(DISCOVERY)
+    manifest_keys = {(resource["method"], resource["path"]) for resource in manifest["resources"]}
+    assert catalog_keys == manifest_keys == _paid_schema_operations(schema) == set(DISCOVERY)
+    assert catalog_keys < _schema_operations(schema)
+    assert all(
+        len(schema["paths"][operation.path][operation.method.lower()]["description"]) >= 40
+        for operation in enabled_paid_operations()
+    )
     assert all(resource["discoverable"] is True for resource in manifest["resources"])
+    assert all(resource["id"].startswith("hyrule.") for resource in manifest["resources"])
+    assert all(resource["intents"] for resource in manifest["resources"])
+    assert all(resource["capabilities"] for resource in manifest["resources"])
+    assert all(resource["inputSchema"] for resource in manifest["resources"])
+    assert all(resource["inputExample"] for resource in manifest["resources"])
+    assert all(resource["price"]["currency"] == "USD" for resource in manifest["resources"])
+    assert all(
+        resource["documentationUrl"] == "https://cloud.hyrule.host/openapi.json"
+        for resource in manifest["resources"]
+    )
+    assert manifest["intents"]
+    assert manifest["capabilities"]
     assert ("POST", "/v1/domain/register") not in catalog_keys
 
 
@@ -293,9 +419,7 @@ async def test_valid_dynamic_input_reaches_handler_for_exact_first_challenge(
 ) -> None:
     # /v1/bgp/jobs is worker-gated; enable both the catalog gate and the
     # route-level guard binding so the dynamic-price path stays covered.
-    monkeypatch.setattr(
-        "hyrule_cloud.services.bgp.stream.bgpstream_worker_enabled", lambda: True
-    )
+    monkeypatch.setattr("hyrule_cloud.services.bgp.stream.bgpstream_worker_enabled", lambda: True)
     monkeypatch.setattr("hyrule_cloud.api.bgp.bgpstream_worker_enabled", lambda: True)
     config = HyruleConfig()
     gate = _gate(_FakeServer(), public_base_url="https://cloud.hyrule.host")

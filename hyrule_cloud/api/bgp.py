@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from hyrule_cloud.api._contract import (
     not_implemented,
@@ -54,6 +54,19 @@ def _session_factory(request: Request) -> Any | None:
 
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _snapshot_download_available(row: BGPSnapshotRow, observed_at: datetime) -> bool:
+    artifact_path = row.artifact_path
+    if not artifact_path:
+        return False
+    expires_at = row.expires_at
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at <= observed_at:
+            return False
+    return Path(artifact_path).is_file()
 
 
 @router.get("/status", response_model=BGPStatusResponse)
@@ -146,15 +159,24 @@ async def list_bgp_router_snapshots(request: Request) -> BGPSnapshotListResponse
     factory = _session_factory(request)
     if factory is None:
         return BGPSnapshotListResponse()
+    observed_at = now_utc()
     async with factory() as session:
         rows = (
             await session.execute(
                 select(BGPSnapshotRow)
-                .where(BGPSnapshotRow.kind == "router_table")
+                .where(
+                    BGPSnapshotRow.kind == "router_table",
+                    BGPSnapshotRow.artifact_path.is_not(None),
+                    or_(
+                        BGPSnapshotRow.expires_at.is_(None),
+                        BGPSnapshotRow.expires_at > observed_at,
+                    ),
+                )
                 .order_by(BGPSnapshotRow.created_at.desc())
                 .limit(100)
             )
         ).scalars().all()
+    available_rows = [row for row in rows if _snapshot_download_available(row, observed_at)]
     return BGPSnapshotListResponse(
         snapshots=[
             BGPSnapshotSummary(
@@ -166,8 +188,9 @@ async def list_bgp_router_snapshots(request: Request) -> BGPSnapshotListResponse
                 formats=[row.artifact_format or "normalized_jsonl.gz"],
                 size_bytes=row.compressed_size_bytes,
                 sha256=row.sha256,
+                download_available=True,
             )
-            for row in rows
+            for row in available_rows
         ]
     )
 

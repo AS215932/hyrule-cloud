@@ -47,6 +47,7 @@ from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.services.discovery import X402Manifest
 
 # Newline-delimited JSON to stdout per AS215932's application logging
 # contract (hyrule-infra/docs/application-logging.md). systemd-journald
@@ -77,6 +78,7 @@ async def lifespan(app: FastAPI):
     # Production guard: refuse to boot in simulation/dev-bypass mode when the
     # deployment declares it must provision real VMs.
     from hyrule_cloud.services.launch_proof import enforce_real_provisioning_guard
+
     enforce_real_provisioning_guard(config)
 
     # Database
@@ -86,6 +88,7 @@ async def lifespan(app: FastAPI):
 
     # Payment gate (official x402 SDK) + append-only payments ledger
     from hyrule_cloud.services.payments_ledger import PaymentLedger
+
     payment_ledger = PaymentLedger(session_factory)
     payment_gate = PaymentGate(
         config.payment,
@@ -96,6 +99,7 @@ async def lifespan(app: FastAPI):
     # Network proxy sidecar client. x402 stays in Hyrule Cloud; the sidecar
     # only executes already-authorized egress requests.
     from hyrule_cloud.providers.network_client import NetworkProvider
+
     network_provider = NetworkProvider(
         proxy_url=config.network_proxy_url,
         token=config.network_proxy_token,
@@ -164,14 +168,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Hyrule Cloud",
-    # Deliberately product-list-free: the payable capability list is generated
-    # from the enabled catalog (see services/discovery.py catalog_description)
-    # so gated-off products can never be advertised here.
     description=(
         "First-party network infrastructure for AI agents on AS215932 (RIPE), "
-        "paid per request in USDC via x402. The live payable capability list is "
-        "generated from the enabled catalog in /.well-known/x402.json, "
-        "/openapi.json, and /llms.txt."
+        "with free, authenticated, account-scoped, and pay-per-request x402 "
+        "operations. This document is the complete API contract; payable "
+        "operations carry x402 annotations and are also listed in "
+        "/.well-known/x402.json."
     ),
     contact={
         "name": "Hyrule Cloud (AS215932)",
@@ -214,7 +216,9 @@ async def handle_domain_http_exception(request: Request, exc: StarletteHTTPExcep
             404: "not_found",
             405: "method_not_allowed",
         }.get(exc.status_code, "request_failed")
-        detail = exc.detail if isinstance(exc.detail, str) else "The request could not be completed."
+        detail = (
+            exc.detail if isinstance(exc.detail, str) else "The request could not be completed."
+        )
         return problem_response(
             request,
             DomainProblem(
@@ -227,6 +231,7 @@ async def handle_domain_http_exception(request: Request, exc: StarletteHTTPExcep
     from fastapi.exception_handlers import http_exception_handler
 
     return await http_exception_handler(request, exc)
+
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -264,21 +269,22 @@ async def llms_txt(request: Request) -> PlainTextResponse:
         catalog_description(),
         "",
         f"Machine-readable catalog: {base}/.well-known/x402.json",
-        f"OpenAPI (payable surface only): {base}/openapi.json",
+        f"OpenAPI (complete API; payable operations are annotated): {base}/openapi.json",
         "Payment: HTTP 402 challenge (x402 v2), USDC; accepted networks at "
         f"{base}/v1/payments/networks",
         "",
         "Golden path:",
         f"  curl -s -X POST {base}/v1/dns/lookup \\",
-        "    -H 'Content-Type: application/json' -d '{\"name\":\"example.com\",\"type\":\"AAAA\"}'",
-        "  -> HTTP 402 with payment requirements; retry with an X-PAYMENT header to settle.",
+        '    -H \'Content-Type: application/json\' -d \'{"name":"example.com","type":"AAAA"}\'',
+        "  -> HTTP 402 with Payment-Required; retry with Payment-Signature to settle.",
         "",
-        "Paid operations (method path — min USD — description):",
+        "Paid operations (method path — min USD — capability — buyer intents):",
     ]
     for operation in enabled_paid_operations():
         price = operation.price.minimum(config.payment)
         lines.append(
-            f"  {operation.method} {operation.path} — ${price} — {operation.description}"
+            f"  {operation.method} {operation.path} — ${price} — "
+            f"{operation.capability_id} — {'; '.join(operation.intents)}"
         )
     return PlainTextResponse("\n".join(lines) + "\n")
 
@@ -381,18 +387,25 @@ async def health():
     return {"status": "ok", "service": "hyrule-cloud"}
 
 
-@app.get("/.well-known/x402.json", include_in_schema=False)
+@app.get(
+    "/.well-known/x402.json",
+    response_model=X402Manifest,
+    response_model_exclude_none=True,
+)
 async def x402_manifest():
-    """Compatibility manifest generated from the curated paid-operation catalog."""
+    """Paid discovery manifest generated from the canonical operation catalog."""
     from hyrule_cloud.services.discovery import build_x402_manifest
 
     config: HyruleConfig = app.state._typed_state.config
     return build_x402_manifest(config)
 
 
-def curated_openapi() -> dict:
-    """Build x402scan's sole, curated OpenAPI document."""
-    from hyrule_cloud.services.discovery import build_curated_openapi
+def full_openapi() -> dict:
+    """Return a cached complete contract, invalidated by live catalog pricing."""
+    from hyrule_cloud.services.discovery import (
+        build_full_openapi,
+        enabled_paid_operations,
+    )
 
     state = getattr(app.state, "_typed_state", None)
     # Production HTTP requests run inside lifespan and therefore always use the
@@ -401,7 +414,22 @@ def curated_openapi() -> dict:
     # providers; it still reads the deployment environment rather than using a
     # separate hard-coded price table.
     config = state.config if state is not None else HyruleConfig()
-    return build_curated_openapi(app, config)
+    signature = tuple(
+        (
+            operation.key,
+            tuple(sorted(operation.price.openapi(config.payment).items())),
+        )
+        for operation in enabled_paid_operations()
+    )
+    if (
+        app.openapi_schema is not None
+        and getattr(app.state, "_full_openapi_signature", None) == signature
+    ):
+        return app.openapi_schema
+    schema = build_full_openapi(app, config)
+    app.openapi_schema = schema
+    app.state._full_openapi_signature = signature
+    return schema
 
 
-app.openapi = curated_openapi
+app.openapi = full_openapi

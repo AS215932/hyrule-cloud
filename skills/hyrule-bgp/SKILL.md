@@ -24,10 +24,13 @@ status endpoint.
 Use `/v1/bgp/lookup` for arbitrary prefix, IP, or ASN investigation. Prefix and
 IP lookups do not require the caller to know the ASN.
 
+The curl example shows the request shape and receives the initial 402. Use an
+official x402 v2 client for `Payment-Required` handling and the paid retry; see
+<https://github.com/AS215932/hyrule-cloud/blob/main/skills/hyrule-cloud/references/payments.md>.
+
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/bgp/lookup \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
   -d '{"subject":{"type":"prefix","value":"2a0c:b641:b50::/44"},"views":["origins","rpki","visibility"]}'
 ```
 
@@ -49,5 +52,5 @@ snapshots.
 
 ## x402
 
-Call a paid endpoint without `X-PAYMENT` to receive a `402 Payment Required`
-challenge. Pay through an x402 facilitator and retry with `X-PAYMENT`.
+An official x402 v2 client reads `Payment-Required`, enforces the operator's
+spend policy, creates the payment, and retries with `Payment-Signature`.
