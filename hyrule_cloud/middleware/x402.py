@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 
 import structlog
 from fastapi import HTTPException, Request, Response
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from x402.extensions.bazaar import bazaar_resource_server_extension
 from x402.http import (
@@ -178,6 +178,7 @@ class VerifiedPayment:
     admin_bypass: bool = False
     admin_account_id: str | None = None
     admin_operation_class: str | None = None
+    admin_quota_window: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -483,7 +484,7 @@ class PaymentGate:
         request.state.admin_bypass_context = context
         return context
 
-    async def _consume_admin_quota(self, context: AdminBypassContext) -> None:
+    async def _consume_admin_quota(self, context: AdminBypassContext) -> datetime:
         """Atomically consume one fixed-window waiver slot in the database."""
         assert self.session_factory is not None
         now = datetime.now(UTC)
@@ -576,6 +577,50 @@ class PaymentGate:
                 status_code=429,
                 detail=f"Admin {context.operation_class} waiver limit reached",
             )
+        return window
+
+    async def _restore_admin_quota(
+        self,
+        context: AdminBypassContext,
+        window: datetime,
+    ) -> None:
+        """Compensate a consumed slot when its mandatory audit did not persist."""
+        assert self.session_factory is not None
+        async with self.session_factory() as session:
+            dialect = session.get_bind().dialect.name
+            stored_window = window.replace(tzinfo=None) if dialect == "sqlite" else window
+            now = datetime.now(UTC)
+            stored_now = now.replace(tzinfo=None) if dialect == "sqlite" else now
+            await session.execute(
+                update(AdminBypassUsageRow)
+                .where(
+                    AdminBypassUsageRow.actor_account_id == context.account_id,
+                    AdminBypassUsageRow.operation_class == context.operation_class,
+                    AdminBypassUsageRow.window_started_at == stored_window,
+                    AdminBypassUsageRow.count > 0,
+                )
+                .values(
+                    count=AdminBypassUsageRow.count - 1,
+                    updated_at=stored_now,
+                )
+            )
+            await session.commit()
+
+    async def _restore_admin_quota_after_failure(
+        self,
+        context: AdminBypassContext,
+        window: datetime,
+    ) -> None:
+        try:
+            await self._restore_admin_quota(context, window)
+        except Exception:
+            # Preserve the original required-audit failure while surfacing a
+            # compensation failure loudly for operator repair.
+            log.exception(
+                "admin_bypass_quota_restore_failed",
+                account_id=context.account_id,
+                operation_class=context.operation_class,
+            )
 
     async def has_payment_credentials(self, request: Request) -> bool:
         """True for an x402 signature, dev credential, or eligible Admin session."""
@@ -595,23 +640,27 @@ class PaymentGate:
         context: AdminBypassContext,
         extra_body: dict[str, Any] | None,
     ) -> str:
-        await self._consume_admin_quota(context)
+        quota_window = await self._consume_admin_quota(context)
         tx_hash = f"admin_bypass_{secrets.token_hex(16)}"
         payer = f"admin:{context.account_id}"
-        await self._record_required(
-            "admin_bypass",
-            request,
-            amount,
-            network="admin-bypass",
-            payer=payer,
-            tx_hash=tx_hash,
-            actor_account_id=context.account_id,
-            extra={
-                **(extra_body or {}),
-                "operation_class": context.operation_class,
-                "retail_amount_usd": str(amount),
-            },
-        )
+        try:
+            await self._record_required(
+                "admin_bypass",
+                request,
+                amount,
+                network="admin-bypass",
+                payer=payer,
+                tx_hash=tx_hash,
+                actor_account_id=context.account_id,
+                extra={
+                    **(extra_body or {}),
+                    "operation_class": context.operation_class,
+                    "retail_amount_usd": str(amount),
+                },
+            )
+        except Exception:
+            await self._restore_admin_quota_after_failure(context, quota_window)
+            raise
         request.state.payment_tx = tx_hash
         request.state.payment_network = "admin-bypass"
         request.state.payment_asset = None
@@ -946,13 +995,14 @@ class PaymentGate:
         if not payment_header:
             admin_context = await self._admin_context(request)
             if admin_context is not None:
-                await self._consume_admin_quota(admin_context)
+                quota_window = await self._consume_admin_quota(admin_context)
                 return VerifiedPayment(
                     payer=f"admin:{admin_context.account_id}",
                     amount=amount,
                     admin_bypass=True,
                     admin_account_id=admin_context.account_id,
                     admin_operation_class=admin_context.operation_class,
+                    admin_quota_window=quota_window,
                 )
 
         extensions = self._discovery_extensions(request)
@@ -1082,20 +1132,34 @@ class PaymentGate:
             return True
 
         if verified.admin_bypass:
-            tx_hash = f"admin_bypass_{secrets.token_hex(16)}"
-            await self._record_required(
-                "admin_bypass",
-                request,
-                verified.amount,
-                network="admin-bypass",
-                payer=verified.payer,
-                tx_hash=tx_hash,
-                actor_account_id=verified.admin_account_id,
-                extra={
-                    "operation_class": verified.admin_operation_class,
-                    "retail_amount_usd": str(verified.amount),
-                },
+            assert verified.admin_account_id is not None
+            assert verified.admin_operation_class is not None
+            assert verified.admin_quota_window is not None
+            context = AdminBypassContext(
+                verified.admin_account_id,
+                verified.admin_operation_class,
             )
+            tx_hash = f"admin_bypass_{secrets.token_hex(16)}"
+            try:
+                await self._record_required(
+                    "admin_bypass",
+                    request,
+                    verified.amount,
+                    network="admin-bypass",
+                    payer=verified.payer,
+                    tx_hash=tx_hash,
+                    actor_account_id=verified.admin_account_id,
+                    extra={
+                        "operation_class": verified.admin_operation_class,
+                        "retail_amount_usd": str(verified.amount),
+                    },
+                )
+            except Exception:
+                await self._restore_admin_quota_after_failure(
+                    context,
+                    verified.admin_quota_window,
+                )
+                raise
             request.state.payment_tx = tx_hash
             request.state.payment_network = "admin-bypass"
             request.state.payment_asset = None

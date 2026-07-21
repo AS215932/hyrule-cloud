@@ -935,6 +935,8 @@ async def vm_action(
         xcpng_uuid = row.xcpng_uuid
         if action == "start" and row.expires_at is not None and _aware(row.expires_at) <= _now():
             raise HTTPException(409, "Expired VMs cannot be started")
+        if action == "start" and row.suspension_reason == "account_disabled":
+            raise HTTPException(409, "Account-disabled VMs must be resumed through account enable")
         if action not in {"reboot", "destroy"} and not xcpng_uuid:
             raise HTTPException(409, "VM has no provider instance")
     await _audit_before_dispatch(
@@ -971,7 +973,13 @@ async def vm_action(
 
 
 async def _assert_transfer_target(session: AsyncSession, account_id: str) -> AccountRow:
-    target = await session.get(AccountRow, account_id)
+    target = (
+        await session.execute(
+            select(AccountRow)
+            .where(AccountRow.account_id == account_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
     if target is None or target.disabled_at is not None:
         raise HTTPException(409, "Target account is missing or disabled")
     return target

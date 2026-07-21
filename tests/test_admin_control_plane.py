@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from hyrule_cloud.api.admin import (
     OwnershipTransferRequest,
     ReasonRequest,
     StepUpRequest,
+    _assert_transfer_target,
     step_up,
     transfer_domain,
     transfer_vm,
@@ -40,7 +42,10 @@ from hyrule_cloud.db import (
 )
 from hyrule_cloud.middleware.x402 import ADMIN_PAYMENT_MODE_HEADER, PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
-from hyrule_cloud.services.admin_operations import process_admin_operations
+from hyrule_cloud.services.admin_operations import (
+    _apply_account_operation,
+    process_admin_operations,
+)
 from hyrule_cloud.services.passwords import hash_password
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.sessions import create_session
@@ -96,7 +101,12 @@ def _browser_request(credentials, *, path: str, extra: dict[str, str] | None = N
     return _request(headers, path=path)
 
 
-def _admin_gate(admin_factory, *, diagnostic_limit: int = 120) -> PaymentGate:
+def _admin_gate(
+    admin_factory,
+    *,
+    diagnostic_limit: int = 120,
+    cost_limit: int = 10,
+) -> PaymentGate:
     gate = PaymentGate(
         PaymentConfig(
             receiver_address=RECEIVER,
@@ -106,6 +116,7 @@ def _admin_gate(admin_factory, *, diagnostic_limit: int = 120) -> PaymentGate:
         session_factory=admin_factory,
         admin_bypass_enabled=True,
         admin_diagnostic_limit=diagnostic_limit,
+        admin_cost_limit=cost_limit,
     )
     gate.server = _FakeServer()  # type: ignore[assignment]
     gate.ledger = PaymentLedger(admin_factory)
@@ -134,7 +145,7 @@ async def test_admin_diagnostic_waiver_is_auditable_and_not_a_settlement(admin_f
 @pytest.mark.asyncio
 async def test_admin_waiver_fails_closed_when_audit_persistence_fails(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
-    gate = _admin_gate(admin_factory)
+    gate = _admin_gate(admin_factory, diagnostic_limit=1)
 
     class FailingLedger:
         async def record(self, **kwargs) -> None:
@@ -152,6 +163,18 @@ async def test_admin_waiver_fails_closed_when_audit_persistence_fails(admin_fact
     assert not hasattr(request.state, "payment_mode")
     async with admin_factory() as session:
         assert list(await session.scalars(select(PaymentEventRow))) == []
+        usage = (await session.scalars(select(AdminBypassUsageRow))).one()
+        assert usage.count == 0
+
+    # A recovered audit store can use the restored slot immediately.
+    gate.ledger = PaymentLedger(admin_factory)
+    retry = _browser_request(credentials, path="/v1/dns/lookup")
+    assert await gate.check_payment(retry, Decimal("0.01"), "DNS lookup") == (
+        "admin:HAAAAAAAAAA"
+    )
+    async with admin_factory() as session:
+        usage = (await session.scalars(select(AdminBypassUsageRow))).one()
+        assert usage.count == 1
 
 
 @pytest.mark.asyncio
@@ -159,12 +182,15 @@ async def test_deferred_admin_waiver_fails_closed_when_audit_persistence_fails(
     admin_factory,
 ) -> None:
     credentials = await _admin_credentials(admin_factory, elevated=True)
-    gate = _admin_gate(admin_factory)
+    gate = _admin_gate(admin_factory, cost_limit=1)
     request = _browser_request(credentials, path="/v1/network/request")
 
     verified = await gate.verify_only(request, Decimal("0.01"), "Network request")
     assert not isinstance(verified, Response)
     assert verified.admin_bypass is True
+    async with admin_factory() as session:
+        usage = (await session.scalars(select(AdminBypassUsageRow))).one()
+        assert usage.count == 1
 
     class FailingLedger:
         async def record(self, **kwargs) -> None:
@@ -178,6 +204,18 @@ async def test_deferred_admin_waiver_fails_closed_when_audit_persistence_fails(
     assert exc.value.status_code == 503
     assert exc.value.detail == "Admin waiver audit unavailable"
     assert not hasattr(request.state, "payment_mode")
+    async with admin_factory() as session:
+        usage = (await session.scalars(select(AdminBypassUsageRow))).one()
+        assert usage.count == 0
+
+    gate.ledger = PaymentLedger(admin_factory)
+    retry = _browser_request(credentials, path="/v1/network/request")
+    retry_verified = await gate.verify_only(retry, Decimal("0.01"), "Network request")
+    assert not isinstance(retry_verified, Response)
+    assert await gate.settle_verified(retry, retry_verified) is True
+    async with admin_factory() as session:
+        usage = (await session.scalars(select(AdminBypassUsageRow))).one()
+        assert usage.count == 1
 
 
 @pytest.mark.asyncio
@@ -833,6 +871,22 @@ async def test_vm_action_audit_is_durable_before_provider_dispatch(admin_factory
         )
 
 
+@pytest.mark.asyncio
+async def test_transfer_target_eligibility_check_locks_account() -> None:
+    target = AccountRow(account_id="HTARGETLOCK", password_hash="unused")
+
+    class Result:
+        def scalar_one_or_none(self):
+            return target
+
+    class Session:
+        async def execute(self, statement):
+            assert statement._for_update_arg is not None
+            return Result()
+
+    assert await _assert_transfer_target(Session(), target.account_id) is target
+
+
 class _AdminXCPNG:
     def __init__(self) -> None:
         self.suspended: list[str] = []
@@ -843,6 +897,156 @@ class _AdminXCPNG:
 
     async def start_vm(self, vm_uuid: str) -> None:
         self.started.append(vm_uuid)
+
+
+@pytest.mark.asyncio
+async def test_admin_start_rejects_account_disabled_vm(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add(
+            VMRow(
+                vm_id="vm_account_disabled",
+                owner_wallet="0xowner",
+                owner_account_id="HAAAAAAAAAA",
+                xcpng_uuid="uuid-account-disabled",
+                status="suspended",
+                suspension_reason="account_disabled",
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+        await session.commit()
+
+    xcpng = _AdminXCPNG()
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(xcpng=xcpng),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await vm_action(
+            "vm_account_disabled",
+            "start",
+            ReasonRequest(reason="manual override"),
+            _browser_request(
+                credentials,
+                path="/v1/admin/vms/vm_account_disabled/actions/start",
+            ),
+            actor,
+            state,
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Account-disabled VMs must be resumed through account enable"
+    assert xcpng.started == []
+    async with admin_factory() as session:
+        row = await session.get(VMRow, "vm_account_disabled")
+        assert row is not None and str(row.status) == "suspended"
+        assert row.suspension_reason == "account_disabled"
+        assert list(await session.scalars(select(AdminAuditRow))) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "vm_status", "suspension_reason", "mail_status"),
+    [
+        ("suspend_account_resources", "running", None, "active"),
+        (
+            "resume_account_resources",
+            "suspended",
+            "account_disabled",
+            "suspended",
+        ),
+    ],
+)
+async def test_admin_resource_operations_revalidate_ownership_under_lock(
+    admin_factory,
+    kind: str,
+    vm_status: str,
+    suspension_reason: str | None,
+    mail_status: str,
+) -> None:
+    async with admin_factory() as session:
+        session.add_all(
+            [
+                AccountRow(account_id="HOLDOWNERAA", password_hash="unused"),
+                AccountRow(account_id="HNEWOWNERAAA", password_hash="unused"),
+                VMRow(
+                    vm_id="vm_transferred_after_snapshot",
+                    owner_wallet="0xowner",
+                    owner_account_id="HOLDOWNERAA",
+                    xcpng_uuid="uuid-transferred",
+                    status=vm_status,
+                    suspension_reason=suspension_reason,
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                ),
+                MailAccountRow(
+                    mailbox_id="mail_transferred_after_snapshot",
+                    address="transfer-race@example.test",
+                    owner_account_id="HOLDOWNERAA",
+                    plan="basic",
+                    status=mail_status,
+                    suspension_reason=suspension_reason,
+                ),
+                AdminOperationRow(
+                    operation_id="operation-transfer-race",
+                    kind=kind,
+                    account_id="HOLDOWNERAA",
+                    actor_account_id="HNEWOWNERAAA",
+                    reason="ownership race regression",
+                ),
+            ]
+        )
+        await session.commit()
+
+    class TransferBeforeFirstResourceLock:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            if self.calls != 2:
+                return admin_factory()
+
+            @asynccontextmanager
+            async def transfer_then_open():
+                async with admin_factory() as mutation:
+                    vm = await mutation.get(VMRow, "vm_transferred_after_snapshot")
+                    mailbox = await mutation.get(
+                        MailAccountRow,
+                        "mail_transferred_after_snapshot",
+                    )
+                    assert vm is not None and mailbox is not None
+                    vm.owner_account_id = "HNEWOWNERAAA"
+                    mailbox.owner_account_id = "HNEWOWNERAAA"
+                    await mutation.commit()
+                async with admin_factory() as locked:
+                    yield locked
+
+            return transfer_then_open()
+
+    xcpng = _AdminXCPNG()
+    progress = await _apply_account_operation(
+        TransferBeforeFirstResourceLock(),  # type: ignore[arg-type]
+        SimpleNamespace(xcpng=xcpng),
+        "operation-transfer-race",
+    )
+
+    assert progress == {"vms": 0, "mailboxes": 0}
+    assert xcpng.suspended == []
+    assert xcpng.started == []
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, "vm_transferred_after_snapshot")
+        mailbox = await session.get(MailAccountRow, "mail_transferred_after_snapshot")
+        assert vm is not None and vm.owner_account_id == "HNEWOWNERAAA"
+        assert str(vm.status) == vm_status
+        assert vm.suspension_reason == suspension_reason
+        assert mailbox is not None and mailbox.owner_account_id == "HNEWOWNERAAA"
+        assert mailbox.status == mail_status
+        assert mailbox.suspension_reason == suspension_reason
 
 
 @pytest.mark.asyncio

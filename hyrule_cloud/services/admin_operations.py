@@ -167,7 +167,9 @@ async def _apply_account_operation(
                         select(VMRow).where(VMRow.vm_id == vm.vm_id).with_for_update()
                     )
                 ).scalar_one_or_none()
-                if current is None or str(current.status) in {
+                if current is None or current.owner_account_id != account_id:
+                    continue
+                if str(current.status) in {
                     VMStatus.DESTROYED.value,
                     VMStatus.FAILED.value,
                     VMStatus.SUSPENDED.value,
@@ -186,8 +188,18 @@ async def _apply_account_operation(
                 vm_count += 1
         async with session_factory() as session:
             for mailbox in mailboxes:
-                mailbox_row = await session.get(MailAccountRow, mailbox.mailbox_id)
-                if mailbox_row is not None and mailbox_row.status != "suspended":
+                mailbox_row = (
+                    await session.execute(
+                        select(MailAccountRow)
+                        .where(MailAccountRow.mailbox_id == mailbox.mailbox_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    mailbox_row is not None
+                    and mailbox_row.owner_account_id == account_id
+                    and mailbox_row.status != "suspended"
+                ):
                     mailbox_row.status = "suspended"
                     mailbox_row.suspension_reason = "account_disabled"
                     mailbox_row.suspended_by_account_id = actor_id
@@ -202,7 +214,11 @@ async def _apply_account_operation(
                         select(VMRow).where(VMRow.vm_id == vm.vm_id).with_for_update()
                     )
                 ).scalar_one_or_none()
-                if current is None or current.suspension_reason != "account_disabled":
+                if (
+                    current is None
+                    or current.owner_account_id != account_id
+                    or current.suspension_reason != "account_disabled"
+                ):
                     continue
                 if str(current.status) in {
                     VMStatus.DESTROYED.value,
@@ -242,8 +258,18 @@ async def _apply_account_operation(
                 orchestrator.start_provisioning(vm.vm_id)
         async with session_factory() as session:
             for mailbox in mailboxes:
-                mailbox_row = await session.get(MailAccountRow, mailbox.mailbox_id)
-                if mailbox_row is not None and mailbox_row.suspension_reason == "account_disabled":
+                mailbox_row = (
+                    await session.execute(
+                        select(MailAccountRow)
+                        .where(MailAccountRow.mailbox_id == mailbox.mailbox_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    mailbox_row is not None
+                    and mailbox_row.owner_account_id == account_id
+                    and mailbox_row.suspension_reason == "account_disabled"
+                ):
                     if (
                         mailbox_row.expires_at is not None
                         and _aware(mailbox_row.expires_at) <= now
