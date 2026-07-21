@@ -75,6 +75,7 @@ from hyrule_cloud.services.refunds import RefundService
 log = structlog.get_logger().bind(component="agent_mail")
 
 _MAIL_CAPACITY_LOCK_ID = 0x4D41494C
+_MAIL_SEND_CAPACITY_LOCK_ID = 0x4D53454E
 _MAIL_CAPACITY_STATUSES = (
     MailboxStatus.PENDING_DOMAIN.value,
     MailboxStatus.PROVISIONING.value,
@@ -502,6 +503,7 @@ class MailService:
                 deleted_account.provision_claimed_at = None
                 deleted_account.provision_retry_count = 0
                 deleted_account.provision_next_attempt_at = None
+                deleted_account.dns_cleanup_pending = False
                 deleted_account.activated_at = None
                 deleted_account.grace_ends_at = None
                 deleted_account.deleted_at = None
@@ -511,6 +513,8 @@ class MailService:
                 deleted_account.payment_tx = None
                 deleted_account.payment_network = None
                 deleted_account.payment_asset = None
+                deleted_account.payment_settlement_pending_at = None
+                deleted_account.payment_settled_at = None
                 mailbox = deleted_account
             try:
                 await session.commit()
@@ -606,10 +610,117 @@ class MailService:
                 row.capacity_reserved_at = None
                 await session.commit()
 
-    async def bind_send_payment_authorization(
+    async def begin_activation_settlement(
+        self,
+        mailbox_id: str,
+        quote_id: str,
+        *,
+        payer: str,
+        payment_network: str | None,
+        payment_asset: str | None,
+    ) -> MailAccountRow:
+        """Persist an activation settlement intent before money can move."""
+
+        async with self.db() as session:
+            row = (
+                await session.execute(
+                    select(MailAccountRow)
+                    .where(MailAccountRow.mailbox_id == mailbox_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                raise MailProblem(404, "mailbox_not_found", "Mailbox not found.")
+            if row.quote_id != quote_id:
+                raise MailProblem(
+                    409,
+                    "mail_activation_superseded",
+                    "This payment belongs to an earlier mailbox activation.",
+                )
+            if row.status != MailboxStatus.AWAITING_PAYMENT.value:
+                raise MailProblem(
+                    409,
+                    "mail_activation_closed",
+                    "This mailbox activation is no longer awaiting payment.",
+                )
+            if row.payment_settled_at is None:
+                row.owner_wallet = payer[:64]
+                row.payment_network = payment_network
+                row.payment_asset = payment_asset
+                row.payment_settlement_pending_at = (
+                    row.payment_settlement_pending_at or _now()
+                )
+                await session.commit()
+            return row
+
+    async def clear_activation_settlement(
+        self, mailbox_id: str, quote_id: str
+    ) -> None:
+        """Clear a pre-settlement intent after a definitive failed settlement."""
+
+        async with self.db() as session:
+            row = await session.get(MailAccountRow, mailbox_id)
+            if (
+                row is not None
+                and row.quote_id == quote_id
+                and row.payment_settled_at is None
+            ):
+                row.owner_wallet = None
+                row.payment_network = None
+                row.payment_asset = None
+                row.payment_settlement_pending_at = None
+                await session.commit()
+
+    async def record_activation_settlement(
+        self,
+        mailbox_id: str,
+        quote_id: str,
+        *,
+        payer: str,
+        tx_hash: str | None,
+        payment_network: str | None,
+        payment_asset: str | None,
+    ) -> MailAccountRow:
+        """Durably record a successful settlement before external handoff work."""
+
+        async with self.db() as session:
+            row = (
+                await session.execute(
+                    select(MailAccountRow)
+                    .where(MailAccountRow.mailbox_id == mailbox_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                raise MailProblem(404, "mailbox_not_found", "Mailbox not found.")
+            if row.quote_id != quote_id:
+                raise MailProblem(
+                    409,
+                    "mail_activation_superseded",
+                    "This payment belongs to an earlier mailbox activation.",
+                )
+            if (
+                row.status != MailboxStatus.AWAITING_PAYMENT.value
+                and row.payment_settled_at is None
+            ):
+                raise MailProblem(
+                    409,
+                    "mail_activation_closed",
+                    "This mailbox activation is no longer awaiting payment.",
+                )
+            row.owner_wallet = payer[:64]
+            row.payment_tx = tx_hash
+            row.payment_network = payment_network
+            row.payment_asset = payment_asset
+            row.payment_settlement_pending_at = None
+            row.payment_settled_at = row.payment_settled_at or _now()
+            await session.commit()
+            return row
+
+    async def bind_payment_authorization(
         self, fingerprint: str, quote_id: str
     ) -> None:
-        """Bind one verified authorization to exactly one send quote forever."""
+        """Bind one verified authorization to exactly one mail quote forever."""
 
         async with self.db() as session:
             session.add(
@@ -633,7 +744,7 @@ class MailService:
                 raise MailProblem(
                     409,
                     "payment_authorization_reused",
-                    "This payment authorization is already bound to another mail send.",
+                    "This payment authorization is already bound to another mail payment.",
                 )
             existing_quote = await session.scalar(
                 select(MailPaymentAuthorizationRow).where(
@@ -644,13 +755,13 @@ class MailService:
                 raise MailProblem(
                     409,
                     "mail_quote_payment_bound",
-                    "This send quote is already bound to another payment authorization; "
+                    "This mail quote is already bound to another payment authorization; "
                     "retry the original authorization.",
                 )
             raise MailProblem(
                 409,
                 "payment_authorization_conflict",
-                "The payment authorization could not be bound to this send quote.",
+                "The payment authorization could not be bound to this mail quote.",
             )
 
     async def mark_activation_paid(
@@ -721,6 +832,8 @@ class MailService:
                 row.payment_tx = tx_hash
                 row.payment_network = payment_network
                 row.payment_asset = payment_asset
+                row.payment_settlement_pending_at = None
+                row.payment_settled_at = row.payment_settled_at or _now()
                 row.capacity_reserved_at = None
                 row.provision_claim_token = None
                 row.provision_claimed_at = None
@@ -848,6 +961,10 @@ class MailService:
             )
             if winner is not None:
                 return winner
+            if session.get_bind().dialect.name == "postgresql":
+                await session.execute(
+                    select(func.pg_advisory_xact_lock(_MAIL_SEND_CAPACITY_LOCK_ID))
+                )
             locked_quote = (
                 await session.execute(
                     select(MailQuoteRow).where(MailQuoteRow.quote_id == quote_id).with_for_update()
@@ -1715,6 +1832,7 @@ class MailService:
                     current_account.backend_credential_ciphertext = None
                     current_account.management_token_ciphertext = None
                     current_account.capacity_reserved_at = None
+                    current_account.dns_cleanup_pending = dns_cleanup_pending
                     if dns_cleanup_pending:
                         current_account.provision_error = "dns_cleanup_pending"
                     event_ids = select(MailEventRow.event_id).where(
@@ -1756,8 +1874,17 @@ class MailService:
             cleanup_pending = list(
                 await session.scalars(
                     select(MailAccountRow).where(
-                        MailAccountRow.status == MailboxStatus.DELETED.value,
-                        MailAccountRow.provision_error == "dns_cleanup_pending",
+                        MailAccountRow.status.in_(
+                            [
+                                MailboxStatus.DELETED.value,
+                                MailboxStatus.FAILED.value,
+                                MailboxStatus.REFUND_DUE.value,
+                            ]
+                        ),
+                        or_(
+                            MailAccountRow.dns_cleanup_pending.is_(True),
+                            MailAccountRow.provision_error == "dns_cleanup_pending",
+                        ),
                     )
                 )
             )
@@ -1771,8 +1898,13 @@ class MailService:
                 continue
             async with self.db() as session:
                 current = await session.get(MailAccountRow, row.mailbox_id)
-                if current is not None and current.provision_error == "dns_cleanup_pending":
-                    current.provision_error = None
+                if current is not None and (
+                    current.dns_cleanup_pending
+                    or current.provision_error == "dns_cleanup_pending"
+                ):
+                    current.dns_cleanup_pending = False
+                    if current.provision_error == "dns_cleanup_pending":
+                        current.provision_error = None
                     await session.commit()
                     changed += 1
         return changed
@@ -1810,6 +1942,11 @@ class MailService:
                     ):
                         continue
                     if account is not None:
+                        if (
+                            account.payment_settlement_pending_at is not None
+                            or account.payment_settled_at is not None
+                        ):
+                            continue
                         settled = await session.scalar(
                             select(PaymentEventRow.event_id)
                             .where(
@@ -1849,6 +1986,47 @@ class MailService:
             return 0
         recovered = 0
         seen: set[tuple[str, str]] = set()
+        async with self.db() as session:
+            durable = list(
+                await session.scalars(
+                    select(MailAccountRow)
+                    .where(
+                        MailAccountRow.payment_settled_at.is_not(None),
+                        or_(
+                            MailAccountRow.status == MailboxStatus.AWAITING_PAYMENT.value,
+                            and_(
+                                MailAccountRow.status == MailboxStatus.FAILED.value,
+                                MailAccountRow.provision_error == "payment_window_expired",
+                                MailAccountRow.management_token_ciphertext.is_not(None),
+                            ),
+                        ),
+                    )
+                    .order_by(MailAccountRow.payment_settled_at)
+                    .limit(limit)
+                )
+            )
+        for durable_account in durable:
+            if not durable_account.quote_id:
+                continue
+            activation = (durable_account.mailbox_id, durable_account.quote_id)
+            seen.add(activation)
+            try:
+                await self.mark_activation_paid(
+                    durable_account.mailbox_id,
+                    durable_account.quote_id,
+                    payer=durable_account.owner_wallet or "unknown",
+                    tx_hash=durable_account.payment_tx,
+                    payment_network=durable_account.payment_network,
+                    payment_asset=durable_account.payment_asset,
+                )
+            except DomainProblem:
+                log.warning(
+                    "mail_durable_payment_handoff_recovery_deferred",
+                    mailbox_id=durable_account.mailbox_id,
+                    exc_info=True,
+                )
+                continue
+            recovered += 1
         cursor: tuple[datetime, str] | None = None
         while True:
             filters = [
@@ -2245,6 +2423,7 @@ class MailService:
                     mailbox_id=row.mailbox_id,
                     backend_id=row.backend_id,
                 )
+        dns_cleanup_pending = False
         if row.plan != MailboxMode.HOSTED.value and row.domain:
             try:
                 await self.domains.remove_service_records(row.domain, managed_by="agent_mail")
@@ -2253,12 +2432,16 @@ class MailService:
                     "mailbox_failed_activation_dns_cleanup_failed",
                     mailbox_id=row.mailbox_id,
                 )
-        if backend_deleted:
+                dns_cleanup_pending = True
+        if backend_deleted or dns_cleanup_pending:
             async with self.db() as session:
                 current = await session.get(MailAccountRow, mailbox_id)
                 if current is not None:
-                    current.backend_id = None
-                    current.backend_credential_ciphertext = None
+                    if backend_deleted:
+                        current.backend_id = None
+                        current.backend_credential_ciphertext = None
+                    if dns_cleanup_pending:
+                        current.dns_cleanup_pending = True
                     await session.commit()
         return True
 

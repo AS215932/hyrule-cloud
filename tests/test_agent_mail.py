@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import inspect
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -18,6 +19,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from hyrule_cloud.api.mail import (
+    _mail_payment_authorization_fingerprint,
     create_account,
     ingest_events,
     internal_router,
@@ -250,6 +252,66 @@ def test_agent_mail_review_safety_schema_contracts():
     ]
     assert len(authorization_quote_constraints) == 1
     assert [column.name for column in authorization_quote_constraints[0].columns] == ["quote_id"]
+    assert MailAccountRow.__table__.c.dns_cleanup_pending.index is True
+    assert MailAccountRow.__table__.c.payment_settled_at.index is True
+
+
+def test_send_reservation_serializes_the_global_capacity_check():
+    source = inspect.getsource(MailService._reserve_send_intent)
+    lock = "pg_advisory_xact_lock(_MAIL_SEND_CAPACITY_LOCK_ID)"
+
+    assert lock in source
+    assert source.index(lock) < source.index("global_count =")
+
+
+def test_payment_fingerprint_uses_canonical_signed_payload_fields():
+    accepted = {
+        "scheme": "exact",
+        "network": "eip155:8453",
+        "asset": "0x" + "1" * 40,
+        "amount": "10000",
+        "payTo": "0x" + "2" * 40,
+        "maxTimeoutSeconds": 300,
+        "extra": {},
+    }
+    signed = {
+        "authorization": {
+            "from": "0x" + "3" * 40,
+            "to": accepted["payTo"],
+            "value": accepted["amount"],
+            "validAfter": "0",
+            "validBefore": "9999999999",
+            "nonce": "0x" + "4" * 64,
+        },
+        "signature": "0x" + "5" * 130,
+    }
+    first = {"x402Version": 2, "accepted": accepted, "payload": signed}
+    second = {
+        "payload": {**signed, "ignoredTransportHint": "not a signed field"},
+        "accepted": accepted,
+        "x402Version": 2,
+    }
+
+    def fingerprint(payload: dict, *, compact: bool) -> str | None:
+        raw = json.dumps(payload, separators=(",", ":") if compact else None, indent=None if compact else 2)
+        encoded = base64.b64encode(raw.encode()).decode()
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/mail/messages/send",
+                "headers": [(b"payment-signature", encoded.encode())],
+            }
+        )
+        return _mail_payment_authorization_fingerprint(request)
+
+    assert fingerprint(first, compact=True) == fingerprint(second, compact=False)
+    signature_variant = json.loads(json.dumps(first))
+    signature_variant["payload"]["signature"] = "0x" + "6" * 130
+    assert fingerprint(first, compact=True) == fingerprint(signature_variant, compact=True)
+    changed_authorization = json.loads(json.dumps(first))
+    changed_authorization["payload"]["authorization"]["nonce"] = "0x" + "7" * 64
+    assert fingerprint(first, compact=True) != fingerprint(changed_authorization, compact=True)
 
 
 @pytest.mark.asyncio
@@ -1196,6 +1258,68 @@ async def test_settlement_ledger_recovers_lost_mail_activation_handoff(mail_serv
 
 
 @pytest.mark.asyncio
+async def test_durable_activation_settlement_recovers_without_metrics_ledger(
+    mail_service, monkeypatch
+):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    service.config.payment.dev_bypass_secret = "mail-dev-bypass"
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="durable-settlement",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "https",
+            "server": ("cloud.hyrule.host", 443),
+            "path": "/v1/mail/accounts",
+            "query_string": b"",
+            "headers": [(b"x-dev-bypass", b"mail-dev-bypass")],
+        }
+    )
+    original_mark_paid = service.mark_activation_paid
+
+    async def interrupted_handoff(*_args, **_kwargs):
+        raise RuntimeError("API process lost the provisioning handoff")
+
+    monkeypatch.setattr(service, "mark_activation_paid", interrupted_handoff)
+    with pytest.raises(MailProblem) as pending:
+        await create_account(
+            MailAccountCreateRequest(quote_id=quote.quote_id),
+            request,
+            Response(),
+            idempotency_key="durable-settlement-idempotency-0001",
+            service=service,
+            gate=PaymentGate(service.config.payment),
+        )
+    assert pending.value.code == "mail_payment_handoff_pending"
+    async with sessions() as session:
+        account = await session.scalar(
+            select(MailAccountRow).where(MailAccountRow.quote_id == quote.quote_id)
+        )
+        assert account.status == MailboxStatus.AWAITING_PAYMENT.value
+        assert account.payment_settled_at is not None
+        assert account.payment_settlement_pending_at is None
+        assert account.payment_tx == "dev_bypass_0x0"
+        assert (
+            await session.scalar(
+                select(func.count()).select_from(PaymentEventRow)
+            )
+            == 0
+        )
+
+    monkeypatch.setattr(service, "mark_activation_paid", original_mark_paid)
+    assert await service.recover_x402_handoffs() == 1
+    async with sessions() as session:
+        recovered = await session.get(MailAccountRow, account.mailbox_id)
+        assert recovered.status == MailboxStatus.PROVISIONING.value
+
+
+@pytest.mark.asyncio
 async def test_unpaid_activation_expiry_releases_address_after_handoff_grace(mail_service):
     service, sessions, _backend, _domains, _refunds = mail_service
     quote = await service.create_account_quote(
@@ -1367,6 +1491,48 @@ async def test_failed_activation_retries_backend_cleanup_and_closes_reads(mail_s
         assert cleaned.backend_id is None
         assert cleaned.backend_credential_ciphertext is None
     assert backend.deleted == [backend_id]
+
+
+@pytest.mark.asyncio
+async def test_failed_activation_persists_and_retries_dns_cleanup(
+    mail_service, monkeypatch
+):
+    service, sessions, _backend, domains, _refunds = mail_service
+    mailbox_id, _token = await _active_hosted(
+        service,
+        local_part="dns-cleanup-retry",
+        idempotency_key="dns-cleanup-retry-idempotency-0001",
+    )
+    async with sessions() as session:
+        account = await session.get(MailAccountRow, mailbox_id)
+        account.plan = MailboxMode.CUSTOM.value
+        account.domain = "dns-cleanup-retry.dev"
+        await session.commit()
+
+    attempts = 0
+
+    async def remove_service_records(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("DNS control plane unavailable")
+
+    monkeypatch.setattr(domains, "remove_service_records", remove_service_records)
+    assert await service._fail_activation(
+        mailbox_id, "post-DNS provisioning failure", refund=True
+    )
+    async with sessions() as session:
+        failed = await session.get(MailAccountRow, mailbox_id)
+        assert failed.status == MailboxStatus.REFUND_DUE.value
+        assert failed.provision_error == "post-DNS provisioning failure"
+        assert failed.dns_cleanup_pending is True
+
+    assert await service.process_lifecycle() == 1
+    async with sessions() as session:
+        cleaned = await session.get(MailAccountRow, mailbox_id)
+        assert cleaned.provision_error == "post-DNS provisioning failure"
+        assert cleaned.dns_cleanup_pending is False
+    assert attempts == 2
 
 
 @pytest.mark.asyncio
@@ -1817,12 +1983,12 @@ async def test_payment_authorization_is_durably_bound_to_one_send_quote(mail_ser
     service, sessions, _backend, _domains, _refunds = mail_service
     fingerprint = hashlib.sha256(b"one-valid-payment-authorization").hexdigest()
 
-    await service.bind_send_payment_authorization(fingerprint, "mailq_first_send")
-    await service.bind_send_payment_authorization(fingerprint, "mailq_first_send")
+    await service.bind_payment_authorization(fingerprint, "mailq_first_send")
+    await service.bind_payment_authorization(fingerprint, "mailq_first_send")
     with pytest.raises(MailProblem) as reused:
-        await service.bind_send_payment_authorization(fingerprint, "mailq_second_send")
+        await service.bind_payment_authorization(fingerprint, "mailq_second_send")
     with pytest.raises(MailProblem) as quote_rebound:
-        await service.bind_send_payment_authorization(
+        await service.bind_payment_authorization(
             hashlib.sha256(b"a-distinct-valid-payment-authorization").hexdigest(),
             "mailq_first_send",
         )

@@ -1,4 +1,4 @@
-"""Bind each Agent Mail send quote to one payment authorization.
+"""Bind each Agent Mail quote to one payment authorization.
 
 Revision ID: 020
 Revises: 019

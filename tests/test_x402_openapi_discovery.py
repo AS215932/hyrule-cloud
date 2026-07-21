@@ -5,6 +5,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from cryptography.fernet import Fernet
 from httpx import ASGITransport, AsyncClient
 from x402.http import (
     PAYMENT_REQUIRED_HEADER,
@@ -17,6 +18,7 @@ from hyrule_cloud.config import HyruleConfig, PaymentConfig
 from hyrule_cloud.services.discovery import (
     DISCOVERY,
     PAID_OPERATIONS,
+    _gate_enabled,
     build_curated_openapi,
     build_x402_manifest,
     enabled_paid_operations,
@@ -57,6 +59,33 @@ def _enable_all_catalog_gates(monkeypatch: pytest.MonkeyPatch) -> None:
         "hyrule_cloud.api.bgp.router_snapshot_download_enabled",
         lambda: True,
     )
+
+
+def test_agent_domain_discovery_rejects_malformed_token_storage_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = HyruleConfig()
+    config.domain.enabled = True
+    config.domain.agent_purchases_enabled = True
+    config.domain.legal_approved = True
+    config.domain.tax_approved = True
+    config.domain.dns_control_url = "https://dns.internal"
+    config.domain.dns_control_secret = "dns-control-secret"
+    config.domain.agent_order_fernet_key = "not-a-fernet-key"
+    config.openprovider.username = "operator"
+    config.openprovider.password = "password"
+    config.openprovider.owner_handle = "owner"
+    config.openprovider.admin_handle = "admin"
+    config.openprovider.tech_handle = "tech"
+    config.openprovider.billing_handle = "billing"
+    monkeypatch.setattr(
+        "hyrule_cloud.services.discovery.HyruleConfig",
+        lambda: config,
+    )
+
+    assert _gate_enabled("agent_domains") is False
+    config.domain.agent_order_fernet_key = Fernet.generate_key().decode()
+    assert _gate_enabled("agent_domains") is True
 
 
 def _schema_operations(schema: dict) -> set[tuple[str, str]]:

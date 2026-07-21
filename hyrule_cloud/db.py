@@ -828,6 +828,9 @@ class MailAccountRow(Base):
     provision_next_attempt_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), index=True
     )
+    dns_cleanup_pending: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", index=True
+    )
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     grace_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -838,6 +841,12 @@ class MailAccountRow(Base):
     payment_tx: Mapped[str | None] = mapped_column(String(128))
     payment_network: Mapped[str | None] = mapped_column(String(64))
     payment_asset: Mapped[str | None] = mapped_column(String(66))
+    payment_settlement_pending_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    payment_settled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
 
 
 class MailDomainRow(Base):
@@ -977,7 +986,7 @@ class MailSendRow(Base):
 
 
 class MailPaymentAuthorizationRow(Base):
-    """Durable binding from one x402 authorization to one mail send quote."""
+    """Durable binding from one x402 authorization to one mail quote."""
 
     __tablename__ = "mail_payment_authorizations"
 

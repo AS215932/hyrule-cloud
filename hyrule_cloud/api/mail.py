@@ -12,6 +12,8 @@ from typing import Annotated
 
 import structlog
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
+from x402.http import decode_payment_signature_header
+from x402.mechanisms.evm.types import ExactEIP3009Payload
 
 from hyrule_cloud.mail.models import (
     MailAccountCreateRequest,
@@ -44,7 +46,35 @@ def _mail_payment_authorization_fingerprint(request: Request) -> str | None:
     supplied = request.headers.get("payment-signature") or request.headers.get("x-payment")
     if not supplied:
         return None
-    return hashlib.sha256(supplied.encode()).hexdigest()
+    try:
+        payment = decode_payment_signature_header(supplied)
+        evm = ExactEIP3009Payload.from_dict(payment.payload)
+        authorization = evm.authorization
+        accepted = getattr(payment, "accepted", None)
+        canonical = json.dumps(
+            {
+                "network": str(payment.get_network()).lower(),
+                "asset": str(getattr(accepted, "asset", "")).lower(),
+                "authorization": {
+                    "from": authorization.from_address.lower(),
+                    "to": authorization.to.lower(),
+                    "value": str(int(authorization.value)),
+                    "validAfter": str(int(authorization.valid_after)),
+                    "validBefore": str(int(authorization.valid_before)),
+                    "nonce": authorization.nonce.lower(),
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+    except (TypeError, ValueError) as exc:
+        raise MailProblem(
+            400,
+            "payment_authorization_invalid",
+            "The payment authorization could not be decoded.",
+        ) from exc
+    return hashlib.sha256(canonical).hexdigest()
 
 
 async def get_mail(state: AppState = Depends(get_app_state)) -> MailService:
@@ -117,6 +147,15 @@ async def create_account(
         body.quote_id,
         idempotency_key=_idempotency(idempotency_key),
     )
+    if account.status == "awaiting_payment" and account.payment_settled_at is not None:
+        account = await service.mark_activation_paid(
+            account.mailbox_id,
+            body.quote_id,
+            payer=account.owner_wallet or "unknown",
+            tx_hash=account.payment_tx,
+            payment_network=account.payment_network,
+            payment_asset=account.payment_asset,
+        )
     if account.status == "awaiting_payment":
         activation_amount = account.total_amount_usd
         if activation_amount is None:
@@ -150,12 +189,23 @@ async def create_account(
         if isinstance(verified, Response):
             verified.headers["Cache-Control"] = "no-store"
             return verified
+        fingerprint = _mail_payment_authorization_fingerprint(request)
+        if fingerprint is not None:
+            await service.bind_payment_authorization(fingerprint, body.quote_id)
         await service.reserve_activation_capacity(
             account.mailbox_id, quote_id=body.quote_id
+        )
+        await service.begin_activation_settlement(
+            account.mailbox_id,
+            body.quote_id,
+            payer=verified.payer or "unknown",
+            payment_network=getattr(verified.matching_requirements, "network", None),
+            payment_asset=getattr(verified.matching_requirements, "asset", None),
         )
         if not await gate.settle_verified(
             request, verified, extra_body=payment_metadata
         ):
+            await service.clear_activation_settlement(account.mailbox_id, body.quote_id)
             await service.release_activation_capacity(account.mailbox_id)
             raise MailProblem(
                 402,
@@ -163,6 +213,35 @@ async def create_account(
                 "Payment did not settle; no mailbox capacity was consumed.",
             )
         payer = getattr(request.state, "payment_payer", None) or verified.payer or "unknown"
+        durable_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                account = await service.record_activation_settlement(
+                    account.mailbox_id,
+                    body.quote_id,
+                    payer=payer,
+                    tx_hash=getattr(request.state, "payment_tx", None),
+                    payment_network=getattr(request.state, "payment_network", None),
+                    payment_asset=getattr(request.state, "payment_asset", None),
+                )
+                durable_error = None
+                break
+            except Exception as exc:
+                durable_error = exc
+                log.warning(
+                    "mail_payment_settlement_record_failed",
+                    mailbox_id=account.mailbox_id,
+                    attempt=attempt + 1,
+                    exc_info=True,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.1 * (attempt + 1))
+        if durable_error is not None:
+            raise MailProblem(
+                503,
+                "mail_payment_handoff_pending",
+                "Payment settled, but activation is pending durable recovery.",
+            ) from durable_error
         handoff_error: Exception | None = None
         for attempt in range(3):
             try:
@@ -241,7 +320,7 @@ async def send_message(
         return verified
     fingerprint = _mail_payment_authorization_fingerprint(request)
     if fingerprint is not None:
-        await service.bind_send_payment_authorization(fingerprint, body.quote_id)
+        await service.bind_payment_authorization(fingerprint, body.quote_id)
     result = await service.deliver_send(body.quote_id, token)
     if not await gate.settle_verified(request, verified, extra_body=payment_metadata):
         raise MailProblem(

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
+from cryptography.fernet import Fernet
 from fastapi.openapi.utils import get_openapi
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ValidationError
@@ -939,6 +940,10 @@ def _gate_enabled(gate: str) -> bool:
     if gate == "agent_domains":
         config = HyruleConfig()
         provider = config.openprovider
+        try:
+            Fernet(config.domain.agent_order_fernet_key.encode())
+        except (TypeError, ValueError):
+            return False
         return bool(
             config.domain.enabled
             and config.domain.agent_purchases_enabled
