@@ -19,6 +19,36 @@ down_revision: str | None = "016"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+_VM_DEV_BYPASS_BACKFILL = sa.text(
+    """
+    UPDATE vms
+    SET billing_mode = 'dev_bypass', cost_total = 0
+    WHERE billing_mode IS NULL
+      AND (
+        payment_tx = 'dev_bypass_0x0'
+        OR owner_wallet = '0xDEV_TEST_WALLET'
+      )
+    """
+)
+_VM_CHARGED_BACKFILL = sa.text(
+    "UPDATE vms SET billing_mode = 'charged' WHERE billing_mode IS NULL"
+)
+_DOMAIN_ORDER_DEV_BYPASS_BACKFILL = sa.text(
+    """
+    UPDATE domain_orders
+    SET billing_mode = 'dev_bypass'
+    WHERE billing_mode IS NULL
+      AND (
+        payment_tx = 'dev_bypass_0x0'
+        OR payment_network = 'dev-bypass'
+        OR payer = '0xDEV_TEST_WALLET'
+      )
+    """
+)
+_DOMAIN_ORDER_CHARGED_BACKFILL = sa.text(
+    "UPDATE domain_orders SET billing_mode = 'charged' WHERE billing_mode IS NULL"
+)
+
 
 def upgrade() -> None:
     op.add_column("accounts", sa.Column("disabled_at", sa.DateTime(timezone=True)))
@@ -45,12 +75,21 @@ def upgrade() -> None:
     )
 
     op.add_column(
-        "vms", sa.Column("billing_mode", sa.String(24), nullable=False, server_default="charged")
+        "vms", sa.Column("billing_mode", sa.String(24), nullable=True)
     )
     op.add_column(
         "vms", sa.Column("retail_cost_total", sa.Numeric(12, 6), nullable=False, server_default="0")
     )
     op.execute("UPDATE vms SET retail_cost_total = cost_total")
+    op.execute(_VM_DEV_BYPASS_BACKFILL)
+    op.execute(_VM_CHARGED_BACKFILL)
+    op.alter_column(
+        "vms",
+        "billing_mode",
+        existing_type=sa.String(24),
+        nullable=False,
+        server_default="charged",
+    )
     op.add_column("vms", sa.Column("suspension_reason", sa.String(32)))
     op.add_column("vms", sa.Column("suspended_by_account_id", sa.String(11)))
     op.create_foreign_key(
@@ -66,7 +105,20 @@ def upgrade() -> None:
 
     op.add_column(
         "domain_orders",
-        sa.Column("billing_mode", sa.String(24), nullable=False, server_default="charged"),
+        sa.Column("billing_mode", sa.String(24), nullable=True),
+    )
+    # Historical development-bypass orders already carry durable payment
+    # markers. Derive their non-charged mode before filling the remaining rows
+    # or installing the non-null production default, otherwise later failures
+    # can create refund obligations for money that never moved.
+    op.execute(_DOMAIN_ORDER_DEV_BYPASS_BACKFILL)
+    op.execute(_DOMAIN_ORDER_CHARGED_BACKFILL)
+    op.alter_column(
+        "domain_orders",
+        "billing_mode",
+        existing_type=sa.String(24),
+        nullable=False,
+        server_default="charged",
     )
     op.create_index("ix_domain_orders_billing_mode", "domain_orders", ["billing_mode"])
 

@@ -18,6 +18,7 @@ from hyrule_cloud.api.admin import (
     ReasonRequest,
     StepUpRequest,
     _assert_transfer_target,
+    retry_job,
     step_up,
     transfer_domain,
     transfer_vm,
@@ -32,7 +33,9 @@ from hyrule_cloud.db import (
     AdminBypassUsageRow,
     AdminOperationRow,
     Base,
+    BGPJobRow,
     DomainJobRow,
+    DomainOrderRow,
     DomainRow,
     MailAccountRow,
     PaymentEventRow,
@@ -178,19 +181,12 @@ async def test_admin_waiver_fails_closed_when_audit_persistence_fails(admin_fact
 
 
 @pytest.mark.asyncio
-async def test_deferred_admin_waiver_fails_closed_when_audit_persistence_fails(
+async def test_deferred_admin_waiver_audits_before_delivery_and_restores_failed_quota(
     admin_factory,
 ) -> None:
     credentials = await _admin_credentials(admin_factory, elevated=True)
     gate = _admin_gate(admin_factory, cost_limit=1)
     request = _browser_request(credentials, path="/v1/network/request")
-
-    verified = await gate.verify_only(request, Decimal("0.01"), "Network request")
-    assert not isinstance(verified, Response)
-    assert verified.admin_bypass is True
-    async with admin_factory() as session:
-        usage = (await session.scalars(select(AdminBypassUsageRow))).one()
-        assert usage.count == 1
 
     class FailingLedger:
         async def record(self, **kwargs) -> None:
@@ -199,7 +195,7 @@ async def test_deferred_admin_waiver_fails_closed_when_audit_persistence_fails(
 
     gate.ledger = FailingLedger()  # type: ignore[assignment]
     with pytest.raises(HTTPException) as exc:
-        await gate.settle_verified(request, verified)
+        await gate.verify_only(request, Decimal("0.01"), "Network request")
 
     assert exc.value.status_code == 503
     assert exc.value.detail == "Admin waiver audit unavailable"
@@ -212,10 +208,20 @@ async def test_deferred_admin_waiver_fails_closed_when_audit_persistence_fails(
     retry = _browser_request(credentials, path="/v1/network/request")
     retry_verified = await gate.verify_only(retry, Decimal("0.01"), "Network request")
     assert not isinstance(retry_verified, Response)
-    assert await gate.settle_verified(retry, retry_verified) is True
+    assert retry_verified.admin_bypass is True
+    assert retry.state.payment_mode == "admin-bypass"
     async with admin_factory() as session:
         usage = (await session.scalars(select(AdminBypassUsageRow))).one()
+        events = list(await session.scalars(select(PaymentEventRow)))
         assert usage.count == 1
+        assert [event.event_type for event in events] == ["admin_bypass"]
+
+    # Settlement remains deferred for real x402 payments only. An Admin
+    # handle is already durably audited and must not write a duplicate event.
+    assert await gate.settle_verified(retry, retry_verified) is True
+    async with admin_factory() as session:
+        events = list(await session.scalars(select(PaymentEventRow)))
+        assert [event.event_type for event in events] == ["admin_bypass"]
 
 
 @pytest.mark.asyncio
@@ -362,6 +368,15 @@ async def test_admin_overview_and_step_up_are_browser_only(admin_factory) -> Non
                     method="POST",
                     service_group="domain",
                     amount_usd=Decimal("2.00"),
+                    network="native",
+                    asset="BTC",
+                    payer_wallet="intent-native-refund",
+                    extra={
+                        "intent_id": "intent-native-refund",
+                        "native_refund_address": "bc1qexampleoperatorrefundtarget",
+                        "amount_received_crypto": "0.00025000",
+                        "private_provider_payload": "must-not-leak",
+                    },
                 ),
                 RefundResolutionRow(
                     resolution_id="resolution-test",
@@ -381,6 +396,15 @@ async def test_admin_overview_and_step_up_are_browser_only(admin_factory) -> Non
                     status="failed",
                     reason="old enable attempt",
                     error="provider unavailable",
+                ),
+                BGPJobRow(
+                    job_id="bgpj_admin_failed",
+                    status="failed",
+                    query={
+                        "subject": {"type": "prefix", "value": "203.0.113.0/24"},
+                        "record_type": "updates",
+                    },
+                    error="collector unavailable",
                 ),
                 VMRow(
                     vm_id="vm_disable_tokens",
@@ -441,6 +465,36 @@ async def test_admin_overview_and_step_up_are_browser_only(admin_factory) -> Non
                 "step_up_seconds": 600,
             }
             assert overview.json()["payments"]["refund_owed_count"] == 1
+            assert overview.json()["operations"]["failed_jobs"] == 1
+
+            jobs = await client.get("/v1/admin/jobs", params={"status": "failed"})
+            assert jobs.status_code == 200
+            assert jobs.json()["items"] == [
+                {
+                    "job_id": "bgpj_admin_failed",
+                    "source": "bgp",
+                    "kind": "bgpstream_updates",
+                    "target": "203.0.113.0/24",
+                    "status": "failed",
+                    "last_error": "collector unavailable",
+                    "claimed_by": None,
+                    "heartbeat_at": None,
+                    "created_at": jobs.json()["items"][0]["created_at"],
+                    "completed_at": None,
+                }
+            ]
+
+            refunds = await client.get("/v1/admin/refunds")
+            assert refunds.status_code == 200
+            open_refund = next(
+                item for item in refunds.json()["items"] if item["event_id"] == "refund-open"
+            )
+            assert open_refund["native_refund_address"] == (
+                "bc1qexampleoperatorrefundtarget"
+            )
+            assert Decimal(open_refund["amount_received_crypto"]) == Decimal("0.00025")
+            assert open_refund["native_intent_id"] == "intent-native-refund"
+            assert "private_provider_payload" not in open_refund
 
             # The outer x402 middleware must ignore ordinary Admin pages, but
             # render waiver-only validation failures on actual paid routes.
@@ -887,6 +941,71 @@ async def test_transfer_target_eligibility_check_locks_account() -> None:
     assert await _assert_transfer_target(Session(), target.account_id) is target
 
 
+@pytest.mark.asyncio
+async def test_admin_retry_rejects_terminal_fulfillment_job(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add_all(
+            [
+                DomainOrderRow(
+                    order_id="do_terminal_refund",
+                    quote_id="dq_terminal_refund",
+                    fqdn="terminal-refund.example",
+                    action="register",
+                    owner_account_id="HAAAAAAAAAA",
+                    idempotency_key="terminal-refund-retry",
+                    status="refund_due",
+                    amount_usd=Decimal("10.00"),
+                    domain_amount_usd=Decimal("10.00"),
+                    vm_amount_usd=Decimal("0"),
+                    payment_method="usdc",
+                    terms_version="2026-01",
+                    terms_accepted_at=datetime.now(UTC),
+                ),
+                DomainJobRow(
+                    job_id="djob_terminal_refund",
+                    kind="fulfill_order",
+                    resource_id="do_terminal_refund",
+                    dedupe_key="fulfill:do_terminal_refund",
+                    status="failed",
+                    attempts=10,
+                    last_error="registrar failed",
+                ),
+            ]
+        )
+        await session.commit()
+
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await retry_job(
+            "djob_terminal_refund",
+            ReasonRequest(reason="operator retry"),
+            _browser_request(
+                credentials,
+                path="/v1/admin/jobs/djob_terminal_refund/retry",
+            ),
+            actor,
+            state,
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Terminal fulfillment jobs cannot be retried"
+    async with admin_factory() as session:
+        job = await session.get(DomainJobRow, "djob_terminal_refund")
+        order = await session.get(DomainOrderRow, "do_terminal_refund")
+        assert job is not None and job.status == "failed"
+        assert order is not None and order.status == "refund_due"
+        assert list(await session.scalars(select(AdminAuditRow))) == []
+
+
 class _AdminXCPNG:
     def __init__(self) -> None:
         self.suspended: list[str] = []
@@ -972,7 +1091,15 @@ async def test_admin_resource_operations_revalidate_ownership_under_lock(
     async with admin_factory() as session:
         session.add_all(
             [
-                AccountRow(account_id="HOLDOWNERAA", password_hash="unused"),
+                AccountRow(
+                    account_id="HOLDOWNERAA",
+                    password_hash="unused",
+                    disabled_at=(
+                        datetime.now(UTC)
+                        if kind == "suspend_account_resources"
+                        else None
+                    ),
+                ),
                 AccountRow(account_id="HNEWOWNERAAA", password_hash="unused"),
                 VMRow(
                     vm_id="vm_transferred_after_snapshot",
@@ -1050,6 +1177,58 @@ async def test_admin_resource_operations_revalidate_ownership_under_lock(
 
 
 @pytest.mark.asyncio
+async def test_stale_resume_operation_does_not_revive_disabled_account(admin_factory) -> None:
+    xcpng = _AdminXCPNG()
+    disabled_at = datetime.now(UTC)
+    async with admin_factory() as session:
+        session.add_all(
+            [
+                AccountRow(
+                    account_id="HSTALESTATE",
+                    password_hash="unused",
+                    disabled_at=disabled_at,
+                ),
+                VMRow(
+                    vm_id="vm_stale_resume",
+                    owner_wallet="0xowner",
+                    owner_account_id="HSTALESTATE",
+                    xcpng_uuid="uuid-stale-resume",
+                    status="suspended",
+                    suspension_reason="account_disabled",
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                ),
+                AdminOperationRow(
+                    operation_id="operation-stale-resume",
+                    kind="resume_account_resources",
+                    account_id="HSTALESTATE",
+                    status="running",
+                    started_at=datetime.now(UTC) - timedelta(minutes=20),
+                    reason="superseded enable",
+                ),
+            ]
+        )
+        await session.commit()
+
+    progress = await _apply_account_operation(
+        admin_factory,
+        SimpleNamespace(xcpng=xcpng),
+        "operation-stale-resume",
+    )
+
+    assert progress == {"vms": 0, "mailboxes": 0}
+    assert xcpng.started == []
+    async with admin_factory() as session:
+        account = await session.get(AccountRow, "HSTALESTATE")
+        vm = await session.get(VMRow, "vm_stale_resume")
+        operation = await session.get(AdminOperationRow, "operation-stale-resume")
+        assert account is not None and account.disabled_at is not None
+        assert vm is not None and str(vm.status) == "suspended"
+        assert vm.suspension_reason == "account_disabled"
+        assert operation is not None and operation.status == "completed"
+        assert operation.progress == {"vms": 0, "mailboxes": 0}
+
+
+@pytest.mark.asyncio
 async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
     admin_factory,
 ) -> None:
@@ -1066,6 +1245,7 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
                 AccountRow(
                     account_id="HBBBBBBBBBB",
                     password_hash=hash_password("another sufficiently long password"),
+                    disabled_at=datetime.now(UTC),
                 ),
             ]
         )
@@ -1150,6 +1330,11 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
             and expired_mailbox.suspension_reason == "account_disabled"
         )
         assert operation is not None and operation.status == "completed"
+        account = await session.get(AccountRow, "HBBBBBBBBBB")
+        assert account is not None
+        account.disabled_at = None
+        account.disabled_reason = None
+        account.disabled_by_account_id = None
         session.add(
             AdminOperationRow(
                 operation_id="operation-resume",

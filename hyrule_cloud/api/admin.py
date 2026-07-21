@@ -24,9 +24,11 @@ from hyrule_cloud.db import (
     AdminAuditRow,
     AdminOperationRow,
     ApiKeyRow,
+    BGPJobRow,
     DiagnosticJobRow,
     DomainJobRow,
     DomainOperationRow,
+    DomainOrderRow,
     DomainRow,
     MailAccountRow,
     PaymentEventRow,
@@ -37,6 +39,7 @@ from hyrule_cloud.db import (
 from hyrule_cloud.domains.models import (
     DNSChangesetRequest,
     DNSSECUpdateRequest,
+    DomainOrderStatus,
     NameserverUpdateRequest,
 )
 from hyrule_cloud.middleware.auth import (
@@ -65,6 +68,52 @@ def _now() -> datetime:
 
 def _aware(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+def _bounded_text(value: Any, *, max_length: int) -> str | None:
+    if not isinstance(value, (str, int, Decimal)):
+        return None
+    text = str(value).strip()
+    return text[:max_length] or None
+
+
+def _native_refund_metadata(row: PaymentEventRow) -> dict[str, str | None]:
+    """Expose only the native payout fields an operator needs."""
+    extra = row.extra if isinstance(row.extra, dict) else {}
+    target = _bounded_text(
+        extra.get("native_refund_address") or extra.get("refund_address"),
+        max_length=128,
+    )
+    raw_amount = extra.get("amount_received_crypto")
+    amount: str | None = None
+    if isinstance(raw_amount, (str, int, Decimal)):
+        try:
+            parsed = Decimal(str(raw_amount))
+        except Exception:
+            pass
+        else:
+            if parsed.is_finite() and parsed >= 0:
+                amount = str(parsed)
+    return {
+        "native_refund_address": target,
+        "amount_received_crypto": amount,
+        "native_intent_id": _bounded_text(extra.get("intent_id"), max_length=36),
+        "order_id": _bounded_text(extra.get("order_id"), max_length=32),
+    }
+
+
+def _bgp_job_target(row: BGPJobRow) -> str | None:
+    query = row.query if isinstance(row.query, dict) else {}
+    subject = query.get("subject")
+    if isinstance(subject, dict):
+        return _bounded_text(subject.get("value"), max_length=512)
+    return _bounded_text(subject, max_length=512)
+
+
+def _bgp_job_kind(row: BGPJobRow) -> str:
+    query = row.query if isinstance(row.query, dict) else {}
+    record_type = _bounded_text(query.get("record_type"), max_length=16) or "updates"
+    return f"bgpstream_{record_type}"
 
 
 def _client_ip(request: Request) -> str | None:
@@ -353,11 +402,27 @@ async def overview(
             )
             or 0
         )
-        failed_jobs = int(
+        failed_domain_jobs = int(
             await session.scalar(
                 select(func.count())
                 .select_from(DomainJobRow)
                 .where(DomainJobRow.status == "failed")
+            )
+            or 0
+        )
+        failed_diagnostic_jobs = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(DiagnosticJobRow)
+                .where(DiagnosticJobRow.status == "failed")
+            )
+            or 0
+        )
+        failed_bgp_jobs = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(BGPJobRow)
+                .where(BGPJobRow.status == "failed")
             )
             or 0
         )
@@ -393,7 +458,9 @@ async def overview(
             ),
             "step_up_seconds": int(getattr(state.config, "admin_step_up_seconds", 600)),
         },
-        "operations": {"failed_jobs": failed_jobs},
+        "operations": {
+            "failed_jobs": failed_domain_jobs + failed_diagnostic_jobs + failed_bgp_jobs
+        },
     }
 
 
@@ -545,6 +612,7 @@ async def list_refunds(
                 "payer_wallet": row.payer_wallet,
                 "original_tx": row.tx_hash,
                 "reason": row.error_reason,
+                **_native_refund_metadata(row),
                 "resolution": (
                     {
                         "status": resolutions[row.event_id].status,
@@ -575,12 +643,15 @@ async def list_jobs(
     diagnostic_stmt = (
         select(DiagnosticJobRow).order_by(DiagnosticJobRow.created_at.desc()).limit(limit)
     )
+    bgp_stmt = select(BGPJobRow).order_by(BGPJobRow.created_at.desc()).limit(limit)
     if status:
         domain_stmt = domain_stmt.where(DomainJobRow.status == status)
         diagnostic_stmt = diagnostic_stmt.where(DiagnosticJobRow.status == status)
+        bgp_stmt = bgp_stmt.where(BGPJobRow.status == status)
     async with _factory(state)() as session:
         domain_rows = list(await session.scalars(domain_stmt))
         diagnostic_rows = list(await session.scalars(diagnostic_stmt))
+        bgp_rows = list(await session.scalars(bgp_stmt))
     items: list[dict[str, Any]] = [
         {
             "job_id": row.job_id,
@@ -607,6 +678,20 @@ async def list_jobs(
             "completed_at": row.completed_at,
         }
         for row in diagnostic_rows
+    ] + [
+        {
+            "job_id": row.job_id,
+            "source": "bgp",
+            "kind": _bgp_job_kind(row),
+            "target": _bgp_job_target(row),
+            "status": row.status,
+            "last_error": row.error,
+            "claimed_by": row.claimed_by,
+            "heartbeat_at": row.heartbeat_at,
+            "created_at": row.created_at,
+            "completed_at": row.completed_at,
+        }
+        for row in bgp_rows
     ]
     items.sort(key=lambda item: _aware(item["created_at"]), reverse=True)
     return {"items": items[:limit]}
@@ -1343,11 +1428,34 @@ async def retry_job(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
-        job = await session.get(DomainJobRow, job_id)
+        job = (
+            await session.execute(
+                select(DomainJobRow)
+                .where(DomainJobRow.job_id == job_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         if job is None:
             raise HTTPException(404, "Retry is supported only for domain jobs")
         if job.status != "failed":
             raise HTTPException(409, "Only failed jobs can be retried")
+        if job.kind == "fulfill_order":
+            order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == job.resource_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if order is None:
+                raise HTTPException(409, "Fulfillment order no longer exists")
+            if order.status in {
+                DomainOrderStatus.REFUND_DUE.value,
+                DomainOrderStatus.REFUNDED.value,
+                DomainOrderStatus.CANCELLED.value,
+                DomainOrderStatus.EXPIRED.value,
+            }:
+                raise HTTPException(409, "Terminal fulfillment jobs cannot be retried")
         job.status = "queued"
         job.available_at = _now()
         job.locked_at = None

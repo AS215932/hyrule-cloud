@@ -176,9 +176,6 @@ class VerifiedPayment:
     matching_requirements: PaymentRequirements | None = None
     dev_bypass: bool = False
     admin_bypass: bool = False
-    admin_account_id: str | None = None
-    admin_operation_class: str | None = None
-    admin_quota_window: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -995,14 +992,16 @@ class PaymentGate:
         if not payment_header:
             admin_context = await self._admin_context(request)
             if admin_context is not None:
-                quota_window = await self._consume_admin_quota(admin_context)
+                payer = await self._apply_admin_bypass(
+                    request,
+                    amount,
+                    admin_context,
+                    extra_body,
+                )
                 return VerifiedPayment(
-                    payer=f"admin:{admin_context.account_id}",
+                    payer=payer,
                     amount=amount,
                     admin_bypass=True,
-                    admin_account_id=admin_context.account_id,
-                    admin_operation_class=admin_context.operation_class,
-                    admin_quota_window=quota_window,
                 )
 
         extensions = self._discovery_extensions(request)
@@ -1132,39 +1131,10 @@ class PaymentGate:
             return True
 
         if verified.admin_bypass:
-            assert verified.admin_account_id is not None
-            assert verified.admin_operation_class is not None
-            assert verified.admin_quota_window is not None
-            context = AdminBypassContext(
-                verified.admin_account_id,
-                verified.admin_operation_class,
-            )
-            tx_hash = f"admin_bypass_{secrets.token_hex(16)}"
-            try:
-                await self._record_required(
-                    "admin_bypass",
-                    request,
-                    verified.amount,
-                    network="admin-bypass",
-                    payer=verified.payer,
-                    tx_hash=tx_hash,
-                    actor_account_id=verified.admin_account_id,
-                    extra={
-                        "operation_class": verified.admin_operation_class,
-                        "retail_amount_usd": str(verified.amount),
-                    },
-                )
-            except Exception:
-                await self._restore_admin_quota_after_failure(
-                    context,
-                    verified.admin_quota_window,
-                )
-                raise
-            request.state.payment_tx = tx_hash
-            request.state.payment_network = "admin-bypass"
-            request.state.payment_asset = None
-            request.state.payment_mode = "admin-bypass"
-            request.state.payment_response_headers = {ADMIN_PAYMENT_MODE_HEADER: "admin-bypass"}
+            # Unlike a real x402 authorization, an Admin waiver has no money to
+            # settle after delivery. verify_only already persisted its required
+            # audit event and attached the payment metadata before returning the
+            # handle, so the real-cost proxy request can never run unaudited.
             return True
 
         try:

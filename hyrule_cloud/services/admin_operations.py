@@ -111,23 +111,24 @@ async def process_admin_operations(
             await session.commit()
 
         try:
-            progress = await _apply_account_operation(session_factory, orchestrator, operation_id)
+            await _apply_account_operation(session_factory, orchestrator, operation_id)
         except Exception as exc:
             log.exception("admin_operation_failed", operation_id=operation_id)
+            # Validation failures that occur before the account lease is
+            # acquired (or a failed terminal-status commit) still need a
+            # durable failure marker. Normal provider failures are already
+            # finalized under the lease and leave this branch as a no-op.
             async with session_factory() as session:
-                current = await session.get(AdminOperationRow, operation_id)
-                if current is not None:
+                current = (
+                    await session.execute(
+                        select(AdminOperationRow)
+                        .where(AdminOperationRow.operation_id == operation_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if current is not None and current.status == "running":
                     current.status = "failed"
                     current.error = str(exc)[:2000]
-                    current.completed_at = _now()
-                    await session.commit()
-        else:
-            async with session_factory() as session:
-                current = await session.get(AdminOperationRow, operation_id)
-                if current is not None:
-                    current.status = "completed"
-                    current.progress = progress
-                    current.error = None
                     current.completed_at = _now()
                     await session.commit()
         processed += 1
@@ -139,23 +140,92 @@ async def _apply_account_operation(
     orchestrator: Orchestrator,
     operation_id: str,
 ) -> dict[str, int]:
-    async with session_factory() as session:
-        operation = await session.get(AdminOperationRow, operation_id)
+    # Retain the account row lock for the full provider/database operation. It
+    # is both the account-state fence (enable/disable cannot change underneath
+    # this worker) and the exclusive lease: another worker's SKIP LOCKED claim
+    # cannot reclaim this operation merely because it legitimately runs longer
+    # than the 15-minute crash-recovery threshold. A dead worker releases the
+    # transaction lock when its connection closes, after which stale recovery
+    # remains available.
+    async with session_factory() as lease_session:
+        operation = await lease_session.get(AdminOperationRow, operation_id)
         if operation is None:
             raise RuntimeError("admin operation disappeared")
         kind = operation.kind
         account_id = operation.account_id
         actor_id = operation.actor_account_id
-        vms = list(await session.scalars(select(VMRow).where(VMRow.owner_account_id == account_id)))
-        mailboxes = list(
-            await session.scalars(
-                select(MailAccountRow).where(MailAccountRow.owner_account_id == account_id)
+        if kind not in {"suspend_account_resources", "resume_account_resources"}:
+            raise RuntimeError(f"unsupported admin operation: {kind}")
+
+        account = (
+            await lease_session.execute(
+                select(AccountRow)
+                .where(AccountRow.account_id == account_id)
+                .with_for_update()
             )
-        )
+        ).scalar_one_or_none()
+        if account is None:
+            raise RuntimeError("admin operation account disappeared")
 
-    if kind not in {"suspend_account_resources", "resume_account_resources"}:
-        raise RuntimeError(f"unsupported admin operation: {kind}")
+        operation_matches_state = (
+            kind == "suspend_account_resources" and account.disabled_at is not None
+        ) or (kind == "resume_account_resources" and account.disabled_at is None)
+        try:
+            if not operation_matches_state:
+                # A newer inverse operation won the account-state transition
+                # before this queued operation ran. Completing it as a no-op
+                # preserves queue ordering without acting against current state.
+                progress = {"vms": 0, "mailboxes": 0}
+            else:
+                vms = list(
+                    await lease_session.scalars(
+                        select(VMRow).where(VMRow.owner_account_id == account_id)
+                    )
+                )
+                mailboxes = list(
+                    await lease_session.scalars(
+                        select(MailAccountRow).where(
+                            MailAccountRow.owner_account_id == account_id
+                        )
+                    )
+                )
+                progress = await _apply_locked_account_operation(
+                    session_factory,
+                    orchestrator,
+                    kind=kind,
+                    account_id=account_id,
+                    actor_id=actor_id,
+                    vms=vms,
+                    mailboxes=mailboxes,
+                )
+        except Exception as exc:
+            # Finalize while the account lease is still held. A second worker
+            # cannot slip into the stale-claim window between the last provider
+            # call and this durable terminal status.
+            operation.status = "failed"
+            operation.error = str(exc)[:2000]
+            operation.completed_at = _now()
+            await lease_session.commit()
+            raise
+        else:
+            operation.status = "completed"
+            operation.progress = progress
+            operation.error = None
+            operation.completed_at = _now()
+            await lease_session.commit()
+            return progress
 
+
+async def _apply_locked_account_operation(
+    session_factory: async_sessionmaker[AsyncSession],
+    orchestrator: Orchestrator,
+    *,
+    kind: str,
+    account_id: str,
+    actor_id: str | None,
+    vms: list[VMRow],
+    mailboxes: list[MailAccountRow],
+) -> dict[str, int]:
     vm_count = 0
     mail_count = 0
     now = _now()
