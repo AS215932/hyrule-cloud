@@ -826,6 +826,7 @@ class DomainService:
         tx_hash: str | None,
         payment_network: str | None = None,
         payment_asset: str | None = None,
+        payment_handoff_grace: timedelta | None = None,
     ) -> DomainOrderRow:
         return await self._mark_paid(
             order_id,
@@ -833,6 +834,7 @@ class DomainService:
             tx_hash=tx_hash,
             payment_network=payment_network,
             payment_asset=payment_asset,
+            payment_handoff_grace=payment_handoff_grace,
         )
 
     async def assert_x402_payable(self, order_id: str) -> None:
@@ -878,6 +880,7 @@ class DomainService:
         tx_hash: str | None,
         payment_network: str | None = None,
         payment_asset: str | None = None,
+        payment_handoff_grace: timedelta | None = None,
     ) -> DomainOrderRow:
         async with self.db() as session:
             order = (
@@ -889,6 +892,42 @@ class DomainService:
             ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            late_handoff = False
+            if (
+                order.status == DomainOrderStatus.EXPIRED.value
+                and payment_handoff_grace is not None
+            ):
+                quote = (
+                    await session.execute(
+                        select(DomainQuoteRow)
+                        .where(DomainQuoteRow.quote_id == order.quote_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                expires_at = _aware(quote.expires_at) if quote is not None else None
+                late_handoff = bool(
+                    quote is not None
+                    and quote.status in {"active", "reserved", "expired"}
+                    and expires_at is not None
+                    and expires_at > _now() - payment_handoff_grace
+                )
+                if late_handoff:
+                    assert quote is not None
+                    order.status = DomainOrderStatus.AWAITING_PAYMENT.value
+                    order.error_code = None
+                    order.error_detail = None
+                    quote.status = "reserved"
+                else:
+                    order.paid_at = _now()
+                    order.payer = payer[:128]
+                    order.payment_tx = tx_hash
+                    order.payment_network = payment_network
+                    order.payment_asset = payment_asset
+                    order.status = DomainOrderStatus.REFUND_DUE.value
+                    order.error_code = "late_payment_after_expiry"
+                    session.add(self._build_refund_event(order, "late_payment_after_expiry"))
+                    await session.commit()
+                    return order
             if order.status not in {
                 DomainOrderStatus.AWAITING_PAYMENT.value,
                 DomainOrderStatus.PAID.value,
@@ -913,7 +952,7 @@ class DomainService:
                 if (
                     quote is None
                     or quote.status not in {"active", "reserved"}
-                    or _aware(quote.expires_at) <= _now()
+                    or (_aware(quote.expires_at) <= _now() and not late_handoff)
                 ):
                     if quote is not None and _aware(quote.expires_at) <= _now():
                         quote.status = "expired"

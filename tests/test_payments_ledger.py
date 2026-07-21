@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from x402.http import PAYMENT_SIGNATURE_HEADER
 
 from hyrule_cloud.app import app
-from hyrule_cloud.db import Base, PaymentEventRow, VMRow
+from hyrule_cloud.db import Base, MailSendRow, PaymentEventRow, VMRow
 from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.models import VMSize, VMStatus
 from hyrule_cloud.services.payments_ledger import PaymentLedger, service_group_for_path
@@ -233,6 +233,15 @@ async def test_metrics_renders_ledger_and_fleet_counters(metrics_app_state) -> N
                 provisioned_at=None,
             )
         )
+        session.add(
+            MailSendRow(
+                send_id="send_metrics_test",
+                mailbox_id="mbx_metrics_test",
+                quote_id="mailq_metrics_test",
+                recipient="proof@example.net",
+                status="accepted",
+            )
+        )
         await session.commit()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -254,6 +263,9 @@ async def test_metrics_renders_ledger_and_fleet_counters(metrics_app_state) -> N
     assert 'hyrule_vms_active{status="ready"} 1' in body
     assert 'hyrule_vm_provision_total{result="ready"} 0' in body
     assert 'hyrule_vm_provision_total{result="failed"} 0' in body
+    assert "# TYPE hyrule_mail_messages_current gauge" in body
+    assert 'hyrule_mail_messages_current{status="accepted"} 1' in body
+    assert "hyrule_mail_messages_total" not in body
 
 
 @pytest.mark.asyncio

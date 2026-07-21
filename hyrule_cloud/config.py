@@ -251,6 +251,7 @@ class MailConfig(BaseSettings):
     mailbox_new_recipient_limit_per_day: int = Field(default=5, ge=1, le=25)
     global_send_limit_per_day: int = Field(default=100, ge=1)
     max_active_mailboxes: int = Field(default=25, ge=1)
+    max_webhooks_per_mailbox: int = Field(default=5, ge=1, le=20)
     max_subject_chars: int = Field(default=998, ge=1, le=998)
     max_text_chars: int = Field(default=100_000, ge=1, le=1_000_000)
     max_html_chars: int = Field(default=100_000, ge=1, le=1_000_000)

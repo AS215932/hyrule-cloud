@@ -365,4 +365,6 @@ class DomainTransferOutRequest(BaseModel):
 
 
 class LegacyDomainClaimRequest(BaseModel):
-    token: str = Field(pattern=r"^hyr_dom_", min_length=20, max_length=128)
+    token: str = Field(
+        pattern=r"^(?:hyr_dom_|hyr_identity_)", min_length=20, max_length=128
+    )

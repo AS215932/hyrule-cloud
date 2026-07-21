@@ -45,7 +45,9 @@ from hyrule_cloud.domains.models import (
     DomainAction,
     DomainFailurePolicy,
     DomainOrderRequest,
+    DomainOrderStatus,
     DomainPaymentMethod,
+    LegacyDomainClaimRequest,
     ManagedRecordType,
     NameserverMode,
     NameserverUpdateRequest,
@@ -373,6 +375,89 @@ async def test_wallet_native_agent_can_buy_and_poll_domain_without_account(domai
     assert domain is not None
     assert domain.owner_account_id is None
     assert domain.anon_management_token_hash
+
+
+def test_combined_identity_token_can_claim_its_purchased_domain() -> None:
+    token = "hyr_identity_" + "x" * 43
+    assert LegacyDomainClaimRequest(token=token).token == token
+
+
+@pytest.mark.asyncio
+async def test_combined_payment_recovers_domain_expired_during_handoff_grace(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote("late-combined.dev", DomainAction.REGISTER, None)
+    order, _token, _created = await service.create_agent_order(
+        quote_id=quote.quote_id,
+        terms_version=service.domain_config.terms_version,
+        idempotency_key="late-combined-domain-idempotency-0001",
+        additional_amount_usd=Decimal("1.00"),
+        management_token="hyr_identity_" + "y" * 43,
+    )
+    async with sessions() as session:
+        stored_quote = await session.get(DomainQuoteRow, quote.quote_id)
+        stored_order = await session.get(DomainOrderRow, order.order_id)
+        stored_quote.status = "expired"
+        stored_quote.expires_at = datetime.now(UTC) - timedelta(minutes=30)
+        stored_order.status = DomainOrderStatus.EXPIRED.value
+        stored_order.error_code = "quote_expired"
+        await session.commit()
+
+    recovered = await service.mark_x402_paid(
+        order.order_id,
+        payer="0x" + "7" * 40,
+        tx_hash="0xlate-combined",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+        payment_handoff_grace=timedelta(hours=1),
+    )
+
+    assert recovered.status == DomainOrderStatus.QUEUED.value
+    async with sessions() as session:
+        consumed_quote = await session.get(DomainQuoteRow, quote.quote_id)
+        refund = await session.scalar(
+            select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
+        )
+        assert consumed_quote.status == "consumed"
+        assert refund is None
+
+
+@pytest.mark.asyncio
+async def test_combined_payment_after_handoff_grace_records_full_refund(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote("late-refund.dev", DomainAction.REGISTER, None)
+    order, _token, _created = await service.create_agent_order(
+        quote_id=quote.quote_id,
+        terms_version=service.domain_config.terms_version,
+        idempotency_key="late-combined-domain-refund-idempotency-0001",
+        additional_amount_usd=Decimal("1.00"),
+        management_token="hyr_identity_" + "z" * 43,
+    )
+    async with sessions() as session:
+        stored_quote = await session.get(DomainQuoteRow, quote.quote_id)
+        stored_order = await session.get(DomainOrderRow, order.order_id)
+        stored_quote.status = "expired"
+        stored_quote.expires_at = datetime.now(UTC) - timedelta(hours=2)
+        stored_order.status = DomainOrderStatus.EXPIRED.value
+        stored_order.error_code = "quote_expired"
+        await session.commit()
+
+    terminal = await service.mark_x402_paid(
+        order.order_id,
+        payer="0x" + "8" * 40,
+        tx_hash="0xlate-combined-refund",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+        payment_handoff_grace=timedelta(hours=1),
+    )
+
+    assert terminal.status == DomainOrderStatus.REFUND_DUE.value
+    async with sessions() as session:
+        refund = await session.scalar(
+            select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
+        )
+        assert refund is not None
+        assert Decimal(refund.amount_usd) == Decimal(order.amount_usd)
+        assert refund.tx_hash == "0xlate-combined-refund"
 
 
 @pytest.mark.asyncio

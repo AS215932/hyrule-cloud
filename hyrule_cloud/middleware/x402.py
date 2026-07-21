@@ -783,7 +783,13 @@ class PaymentGate:
             log.error("payment_processing_error", exc_info=True)
             return self._json_response(502, {"error": "Payment processing error"})
 
-    async def settle_verified(self, request: Request, verified: VerifiedPayment) -> bool:
+    async def settle_verified(
+        self,
+        request: Request,
+        verified: VerifiedPayment,
+        *,
+        extra_body: dict[str, Any] | None = None,
+    ) -> bool:
         """Settle a payment already verified by ``verify_only``.
 
         Call ONLY after the paid resource has been delivered. Attaches the
@@ -794,12 +800,16 @@ class PaymentGate:
         """
         if verified.dev_bypass:
             request.state.payment_tx = "dev_bypass_0x0"
+            request.state.payment_network = "dev-bypass"
+            request.state.payment_asset = "USDC"
+            request.state.payment_payer = verified.payer
             await self._record(
                 "dev_bypass",
                 request,
                 verified.amount,
                 payer="0xDEV_TEST_WALLET",
                 tx_hash="dev_bypass_0x0",
+                extra=extra_body,
             )
             return True
 
@@ -856,8 +866,12 @@ class PaymentGate:
             asset=verified.matching_requirements.asset,
             payer=wallet,
             tx_hash=tx_hash,
+            extra=extra_body,
         )
         request.state.payment_tx = tx_hash
+        request.state.payment_network = verified.matching_requirements.network
+        request.state.payment_asset = verified.matching_requirements.asset
+        request.state.payment_payer = wallet
         return True
 
     @staticmethod

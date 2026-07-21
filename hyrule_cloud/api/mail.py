@@ -7,8 +7,6 @@ import hashlib
 import hmac
 import json
 from base64 import b64encode
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Annotated
 
@@ -42,30 +40,11 @@ router = APIRouter(prefix="/v1/mail", tags=["agent-mail"])
 internal_router = APIRouter(prefix="/v1/internal/mail", tags=["internal"], include_in_schema=False)
 log = structlog.get_logger().bind(component="agent_mail_api")
 
-# The paid send performs a non-idempotent external action before deferred x402
-# settlement. Serialize reuse of the same authorization in this process; a
-# retry of the same quote remains idempotent at the database layer.
-_mail_inflight_authorizations: set[str] = set()
-
-
-@asynccontextmanager
-async def _mail_payment_authorization_guard(request: Request) -> AsyncIterator[None]:
+def _mail_payment_authorization_fingerprint(request: Request) -> str | None:
     supplied = request.headers.get("payment-signature") or request.headers.get("x-payment")
     if not supplied:
-        yield
-        return
-    fingerprint = hashlib.sha256(supplied.encode()).hexdigest()
-    if fingerprint in _mail_inflight_authorizations:
-        raise MailProblem(
-            409,
-            "payment_authorization_in_flight",
-            "This payment authorization is already sending a message.",
-        )
-    _mail_inflight_authorizations.add(fingerprint)
-    try:
-        yield
-    finally:
-        _mail_inflight_authorizations.discard(fingerprint)
+        return None
+    return hashlib.sha256(supplied.encode()).hexdigest()
 
 
 async def get_mail(state: AppState = Depends(get_app_state)) -> MailService:
@@ -158,21 +137,35 @@ async def create_account(
         # the payment ledger for recovery and must never contain secrets.
         if not isinstance(gate, PaymentGate) or not gate.has_payment_credentials(request):
             challenge_metadata["management_token"] = token
-        paid = await gate.check_payment(
+        verification_metadata = (
+            payment_metadata if gate.has_payment_credentials(request) else challenge_metadata
+        )
+        verified = await gate.verify_only(
             request,
             amount=activation_amount,
             description=f"Activate Agent Mail for {account.address}",
-            extra_body=challenge_metadata,
+            extra_body=verification_metadata,
         )
-        if isinstance(paid, Response):
-            paid.headers["Cache-Control"] = "no-store"
-            return paid
+        if isinstance(verified, Response):
+            verified.headers["Cache-Control"] = "no-store"
+            return verified
+        await service.reserve_activation_capacity(account.mailbox_id)
+        if not await gate.settle_verified(
+            request, verified, extra_body=payment_metadata
+        ):
+            await service.release_activation_capacity(account.mailbox_id)
+            raise MailProblem(
+                402,
+                "mail_payment_settlement_failed",
+                "Payment did not settle; no mailbox capacity was consumed.",
+            )
+        payer = getattr(request.state, "payment_payer", None) or verified.payer or "unknown"
         handoff_error: Exception | None = None
         for attempt in range(3):
             try:
                 account = await service.mark_activation_paid(
                     account.mailbox_id,
-                    payer=paid,
+                    payer=payer,
                     tx_hash=getattr(request.state, "payment_tx", None),
                     payment_network=getattr(request.state, "payment_network", None),
                     payment_asset=getattr(request.state, "payment_asset", None),
@@ -226,29 +219,32 @@ async def send_message(
     service: MailService = Depends(get_mail),
     gate: PaymentGate = Depends(get_gate),
 ) -> MailSendResponse | Response:
-    async with _mail_payment_authorization_guard(request):
-        quote = await service.get_quote(body.quote_id)
-        if quote.kind != "send":
-            raise MailProblem(422, "wrong_quote_kind", "A send quote is required.")
-        verified = await gate.verify_only(
-            request,
-            amount=Decimal(quote.amount_usd),
-            description="Send one Agent Mail message",
-            extra_body={"quote_id": body.quote_id, "one_recipient": True},
+    quote = await service.get_quote(body.quote_id)
+    if quote.kind != "send":
+        raise MailProblem(422, "wrong_quote_kind", "A send quote is required.")
+    payment_metadata = {"quote_id": body.quote_id, "one_recipient": True}
+    verified = await gate.verify_only(
+        request,
+        amount=Decimal(quote.amount_usd),
+        description="Send one Agent Mail message",
+        extra_body=payment_metadata,
+    )
+    if isinstance(verified, Response):
+        return verified
+    fingerprint = _mail_payment_authorization_fingerprint(request)
+    if fingerprint is not None:
+        await service.bind_send_payment_authorization(fingerprint, body.quote_id)
+    result = await service.deliver_send(body.quote_id, _token(request))
+    if not await gate.settle_verified(request, verified, extra_body=payment_metadata):
+        raise MailProblem(
+            402,
+            "mail_payment_settlement_pending",
+            "The message was accepted, but payment did not settle; retry this same quote.",
         )
-        if isinstance(verified, Response):
-            return verified
-        result = await service.deliver_send(body.quote_id, _token(request))
-        if not await gate.settle_verified(request, verified):
-            raise MailProblem(
-                402,
-                "mail_payment_settlement_pending",
-                "The message was accepted, but payment did not settle; retry this same quote.",
-            )
-        await service.attribute_send_payment(
-            result.send_id, getattr(request.state, "payment_tx", None)
-        )
-        return result
+    await service.attribute_send_payment(
+        result.send_id, getattr(request.state, "payment_tx", None)
+    )
+    return result
 
 
 @router.get("/accounts/{mailbox_id}/messages", response_model=MailMessagesResponse)

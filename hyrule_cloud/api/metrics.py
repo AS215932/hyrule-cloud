@@ -230,9 +230,9 @@ async def _render(session_factory: Any) -> str:
 
         _metric(
             lines,
-            "hyrule_mail_messages_total",
-            "Agent Mail outbound messages by acceptance or delivery status.",
-            "counter",
+            "hyrule_mail_messages_current",
+            "Current retained Agent Mail outbound message rows by status.",
+            "gauge",
         )
         rows = (
             await session.execute(
@@ -240,7 +240,7 @@ async def _render(session_factory: Any) -> str:
             )
         ).all()
         for status, count in rows:
-            lines.append(f'hyrule_mail_messages_total{{status="{_esc(status)}"}} {count}')
+            lines.append(f'hyrule_mail_messages_current{{status="{_esc(status)}"}} {count}')
 
     return "\n".join(lines) + "\n"
 

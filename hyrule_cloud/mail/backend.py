@@ -21,6 +21,10 @@ class MailBackendError(RuntimeError):
     pass
 
 
+class MailDNSIncompleteError(MailBackendError):
+    pass
+
+
 class MailAttachmentTooLargeError(MailBackendError):
     pass
 
@@ -166,7 +170,12 @@ class StalwartClient:
         data = self._method_data(loaded, "get-domain")
         items = data.get("list") or []
         zone = items[0].get("dnsZoneFile", "") if items else ""
-        return domain_id, _zone_file_records(zone)
+        records = _zone_file_records(zone)
+        if not _mail_dns_records_complete(domain, records):
+            raise MailDNSIncompleteError(
+                "Stalwart DNS zone is incomplete; MX, SPF, and DKIM are required"
+            )
+        return domain_id, records
 
     async def create_account(
         self,
@@ -532,10 +541,17 @@ class StalwartClient:
     async def get_message(self, *, address: str, password: str, message_id: str) -> dict[str, Any]:
         session, _auth = await self._session(address, password)
         account_id = str(session.get("primaryAccounts", {}).get("urn:ietf:params:jmap:mail", ""))
+        if not account_id:
+            raise MailBackendError("Mailbox has no JMAP mail account")
         result = await self._jmap(
             address,
             password,
             [
+                [
+                    "Mailbox/get",
+                    {"accountId": account_id, "properties": ["id", "role"]},
+                    "get-message-mailboxes",
+                ],
                 [
                     "Email/get",
                     {
@@ -545,6 +561,7 @@ class StalwartClient:
                             "id",
                             "blobId",
                             "threadId",
+                            "messageId",
                             "mailboxIds",
                             "keywords",
                             "receivedAt",
@@ -568,7 +585,96 @@ class StalwartClient:
         items = self._method_data(result["response"], "get-email").get("list", [])
         if not items:
             raise MailBackendError("Message not found")
-        return dict(items[0])
+        roles = {
+            str(item.get("id")): str(item.get("role") or "other")
+            for item in self._method_data(
+                result["response"], "get-message-mailboxes"
+            ).get("list", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        item = dict(items[0])
+        item["folder"] = _mailbox_folder(item.get("mailboxIds"), roles)
+        return item
+
+    async def list_messages(
+        self, *, address: str, password: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """List directly from authoritative JMAP state, including mailbox roles."""
+
+        session, _auth = await self._session(address, password)
+        account_id = str(session.get("primaryAccounts", {}).get("urn:ietf:params:jmap:mail", ""))
+        if not account_id:
+            raise MailBackendError("Mailbox has no JMAP mail account")
+        queried = await self._jmap(
+            address,
+            password,
+            [
+                [
+                    "Email/query",
+                    {
+                        "accountId": account_id,
+                        "sort": [{"property": "receivedAt", "isAscending": False}],
+                        "limit": min(max(limit, 1), 100),
+                    },
+                    "list-email-query",
+                ]
+            ],
+            ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        )
+        ids = [
+            str(value)
+            for value in self._method_data(
+                queried["response"], "list-email-query"
+            ).get("ids", [])
+            if value
+        ]
+        if not ids:
+            return []
+        loaded = await self._jmap(
+            address,
+            password,
+            [
+                [
+                    "Mailbox/get",
+                    {"accountId": account_id, "properties": ["id", "role"]},
+                    "list-mailboxes",
+                ],
+                [
+                    "Email/get",
+                    {
+                        "accountId": account_id,
+                        "ids": ids,
+                        "properties": [
+                            "id",
+                            "messageId",
+                            "mailboxIds",
+                            "keywords",
+                            "receivedAt",
+                            "from",
+                            "to",
+                            "subject",
+                            "attachments",
+                        ],
+                    },
+                    "list-emails",
+                ],
+            ],
+            ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        )
+        response = loaded["response"]
+        roles = {
+            str(item.get("id")): str(item.get("role") or "other")
+            for item in self._method_data(response, "list-mailboxes").get("list", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        result: list[dict[str, Any]] = []
+        for raw in self._method_data(response, "list-emails").get("list", []):
+            if not isinstance(raw, dict) or not raw.get("id"):
+                continue
+            item = dict(raw)
+            item["folder"] = _mailbox_folder(item.get("mailboxIds"), roles)
+            result.append(item)
+        return result
 
     async def download_blob(
         self,
@@ -648,3 +754,46 @@ def _zone_file_records(zone: str) -> list[dict[str, Any]]:
             }
         )
     return records
+
+
+def _mail_dns_records_complete(domain: str, records: list[dict[str, Any]]) -> bool:
+    domain = domain.rstrip(".").lower()
+
+    def owner(record: dict[str, Any]) -> str:
+        value = str(record.get("name") or "").rstrip(".").lower()
+        return domain if value in {"", "@"} else value
+
+    root_txt = [
+        str(record.get("value") or "").strip('"').lower()
+        for record in records
+        if record.get("type") == "TXT" and owner(record) == domain
+    ]
+    has_mx = any(
+        record.get("type") == "MX" and owner(record) == domain
+        for record in records
+    )
+    has_spf = any(value.startswith("v=spf1") for value in root_txt)
+    has_dkim = any(
+        record.get("type") == "TXT"
+        and "._domainkey" in owner(record)
+        and "v=dkim1" in str(record.get("value") or "").lower()
+        for record in records
+    )
+    return has_mx and has_spf and has_dkim
+
+
+def _mailbox_folder(mailbox_ids: Any, roles: dict[str, str]) -> str:
+    message_roles = (
+        [
+            roles.get(str(mailbox_id), "other")
+            for mailbox_id, enabled in mailbox_ids.items()
+            if enabled
+        ]
+        if isinstance(mailbox_ids, dict)
+        else []
+    )
+    role_priority = ("inbox", "sent", "drafts", "junk", "trash", "archive")
+    return next(
+        (role for role in role_priority if role in message_roles),
+        message_roles[0] if message_roles else "other",
+    )
