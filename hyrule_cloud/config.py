@@ -314,6 +314,13 @@ class HyruleConfig(BaseSettings):
     # reachable behind Caddy, so never expose the exporter unauthenticated.
     metrics_token: str = ""
 
+    # Administrator payment waivers are deliberately opt-in. They apply only
+    # to an enabled Admin's browser session and still execute the real service.
+    admin_payment_bypass_enabled: bool = False
+    admin_step_up_seconds: int = Field(default=600, ge=60, le=3600)
+    admin_diagnostic_bypass_per_minute: int = Field(default=120, ge=1, le=10000)
+    admin_cost_bypass_per_hour: int = Field(default=10, ge=1, le=1000)
+
     # Internal Go sidecar for x402-gated /v1/network/request execution.
     # Hyrule Cloud verifies/settles x402; the sidecar performs egress.
     network_proxy_url: str = "http://127.0.0.1:8450"

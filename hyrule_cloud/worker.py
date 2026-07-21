@@ -18,6 +18,7 @@ from hyrule_cloud.logging_config import SAFE_DICT_TRACEBACKS
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.services.admin_operations import process_admin_operations
 from hyrule_cloud.services.intents import scan_pending_intents
 
 structlog.configure(
@@ -74,6 +75,7 @@ async def run_worker() -> None:
     next_catalog = now
     next_reconcile = now
     next_renewal_state = now
+    next_admin_operations = now
     worker_id = f"{socket.gethostname()}:{id(stop)}"
     log.info(
         "worker_started",
@@ -106,6 +108,12 @@ async def run_worker() -> None:
                 except Exception:
                     log.exception("domain_jobs_failed")
                 next_jobs = now + timedelta(seconds=config.domain.worker_poll_seconds)
+            if now >= next_admin_operations:
+                try:
+                    await process_admin_operations(sessions, orchestrator, limit=10)
+                except Exception:
+                    log.exception("admin_operations_failed")
+                next_admin_operations = now + timedelta(seconds=5)
             if now >= next_expiry:
                 try:
                     await orchestrator.check_expiries()

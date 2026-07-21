@@ -1950,13 +1950,19 @@ async def test_bundle_claims_domain_before_reserving_vm(domain_service):
     async def release_vm_reservation(_vm_id):
         return None
 
-    async def persist_charged_amount(_vm_id: str, _amount: Decimal) -> None:
+    async def persist_payment_billing(
+        _vm_id: str,
+        _amount: Decimal,
+        *,
+        admin_waived: bool,
+        payment_tx: str | None = None,
+    ) -> None:
         return None
 
     service.orchestrator.reserve_vm_with_capacity = reserve_vm_with_capacity
     service.orchestrator.activate_vm_reservation = activate_vm_reservation
     service.orchestrator.release_vm_reservation = release_vm_reservation
-    service.orchestrator.persist_charged_amount = persist_charged_amount
+    service.orchestrator.persist_payment_billing = persist_payment_billing
     await service._provision_bundle(order.order_id)
 
     assert len(observed_claim) == 1

@@ -407,6 +407,16 @@ class _OrchForCreate:
         self.last_token = generate_anon_management_token()
         return self.last_row, self.last_token
 
+    async def persist_payment_billing(
+        self,
+        vm_id: str,
+        retail_amount: Decimal,
+        *,
+        admin_waived: bool,
+        payment_tx: str | None = None,
+    ) -> None:
+        self.last_row.payment_tx = payment_tx
+
 
 @pytest.fixture
 def _state_create():

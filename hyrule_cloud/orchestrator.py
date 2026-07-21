@@ -360,6 +360,7 @@ class Orchestrator:
                     domain=request.domain,
                     expires_at=expires_at,
                     cost_total=total,
+                    retail_cost_total=total,
                 )
                 session.add(row)
                 try:
@@ -884,8 +885,9 @@ class Orchestrator:
         if await self._record_native_refund(vm_id, reason=reason):
             return
         is_dev_bypass = bool(payment_tx and payment_tx.startswith("dev_bypass"))
+        is_admin_bypass = bool(payment_tx and payment_tx.startswith("admin_bypass"))
         was_charged = bool(payment_tx) or (amount is not None and amount > 0)
-        if was_charged and not is_dev_bypass:
+        if was_charged and not is_dev_bypass and not is_admin_bypass:
             # A charge settled but couldn't be attributed to an EVM wallet or a
             # native intent — e.g. the SDK settled exposing neither a payer
             # ("unknown") NOR a tx string AND the best-effort settled ledger row
@@ -949,6 +951,27 @@ class Orchestrator:
             row = await session.get(VMRow, vm_id)
             if row is not None:
                 row.cost_total = amount
+                row.retail_cost_total = amount
+                row.billing_mode = "charged"
+                await session.commit()
+
+    async def persist_payment_billing(
+        self,
+        vm_id: str,
+        retail_amount: Decimal,
+        *,
+        admin_waived: bool,
+        payment_tx: str | None = None,
+    ) -> None:
+        """Persist retail value separately from money actually charged."""
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.retail_cost_total = retail_amount
+                row.cost_total = Decimal("0") if admin_waived else retail_amount
+                row.billing_mode = "admin_waived" if admin_waived else "charged"
+                if payment_tx:
+                    row.payment_tx = payment_tx
                 await session.commit()
 
     async def record_create_failure_refund(
@@ -974,7 +997,7 @@ class Orchestrator:
         # exposes no transaction string (middleware stores `settlement.transaction
         # or ""`) still charged the customer, so it must still be refunded using
         # payer + amount.
-        if payment_tx and payment_tx.startswith("dev_bypass"):
+        if payment_tx and payment_tx.startswith(("dev_bypass", "admin_bypass")):
             return
         settled = None
         if payment_tx:
@@ -1467,6 +1490,10 @@ class Orchestrator:
                     await session.execute(
                         update(VMRow)
                         .where(VMRow.vm_id == vm["vm_id"])
-                        .values(status=VMStatus.SUSPENDED)
+                        .values(
+                            status=VMStatus.SUSPENDED,
+                            suspension_reason="expired",
+                            suspended_by_account_id=None,
+                        )
                     )
                     await session.commit()

@@ -72,6 +72,7 @@ class PaymentLedger:
         facilitator_host: str | None = None,
         error: str | None = None,
         extra: dict[str, Any] | None = None,
+        actor_account_id: str | None = None,
     ) -> None:
         """Record a payment-gate outcome derived from an HTTP request."""
         await self.record_event(
@@ -86,6 +87,7 @@ class PaymentLedger:
             facilitator_host=facilitator_host,
             error=error,
             extra=extra,
+            actor_account_id=actor_account_id,
         )
 
     async def record_event(
@@ -102,6 +104,7 @@ class PaymentLedger:
         facilitator_host: str | None = None,
         error: str | None = None,
         extra: dict[str, Any] | None = None,
+        actor_account_id: str | None = None,
     ) -> None:
         """Record an event from explicit fields (no HTTP request required).
 
@@ -123,6 +126,7 @@ class PaymentLedger:
                         facilitator_host=facilitator_host,
                         error=error,
                         extra=extra,
+                        actor_account_id=actor_account_id,
                     )
                 )
                 await session.commit()
@@ -144,6 +148,7 @@ class PaymentLedger:
         facilitator_host: str | None = None,
         error: str | None = None,
         extra: dict[str, Any] | None = None,
+        actor_account_id: str | None = None,
     ) -> PaymentEventRow:
         """Build a PaymentEventRow without persisting it, so a caller can add it
         to its own session and commit it atomically with related writes (e.g. a
@@ -163,4 +168,5 @@ class PaymentLedger:
             facilitator_host=facilitator_host,
             error_reason=str(error)[:256] if error else None,
             extra=extra,
+            actor_account_id=actor_account_id,
         )

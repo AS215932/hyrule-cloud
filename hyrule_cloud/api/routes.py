@@ -902,7 +902,7 @@ async def create_vm(
     # isinstance on purpose: reservation semantics are coupled to the real
     # gate; test doubles (mocks / X-Mock-Paid fakes) keep the legacy
     # allocate-after-payment path.
-    if isinstance(gate, PaymentGate) and gate.has_payment_credentials(request):
+    if isinstance(gate, PaymentGate) and await gate.has_payment_credentials(request):
         try:
             reservation_row, reservation_token = await orch.reserve_vm_with_capacity(
                 order,
@@ -967,6 +967,7 @@ async def create_vm(
         return result
 
     wallet = result
+    admin_waived = getattr(request.state, "payment_mode", None) == "admin-bypass"
     # Issue #14 / Sourcery (#16): claim the quote atomically BEFORE provisioning
     # so two concurrent paid creates for the same quote can't each provision a VM
     # — only the winner of the CREATED → CONSUMED flip proceeds.
@@ -1029,10 +1030,17 @@ async def create_vm(
                 legacy_billing=quote_row is not None and quote_row.pricing_snapshot is None,
             )
             row.payment_tx = getattr(request.state, "payment_tx", None)
+        await orch.persist_payment_billing(
+            row.vm_id,
+            quote_row.amount_usd if quote_row is not None else total,
+            admin_waived=admin_waived,
+            payment_tx=getattr(request.state, "payment_tx", None),
+        )
         if quote_row is not None:
             # Persist the locked charged amount first so a later refund is
             # accurate even if the quote link below fails.
-            await orch.persist_charged_amount(row.vm_id, quote_row.amount_usd)
+            # persist_payment_billing above keeps the locked retail quote while
+            # recording zero charged revenue for an administrator waiver.
             # The consumed-quote replay path can only rediscover this paid VM
             # once the quote carries its vm_id, so retry a transient link failure
             # before giving up rather than leaving the quote consumed-but-unlinked.
@@ -1097,10 +1105,12 @@ async def create_vm(
             # PROVISIONING pinning its customer /64 (the sweeper won't reclaim a
             # row with an owner_wallet).
             await orch.mark_vm_failed(failed_vm_id, f"create failed post-charge: {exc}")
-        raise HTTPException(
-            status_code=500,
-            detail="Provisioning failed after payment; a refund has been recorded and will be processed.",
+        detail = (
+            "Provisioning failed; no payment was taken."
+            if admin_waived
+            else "Provisioning failed after payment; a refund has been recorded and will be processed."
         )
+        raise HTTPException(status_code=500, detail=detail)
 
     # The except above re-raises on any failure, so a fall-through here means the
     # VM row was created and provisioning was scheduled.

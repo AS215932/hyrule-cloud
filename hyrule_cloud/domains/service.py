@@ -641,6 +641,7 @@ class DomainService:
         tx_hash: str | None,
         payment_network: str | None = None,
         payment_asset: str | None = None,
+        billing_mode: str = "charged",
     ) -> DomainOrderRow:
         return await self._mark_paid(
             order_id,
@@ -648,6 +649,7 @@ class DomainService:
             tx_hash=tx_hash,
             payment_network=payment_network,
             payment_asset=payment_asset,
+            billing_mode=billing_mode,
         )
 
     async def assert_x402_payable(self, order_id: str) -> None:
@@ -693,6 +695,7 @@ class DomainService:
         tx_hash: str | None,
         payment_network: str | None = None,
         payment_asset: str | None = None,
+        billing_mode: str = "charged",
     ) -> DomainOrderRow:
         async with self.db() as session:
             order = (
@@ -718,6 +721,7 @@ class DomainService:
                 order.payment_tx = tx_hash
                 order.payment_network = payment_network
                 order.payment_asset = payment_asset
+                order.billing_mode = billing_mode
                 quote = (
                     await session.execute(
                         select(DomainQuoteRow)
@@ -732,9 +736,14 @@ class DomainService:
                 ):
                     if quote is not None and _aware(quote.expires_at) <= _now():
                         quote.status = "expired"
-                    order.status = DomainOrderStatus.REFUND_DUE.value
+                    order.status = (
+                        DomainOrderStatus.FAILED.value
+                        if order.billing_mode == "admin_waived"
+                        else DomainOrderStatus.REFUND_DUE.value
+                    )
                     order.error_code = "quote_already_consumed"
-                    session.add(self._build_refund_event(order, "quote_already_consumed"))
+                    if order.billing_mode != "admin_waived":
+                        session.add(self._build_refund_event(order, "quote_already_consumed"))
                     await session.commit()
                     return order
                 quote.status = "consumed"
@@ -742,11 +751,16 @@ class DomainService:
                 if order.vm_quote_id:
                     vm_quote = await session.get(VMQuoteRow, order.vm_quote_id)
                     if vm_quote is None or vm_quote.status != QuoteStatus.CONSUMED:
-                        order.status = DomainOrderStatus.REFUND_DUE.value
-                        order.error_code = "vm_quote_already_consumed"
-                        session.add(
-                            self._build_refund_event(order, "vm_quote_already_consumed")
+                        order.status = (
+                            DomainOrderStatus.FAILED.value
+                            if order.billing_mode == "admin_waived"
+                            else DomainOrderStatus.REFUND_DUE.value
                         )
+                        order.error_code = "vm_quote_already_consumed"
+                        if order.billing_mode != "admin_waived":
+                            session.add(
+                                self._build_refund_event(order, "vm_quote_already_consumed")
+                            )
                         await session.commit()
                         return order
                 order.status = DomainOrderStatus.QUEUED.value
@@ -1236,7 +1250,7 @@ class DomainService:
         cursor: tuple[datetime, str] | None = None
         while True:
             filters = [
-                PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
+                PaymentEventRow.event_type.in_(["settled", "dev_bypass", "admin_bypass"]),
                 PaymentEventRow.resource_path == "/v1/domains/orders",
             ]
             if cursor is not None:
@@ -1284,6 +1298,11 @@ class DomainService:
                     tx_hash=event.tx_hash,
                     payment_network=event.network,
                     payment_asset=event.asset,
+                    billing_mode=(
+                        "admin_waived"
+                        if event.event_type == "admin_bypass"
+                        else "charged"
+                    ),
                 )
                 recovered += 1
             if len(events) < limit:
@@ -2212,7 +2231,12 @@ class DomainService:
             if not fallback_auto_domain:
                 await self.release_vm_attachment_claim(planned_vm_id)
             raise
-        await self.orchestrator.persist_charged_amount(vm.vm_id, Decimal(order.vm_amount_usd))
+        await self.orchestrator.persist_payment_billing(
+            vm.vm_id,
+            Decimal(order.vm_amount_usd),
+            admin_waived=order.billing_mode == "admin_waived",
+            payment_tx=order.payment_tx,
+        )
         await link_quote_vm(self.db, quote.quote_id, vm.vm_id)
         async with self.db() as session:
             current = await session.get(DomainOrderRow, order_id)
@@ -2247,7 +2271,11 @@ class DomainService:
             ).scalar_one_or_none()
             if current is None:
                 return
-            current.status = DomainOrderStatus.REFUND_DUE.value
+            current.status = (
+                DomainOrderStatus.FAILED.value
+                if current.billing_mode == "admin_waived"
+                else DomainOrderStatus.REFUND_DUE.value
+            )
             current.error_code = code
             current.error_detail = detail[:1000]
             operation = (
@@ -2267,7 +2295,8 @@ class DomainService:
             if domain is not None and domain.openprovider_id is None:
                 domain.status = DomainStatus.FAILED
                 domain.error = detail[:1000]
-            session.add(self._build_refund_event(current, code, amount=refund_amount))
+            if current.billing_mode != "admin_waived":
+                session.add(self._build_refund_event(current, code, amount=refund_amount))
             await session.commit()
 
     def _build_refund_event(

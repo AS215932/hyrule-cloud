@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from x402.http import PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER
 
+from hyrule_cloud.api.admin import router as admin_router
 from hyrule_cloud.api.auth import router as auth_router
 from hyrule_cloud.api.bgp import router as bgp_router
 from hyrule_cloud.api.dns import router as dns_router
@@ -43,7 +44,7 @@ from hyrule_cloud.domains.wallet_auth import WalletAuthService
 from hyrule_cloud.domains.wallet_auth import router as wallet_auth_router
 from hyrule_cloud.logging_config import SAFE_DICT_TRACEBACKS
 from hyrule_cloud.middleware.metrics import install_metrics
-from hyrule_cloud.middleware.x402 import PaymentGate
+from hyrule_cloud.middleware.x402 import ADMIN_PAYMENT_MODE_HEADER, PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
@@ -91,6 +92,11 @@ async def lifespan(app: FastAPI):
         config.payment,
         public_base_url=config.public_base_url,
         ledger=payment_ledger,
+        session_factory=session_factory,
+        admin_bypass_enabled=config.admin_payment_bypass_enabled,
+        admin_step_up_seconds=config.admin_step_up_seconds,
+        admin_diagnostic_limit=config.admin_diagnostic_bypass_per_minute,
+        admin_cost_limit=config.admin_cost_bypass_per_hour,
     )
 
     # Network proxy sidecar client. x402 stays in Hyrule Cloud; the sidecar
@@ -287,6 +293,10 @@ async def llms_txt(request: Request) -> PlainTextResponse:
 async def attach_payment_response_headers(request: Request, call_next) -> Response:
     """Attach x402 settlement headers saved by PaymentGate to successful responses."""
     response = await call_next(request)
+    if request.url.path.startswith("/v1/admin"):
+        # Cookie-authenticated operational data must never enter browser,
+        # intermediary, or shared caches, including error responses.
+        response.headers["Cache-Control"] = "no-store"
     headers = getattr(request.state, "payment_response_headers", None)
     if not headers:
         return response
@@ -299,7 +309,9 @@ async def attach_payment_response_headers(request: Request, call_next) -> Respon
         for h in response.headers.get("Access-Control-Expose-Headers", "").split(",")
         if h.strip()
     }
-    exposed.update({PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER})
+    exposed.update(
+        {PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER, ADMIN_PAYMENT_MODE_HEADER}
+    )
     response.headers["Access-Control-Expose-Headers"] = ", ".join(sorted(exposed))
     return response
 
@@ -316,7 +328,7 @@ async def challenge_curated_x402_requests(request: Request, call_next) -> Respon
 
     state = getattr(request.app.state, "_typed_state", None)
     gate = getattr(state, "payment_gate", None)
-    if not isinstance(gate, PaymentGate) or gate.has_payment_credentials(request):
+    if not isinstance(gate, PaymentGate) or await gate.has_payment_credentials(request):
         return await call_next(request)
 
     from hyrule_cloud.services.discovery import match_enabled_operation
@@ -365,6 +377,7 @@ app.include_router(internal_bgp_router)
 app.include_router(status_router)
 # Block A1 (Wave 2): /v1/auth/* and /v1/me/* live in api/auth.py.
 app.include_router(auth_router)
+app.include_router(admin_router)
 app.include_router(wallet_auth_router)
 app.include_router(domains_router)
 # Payments/fleet Prometheus exporter (bearer-token gated, off by default).

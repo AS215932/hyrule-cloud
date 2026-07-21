@@ -94,6 +94,27 @@ the dedicated worker):
 docker compose up
 ```
 
+## Administrator bootstrap
+
+Apply migrations first, then create the first administrator interactively on
+a trusted host. The password is never accepted as a command-line argument, and
+the account ID plus recovery code are shown once:
+
+```bash
+alembic upgrade head
+hyrule-admin create
+```
+
+The command refuses to create a second enabled Admin unless
+`--allow-additional` is supplied intentionally. To allow Admin browser sessions
+to execute paid x402 services without transferring funds, set
+`HYRULE_ADMIN_PAYMENT_BYPASS_ENABLED=true` and restart the API. Diagnostic
+waivers are capped per minute; VM, domain, and other real-cost waivers require
+a recent password confirmation and are capped per hour. Each waiver records
+its retail value as an `admin_bypass` payment event, never as settled revenue.
+Supplying a real `Payment-Signature` always takes precedence and performs a
+normal settlement.
+
 ## XCP-NG Template Preparation
 
 Templates are managed via Xen Orchestra. Each template needs cloud-init

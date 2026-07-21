@@ -75,9 +75,11 @@ from hyrule_cloud.services.passwords import (
     verify_recovery_code,
 )
 from hyrule_cloud.services.sessions import (
+    CSRF_COOKIE_NAME,
     SESSION_COOKIE_NAME,
     cookie_kwargs_for_set,
     create_session,
+    csrf_cookie_kwargs_for_set,
     revoke_all_sessions_for,
     revoke_session,
 )
@@ -325,7 +327,7 @@ async def register(
         else:
             raise HTTPException(500, "Account creation failed")
 
-        token = await create_session(
+        credentials = await create_session(
             db,
             account_id,
             user_agent=request.headers.get("user-agent"),
@@ -355,7 +357,13 @@ async def register(
             api_key_id = key_row.key_id
             api_key_scopes = list(key_row.scopes)
 
-    response.set_cookie(value=token, **cookie_kwargs_for_set(secure=_should_secure(request)))
+    secure = _should_secure(request)
+    response.set_cookie(
+        value=credentials.token, **cookie_kwargs_for_set(secure=secure)
+    )
+    response.set_cookie(
+        value=credentials.csrf_token, **csrf_cookie_kwargs_for_set(secure=secure)
+    )
     log.info(
         "account_registered",
         account_id=account_id,
@@ -395,18 +403,26 @@ async def login(
             raise HTTPException(401, "Invalid credentials")
         if not verify_password(acct.password_hash, body.password):
             raise HTTPException(401, "Invalid credentials")
+        if acct.disabled_at is not None:
+            raise HTTPException(403, "Account disabled")
 
         acct.last_login_at = _now()
         await db.commit()
 
-        token = await create_session(
+        credentials = await create_session(
             db,
             acct.account_id,
             user_agent=request.headers.get("user-agent"),
             ip_prefix_hash=ip_hash,
         )
 
-    response.set_cookie(value=token, **cookie_kwargs_for_set(secure=_should_secure(request)))
+    secure = _should_secure(request)
+    response.set_cookie(
+        value=credentials.token, **cookie_kwargs_for_set(secure=secure)
+    )
+    response.set_cookie(
+        value=credentials.csrf_token, **csrf_cookie_kwargs_for_set(secure=secure)
+    )
     log.info("account_logged_in", account_id=body.account_id)
     return AuthLoginResponse(account_id=body.account_id)
 
@@ -422,6 +438,7 @@ async def logout(
         async with factory() as db:
             await revoke_session(db, session_cookie)
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    response.delete_cookie(CSRF_COOKIE_NAME, path="/")
     return {"status": "ok"}
 
 
@@ -856,6 +873,11 @@ async def delete_me(
       - destroy: immediately destroy all owned VMs, then delete the account
       - detach: generate fresh anon management tokens for each VM, return ONCE
     """
+    if account.is_admin:
+        raise HTTPException(
+            409,
+            "Administrator accounts must be demoted before account deletion.",
+        )
     vm_policy = request.query_params.get("vm_policy", "detach")
     if vm_policy not in ("destroy", "detach"):
         raise HTTPException(400, "vm_policy must be 'destroy' or 'detach'")
@@ -927,6 +949,7 @@ async def delete_me(
             await db.commit()
 
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    response.delete_cookie(CSRF_COOKIE_NAME, path="/")
     log.info(
         "account_deleted",
         account_id=account.account_id,

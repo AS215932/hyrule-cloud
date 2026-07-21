@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 
 PriceMode = Literal["fixed", "dynamic"]
+AdminOperationClass = Literal["diagnostic", "real_cost"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +115,7 @@ class PaidOperation:
     output_example: Any
     path_examples: dict[str, Any]
     gate: str = "always"
+    admin_operation_class: AdminOperationClass = "diagnostic"
     tags: tuple[str, ...] = ()
 
     @property
@@ -237,6 +239,7 @@ def _body_operation(
     *,
     gate: str = "always",
     input_schema: dict[str, Any] | None = None,
+    admin_operation_class: AdminOperationClass = "diagnostic",
 ) -> PaidOperation:
     resolved_input_schema = input_schema or _inline_defs(request_model.model_json_schema())
     return PaidOperation(
@@ -257,6 +260,7 @@ def _body_operation(
         output_example=output_example,
         path_examples={},
         gate=gate,
+        admin_operation_class=admin_operation_class,
         tags=_default_tags(path),
     )
 
@@ -465,6 +469,7 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
             "status_url": "/v1/vm/vm_a1b2c3d4e5f6/status",
         },
         gate="real_vm",
+        admin_operation_class="real_cost",
     ),
     # Domain registration is intentionally absent. Its provider/readiness fix
     # is deferred to a separate PR and will opt the operation back in here.
@@ -487,6 +492,7 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
             "elapsed_seconds": 0.12,
             "proxy_mode": "direct",
         },
+        admin_operation_class="real_cost",
     ),
     _body_operation(
         "/v1/bgp/lookup",
