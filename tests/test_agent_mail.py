@@ -262,6 +262,9 @@ def test_agent_mail_review_safety_schema_contracts():
     assert MailAccountRow.__table__.c.dns_cleanup_pending.index is True
     assert MailAccountRow.__table__.c.payment_settled_at.index is True
     assert MailAccountRow.__table__.c.payment_authorization_header.type.length is None
+    assert MailSendRow.__table__.c.payment_settled_at.index is True
+    assert MailSendRow.__table__.c.payment_authorization_header.type.length is None
+    assert MailSendRow.__table__.c.payment_settlement_pending_at.nullable is True
     assert MailAccountRow.__table__.c.domain_authority_hash.type.length == 64
     assert [column.name for column in MailMessageIndexRow.__table__.primary_key.columns] == [
         "mailbox_id",
@@ -950,19 +953,33 @@ async def test_stalwart_send_reconciliation_queries_the_stable_header(monkeypatc
 
     async def session(_address, _password):
         return (
-            {"primaryAccounts": {"urn:ietf:params:jmap:mail": "account-1"}},
+            {
+                "primaryAccounts": {
+                    "urn:ietf:params:jmap:mail": "account-1",
+                    "urn:ietf:params:jmap:submission": "submission-account-1",
+                }
+            },
             None,
         )
 
     async def jmap(_address, _password, method_calls, _using):
         calls.append(method_calls)
-        return {
-            "response": {
-                "methodResponses": [
-                    ["Email/query", {"ids": ["message-recovered"]}, "send-intent-query"]
-                ]
-            }
-        }
+        method = method_calls[0][0]
+        if method == "Email/query":
+            response = ["Email/query", {"ids": ["message-recovered"]}, "send-intent-query"]
+        elif method == "EmailSubmission/query":
+            response = [
+                "EmailSubmission/query",
+                {"ids": ["submission-recovered"]},
+                "send-submission-query",
+            ]
+        else:
+            response = [
+                "EmailSubmission/get",
+                {"list": [{"id": "submission-recovered", "emailId": "message-recovered"}]},
+                "send-submission-get",
+            ]
+        return {"response": {"methodResponses": [response]}}
 
     monkeypatch.setattr(client, "_session", session)
     monkeypatch.setattr(client, "_jmap", jmap)
@@ -978,6 +995,44 @@ async def test_stalwart_send_reconciliation_queries_the_stable_header(monkeypatc
     finally:
         await client.close()
     assert calls[0][0][1]["filter"] == {"header": ["X-Hyrule-Send-ID", "send_recovery_123"]}
+    assert calls[1][0][0] == "EmailSubmission/query"
+    assert calls[1][0][1]["filter"] == {"emailIds": ["message-recovered"]}
+    assert calls[2][0][0] == "EmailSubmission/get"
+
+
+@pytest.mark.asyncio
+async def test_stalwart_send_reconciliation_ignores_matching_drafts(monkeypatch):
+    config = HyruleConfig().mail
+    config.backend_url = "https://mail.internal"
+    config.backend_token = "token"
+    client = StalwartClient(config)
+
+    async def session(_address, _password):
+        return (
+            {"primaryAccounts": {"urn:ietf:params:jmap:mail": "account-1"}},
+            None,
+        )
+
+    async def jmap(_address, _password, method_calls, _using):
+        if method_calls[0][0] == "Email/query":
+            response = ["Email/query", {"ids": ["draft-only"]}, "send-intent-query"]
+        else:
+            response = ["EmailSubmission/query", {"ids": []}, "send-submission-query"]
+        return {"response": {"methodResponses": [response]}}
+
+    monkeypatch.setattr(client, "_session", session)
+    monkeypatch.setattr(client, "_jmap", jmap)
+    try:
+        assert (
+            await client.find_message_by_send_id(
+                address="journey@example.test",
+                password="generated-secret",
+                send_id="send_draft_only",
+            )
+            is None
+        )
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
@@ -1569,6 +1624,27 @@ async def test_stored_authorization_recovers_mail_payment_without_metrics_ledger
 
 
 @pytest.mark.asyncio
+async def test_unpaid_activation_reports_zero_charged_amount(mail_service):
+    service, _sessions, _backend, _domains, _refunds = mail_service
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="uncharged-activation",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    account, token, _created = await service.prepare_activation(
+        quote.quote_id,
+        idempotency_key="uncharged-activation-idempotency-0001",
+    )
+
+    pending = await service.activation_response(account, management_token=token)
+
+    assert pending.status is MailboxStatus.AWAITING_PAYMENT
+    assert pending.charged_amount_usd == "0.00"
+
+
+@pytest.mark.asyncio
 async def test_terminal_authorization_releases_mail_capacity(mail_service):
     service, sessions, _backend, _domains, _refunds = mail_service
     quote = await service.create_account_quote(
@@ -1810,6 +1886,10 @@ async def test_failed_activation_persists_and_retries_dns_cleanup(mail_service, 
         nonlocal attempts
         attempts += 1
         if attempts == 1:
+            async with sessions() as session:
+                terminal = await session.get(MailAccountRow, mailbox_id)
+                assert terminal.status == MailboxStatus.REFUND_DUE.value
+                assert terminal.dns_cleanup_pending is True
             raise RuntimeError("DNS control plane unavailable")
 
     monkeypatch.setattr(domains, "remove_service_records", remove_service_records)
@@ -2194,7 +2274,7 @@ async def test_send_intent_reconciles_after_acceptance_without_duplicate_submiss
     assert await service.reconcile_send_intents() == 1
     replay = await service.deliver_send(quote.quote_id, token)
     assert replay.status == "accepted"
-    assert replay.charged_amount_usd == quote.amount_usd
+    assert replay.charged_amount_usd == "0.00"
     assert len(backend.sent) == 1
 
 
@@ -2218,9 +2298,19 @@ async def test_send_route_verifies_and_reports_the_immutable_quote_amount(mail_s
 
         async def verify_only(self, _request, *, amount, **_kwargs):
             self.amount = amount
-            return object()
+            return SimpleNamespace(
+                payer="0x" + "7" * 40,
+                matching_requirements=SimpleNamespace(
+                    network="eip155:8453",
+                    asset="USDC",
+                ),
+            )
 
-        async def settle_verified(self, _request, _verified, **_kwargs):
+        async def settle_verified(self, request, _verified, **_kwargs):
+            request.state.payment_tx = "0xsend-settled"
+            request.state.payment_network = "eip155:8453"
+            request.state.payment_asset = "USDC"
+            request.state.payment_payer = "0x" + "7" * 40
             return True
 
     gate = Gate()
@@ -2307,6 +2397,68 @@ async def test_send_route_replays_ledger_settlement_without_a_second_payment(mai
     )
     assert not isinstance(replay, Response)
     assert replay.send_id == sent.send_id
+    assert replay.charged_amount_usd == quote.amount_usd
+    async with sessions() as session:
+        attributed = await session.get(MailSendRow, sent.send_id)
+    assert attributed.payment_settled_at is not None
+    assert attributed.payment_tx == "0xsettled-before-attribution"
+
+
+@pytest.mark.asyncio
+async def test_stored_authorization_recovers_send_payment_without_metrics_ledger(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    mailbox_id, token = await _active_hosted(
+        service,
+        local_part="send-payment-recovery",
+        idempotency_key="send-payment-recovery-idempotency-0001",
+    )
+    quote = await service.create_send_quote(
+        MailSendQuoteRequest(
+            mailbox_id=mailbox_id,
+            to="proof@example.net",
+            subject="Recover settlement",
+            text="The accepted message remains attributable.",
+        ),
+        token,
+    )
+    sent = await service.deliver_send(quote.quote_id, token)
+    await service.begin_send_settlement(
+        sent.send_id,
+        quote.quote_id,
+        payer="0x" + "4" * 40,
+        payment_network="eip155:8453",
+        payment_asset="0x" + "5" * 40,
+        payment_authorization="stored-send-authorization",
+    )
+
+    with pytest.raises(MailProblem) as pending:
+        await service.settled_send_response(quote.quote_id, token)
+    assert pending.value.code == "mail_payment_settlement_pending"
+
+    class _RecoveryGate:
+        async def reconcile_settlement(self, header, amount, *, pending_since):
+            assert header == "stored-send-authorization"
+            assert amount == Decimal(quote.amount_usd)
+            assert pending_since is not None
+            return PaymentReconciliation(
+                payment=RecoveredPayment(
+                    payer="0x" + "4" * 40,
+                    tx_hash="0xsend-authorization-recovered",
+                    network="eip155:8453",
+                    asset="0x" + "5" * 40,
+                )
+            )
+
+    assert await service.recover_x402_handoffs(gate=_RecoveryGate()) == 1
+    replay = await service.settled_send_response(quote.quote_id, token)
+    assert replay is not None
+    assert replay.charged_amount_usd == quote.amount_usd
+    async with sessions() as session:
+        recovered = await session.get(MailSendRow, sent.send_id)
+    assert recovered.payment_tx == "0xsend-authorization-recovered"
+    assert recovered.payment_authorization_header is None
+    assert recovered.payment_settlement_pending_at is None
+    assert recovered.payment_settled_at is not None
 
 
 @pytest.mark.asyncio
@@ -2592,6 +2744,84 @@ async def test_webhook_delivery_tries_every_validated_address(mail_service, monk
     assert delivery is not None
     assert delivery.status == "delivered"
     assert delivery.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_webhook_delivery_isolates_undecryptable_signing_secrets(mail_service, monkeypatch):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    mailbox_id, token = await _active_hosted(
+        service,
+        local_part="webhook-secret-isolation",
+        idempotency_key="webhook-secret-isolation-idempotency-0001",
+    )
+
+    async def safe_url(url):
+        return url, ["203.0.113.10"]
+
+    monkeypatch.setattr("hyrule_cloud.mail.service.validate_webhook_url", safe_url)
+    service.mail_config.max_webhooks_per_mailbox = 2
+    broken = await service.create_webhook(
+        mailbox_id,
+        token,
+        MailWebhookCreateRequest(
+            url="https://broken-hooks.example.net/mail",
+            events=["message.received"],
+        ),
+    )
+    healthy = await service.create_webhook(
+        mailbox_id,
+        token,
+        MailWebhookCreateRequest(
+            url="https://healthy-hooks.example.net/mail",
+            events=["message.received"],
+        ),
+    )
+    async with sessions() as session:
+        broken_row = await session.get(MailWebhookRow, broken.webhook_id)
+        broken_row.secret_ciphertext = "not-a-fernet-token"
+        account = await session.get(MailAccountRow, mailbox_id)
+        await session.commit()
+    assert account is not None
+    assert (
+        await service.ingest_stalwart_events(
+            [
+                {
+                    "id": "webhook-secret-isolation-event",
+                    "type": "store.ingest",
+                    "data": {
+                        "from": "sender@example.net",
+                        "to": [account.address],
+                        "messageId": "webhook-secret-isolation-message",
+                        "subject": "Secret isolation",
+                    },
+                }
+            ]
+        )
+        == 1
+    )
+    delivered_to: list[str] = []
+
+    async def post_pinned(url, *_args):
+        delivered_to.append(url)
+
+    monkeypatch.setattr(service, "_post_pinned", post_pinned)
+
+    assert await service.deliver_webhooks() == 1
+    assert delivered_to == ["https://healthy-hooks.example.net/mail"]
+    async with sessions() as session:
+        broken_delivery = await session.scalar(
+            select(MailWebhookDeliveryRow).where(
+                MailWebhookDeliveryRow.webhook_id == broken.webhook_id
+            )
+        )
+        healthy_delivery = await session.scalar(
+            select(MailWebhookDeliveryRow).where(
+                MailWebhookDeliveryRow.webhook_id == healthy.webhook_id
+            )
+        )
+    assert broken_delivery.status == "pending"
+    assert broken_delivery.attempt_count == 1
+    assert healthy_delivery.status == "delivered"
 
 
 @pytest.mark.asyncio

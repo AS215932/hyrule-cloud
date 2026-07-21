@@ -269,6 +269,14 @@ class PaymentGate:
         self.config = config
         self.public_base_url = public_base_url.rstrip("/")
         self.ledger = ledger
+        missing_recovery_rpc = [
+            network.key for network in config.enabled_networks() if not network.rpc_url.strip()
+        ]
+        if missing_recovery_rpc:
+            raise ValueError(
+                "Enabled payment networks require recovery RPC URLs: "
+                + ", ".join(missing_recovery_rpc)
+            )
         self._facilitator_host = urlparse(config.facilitator_url).hostname or ""
         self.facilitator = HTTPFacilitatorClient(_facilitator_config(config))
         self.server = x402ResourceServer(self.facilitator)

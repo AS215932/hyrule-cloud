@@ -308,14 +308,59 @@ async def send_message(
     if fingerprint is not None:
         await service.bind_payment_authorization(fingerprint, body.quote_id)
     result = await service.deliver_send(body.quote_id, token)
-    if not await gate.settle_verified(request, verified, extra_body=payment_metadata):
+    await service.begin_send_settlement(
+        result.send_id,
+        body.quote_id,
+        payer=verified.payer or "unknown",
+        payment_network=getattr(verified.matching_requirements, "network", None),
+        payment_asset=getattr(verified.matching_requirements, "asset", None),
+        payment_authorization=_mail_payment_authorization(request),
+    )
+    settlement_metadata = {**payment_metadata, "send_id": result.send_id}
+    if not await gate.settle_verified(request, verified, extra_body=settlement_metadata):
+        if getattr(request.state, "payment_settlement_indeterminate", False):
+            raise MailProblem(
+                503,
+                "mail_payment_settlement_pending",
+                "The message was accepted and its payment outcome is being reconciled.",
+            )
+        await service.clear_send_settlement(result.send_id, body.quote_id)
         raise MailProblem(
             402,
-            "mail_payment_settlement_pending",
+            "mail_payment_settlement_failed",
             "The message was accepted, but payment did not settle; retry this same quote.",
         )
-    await service.attribute_send_payment(result.send_id, getattr(request.state, "payment_tx", None))
-    return result
+    payer = getattr(request.state, "payment_payer", None) or verified.payer or "unknown"
+    durable_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            send = await service.record_send_settlement(
+                result.send_id,
+                body.quote_id,
+                payer=payer,
+                tx_hash=getattr(request.state, "payment_tx", None),
+                payment_network=getattr(request.state, "payment_network", None),
+                payment_asset=getattr(request.state, "payment_asset", None),
+            )
+            durable_error = None
+            break
+        except Exception as exc:
+            durable_error = exc
+            log.warning(
+                "mail_send_payment_settlement_record_failed",
+                send_id=result.send_id,
+                attempt=attempt + 1,
+                exc_info=True,
+            )
+            if attempt < 2:
+                await asyncio.sleep(0.1 * (attempt + 1))
+    if durable_error is not None:
+        raise MailProblem(
+            503,
+            "mail_payment_handoff_pending",
+            "Payment settled, but send attribution is pending durable recovery.",
+        ) from durable_error
+    return send
 
 
 @router.get("/accounts/{mailbox_id}/messages", response_model=MailMessagesResponse)

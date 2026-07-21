@@ -219,6 +219,16 @@ def _payment_header(req: PaymentRequirements | None = None) -> str:
     return encode_payment_signature_header(payload)
 
 
+def test_enabled_payment_networks_require_recovery_rpc_urls() -> None:
+    config = PaymentConfig()
+    config.payment_networks = [
+        replace(config.payment_networks[0], rpc_url="", enabled=True),
+    ]
+
+    with pytest.raises(ValueError, match="recovery RPC URLs: base"):
+        PaymentGate(config)
+
+
 def test_sdk_accepts_dollar_prefixed_money_price() -> None:
     parsed = ExactEvmServerScheme().parse_price("$0.05", "eip155:8453")
 

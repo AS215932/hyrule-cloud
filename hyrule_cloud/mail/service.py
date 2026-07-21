@@ -1027,10 +1027,12 @@ class MailService:
             send = await session.scalar(select(MailSendRow).where(MailSendRow.quote_id == quote_id))
             if send is None or send.status != "accepted":
                 return None
-            if send.payment_tx:
+            if send.payment_settled_at is not None or send.payment_tx:
+                return self._send_response(send)
+            if (send.error or "").startswith("payment_authorization_"):
                 return self._send_response(send)
             settlement = await session.scalar(
-                select(PaymentEventRow.event_id)
+                select(PaymentEventRow)
                 .where(
                     PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
                     PaymentEventRow.resource_path == "/v1/mail/messages/send",
@@ -1039,7 +1041,26 @@ class MailService:
                 )
                 .limit(1)
             )
-            return self._send_response(send) if settlement is not None else None
+            if settlement is None:
+                if (
+                    send.payment_settlement_pending_at is not None
+                    and send.payment_authorization_header
+                ):
+                    raise MailProblem(
+                        503,
+                        "mail_payment_settlement_pending",
+                        "The accepted message's payment outcome is being reconciled.",
+                    )
+                return None
+            send.payment_payer = settlement.payer_wallet
+            send.payment_network = settlement.network
+            send.payment_asset = settlement.asset
+            send.payment_tx = settlement.tx_hash
+            send.payment_authorization_header = None
+            send.payment_settlement_pending_at = None
+            send.payment_settled_at = send.payment_settled_at or _now()
+            await session.commit()
+            return self._send_response(send)
 
     async def _reserve_send_intent(self, quote_id: str) -> MailSendRow:
         """Commit the paid operation intent before the first external write."""
@@ -1368,12 +1389,127 @@ class MailService:
                 log.exception("mail_send_intent_reconciliation_failed", send_id=send_id)
         return reconciled
 
-    async def attribute_send_payment(self, send_id: str, tx_hash: str | None) -> None:
+    async def begin_send_settlement(
+        self,
+        send_id: str,
+        quote_id: str,
+        *,
+        payer: str,
+        payment_network: str | None,
+        payment_asset: str | None,
+        payment_authorization: str | None,
+    ) -> MailSendRow:
+        """Persist a send settlement intent before money can move."""
+
+        async with self.db() as session:
+            row = (
+                await session.execute(
+                    select(MailSendRow).where(MailSendRow.send_id == send_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                raise MailProblem(404, "mail_send_not_found", "Mail send not found.")
+            if row.quote_id != quote_id:
+                raise MailProblem(
+                    409,
+                    "mail_send_superseded",
+                    "This payment belongs to an earlier mail send.",
+                )
+            if row.status != "accepted":
+                raise MailProblem(
+                    409,
+                    "mail_send_not_accepted",
+                    "This message has not been accepted for delivery.",
+                )
+            if row.payment_settled_at is None:
+                row.payment_payer = payer[:64]
+                row.payment_network = payment_network
+                row.payment_asset = payment_asset
+                row.payment_authorization_header = payment_authorization
+                row.payment_settlement_pending_at = row.payment_settlement_pending_at or _now()
+                row.error = None
+                await session.commit()
+            return row
+
+    async def clear_send_settlement(self, send_id: str, quote_id: str) -> None:
+        """Clear a send settlement intent after a definitive failure."""
+
         async with self.db() as session:
             row = await session.get(MailSendRow, send_id)
-            if row is not None and not row.payment_tx:
-                row.payment_tx = tx_hash
+            if row is not None and row.quote_id == quote_id and row.payment_settled_at is None:
+                row.payment_payer = None
+                row.payment_network = None
+                row.payment_asset = None
+                row.payment_authorization_header = None
+                row.payment_settlement_pending_at = None
                 await session.commit()
+
+    async def fail_send_settlement(self, send_id: str, quote_id: str, *, reason: str) -> None:
+        """Close a send authorization that provably can no longer settle."""
+
+        async with self.db() as session:
+            row = (
+                await session.execute(
+                    select(MailSendRow).where(MailSendRow.send_id == send_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                row is None
+                or row.quote_id != quote_id
+                or row.status != "accepted"
+                or row.payment_settled_at is not None
+            ):
+                return
+            row.payment_payer = None
+            row.payment_network = None
+            row.payment_asset = None
+            row.payment_authorization_header = None
+            row.payment_settlement_pending_at = None
+            row.error = f"payment_authorization_{reason}"[:2000]
+            await session.commit()
+
+    async def record_send_settlement(
+        self,
+        send_id: str,
+        quote_id: str,
+        *,
+        payer: str,
+        tx_hash: str | None,
+        payment_network: str | None,
+        payment_asset: str | None,
+    ) -> MailSendResponse:
+        """Durably attribute a successful settlement to an accepted send."""
+
+        async with self.db() as session:
+            row = (
+                await session.execute(
+                    select(MailSendRow).where(MailSendRow.send_id == send_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                raise MailProblem(404, "mail_send_not_found", "Mail send not found.")
+            if row.quote_id != quote_id:
+                raise MailProblem(
+                    409,
+                    "mail_send_superseded",
+                    "This payment belongs to an earlier mail send.",
+                )
+            if row.status != "accepted" and row.payment_settled_at is None:
+                raise MailProblem(
+                    409,
+                    "mail_send_not_accepted",
+                    "This message has not been accepted for delivery.",
+                )
+            row.payment_payer = payer[:64]
+            row.payment_network = payment_network
+            row.payment_asset = payment_asset
+            row.payment_tx = tx_hash
+            row.payment_authorization_header = None
+            row.payment_settlement_pending_at = None
+            row.payment_settled_at = row.payment_settled_at or _now()
+            row.error = None
+            await session.commit()
+            return self._send_response(row)
 
     async def list_messages(
         self, mailbox_id: str, token: str, *, limit: int = 50
@@ -2087,13 +2223,61 @@ class MailService:
         gate: Any | None = None,
         limit: int = 200,
     ) -> int:
-        """Replay settled activation payments whose state handoff was lost."""
+        """Replay settled mail payments whose state handoff was lost."""
 
         if limit < 1:
             return 0
         recovered = 0
         seen: set[tuple[str, str]] = set()
         if gate is not None:
+            async with self.db() as session:
+                pending_sends = list(
+                    await session.scalars(
+                        select(MailSendRow)
+                        .where(
+                            MailSendRow.status == "accepted",
+                            MailSendRow.payment_settlement_pending_at.is_not(None),
+                            MailSendRow.payment_settled_at.is_(None),
+                            MailSendRow.payment_authorization_header.is_not(None),
+                        )
+                        .order_by(MailSendRow.payment_settlement_pending_at)
+                        .limit(limit)
+                    )
+                )
+            for pending_send in pending_sends:
+                if not pending_send.payment_authorization_header:
+                    continue
+                try:
+                    send_reconciliation: PaymentReconciliation = await gate.reconcile_settlement(
+                        pending_send.payment_authorization_header,
+                        Decimal(pending_send.amount_usd),
+                        pending_since=_aware(pending_send.payment_settlement_pending_at),
+                    )
+                    if send_reconciliation.terminal_unsettled:
+                        await self.fail_send_settlement(
+                            pending_send.send_id,
+                            pending_send.quote_id,
+                            reason=send_reconciliation.reason or "unsettled",
+                        )
+                        continue
+                    send_payment = send_reconciliation.payment
+                    if send_payment is None:
+                        continue
+                    await self.record_send_settlement(
+                        pending_send.send_id,
+                        pending_send.quote_id,
+                        payer=send_payment.payer,
+                        tx_hash=send_payment.tx_hash,
+                        payment_network=send_payment.network,
+                        payment_asset=send_payment.asset,
+                    )
+                    recovered += 1
+                except Exception:
+                    log.warning(
+                        "mail_send_payment_authorization_reconciliation_deferred",
+                        send_id=pending_send.send_id,
+                        exc_info=True,
+                    )
             async with self.db() as session:
                 pending = list(
                     await session.scalars(
@@ -2305,9 +2489,9 @@ class MailService:
                 "created_at": event.created_at.isoformat(),
             }
             raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-            secret = self._decrypt(self._fernet(), hook.secret_ciphertext)
-            signature = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
             try:
+                secret = self._decrypt(self._fernet(), hook.secret_ciphertext)
+                signature = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
                 url, addresses = await validate_webhook_url(hook.url)
                 last_error: Exception | None = None
                 for address in addresses:
@@ -2582,8 +2766,10 @@ class MailService:
                     return False
                 if refund_event is not None:
                     session.add(refund_event)
+            needs_dns_cleanup = row.plan != MailboxMode.HOSTED.value and bool(row.domain)
             row.status = MailboxStatus.REFUND_DUE.value if refund else MailboxStatus.FAILED.value
             row.provision_error = reason[:2000]
+            row.dns_cleanup_pending = needs_dns_cleanup
             row.capacity_reserved_at = None
             row.provision_claim_token = None
             row.provision_claimed_at = None
@@ -2600,25 +2786,25 @@ class MailService:
                     mailbox_id=row.mailbox_id,
                     backend_id=row.backend_id,
                 )
-        dns_cleanup_pending = False
-        if row.plan != MailboxMode.HOSTED.value and row.domain:
+        dns_cleanup_pending = needs_dns_cleanup
+        if needs_dns_cleanup and row.domain:
             try:
                 await self.domains.remove_service_records(row.domain, managed_by="agent_mail")
+                dns_cleanup_pending = False
             except Exception:
                 log.exception(
                     "mailbox_failed_activation_dns_cleanup_failed",
                     mailbox_id=row.mailbox_id,
                 )
                 dns_cleanup_pending = True
-        if backend_deleted or dns_cleanup_pending:
+        if backend_deleted or needs_dns_cleanup:
             async with self.db() as session:
                 current = await session.get(MailAccountRow, mailbox_id)
                 if current is not None:
                     if backend_deleted:
                         current.backend_id = None
                         current.backend_credential_ciphertext = None
-                    if dns_cleanup_pending:
-                        current.dns_cleanup_pending = True
+                    current.dns_cleanup_pending = dns_cleanup_pending
                     await session.commit()
         return True
 
@@ -2908,6 +3094,8 @@ class MailService:
             grace_ends_at=row.grace_ends_at,
             charged_amount_usd=amount(
                 Decimal(row.total_amount_usd or row.activation_amount_usd or 0)
+                if row.payment_settled_at is not None or row.payment_tx
+                else Decimal("0")
             ),
             error=row.provision_error,
         )
@@ -2920,7 +3108,11 @@ class MailService:
             status=row.status,
             recipient=row.recipient,
             accepted_at=row.accepted_at,
-            charged_amount_usd=amount(Decimal(row.amount_usd)),
+            charged_amount_usd=amount(
+                Decimal(row.amount_usd)
+                if row.payment_settled_at is not None or row.payment_tx
+                else Decimal("0")
+            ),
         )
 
     @staticmethod

@@ -524,27 +524,97 @@ class StalwartClient:
         """Find a previously submitted message using its durable send intent id."""
 
         session, _auth = await self._session(address, password)
-        account_id = str(session.get("primaryAccounts", {}).get("urn:ietf:params:jmap:mail", ""))
-        if not account_id:
+        primary_accounts = session.get("primaryAccounts", {})
+        mail_account_id = str(primary_accounts.get("urn:ietf:params:jmap:mail", ""))
+        if not mail_account_id:
             raise MailBackendError("Mailbox has no JMAP mail account")
-        result = await self._jmap(
+        query_result = await self._jmap(
             address,
             password,
             [
                 [
                     "Email/query",
                     {
-                        "accountId": account_id,
+                        "accountId": mail_account_id,
                         "filter": {"header": ["X-Hyrule-Send-ID", send_id]},
-                        "limit": 1,
+                        "limit": 100,
                     },
                     "send-intent-query",
                 ]
             ],
             ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
         )
-        ids = self._method_data(result["response"], "send-intent-query").get("ids", [])
-        return str(ids[0]) if ids else None
+        email_ids = [
+            str(email_id)
+            for email_id in self._method_data(query_result["response"], "send-intent-query").get(
+                "ids", []
+            )
+            if email_id
+        ]
+        if not email_ids:
+            return None
+
+        submission_account_id = str(
+            primary_accounts.get("urn:ietf:params:jmap:submission", mail_account_id)
+        )
+        submission_query = await self._jmap(
+            address,
+            password,
+            [
+                [
+                    "EmailSubmission/query",
+                    {
+                        "accountId": submission_account_id,
+                        "filter": {"emailIds": email_ids},
+                        "limit": len(email_ids),
+                    },
+                    "send-submission-query",
+                ]
+            ],
+            [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:mail",
+                "urn:ietf:params:jmap:submission",
+            ],
+        )
+        submission_ids = [
+            str(submission_id)
+            for submission_id in self._method_data(
+                submission_query["response"], "send-submission-query"
+            ).get("ids", [])
+            if submission_id
+        ]
+        if not submission_ids:
+            return None
+
+        submission_result = await self._jmap(
+            address,
+            password,
+            [
+                [
+                    "EmailSubmission/get",
+                    {
+                        "accountId": submission_account_id,
+                        "ids": submission_ids,
+                        "properties": ["emailId"],
+                    },
+                    "send-submission-get",
+                ]
+            ],
+            [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:mail",
+                "urn:ietf:params:jmap:submission",
+            ],
+        )
+        submitted_email_ids = {
+            str(item.get("emailId"))
+            for item in self._method_data(submission_result["response"], "send-submission-get").get(
+                "list", []
+            )
+            if isinstance(item, dict) and item.get("emailId")
+        }
+        return next((email_id for email_id in email_ids if email_id in submitted_email_ids), None)
 
     async def get_message(self, *, address: str, password: str, message_id: str) -> dict[str, Any]:
         session, _auth = await self._session(address, password)
