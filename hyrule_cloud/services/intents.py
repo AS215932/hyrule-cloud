@@ -20,6 +20,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
+from weakref import WeakValueDictionary
 
 import structlog
 from pydantic import BaseModel
@@ -67,6 +68,19 @@ EXACT_AMOUNT_TOLERANCE = Decimal("0.001")  # 0.1%
 # Give a healthy settlement worker ample time to reserve, link, and schedule a
 # VM before another poller treats PROVISIONING as an interrupted handoff.
 VM_PROVISIONING_RECOVERY_DELAY = timedelta(minutes=5)
+
+# SQLite ignores SELECT ... FOR UPDATE, so concurrent poll tasks in the same
+# process also need a keyed lock. Weak values avoid retaining one lock for
+# every intent ever seen; PostgreSQL row locks remain the cross-process fence.
+_poll_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+
+def _poll_lock(intent_id: str) -> asyncio.Lock:
+    lock = _poll_locks.get(intent_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _poll_locks[intent_id] = lock
+    return lock
 
 
 class _NativeHandoffFencedError(RuntimeError):
@@ -252,9 +266,36 @@ async def poll_one_intent(
         log.exception("intent_scan_failed", intent_id=intent_id, asset=row.asset)
         return row
 
+    async with _poll_lock(intent_id):
+        return await _apply_intent_scan(
+            intent_id=intent_id,
+            session_factory=session_factory,
+            scan=scan,
+            min_confs=min_confs,
+            rates=rates,
+            orch=orch,
+        )
+
+
+async def _apply_intent_scan(
+    *,
+    intent_id: str,
+    session_factory: async_sessionmaker,
+    scan: AddressScanResult,
+    min_confs: int,
+    rates: RateProvider,
+    orch: Orchestrator,
+) -> CryptoIntentRow | None:
+    """Persist one scan and complete any settlement under the intent fence."""
     # Apply LENIENT policy and persist.
     async with session_factory() as db:
-        row = await db.get(CryptoIntentRow, intent_id)
+        row = (
+            await db.execute(
+                select(CryptoIntentRow)
+                .where(CryptoIntentRow.intent_id == intent_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         if row is None:
             return None
         # A concurrent poll may have completed while this network scan was in
