@@ -64,14 +64,6 @@ def upgrade() -> None:
     op.create_index("ix_domain_orders_billing_mode", "domain_orders", ["billing_mode"])
 
     op.add_column("payment_events", sa.Column("actor_account_id", sa.String(11)))
-    op.create_foreign_key(
-        "fk_payment_events_actor",
-        "payment_events",
-        "accounts",
-        ["actor_account_id"],
-        ["account_id"],
-        ondelete="SET NULL",
-    )
     op.create_index("ix_payment_events_actor_account_id", "payment_events", ["actor_account_id"])
 
     op.add_column("mail_accounts", sa.Column("suspension_reason", sa.String(32)))
@@ -92,7 +84,7 @@ def upgrade() -> None:
         sa.Column(
             "actor_account_id",
             sa.String(11),
-            sa.ForeignKey("accounts.account_id", ondelete="SET NULL"),
+            nullable=False,
         ),
         sa.Column("action", sa.String(96), nullable=False),
         sa.Column("target_type", sa.String(32)),
@@ -214,7 +206,6 @@ def downgrade() -> None:
     op.drop_column("mail_accounts", "suspension_reason")
 
     op.drop_index("ix_payment_events_actor_account_id", table_name="payment_events")
-    op.drop_constraint("fk_payment_events_actor", "payment_events", type_="foreignkey")
     op.drop_column("payment_events", "actor_account_id")
 
     op.drop_index("ix_domain_orders_billing_mode", table_name="domain_orders")

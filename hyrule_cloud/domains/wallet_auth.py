@@ -238,6 +238,8 @@ class WalletAuthService:
                     loaded_account = await session.get(AccountRow, wallet.account_id)
                     if loaded_account is None:
                         raise DomainProblem(401, "invalid_wallet_account", "The wallet account is unavailable.")
+                    if loaded_account.disabled_at is not None:
+                        raise DomainProblem(403, "account_disabled", "This account is disabled.")
                     account_row = loaded_account
                 challenge.used_at = _now()
                 await session.commit()

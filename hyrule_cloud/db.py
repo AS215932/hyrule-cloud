@@ -589,10 +589,9 @@ class PaymentEventRow(Base):
     error_reason: Mapped[str | None] = mapped_column(String(256))
     extra: Mapped[dict | None] = mapped_column(_JSONB)
     # Populated for browser-only administrator waivers and administrative
-    # adjustments. This is an actor, never a payer identity.
-    actor_account_id: Mapped[str | None] = mapped_column(
-        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
-    )
+    # adjustments. This is immutable actor attribution, never a payer identity;
+    # deliberately not a foreign key so account deletion cannot erase history.
+    actor_account_id: Mapped[str | None] = mapped_column(String(11), index=True)
 
     __table_args__ = (
         Index("ix_payment_events_type_created", "event_type", "created_at"),
@@ -1011,9 +1010,8 @@ class AdminAuditRow(Base):
     __tablename__ = "admin_audit"
 
     audit_id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    actor_account_id: Mapped[str | None] = mapped_column(
-        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
-    )
+    # Keep the immutable identifier after an operator account is offboarded.
+    actor_account_id: Mapped[str] = mapped_column(String(11), index=True)
     action: Mapped[str] = mapped_column(String(96), index=True)
     target_type: Mapped[str | None] = mapped_column(String(32), index=True)
     target_id: Mapped[str | None] = mapped_column(String(256), index=True)

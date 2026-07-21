@@ -328,13 +328,22 @@ async def challenge_curated_x402_requests(request: Request, call_next) -> Respon
 
     state = getattr(request.app.state, "_typed_state", None)
     gate = getattr(state, "payment_gate", None)
-    if not isinstance(gate, PaymentGate) or await gate.has_payment_credentials(request):
+    if not isinstance(gate, PaymentGate):
         return await call_next(request)
 
     from hyrule_cloud.services.discovery import match_enabled_operation
 
     operation = match_enabled_operation(request.method, request.url.path)
     if operation is None:
+        return await call_next(request)
+
+    try:
+        has_credentials = await gate.has_payment_credentials(request)
+    except StarletteHTTPException as exc:
+        # User middleware runs outside FastAPI's ExceptionMiddleware, so
+        # expected Admin-waiver validation failures must be rendered here.
+        return await handle_domain_http_exception(request, exc)
+    if has_credentials:
         return await call_next(request)
 
     # Dynamic prices depend on validated request data (VM size/duration, proxy

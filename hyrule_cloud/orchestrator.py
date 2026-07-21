@@ -737,11 +737,24 @@ class Orchestrator:
             custom_domain: str | None = None
             custom_account_id: str | None = None
             async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
-                if not row:
+                row = (
+                    await session.execute(
+                        select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if row is None:
                     return
+                admin_suspended = row.suspension_reason in {
+                    "account_disabled",
+                    "manual_admin",
+                }
+                if admin_suspended:
+                    # Serialize with account re-enablement while the row lock is
+                    # held: a disabled account must never observe a newly built
+                    # provider VM transition through READY.
+                    await self.xcpng.suspend_vm(xcpng_uuid)
                 row.ipv6 = ipv6
-                row.status = VMStatus.READY
+                row.status = VMStatus.SUSPENDED if admin_suspended else VMStatus.READY
                 # Block B (Wave 2): timestamp the READY transition so
                 # /v1/stats/runtime can roll a rolling avg over recent
                 # provisioning durations.
@@ -1163,8 +1176,12 @@ class Orchestrator:
         await asyncio.sleep(0.1)
 
         async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row:
+            row = (
+                await session.execute(
+                    select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
                 return
             # Keep the simulated address consistent with the allocated
             # customer /64 — the status API exposes both, and an address
@@ -1174,7 +1191,11 @@ class Orchestrator:
             else:
                 fake_ipv6 = f"2001:db8::{random.randint(0x1000, 0x9999):04x}"
             row.ipv6 = fake_ipv6
-            row.status = VMStatus.READY
+            row.status = (
+                VMStatus.SUSPENDED
+                if row.suspension_reason in {"account_disabled", "manual_admin"}
+                else VMStatus.READY
+            )
             row.provisioned_at = _now()
             meta = row.metadata_ or {}
             lp = meta.get("launch_proof", {})
@@ -1271,7 +1292,11 @@ class Orchestrator:
     async def extend_vm(self, vm_id: str, days: int) -> VMRow | None:
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
-            if not row or not row.expires_at:
+            if (
+                not row
+                or not row.expires_at
+                or row.suspension_reason in {"account_disabled", "manual_admin"}
+            ):
                 return None
 
             now = _now()

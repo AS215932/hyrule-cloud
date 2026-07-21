@@ -161,26 +161,29 @@ async def _apply_account_operation(
     now = _now()
     if kind == "suspend_account_resources":
         for vm in vms:
-            if str(vm.status) in {
-                VMStatus.DESTROYED.value,
-                VMStatus.FAILED.value,
-                VMStatus.SUSPENDED.value,
-            }:
-                continue
-            if vm.xcpng_uuid:
-                await orchestrator.xcpng.suspend_vm(vm.xcpng_uuid)
             async with session_factory() as session:
-                current = await session.get(VMRow, vm.vm_id)
-                if current is not None and str(current.status) not in {
+                current = (
+                    await session.execute(
+                        select(VMRow).where(VMRow.vm_id == vm.vm_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if current is None or str(current.status) in {
                     VMStatus.DESTROYED.value,
                     VMStatus.FAILED.value,
                     VMStatus.SUSPENDED.value,
                 }:
+                    continue
+                if str(current.status) != VMStatus.PROVISIONING.value and current.xcpng_uuid:
+                    await orchestrator.xcpng.suspend_vm(current.xcpng_uuid)
+                # A provisioner owns the PROVISIONING transition. Mark the
+                # desired terminal state without making its initial guard exit;
+                # finalization will suspend the new provider VM under the row lock.
+                if str(current.status) != VMStatus.PROVISIONING.value:
                     current.status = VMStatus.SUSPENDED
-                    current.suspension_reason = "account_disabled"
-                    current.suspended_by_account_id = actor_id
-                    await session.commit()
-                    vm_count += 1
+                current.suspension_reason = "account_disabled"
+                current.suspended_by_account_id = actor_id
+                await session.commit()
+                vm_count += 1
         async with session_factory() as session:
             for mailbox in mailboxes:
                 mailbox_row = await session.get(MailAccountRow, mailbox.mailbox_id)
@@ -192,26 +195,43 @@ async def _apply_account_operation(
             await session.commit()
     else:
         for vm in vms:
-            if vm.suspension_reason != "account_disabled":
-                continue
-            if vm.expires_at is not None and _aware(vm.expires_at) <= now:
-                async with session_factory() as session:
-                    current = await session.get(VMRow, vm.vm_id)
-                    if current is not None:
-                        current.suspension_reason = "expired"
-                        current.suspended_by_account_id = None
-                        await session.commit()
-                continue
-            if vm.xcpng_uuid:
-                await orchestrator.xcpng.start_vm(vm.xcpng_uuid)
+            restart_provisioning = False
             async with session_factory() as session:
-                current = await session.get(VMRow, vm.vm_id)
-                if current is not None and current.suspension_reason == "account_disabled":
+                current = (
+                    await session.execute(
+                        select(VMRow).where(VMRow.vm_id == vm.vm_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if current is None or current.suspension_reason != "account_disabled":
+                    continue
+                if current.expires_at is not None and _aware(current.expires_at) <= now:
+                    current.suspension_reason = "expired"
+                    current.suspended_by_account_id = None
+                    await session.commit()
+                    continue
+                if str(current.status) == VMStatus.PROVISIONING.value:
+                    # The existing provisioner will observe the cleared marker
+                    # and complete normally; do not invent a RUNNING row before
+                    # a provider UUID exists.
+                    current.suspension_reason = None
+                    current.suspended_by_account_id = None
+                elif current.xcpng_uuid:
+                    await orchestrator.xcpng.start_vm(current.xcpng_uuid)
                     current.status = VMStatus.RUNNING
                     current.suspension_reason = None
                     current.suspended_by_account_id = None
-                    await session.commit()
-                    vm_count += 1
+                else:
+                    # Recover a legacy row that was incorrectly suspended before
+                    # provider creation by returning it to the provision queue.
+                    current.status = VMStatus.PROVISIONING
+                    current.suspension_reason = None
+                    current.suspended_by_account_id = None
+                    current.error = None
+                    restart_provisioning = True
+                await session.commit()
+                vm_count += 1
+            if restart_provisioning:
+                orchestrator.start_provisioning(vm.vm_id)
         async with session_factory() as session:
             for mailbox in mailboxes:
                 mailbox_row = await session.get(MailAccountRow, mailbox.mailbox_id)

@@ -581,12 +581,7 @@ class PaymentGate:
         await self._consume_admin_quota(context)
         tx_hash = f"admin_bypass_{secrets.token_hex(16)}"
         payer = f"admin:{context.account_id}"
-        request.state.payment_tx = tx_hash
-        request.state.payment_network = "admin-bypass"
-        request.state.payment_asset = None
-        request.state.payment_mode = "admin-bypass"
-        request.state.payment_response_headers = {ADMIN_PAYMENT_MODE_HEADER: "admin-bypass"}
-        await self._record(
+        await self._record_required(
             "admin_bypass",
             request,
             amount,
@@ -600,12 +595,46 @@ class PaymentGate:
                 "retail_amount_usd": str(amount),
             },
         )
+        request.state.payment_tx = tx_hash
+        request.state.payment_network = "admin-bypass"
+        request.state.payment_asset = None
+        request.state.payment_mode = "admin-bypass"
+        request.state.payment_response_headers = {ADMIN_PAYMENT_MODE_HEADER: "admin-bypass"}
         return payer
 
     # Ledger writes are best-effort observability: a slow/exhausted payments
     # DB must never hold a settled response hostage. Writes that exceed this
     # bound are dropped with a warning.
     _LEDGER_WRITE_TIMEOUT_SECONDS = 2.0
+
+    async def _record_required(
+        self,
+        event_type: str,
+        request: Request,
+        amount: Decimal,
+        **kwargs: Any,
+    ) -> None:
+        """Persist a security-critical ledger event or fail closed."""
+        if self.ledger is None:
+            raise HTTPException(status_code=503, detail="Admin waiver audit unavailable")
+        try:
+            await asyncio.wait_for(
+                self.ledger.record(
+                    event_type=event_type,
+                    request=request,
+                    amount=amount,
+                    facilitator_host=self._facilitator_host,
+                    required=True,
+                    **kwargs,
+                ),
+                timeout=self._LEDGER_WRITE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            log.error("required_payment_ledger_write_failed", event_type=event_type, exc_info=True)
+            raise HTTPException(
+                status_code=503,
+                detail="Admin waiver audit unavailable",
+            ) from exc
 
     async def _record(self, event_type: str, request: Request, amount: Decimal, **kwargs: Any) -> None:
         """Bounded ledger write; no-op without a ledger, never raises."""

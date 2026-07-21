@@ -945,19 +945,27 @@ async def create_vm(
         # currently fit.
         await _enforce_compute_capacity(orch, order)
 
-    result = await gate.check_payment(
-        request,
-        amount=total,
-        description=(
-            f"Hyrule Cloud VM ({VM_PROFILE_LABELS[order.size]}) "
-            f"for {order.duration_days} days"
-        ),
-        extra_body={
-            "cost_breakdown": breakdown.model_dump(),
-            "specs": {**specs, "ipv6": True, "ipv4": False, "region": "eu-west"},
-            "estimated_provision_time_seconds": 60,
-        },
-    )
+    try:
+        result = await gate.check_payment(
+            request,
+            amount=total,
+            description=(
+                f"Hyrule Cloud VM ({VM_PROFILE_LABELS[order.size]}) "
+                f"for {order.duration_days} days"
+            ),
+            extra_body={
+                "cost_breakdown": breakdown.model_dump(),
+                "specs": {**specs, "ipv6": True, "ipv4": False, "region": "eu-west"},
+                "estimated_provision_time_seconds": 60,
+            },
+        )
+    except Exception:
+        # Admin quota and required-audit failures raise instead of returning a
+        # 402. They must release the unpaid capacity reservation just like the
+        # ordinary Response path below.
+        if reservation_row is not None:
+            await orch.release_vm_reservation(reservation_row.vm_id)
+        raise
 
     if isinstance(result, Response):
         # No/invalid payment yet (402) — the quote stays CREATED so the EVM
@@ -1216,6 +1224,9 @@ async def extend_vm(
     # A simulated VM must not be charged to extend either — same guard as
     # create/quote/intent. Refuse before check_payment so no money moves.
     _require_vm_service_open(gate)
+
+    if row.suspension_reason in {"account_disabled", "manual_admin"}:
+        raise HTTPException(409, "Admin-suspended VMs cannot be extended")
 
     total = current_daily_price_for_vm(row, cfg.payment) * body.days
 

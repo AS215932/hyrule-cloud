@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.db import (
     AccountRow,
+    AccountWalletRow,
     AdminAuditRow,
     AdminOperationRow,
     ApiKeyRow,
@@ -83,19 +84,47 @@ def _audit(
     target_id: str | None = None,
     reason: str | None = None,
     details: dict[str, Any] | None = None,
-) -> None:
-    session.add(
-        AdminAuditRow(
-            audit_id=str(uuid.uuid4()),
-            actor_account_id=actor.account_id,
-            action=action,
+) -> AdminAuditRow:
+    row = AdminAuditRow(
+        audit_id=str(uuid.uuid4()),
+        actor_account_id=actor.account_id,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        reason=reason,
+        details=details,
+        ip_prefix_hash=derive_ip_prefix_hash(_client_ip(request)),
+    )
+    session.add(row)
+    return row
+
+
+async def _audit_before_dispatch(
+    state: AppState,
+    request: Request,
+    actor: AccountRow,
+    action: str,
+    *,
+    target_type: str,
+    target_id: str,
+    reason: str,
+    details: dict[str, Any] | None = None,
+) -> str:
+    """Durably record a privileged request before its external side effect."""
+    async with _factory(state)() as session:
+        row = _audit(
+            session,
+            request,
+            actor,
+            f"{action}.requested",
             target_type=target_type,
             target_id=target_id,
             reason=reason,
             details=details,
-            ip_prefix_hash=derive_ip_prefix_hash(_client_ip(request)),
         )
-    )
+        audit_id = row.audit_id
+        await session.commit()
+    return audit_id
 
 
 class StepUpRequest(BaseModel):
@@ -841,6 +870,17 @@ async def vm_action(
         xcpng_uuid = row.xcpng_uuid
         if action == "start" and row.expires_at is not None and _aware(row.expires_at) <= _now():
             raise HTTPException(409, "Expired VMs cannot be started")
+        if action not in {"reboot", "destroy"} and not xcpng_uuid:
+            raise HTTPException(409, "VM has no provider instance")
+    await _audit_before_dispatch(
+        state,
+        request,
+        actor,
+        f"vm.{action}",
+        target_type="vm",
+        target_id=vm_id,
+        reason=body.reason,
+    )
     if action == "reboot":
         if not await orch.reboot_vm(vm_id):
             raise HTTPException(409, "VM cannot be rebooted")
@@ -848,8 +888,7 @@ async def vm_action(
         if not await orch.destroy_vm(vm_id):
             raise HTTPException(409, "VM cannot be destroyed")
     else:
-        if not xcpng_uuid:
-            raise HTTPException(409, "VM has no provider instance")
+        assert xcpng_uuid is not None
         if action == "start":
             await orch.xcpng.start_vm(xcpng_uuid)
         elif action == "shutdown":
@@ -863,17 +902,6 @@ async def vm_action(
                 current.suspension_reason = None if action == "start" else "manual_admin"
                 current.suspended_by_account_id = None if action == "start" else actor.account_id
                 await session.commit()
-    async with _factory(state)() as session:
-        _audit(
-            session,
-            request,
-            actor,
-            f"vm.{action}",
-            target_type="vm",
-            target_id=vm_id,
-            reason=body.reason,
-        )
-        await session.commit()
     return {"vm_id": vm_id, "action": action, "status": "accepted"}
 
 
@@ -882,6 +910,16 @@ async def _assert_transfer_target(session: AsyncSession, account_id: str) -> Acc
     if target is None or target.disabled_at is not None:
         raise HTTPException(409, "Target account is missing or disabled")
     return target
+
+
+async def _transfer_wallet_identity(session: AsyncSession, account_id: str) -> str:
+    """Use the transferee's wallet, or a non-signable account marker."""
+    address = await session.scalar(
+        select(AccountWalletRow.address)
+        .where(AccountWalletRow.account_id == account_id)
+        .limit(1)
+    )
+    return address or f"account:{account_id}"
 
 
 async def _pending_domain_operation(session: AsyncSession, fqdn: str) -> bool:
@@ -907,7 +945,10 @@ async def transfer_vm(
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
         await _assert_transfer_target(session, body.target_account_id)
-        vm = await session.get(VMRow, vm_id)
+        new_owner_wallet = await _transfer_wallet_identity(session, body.target_account_id)
+        vm = (
+            await session.execute(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+        ).scalar_one_or_none()
         if vm is None:
             raise HTTPException(404, "VM not found")
         domain = (
@@ -917,9 +958,14 @@ async def transfer_vm(
         ).scalar_one_or_none()
         if domain is not None and await _pending_domain_operation(session, domain.fqdn):
             raise HTTPException(409, "Attached domain has a pending operation")
+        previous_account_id = vm.owner_account_id
         vm.owner_account_id = body.target_account_id
+        vm.owner_wallet = new_owner_wallet
+        vm.anon_management_token_hash = None
         if domain is not None:
             domain.owner_account_id = body.target_account_id
+            domain.owner_wallet = new_owner_wallet
+            domain.anon_management_token_hash = None
         _audit(
             session,
             request,
@@ -930,6 +976,7 @@ async def transfer_vm(
             reason=body.reason,
             details={
                 "target_account_id": body.target_account_id,
+                "previous_account_id": previous_account_id,
                 "attached_domain": domain.fqdn if domain else None,
             },
         )
@@ -948,6 +995,7 @@ async def transfer_domain(
     fqdn = fqdn.lower().rstrip(".")
     async with _factory(state)() as session:
         await _assert_transfer_target(session, body.target_account_id)
+        new_owner_wallet = await _transfer_wallet_identity(session, body.target_account_id)
         domain = (
             await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn).with_for_update())
         ).scalar_one_or_none()
@@ -955,11 +1003,20 @@ async def transfer_domain(
             raise HTTPException(404, "Domain not found")
         if await _pending_domain_operation(session, fqdn):
             raise HTTPException(409, "Domain has a pending operation")
+        previous_account_id = domain.owner_account_id
         domain.owner_account_id = body.target_account_id
+        domain.owner_wallet = new_owner_wallet
+        domain.anon_management_token_hash = None
         if domain.vm_id:
-            vm = await session.get(VMRow, domain.vm_id)
+            vm = (
+                await session.execute(
+                    select(VMRow).where(VMRow.vm_id == domain.vm_id).with_for_update()
+                )
+            ).scalar_one_or_none()
             if vm is not None:
                 vm.owner_account_id = body.target_account_id
+                vm.owner_wallet = new_owner_wallet
+                vm.anon_management_token_hash = None
         _audit(
             session,
             request,
@@ -968,7 +1025,11 @@ async def transfer_domain(
             target_type="domain",
             target_id=fqdn,
             reason=body.reason,
-            details={"target_account_id": body.target_account_id, "attached_vm": domain.vm_id},
+            details={
+                "target_account_id": body.target_account_id,
+                "previous_account_id": previous_account_id,
+                "attached_vm": domain.vm_id,
+            },
         )
         await session.commit()
     return {"domain": fqdn, "owner_account_id": body.target_account_id}
@@ -997,20 +1058,20 @@ async def admin_nameservers(
     if state.domains is None:
         raise HTTPException(503, "Domain service unavailable")
     owner = await _domain_owner(state, fqdn)
-    result = await state.domains.enqueue_nameserver_update(
-        owner, fqdn, body.request, str(uuid.uuid4())
+    idempotency_key = str(uuid.uuid4())
+    await _audit_before_dispatch(
+        state,
+        request,
+        actor,
+        "domain.nameservers",
+        target_type="domain",
+        target_id=fqdn,
+        reason=body.reason,
+        details={"idempotency_key": idempotency_key},
     )
-    async with _factory(state)() as session:
-        _audit(
-            session,
-            request,
-            actor,
-            "domain.nameservers",
-            target_type="domain",
-            target_id=fqdn,
-            reason=body.reason,
-        )
-        await session.commit()
+    result = await state.domains.enqueue_nameserver_update(
+        owner, fqdn, body.request, idempotency_key
+    )
     return result
 
 
@@ -1025,20 +1086,27 @@ async def admin_dns(
     if state.domains is None:
         raise HTTPException(503, "Domain service unavailable")
     owner = await _domain_owner(state, fqdn)
-    result = await state.domains.apply_changeset(
-        owner, fqdn, body.expected_revision, body.request, idempotency_key=str(uuid.uuid4())
+    idempotency_key = str(uuid.uuid4())
+    await _audit_before_dispatch(
+        state,
+        request,
+        actor,
+        "domain.dns",
+        target_type="domain",
+        target_id=fqdn,
+        reason=body.reason,
+        details={
+            "idempotency_key": idempotency_key,
+            "expected_revision": body.expected_revision,
+        },
     )
-    async with _factory(state)() as session:
-        _audit(
-            session,
-            request,
-            actor,
-            "domain.dns",
-            target_type="domain",
-            target_id=fqdn,
-            reason=body.reason,
-        )
-        await session.commit()
+    result = await state.domains.apply_changeset(
+        owner,
+        fqdn,
+        body.expected_revision,
+        body.request,
+        idempotency_key=idempotency_key,
+    )
     return result
 
 
@@ -1053,18 +1121,23 @@ async def admin_dnssec(
     if state.domains is None:
         raise HTTPException(503, "Domain service unavailable")
     owner = await _domain_owner(state, fqdn)
-    result = await state.domains.enqueue_dnssec_update(owner, fqdn, body.request, str(uuid.uuid4()))
-    async with _factory(state)() as session:
-        _audit(
-            session,
-            request,
-            actor,
-            "domain.dnssec",
-            target_type="domain",
-            target_id=fqdn,
-            reason=body.reason,
-        )
-        await session.commit()
+    idempotency_key = str(uuid.uuid4())
+    await _audit_before_dispatch(
+        state,
+        request,
+        actor,
+        "domain.dnssec",
+        target_type="domain",
+        target_id=fqdn,
+        reason=body.reason,
+        details={"idempotency_key": idempotency_key},
+    )
+    result = await state.domains.enqueue_dnssec_update(
+        owner,
+        fqdn,
+        body.request,
+        idempotency_key,
+    )
     return result
 
 

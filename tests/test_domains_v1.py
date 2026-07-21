@@ -29,6 +29,7 @@ from hyrule_cloud.db import (
     PaymentEventRow,
     VMQuoteRow,
     VMRow,
+    WalletChallengeRow,
     create_db_engine,
     create_session_factory,
 )
@@ -2352,4 +2353,64 @@ async def test_wallet_login_and_two_signature_rotation(tmp_path):
     )
     assert action is WalletAction.ROTATE
     assert rotated.address.lower() == replacement.address.lower()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_wallet_login_rejects_disabled_account_without_consuming_challenge(tmp_path):
+    engine = create_db_engine(f"sqlite+aiosqlite:///{tmp_path / 'wallet-disabled.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = create_session_factory(engine)
+    service = WalletAuthService(HyruleConfig(), sessions)
+    wallet_account = Account.create()
+    request = SimpleNamespace(headers={}, client=None)
+
+    initial = await service.create_challenge(
+        WalletChallengeRequest(
+            action=WalletAction.LOGIN,
+            address=wallet_account.address,
+            chain_id=8453,
+        ),
+        account=None,
+    )
+    initial_signature = Account.sign_message(
+        encode_defunct(text=initial.message),
+        wallet_account.key,
+    ).signature.hex()
+    account, *_ = await service.verify_login_or_account_action(
+        WalletVerifyRequest(nonce=initial.nonce, signature=initial_signature),
+        account=None,
+        request=request,
+    )
+    async with sessions() as session:
+        stored = await session.get(AccountRow, account.account_id)
+        assert stored is not None
+        stored.disabled_at = datetime.now(UTC)
+        await session.commit()
+
+    retry = await service.create_challenge(
+        WalletChallengeRequest(
+            action=WalletAction.LOGIN,
+            address=wallet_account.address,
+            chain_id=8453,
+        ),
+        account=None,
+    )
+    retry_signature = Account.sign_message(
+        encode_defunct(text=retry.message),
+        wallet_account.key,
+    ).signature.hex()
+    with pytest.raises(DomainProblem) as rejected:
+        await service.verify_login_or_account_action(
+            WalletVerifyRequest(nonce=retry.nonce, signature=retry_signature),
+            account=None,
+            request=request,
+        )
+
+    assert rejected.value.status == 403
+    assert rejected.value.code == "account_disabled"
+    async with sessions() as session:
+        stored_challenge = await session.get(WalletChallengeRow, retry.nonce)
+        assert stored_challenge is not None and stored_challenge.used_at is None
     await engine.dispose()
