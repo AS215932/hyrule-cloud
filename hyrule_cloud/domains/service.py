@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
+    AccountRow,
     CryptoIntentRow,
     DomainDNSRecordRow,
     DomainIdempotencyRow,
@@ -702,6 +703,21 @@ class DomainService:
         billing_mode: str = "charged",
     ) -> DomainOrderRow:
         async with self.db() as session:
+            # Account disable uses this row as its lifecycle fence. Acquire it
+            # before the order lock so a settlement either queues while the
+            # owner is enabled or becomes a refund after disable, never both.
+            snapshot = await session.get(DomainOrderRow, order_id)
+            if snapshot is None:
+                raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            owner = None
+            if snapshot.owner_account_id is not None:
+                owner = (
+                    await session.execute(
+                        select(AccountRow)
+                        .where(AccountRow.account_id == snapshot.owner_account_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
             order = (
                 await session.execute(
                     select(DomainOrderRow)
@@ -711,6 +727,12 @@ class DomainService:
             ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            if order.owner_account_id != snapshot.owner_account_id:
+                raise DomainProblem(
+                    409,
+                    "order_owner_changed",
+                    "The order owner changed while payment was settling.",
+                )
             if order.status not in {
                 DomainOrderStatus.AWAITING_PAYMENT.value,
                 DomainOrderStatus.PAID.value,
@@ -726,6 +748,22 @@ class DomainService:
                 order.payment_network = payment_network
                 order.payment_asset = payment_asset
                 order.billing_mode = billing_mode
+                if order.owner_account_id is not None and (
+                    owner is None or owner.disabled_at is not None
+                ):
+                    order.status = (
+                        DomainOrderStatus.FAILED.value
+                        if _is_waived_billing(order.billing_mode)
+                        else DomainOrderStatus.REFUND_DUE.value
+                    )
+                    order.error_code = "account_disabled"
+                    order.error_detail = (
+                        "The owning account was disabled before payment settled."
+                    )
+                    if not _is_waived_billing(order.billing_mode):
+                        session.add(self._build_refund_event(order, "account_disabled"))
+                    await session.commit()
+                    return order
                 quote = (
                     await session.execute(
                         select(DomainQuoteRow)

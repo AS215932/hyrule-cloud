@@ -1264,9 +1264,27 @@ async def extend_vm(
     if isinstance(result, Response):
         return result
 
-    updated = await orch.extend_vm(vm_id, body.days)
+    payment_tx = getattr(request.state, "payment_tx", None)
+    try:
+        updated = await orch.extend_vm(vm_id, body.days)
+    except Exception as exc:
+        await orch.record_extension_failure_refund(
+            vm_id=vm_id,
+            owner_wallet=result,
+            payment_tx=payment_tx,
+            charged_amount=total,
+            reason=f"vm_extension_failed: {exc}",
+        )
+        raise HTTPException(500, "Failed to extend VM; a refund has been recorded") from exc
     if not updated:
-        raise HTTPException(500, "Failed to extend VM")
+        await orch.record_extension_failure_refund(
+            vm_id=vm_id,
+            owner_wallet=result,
+            payment_tx=payment_tx,
+            charged_amount=total,
+            reason="vm_extension_rejected_post_settlement",
+        )
+        raise HTTPException(409, "VM extension was rejected; a refund has been recorded")
 
     return {
         "vm_id": vm_id,

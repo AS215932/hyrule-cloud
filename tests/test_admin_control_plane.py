@@ -632,6 +632,16 @@ async def test_admin_step_up_rate_limits_argon_checks_per_session(
         assert row is not None
         assert row.admin_step_up_attempts == 0
         assert row.admin_step_up_window_started_at is None
+        audits = list(
+            await session.scalars(
+                select(AdminAuditRow).order_by(AdminAuditRow.created_at)
+            )
+        )
+    failures = [row for row in audits if row.action == "admin.step_up_failed"]
+    successes = [row for row in audits if row.action == "admin.step_up"]
+    assert len(failures) == 5
+    assert all(row.succeeded is False for row in failures)
+    assert len(successes) == 1 and successes[0].succeeded is True
 
 
 @pytest.mark.asyncio
@@ -882,6 +892,90 @@ async def test_transfers_block_active_domain_attachment_jobs(admin_factory) -> N
 
 
 @pytest.mark.asyncio
+async def test_transfers_preserve_provisioning_vm_payer(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    original_wallet = "0x2222222222222222222222222222222222222222"
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add_all(
+            [
+                AccountRow(account_id="HBBBBBBBBBB", password_hash="unused"),
+                AccountRow(account_id="HCCCCCCCCCC", password_hash="unused"),
+                VMRow(
+                    vm_id="vm_provisioning_transfer",
+                    owner_wallet=original_wallet,
+                    owner_account_id="HBBBBBBBBBB",
+                    status="provisioning",
+                ),
+                DomainRow(
+                    name="provisioning-transfer",
+                    extension="example",
+                    fqdn="provisioning-transfer.example",
+                    vm_id="vm_provisioning_transfer",
+                    owner_wallet=original_wallet,
+                    owner_account_id="HBBBBBBBBBB",
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    body = OwnershipTransferRequest(
+        target_account_id="HCCCCCCCCCC",
+        reason="customer-approved transfer",
+    )
+    with pytest.raises(HTTPException) as vm_error:
+        await transfer_vm(
+            "vm_provisioning_transfer",
+            body,
+            _browser_request(
+                credentials,
+                path="/v1/admin/vms/vm_provisioning_transfer/transfer",
+            ),
+            actor,
+            state,
+        )
+    assert vm_error.value.status_code == 409
+
+    with pytest.raises(HTTPException) as domain_error:
+        await transfer_domain(
+            "provisioning-transfer.example",
+            body,
+            _browser_request(
+                credentials,
+                path="/v1/admin/domains/provisioning-transfer.example/transfer",
+            ),
+            actor,
+            state,
+        )
+    assert domain_error.value.status_code == 409
+
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, "vm_provisioning_transfer")
+        domain = (
+            await session.execute(
+                select(DomainRow).where(
+                    DomainRow.fqdn == "provisioning-transfer.example"
+                )
+            )
+        ).scalar_one()
+        audits = list(await session.scalars(select(AdminAuditRow)))
+    assert vm is not None and vm.owner_account_id == "HBBBBBBBBBB"
+    assert vm.owner_wallet == original_wallet
+    assert domain.owner_account_id == "HBBBBBBBBBB"
+    assert domain.owner_wallet == original_wallet
+    assert audits == []
+
+
+@pytest.mark.asyncio
 async def test_vm_action_audit_is_durable_before_provider_dispatch(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
     async with admin_factory() as session:
@@ -1110,6 +1204,63 @@ class _AdminXCPNG:
 
 
 @pytest.mark.asyncio
+async def test_admin_start_updates_vm_while_owner_fence_is_held(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add(
+            VMRow(
+                vm_id="vm_admin_start",
+                owner_wallet="0xowner",
+                owner_account_id="HAAAAAAAAAA",
+                xcpng_uuid="uuid-admin-start",
+                status="suspended",
+                suspension_reason="manual_admin",
+                suspended_by_account_id="HAAAAAAAAAA",
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+        await session.commit()
+
+    xcpng = _AdminXCPNG()
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(xcpng=xcpng),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    result = await vm_action(
+        "vm_admin_start",
+        "start",
+        ReasonRequest(reason="customer confirmed recovery"),
+        _browser_request(
+            credentials,
+            path="/v1/admin/vms/vm_admin_start/actions/start",
+        ),
+        actor,
+        state,
+    )
+
+    assert result["status"] == "accepted"
+    assert xcpng.started == ["uuid-admin-start"]
+    async with admin_factory() as session:
+        row = await session.get(VMRow, "vm_admin_start")
+        audit = (
+            await session.execute(
+                select(AdminAuditRow).where(
+                    AdminAuditRow.action == "vm.start.requested"
+                )
+            )
+        ).scalar_one()
+    assert row is not None and str(row.status) == "running"
+    assert row.suspension_reason is None
+    assert row.suspended_by_account_id is None
+    assert audit.succeeded is True
+
+
+@pytest.mark.asyncio
 async def test_admin_start_rejects_account_disabled_vm(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
     async with admin_factory() as session:
@@ -1156,6 +1307,61 @@ async def test_admin_start_rejects_account_disabled_vm(admin_factory) -> None:
         row = await session.get(VMRow, "vm_account_disabled")
         assert row is not None and str(row.status) == "suspended"
         assert row.suspension_reason == "account_disabled"
+        assert list(await session.scalars(select(AdminAuditRow))) == []
+
+
+@pytest.mark.asyncio
+async def test_admin_start_fences_on_disabled_owner_without_vm_marker(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add(
+            AccountRow(
+                account_id="HBBBBBBBBBB",
+                password_hash="unused",
+                disabled_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            VMRow(
+                vm_id="vm_disabled_owner",
+                owner_wallet="0xowner",
+                owner_account_id="HBBBBBBBBBB",
+                xcpng_uuid="uuid-disabled-owner",
+                status="suspended",
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+        await session.commit()
+
+    xcpng = _AdminXCPNG()
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(xcpng=xcpng),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await vm_action(
+            "vm_disabled_owner",
+            "start",
+            ReasonRequest(reason="manual override"),
+            _browser_request(
+                credentials,
+                path="/v1/admin/vms/vm_disabled_owner/actions/start",
+            ),
+            actor,
+            state,
+        )
+
+    assert exc.value.status_code == 409
+    assert xcpng.started == []
+    async with admin_factory() as session:
+        row = await session.get(VMRow, "vm_disabled_owner")
+        assert row is not None and str(row.status) == "suspended"
+        assert row.suspension_reason is None
         assert list(await session.scalars(select(AdminAuditRow))) == []
 
 

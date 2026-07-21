@@ -644,6 +644,64 @@ async def test_native_domain_intent_expires_with_its_quote(domain_service):
 
 
 @pytest.mark.asyncio
+async def test_native_domain_settlement_refunds_disabled_owner(domain_service):
+    service, provider, sessions = domain_service
+
+    async def usd_per(asset: str) -> Decimal:
+        assert asset == "BTC"
+        return Decimal("60000")
+
+    service.rates.get_usd_per = usd_per
+    service.native_crypto.derive_btc_address = lambda _index: BTC_REFUND_ADDRESS
+    quote = await service.create_quote(
+        "disabled-owner-native.dev",
+        DomainAction.REGISTER,
+        "H1234567890",
+    )
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.BTC,
+            refund_address=BTC_REFUND_ADDRESS,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="disabled-owner-native",
+    )
+    async with sessions() as session:
+        account = await session.get(AccountRow, "H1234567890")
+        intent = await session.get(CryptoIntentRow, order.native_intent_id)
+        assert account is not None and intent is not None
+        account.disabled_at = datetime.now(UTC)
+        intent.tx_hash = "native-disabled-owner-tx"
+        await session.commit()
+
+    settled = await service.native_order_settled(order.order_id, intent)
+
+    assert settled.status == "refund_due"
+    assert settled.error_code == "account_disabled"
+    async with sessions() as session:
+        stored_quote = await session.get(DomainQuoteRow, quote.quote_id)
+        operations = list(await session.scalars(select(DomainOperationRow)))
+        jobs = list(await session.scalars(select(DomainJobRow)))
+        refunds = list(
+            await session.scalars(
+                select(PaymentEventRow).where(
+                    PaymentEventRow.event_type == "refund_owed"
+                )
+            )
+        )
+    assert stored_quote is not None and stored_quote.status == "reserved"
+    assert operations == []
+    assert jobs == []
+    assert provider.registrations == []
+    assert len(refunds) == 1
+    assert refunds[0].amount_usd == order.amount_usd
+    assert refunds[0].tx_hash == "native-disabled-owner-tx"
+    assert refunds[0].extra["refund_address"] == BTC_REFUND_ADDRESS
+
+
+@pytest.mark.asyncio
 async def test_renewal_order_rejects_vm_bundle(domain_service):
     service, _provider, sessions = domain_service
     quote = await service.create_quote("renew-no-bundle.dev", DomainAction.REGISTER, "H1234567890")

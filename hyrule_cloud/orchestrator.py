@@ -1137,6 +1137,44 @@ class Orchestrator:
             vm_id=vm_id,
         )
 
+    async def record_extension_failure_refund(
+        self,
+        *,
+        vm_id: str,
+        owner_wallet: str,
+        payment_tx: str | None,
+        charged_amount: Decimal,
+        reason: str,
+    ) -> None:
+        """Record a paid VM extension rejected after x402 settlement."""
+        if payment_tx and payment_tx.startswith(("dev_bypass", "admin_bypass")):
+            return
+        settled = None
+        if payment_tx:
+            async with self.db() as session:
+                settled = (
+                    await session.execute(
+                        select(PaymentEventRow)
+                        .where(
+                            PaymentEventRow.tx_hash == payment_tx,
+                            PaymentEventRow.event_type == "settled",
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+        await self.refunds.record_owed(
+            resource_path=f"/v1/vm/{vm_id}/extend",
+            payer=(settled.payer_wallet if settled is not None else None)
+            or owner_wallet
+            or "unknown",
+            amount=settled.amount_usd if settled is not None else charged_amount,
+            network=settled.network if settled is not None else None,
+            asset=settled.asset if settled is not None else None,
+            original_tx=payment_tx,
+            reason=reason,
+            vm_id=vm_id,
+        )
+
     async def _record_native_refund(self, vm_id: str, *, reason: str) -> bool:
         """Transition a failed native-intent VM's intent to REFUND_MANUAL and
         record the owed refund. Returns False when no native intent is linked to

@@ -137,6 +137,7 @@ def _audit(
     target_id: str | None = None,
     reason: str | None = None,
     details: dict[str, Any] | None = None,
+    succeeded: bool = True,
 ) -> AdminAuditRow:
     row = AdminAuditRow(
         audit_id=str(uuid.uuid4()),
@@ -146,6 +147,7 @@ def _audit(
         target_id=target_id,
         reason=reason,
         details=details,
+        succeeded=succeeded,
         ip_prefix_hash=derive_ip_prefix_hash(_client_ip(request)),
     )
     session.add(row)
@@ -320,6 +322,7 @@ async def step_up(
                 account,
                 "admin.step_up_failed",
                 target_type="session",
+                succeeded=False,
             )
             await session.commit()
             raise HTTPException(401, "Password is incorrect")
@@ -1024,15 +1027,69 @@ async def vm_action(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     orch = state.orchestrator
+    if action == "start":
+        # Account disable and its resource worker retain this same account row
+        # lock as their state fence. Holding it through provider dispatch keeps
+        # a start from clearing an account-disabled suspension written by a
+        # concurrent worker.
+        async with _factory(state)() as session:
+            snapshot = await session.get(VMRow, vm_id)
+            if snapshot is None:
+                raise HTTPException(404, "VM not found")
+            owner_account_id = snapshot.owner_account_id
+            owner = None
+            if owner_account_id is not None:
+                owner = (
+                    await session.execute(
+                        select(AccountRow)
+                        .where(AccountRow.account_id == owner_account_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if owner is None or owner.disabled_at is not None:
+                    raise HTTPException(
+                        409,
+                        "Account-disabled VMs must be resumed through account enable",
+                    )
+            current = (
+                await session.execute(
+                    select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if current is None:
+                raise HTTPException(404, "VM not found")
+            if current.owner_account_id != owner_account_id:
+                raise HTTPException(409, "VM ownership changed; retry the action")
+            if current.expires_at is not None and _aware(current.expires_at) <= _now():
+                raise HTTPException(409, "Expired VMs cannot be started")
+            if current.suspension_reason == "account_disabled":
+                raise HTTPException(
+                    409,
+                    "Account-disabled VMs must be resumed through account enable",
+                )
+            if not current.xcpng_uuid:
+                raise HTTPException(409, "VM has no provider instance")
+            await _audit_before_dispatch(
+                state,
+                request,
+                actor,
+                "vm.start",
+                target_type="vm",
+                target_id=vm_id,
+                reason=body.reason,
+            )
+            await orch.xcpng.start_vm(current.xcpng_uuid)
+            current.status = VMStatus.RUNNING
+            current.suspension_reason = None
+            current.suspended_by_account_id = None
+            await session.commit()
+        return {"vm_id": vm_id, "action": action, "status": "accepted"}
+
     async with _factory(state)() as session:
         row = await session.get(VMRow, vm_id)
         if row is None:
             raise HTTPException(404, "VM not found")
         xcpng_uuid = row.xcpng_uuid
-        if action == "start" and row.expires_at is not None and _aware(row.expires_at) <= _now():
-            raise HTTPException(409, "Expired VMs cannot be started")
-        if action == "start" and row.suspension_reason == "account_disabled":
-            raise HTTPException(409, "Account-disabled VMs must be resumed through account enable")
         if action not in {"reboot", "destroy"} and not xcpng_uuid:
             raise HTTPException(409, "VM has no provider instance")
     await _audit_before_dispatch(
@@ -1052,18 +1109,16 @@ async def vm_action(
             raise HTTPException(409, "VM cannot be destroyed")
     else:
         assert xcpng_uuid is not None
-        if action == "start":
-            await orch.xcpng.start_vm(xcpng_uuid)
-        elif action == "shutdown":
+        if action == "shutdown":
             await orch.xcpng.shutdown_vm(xcpng_uuid)
         else:
             await orch.xcpng.suspend_vm(xcpng_uuid)
         async with _factory(state)() as session:
             current = await session.get(VMRow, vm_id)
             if current is not None:
-                current.status = VMStatus.RUNNING if action == "start" else VMStatus.SUSPENDED
-                current.suspension_reason = None if action == "start" else "manual_admin"
-                current.suspended_by_account_id = None if action == "start" else actor.account_id
+                current.status = VMStatus.SUSPENDED
+                current.suspension_reason = "manual_admin"
+                current.suspended_by_account_id = actor.account_id
                 await session.commit()
     return {"vm_id": vm_id, "action": action, "status": "accepted"}
 
@@ -1198,6 +1253,8 @@ async def transfer_vm(
         ).scalar_one_or_none()
         if vm is None:
             raise HTTPException(404, "VM not found")
+        if str(vm.status) == VMStatus.PROVISIONING.value:
+            raise HTTPException(409, "Provisioning VMs cannot be transferred")
         domain = (
             await session.execute(
                 select(DomainRow).where(DomainRow.vm_id == vm_id).with_for_update()
@@ -1256,10 +1313,7 @@ async def transfer_domain(
             raise HTTPException(404, "Domain not found")
         if await _pending_domain_work(session, fqdn=fqdn, vm_id=domain.vm_id):
             raise HTTPException(409, "Domain has a pending operation")
-        previous_account_id = domain.owner_account_id
-        domain.owner_account_id = body.target_account_id
-        domain.owner_wallet = new_owner_wallet
-        domain.anon_management_token_hash = None
+        vm = None
         if domain.vm_id:
             attached_vm_id = domain.vm_id
             vm = (
@@ -1267,10 +1321,16 @@ async def transfer_domain(
                     select(VMRow).where(VMRow.vm_id == domain.vm_id).with_for_update()
                 )
             ).scalar_one_or_none()
-            if vm is not None:
-                vm.owner_account_id = body.target_account_id
-                vm.owner_wallet = new_owner_wallet
-                vm.anon_management_token_hash = None
+            if vm is not None and str(vm.status) == VMStatus.PROVISIONING.value:
+                raise HTTPException(409, "Provisioning VMs cannot be transferred")
+        previous_account_id = domain.owner_account_id
+        domain.owner_account_id = body.target_account_id
+        domain.owner_wallet = new_owner_wallet
+        domain.anon_management_token_hash = None
+        if vm is not None:
+            vm.owner_account_id = body.target_account_id
+            vm.owner_wallet = new_owner_wallet
+            vm.anon_management_token_hash = None
         _audit(
             session,
             request,

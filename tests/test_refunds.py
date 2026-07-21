@@ -10,12 +10,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from hyrule_cloud.api.routes import extend_vm as extend_vm_route
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
     AccountRow,
@@ -31,6 +34,7 @@ from hyrule_cloud.models import (
     CryptoIntentStatus,
     QuoteStatus,
     VMCreateRequest,
+    VMExtendRequest,
     VMSize,
     VMStatus,
 )
@@ -105,6 +109,59 @@ async def test_refund_service_skips_when_unpaid(session_factory) -> None:
         is False
     )
     assert await _events(session_factory) == []
+
+
+@pytest.mark.asyncio
+async def test_extension_rejected_after_settlement_records_refund(
+    session_factory,
+    monkeypatch,
+) -> None:
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+    monkeypatch.setattr(orch, "extend_vm", AsyncMock(return_value=None))
+
+    class SettlingGate:
+        async def check_payment(self, request, **_kwargs):
+            request.state.payment_tx = "0xEXTENSION_SETTLED"
+            return EVM_WALLET
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/vm/vm_extension_refund/extend",
+            "headers": [],
+        }
+    )
+    row = VMRow(
+        vm_id="vm_extension_refund",
+        owner_wallet=EVM_WALLET,
+        status=VMStatus.SUSPENDED,
+        size=VMSize.XS,
+        expires_at=datetime.now(UTC) + timedelta(days=1),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await extend_vm_route(
+            "vm_extension_refund",
+            VMExtendRequest(days=3),
+            request,
+            row,
+            orch,
+            cfg,
+            SettlingGate(),
+        )
+
+    assert exc.value.status_code == 409
+    events = await _events(session_factory)
+    assert len(events) == 1
+    event = events[0]
+    assert event.event_type == "refund_owed"
+    assert event.resource_path == "/v1/vm/vm_extension_refund/extend"
+    assert event.payer_wallet == EVM_WALLET
+    assert event.amount_usd == Decimal("0.60")
+    assert event.tx_hash == "0xEXTENSION_SETTLED"
+    assert event.error_reason == "vm_extension_rejected_post_settlement"
 
 
 def _paid_provisioning_vm(vm_id: str, *, wallet: str, tx: str | None, cost: str) -> VMRow:
