@@ -1034,7 +1034,11 @@ def _key_summary(row) -> ApiKeySummary:
     )
 
 
-@router.get("/me/api-keys", response_model=ApiKeyListResponse)
+@router.get(
+    "/me/api-keys",
+    response_model=ApiKeyListResponse,
+    openapi_extra={"x-hyrule-required-api-key-scopes": ["api_keys:read"]},
+)
 async def list_api_keys(
     request: Request,
     account: AccountRow = Depends(require_account),
@@ -1059,7 +1063,11 @@ async def list_api_keys(
     return ApiKeyListResponse(keys=[_key_summary(r) for r in rows])
 
 
-@router.post("/me/api-keys", response_model=ApiKeyCreateResponse)
+@router.post(
+    "/me/api-keys",
+    response_model=ApiKeyCreateResponse,
+    openapi_extra={"x-hyrule-required-api-key-scopes": ["api_keys:write"]},
+)
 async def create_api_key_endpoint(
     body: ApiKeyCreateRequest,
     request: Request,
@@ -1109,7 +1117,10 @@ async def create_api_key_endpoint(
     return ApiKeyCreateResponse(api_key=cleartext, key=_key_summary(row))
 
 
-@router.delete("/me/api-keys/{key_id}")
+@router.delete(
+    "/me/api-keys/{key_id}",
+    openapi_extra={"x-hyrule-required-api-key-scopes": ["api_keys:write"]},
+)
 async def revoke_api_key_endpoint(
     key_id: str,
     request: Request,

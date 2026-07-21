@@ -202,6 +202,15 @@ def test_full_openapi_documents_account_and_worker_authentication() -> None:
     assert schema["paths"]["/v1/domains/{domain}/nameservers"]["put"][
         "x-hyrule-required-api-key-scopes"
     ] == ["domain:nameservers"]
+    assert schema["paths"]["/v1/me/api-keys"]["get"]["x-hyrule-required-api-key-scopes"] == [
+        "api_keys:read"
+    ]
+    assert schema["paths"]["/v1/me/api-keys"]["post"]["x-hyrule-required-api-key-scopes"] == [
+        "api_keys:write"
+    ]
+    assert schema["paths"]["/v1/me/api-keys/{key_id}"]["delete"][
+        "x-hyrule-required-api-key-scopes"
+    ] == ["api_keys:write"]
     assert "security" not in schema["paths"]["/v1/auth/login"]["post"]
 
 
