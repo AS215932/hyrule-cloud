@@ -16,10 +16,12 @@ from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
 from hyrule_cloud.domains.service import DomainService
 from hyrule_cloud.logging_config import SAFE_DICT_TRACEBACKS
 from hyrule_cloud.mail.service import MailService
+from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
 from hyrule_cloud.services.intents import scan_pending_intents
+from hyrule_cloud.services.payments_ledger import PaymentLedger
 
 structlog.configure(
     processors=[
@@ -41,6 +43,11 @@ async def run_worker() -> None:
     engine = create_db_engine(config.database_url)
     await init_db(engine)
     sessions = create_session_factory(engine)
+    payment_gate = PaymentGate(
+        config.payment,
+        public_base_url=config.public_base_url,
+        ledger=PaymentLedger(sessions),
+    )
     orchestrator = Orchestrator(config, sessions)
     rates = RateProvider()
     native = NativeCryptoProvider(config.payment)
@@ -101,11 +108,11 @@ async def run_worker() -> None:
                 next_intents = now + timedelta(seconds=15)
             if now >= next_payment_handoffs:
                 try:
-                    await domains.recover_x402_handoffs()
+                    await domains.recover_x402_handoffs(gate=payment_gate)
                 except Exception:
                     log.exception("domain_payment_handoff_recovery_failed")
                 try:
-                    await mail.recover_x402_handoffs()
+                    await mail.recover_x402_handoffs(gate=payment_gate)
                 except Exception:
                     log.exception("mail_payment_handoff_recovery_failed")
                 try:

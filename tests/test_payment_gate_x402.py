@@ -42,9 +42,7 @@ def _request(
     *,
     path: str = "/v1/vm/create",
 ) -> Request:
-    raw_headers = [
-        (k.lower().encode(), v.encode()) for k, v in (headers or {}).items()
-    ]
+    raw_headers = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     return Request(
         {
             "type": "http",
@@ -167,6 +165,16 @@ class _FailingInitServer(_FakeServer):
         raise RuntimeError("facilitator down")
 
 
+class _IndeterminateSettlementServer(_FakeServer):
+    async def settle_payment(
+        self,
+        payload: PaymentPayload,
+        requirements: PaymentRequirements,
+    ) -> SettleResponse:
+        self.settle_payment_calls += 1
+        raise TimeoutError("facilitator response was lost")
+
+
 def _gate(server: _FakeServer, public_base_url: str = "") -> PaymentGate:
     gate = PaymentGate(
         PaymentConfig(
@@ -223,7 +231,9 @@ def test_unknown_facilitator_host_is_rejected() -> None:
         "https://pay.openfacilitator.io",
     ],
 )
-def test_non_cdp_facilitator_does_not_attach_cdp_auth(monkeypatch: pytest.MonkeyPatch, facilitator_url: str) -> None:
+def test_non_cdp_facilitator_does_not_attach_cdp_auth(
+    monkeypatch: pytest.MonkeyPatch, facilitator_url: str
+) -> None:
     monkeypatch.setenv("CDP_API_KEY_ID", "organizations/test/apiKeys/key-id")
     monkeypatch.setenv("CDP_API_KEY_SECRET", "not-used-for-public-facilitator")
 
@@ -415,6 +425,36 @@ async def test_settlement_failure_returns_402_with_payment_response_headers() ->
     assert result.status_code == 402
     assert PAYMENT_RESPONSE_HEADER in result.headers
     assert X_PAYMENT_RESPONSE_HEADER in result.headers
+
+
+@pytest.mark.asyncio
+async def test_reconcile_settlement_replays_stored_single_use_authorization() -> None:
+    server = _FakeServer()
+    gate = _gate(server)
+
+    recovered = await gate.reconcile_settlement(
+        _payment_header(server.requirements[0]),
+        Decimal("0.05"),
+    )
+
+    assert recovered is not None
+    assert recovered.payer == PAYER
+    assert recovered.tx_hash == "0xSETTLED"
+    assert recovered.network == "eip155:8453"
+    assert recovered.asset == ASSET
+    assert server.settle_payment_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_settlement_timeout_marks_outcome_indeterminate() -> None:
+    server = _IndeterminateSettlementServer()
+    request = _request({PAYMENT_SIGNATURE_HEADER: _payment_header(server.requirements[0])})
+    gate = _gate(server)
+    verified = await gate.verify_only(request, Decimal("0.05"), "VM creation")
+
+    assert not isinstance(verified, Response)
+    assert await gate.settle_verified(request, verified) is False
+    assert request.state.payment_settlement_indeterminate is True
 
 
 @pytest.mark.asyncio

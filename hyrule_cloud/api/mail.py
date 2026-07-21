@@ -12,8 +12,6 @@ from typing import Annotated
 
 import structlog
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
-from x402.http import decode_payment_signature_header
-from x402.mechanisms.evm.types import ExactEIP3009Payload
 
 from hyrule_cloud.mail.models import (
     MailAccountCreateRequest,
@@ -35,46 +33,30 @@ from hyrule_cloud.mail.models import (
     StalwartEventEnvelope,
 )
 from hyrule_cloud.mail.service import MailProblem, MailService
-from hyrule_cloud.middleware.x402 import PaymentGate
+from hyrule_cloud.middleware.x402 import PaymentGate, canonical_payment_authorization
 from hyrule_cloud.state import AppState, get_app_state
 
 router = APIRouter(prefix="/v1/mail", tags=["agent-mail"])
 internal_router = APIRouter(prefix="/v1/internal/mail", tags=["internal"], include_in_schema=False)
 log = structlog.get_logger().bind(component="agent_mail_api")
 
+
+def _mail_payment_authorization(request: Request) -> str | None:
+    return request.headers.get("payment-signature") or request.headers.get("x-payment")
+
+
 def _mail_payment_authorization_fingerprint(request: Request) -> str | None:
-    supplied = request.headers.get("payment-signature") or request.headers.get("x-payment")
+    supplied = _mail_payment_authorization(request)
     if not supplied:
         return None
     try:
-        payment = decode_payment_signature_header(supplied)
-        evm = ExactEIP3009Payload.from_dict(payment.payload)
-        authorization = evm.authorization
-        accepted = getattr(payment, "accepted", None)
-        canonical = json.dumps(
-            {
-                "network": str(payment.get_network()).lower(),
-                "asset": str(getattr(accepted, "asset", "")).lower(),
-                "authorization": {
-                    "from": authorization.from_address.lower(),
-                    "to": authorization.to.lower(),
-                    "value": str(int(authorization.value)),
-                    "validAfter": str(int(authorization.valid_after)),
-                    "validBefore": str(int(authorization.valid_before)),
-                    "nonce": authorization.nonce.lower(),
-                },
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode()
+        return canonical_payment_authorization(supplied).fingerprint
     except (TypeError, ValueError) as exc:
         raise MailProblem(
             400,
             "payment_authorization_invalid",
             "The payment authorization could not be decoded.",
         ) from exc
-    return hashlib.sha256(canonical).hexdigest()
 
 
 async def get_mail(state: AppState = Depends(get_app_state)) -> MailService:
@@ -192,19 +174,22 @@ async def create_account(
         fingerprint = _mail_payment_authorization_fingerprint(request)
         if fingerprint is not None:
             await service.bind_payment_authorization(fingerprint, body.quote_id)
-        await service.reserve_activation_capacity(
-            account.mailbox_id, quote_id=body.quote_id
-        )
+        await service.reserve_activation_capacity(account.mailbox_id, quote_id=body.quote_id)
         await service.begin_activation_settlement(
             account.mailbox_id,
             body.quote_id,
             payer=verified.payer or "unknown",
             payment_network=getattr(verified.matching_requirements, "network", None),
             payment_asset=getattr(verified.matching_requirements, "asset", None),
+            payment_authorization=_mail_payment_authorization(request),
         )
-        if not await gate.settle_verified(
-            request, verified, extra_body=payment_metadata
-        ):
+        if not await gate.settle_verified(request, verified, extra_body=payment_metadata):
+            if getattr(request.state, "payment_settlement_indeterminate", False):
+                raise MailProblem(
+                    503,
+                    "mail_payment_settlement_pending",
+                    "Payment outcome is being reconciled; retry this activation later.",
+                )
             await service.clear_activation_settlement(account.mailbox_id, body.quote_id)
             await service.release_activation_capacity(account.mailbox_id)
             raise MailProblem(
@@ -302,6 +287,7 @@ async def send_message(
     service: MailService = Depends(get_mail),
     gate: PaymentGate = Depends(get_gate),
 ) -> MailSendResponse | Response:
+    service.require_launch()
     quote = await service.get_quote(body.quote_id)
     if quote.kind != "send":
         raise MailProblem(422, "wrong_quote_kind", "A send quote is required.")
@@ -328,9 +314,7 @@ async def send_message(
             "mail_payment_settlement_pending",
             "The message was accepted, but payment did not settle; retry this same quote.",
         )
-    await service.attribute_send_payment(
-        result.send_id, getattr(request.state, "payment_tx", None)
-    )
+    await service.attribute_send_payment(result.send_id, getattr(request.state, "payment_tx", None))
     return result
 
 

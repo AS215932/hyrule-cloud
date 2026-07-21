@@ -94,7 +94,8 @@ class MailPricingResponse(BaseModel):
     activation_usd: str
     outbound_message_usd: str
     inbound_usd: str = "0.00"
-    storage_gb: int = 1
+    storage_gb: float
+    storage_bytes: int
     active_days: int = 30
     grace_days: int = 7
     auto_renew: bool = False

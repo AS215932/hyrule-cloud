@@ -172,6 +172,10 @@ class MailService:
         ready = self.mail_config.public_ready
         constraints = [
             "API-only submission and retrieval; no public SMTP submission, IMAP, or webmail",
+            (
+                f"{self.mail_config.active_days}-day activation; "
+                f"{self._storage_quota_label()} mailbox storage"
+            ),
             f"one recipient, {self.mail_config.mailbox_send_limit_per_day} outbound/day",
             f"{self.mail_config.mailbox_new_recipient_limit_per_day} new recipients/day",
             "outbound attachments disabled; inbound attachments retained",
@@ -194,7 +198,10 @@ class MailService:
                     id="agent-mail-custom",
                     title="Agent mailbox on a Hyrule-managed domain",
                     price_usd=amount(self.config.payment.price_mail_activation),
-                    billing="domain quote plus activation; no auto-renew",
+                    billing=(
+                        f"{self.mail_config.active_days} days; "
+                        "domain quote plus activation; no auto-renew"
+                    ),
                     available=ready and self.config.domain.agent_purchases_enabled,
                     constraints=constraints,
                 ),
@@ -202,7 +209,10 @@ class MailService:
                     id="agent-mail-domain-bundle",
                     title="Hyrule-managed domain and Agent Mail mailbox",
                     price_usd=amount(self.config.payment.price_mail_activation),
-                    billing="live domain quote plus activation; no auto-renew",
+                    billing=(
+                        f"{self.mail_config.active_days} days; "
+                        "live domain quote plus activation; no auto-renew"
+                    ),
                     available=ready and self.config.domain.agent_purchases_enabled,
                     constraints=constraints,
                 ),
@@ -213,6 +223,8 @@ class MailService:
         return MailPricingResponse(
             activation_usd=amount(self.config.payment.price_mail_activation),
             outbound_message_usd=amount(self.config.payment.price_mail_send),
+            storage_gb=float(Decimal(self.mail_config.storage_quota_bytes) / Decimal(1024**3)),
+            storage_bytes=self.mail_config.storage_quota_bytes,
             active_days=self.mail_config.active_days,
             grace_days=self.mail_config.grace_days,
         )
@@ -233,6 +245,7 @@ class MailService:
         domain = body.domain or self.mail_config.hosted_domain
         address = f"{body.local_part}@{domain}"
         domain_quote_id: str | None = None
+        domain_authority_hash: str | None = None
         domain_amount = Decimal("0")
         activation_amount = Decimal(self.config.payment.price_mail_activation)
 
@@ -244,7 +257,11 @@ class MailService:
                 headers={"Retry-After": "3600"},
             )
         if body.mode is MailboxMode.CUSTOM:
-            await self._assert_managed_domain_token(domain, body.domain_management_token or "")
+            managed_domain = await self._assert_managed_domain_token(
+                domain,
+                body.domain_management_token or "",
+            )
+            domain_authority_hash = managed_domain.anon_management_token_hash
         elif body.mode is MailboxMode.DOMAIN_AND_MAILBOX:
             if body.domain_terms_version != self.config.domain.terms_version:
                 raise MailProblem(
@@ -285,9 +302,7 @@ class MailService:
                         "The MVP supports one Agent Mail mailbox per custom domain.",
                     )
             active_count = await session.scalar(
-                select(func.count())
-                .select_from(MailAccountRow)
-                .where(_mailbox_occupies_capacity())
+                select(func.count()).select_from(MailAccountRow).where(_mailbox_occupies_capacity())
             )
             if int(active_count or 0) >= self.mail_config.max_active_mailboxes:
                 raise MailProblem(
@@ -300,6 +315,7 @@ class MailService:
                 "address": address,
                 "mode": body.mode.value,
                 "domain_quote_id": domain_quote_id,
+                "domain_authority_hash": domain_authority_hash,
                 "domain_terms_version": body.domain_terms_version,
                 "activation_amount_usd": str(activation_amount),
             }
@@ -399,6 +415,11 @@ class MailService:
 
         token = "hyr_identity_" + secrets.token_urlsafe(32)
         mode = MailboxMode(payload["mode"])
+        if mode is MailboxMode.CUSTOM:
+            await self._assert_managed_domain_authority(
+                str(payload["domain"]),
+                str(payload.get("domain_authority_hash") or ""),
+            )
         activation_amount = Decimal(str(payload["activation_amount_usd"]))
         domain_order_id: str | None = None
         if mode is MailboxMode.DOMAIN_AND_MAILBOX:
@@ -433,6 +454,11 @@ class MailService:
             domain=str(payload["domain"]),
             local_part=str(payload["local_part"]),
             domain_order_id=domain_order_id,
+            domain_authority_hash=(
+                str(payload.get("domain_authority_hash"))
+                if payload.get("domain_authority_hash")
+                else None
+            ),
             quote_id=quote_id,
             idempotency_hash=idem_hash,
             terms_version=quote.terms_version,
@@ -507,6 +533,7 @@ class MailService:
                     "domain",
                     "local_part",
                     "domain_order_id",
+                    "domain_authority_hash",
                     "quote_id",
                     "idempotency_hash",
                     "terms_version",
@@ -532,6 +559,7 @@ class MailService:
                 deleted_account.payment_asset = None
                 deleted_account.payment_settlement_pending_at = None
                 deleted_account.payment_settled_at = None
+                deleted_account.payment_authorization_header = None
                 mailbox = deleted_account
             try:
                 await session.commit()
@@ -613,6 +641,21 @@ class MailService:
                         "domain_mailbox_exists",
                         "The MVP supports one Agent Mail mailbox per custom domain.",
                     )
+            if row.plan == MailboxMode.CUSTOM.value:
+                authority = (
+                    await session.execute(
+                        select(DomainRow).where(DomainRow.fqdn == row.domain).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if not self._domain_authority_matches(
+                    authority,
+                    row.domain_authority_hash,
+                ):
+                    raise MailProblem(
+                        409,
+                        "managed_domain_authority_changed",
+                        "The managed-domain capability changed; create a new quote.",
+                    )
             if recoverable_expiry:
                 row.status = MailboxStatus.AWAITING_PAYMENT.value
                 row.provision_error = None
@@ -635,6 +678,7 @@ class MailService:
         payer: str,
         payment_network: str | None,
         payment_asset: str | None,
+        payment_authorization: str | None = None,
     ) -> MailAccountRow:
         """Persist an activation settlement intent before money can move."""
 
@@ -664,27 +708,21 @@ class MailService:
                 row.owner_wallet = payer[:64]
                 row.payment_network = payment_network
                 row.payment_asset = payment_asset
-                row.payment_settlement_pending_at = (
-                    row.payment_settlement_pending_at or _now()
-                )
+                row.payment_authorization_header = payment_authorization
+                row.payment_settlement_pending_at = row.payment_settlement_pending_at or _now()
                 await session.commit()
             return row
 
-    async def clear_activation_settlement(
-        self, mailbox_id: str, quote_id: str
-    ) -> None:
+    async def clear_activation_settlement(self, mailbox_id: str, quote_id: str) -> None:
         """Clear a pre-settlement intent after a definitive failed settlement."""
 
         async with self.db() as session:
             row = await session.get(MailAccountRow, mailbox_id)
-            if (
-                row is not None
-                and row.quote_id == quote_id
-                and row.payment_settled_at is None
-            ):
+            if row is not None and row.quote_id == quote_id and row.payment_settled_at is None:
                 row.owner_wallet = None
                 row.payment_network = None
                 row.payment_asset = None
+                row.payment_authorization_header = None
                 row.payment_settlement_pending_at = None
                 await session.commit()
 
@@ -729,14 +767,13 @@ class MailService:
             row.payment_tx = tx_hash
             row.payment_network = payment_network
             row.payment_asset = payment_asset
+            row.payment_authorization_header = None
             row.payment_settlement_pending_at = None
             row.payment_settled_at = row.payment_settled_at or _now()
             await session.commit()
             return row
 
-    async def bind_payment_authorization(
-        self, fingerprint: str, quote_id: str
-    ) -> None:
+    async def bind_payment_authorization(self, fingerprint: str, quote_id: str) -> None:
         """Bind one verified authorization to exactly one mail quote forever."""
 
         async with self.db() as session:
@@ -752,9 +789,7 @@ class MailService:
                 return
             except IntegrityError:
                 await session.rollback()
-            existing_fingerprint = await session.get(
-                MailPaymentAuthorizationRow, fingerprint
-            )
+            existing_fingerprint = await session.get(MailPaymentAuthorizationRow, fingerprint)
             if existing_fingerprint is not None:
                 if existing_fingerprint.quote_id == quote_id:
                     return
@@ -849,6 +884,7 @@ class MailService:
                 row.payment_tx = tx_hash
                 row.payment_network = payment_network
                 row.payment_asset = payment_asset
+                row.payment_authorization_header = None
                 row.payment_settlement_pending_at = None
                 row.payment_settled_at = row.payment_settled_at or _now()
                 row.capacity_reserved_at = None
@@ -882,6 +918,7 @@ class MailService:
         return self._account_response(row)
 
     async def create_send_quote(self, body: MailSendQuoteRequest, token: str) -> MailQuoteResponse:
+        self.require_launch()
         row = await self._authorized_account(body.mailbox_id, token)
         self._assert_sendable(row)
         if len(body.subject) > self.mail_config.max_subject_chars:
@@ -894,9 +931,7 @@ class MailService:
         sanitized_html = sanitize_html(body.html)
         reply_reference: str | None = None
         if body.in_reply_to:
-            reply_reference = await self._resolve_reply_reference(
-                row, body.in_reply_to, body.to
-            )
+            reply_reference = await self._resolve_reply_reference(row, body.in_reply_to, body.to)
         payload = body.model_dump()
         payload["html"] = sanitized_html
         payload["in_reply_to"] = reply_reference
@@ -921,6 +956,7 @@ class MailService:
         return self._quote_response(quote)
 
     async def deliver_send(self, quote_id: str, token: str) -> MailSendResponse:
+        self.require_launch()
         async with self.db() as session:
             quote = await session.get(MailQuoteRow, quote_id)
             if quote is None or quote.kind != "send" or not quote.mailbox_id:
@@ -936,9 +972,7 @@ class MailService:
             return self._send_response(send)
         return await self._submit_send_intent(send.send_id)
 
-    async def settled_send_response(
-        self, quote_id: str, token: str
-    ) -> MailSendResponse | None:
+    async def settled_send_response(self, quote_id: str, token: str) -> MailSendResponse | None:
         """Return an already-paid send without asking the payer to settle again."""
 
         async with self.db() as session:
@@ -948,9 +982,7 @@ class MailService:
             account = await session.get(MailAccountRow, quote.mailbox_id)
             if account is None or not self._token_matches(account, token):
                 raise MailProblem(404, "mail_quote_not_found", "Mail send quote not found.")
-            send = await session.scalar(
-                select(MailSendRow).where(MailSendRow.quote_id == quote_id)
-            )
+            send = await session.scalar(select(MailSendRow).where(MailSendRow.quote_id == quote_id))
             if send is None or send.status != "accepted":
                 return None
             if send.payment_tx:
@@ -1073,9 +1105,7 @@ class MailService:
                         )
                     )
                 )
-                new_count = len(
-                    new_recipients_today | (pending_recipients - known_recipients)
-                )
+                new_count = len(new_recipients_today | (pending_recipients - known_recipients))
                 if new_count >= self.mail_config.mailbox_new_recipient_limit_per_day:
                     raise MailProblem(
                         429,
@@ -1492,9 +1522,7 @@ class MailService:
     ) -> MailWebhookResponse:
         account = await self._authorized_account(mailbox_id, token)
         if account.status != MailboxStatus.ACTIVE.value:
-            raise MailProblem(
-                409, "mailbox_not_active", "Webhooks require an active mailbox."
-            )
+            raise MailProblem(409, "mailbox_not_active", "Webhooks require an active mailbox.")
         try:
             url, _addresses = await validate_webhook_url(body.url)
         except ValueError as exc:
@@ -1524,9 +1552,7 @@ class MailService:
                 )
             ).scalar_one_or_none()
             if locked_account is None or locked_account.status != MailboxStatus.ACTIVE.value:
-                raise MailProblem(
-                    409, "mailbox_not_active", "Webhooks require an active mailbox."
-                )
+                raise MailProblem(409, "mailbox_not_active", "Webhooks require an active mailbox.")
             active_count = int(
                 await session.scalar(
                     select(func.count())
@@ -1830,8 +1856,7 @@ class MailService:
             for row in active:
                 row.status = MailboxStatus.GRACE.value
                 row.grace_ends_at = row.grace_ends_at or (
-                    (_aware(row.expires_at) or now)
-                    + timedelta(days=self.mail_config.grace_days)
+                    (_aware(row.expires_at) or now) + timedelta(days=self.mail_config.grace_days)
                 )
                 changed += 1
             await session.commit()
@@ -1936,8 +1961,7 @@ class MailService:
             async with self.db() as session:
                 current = await session.get(MailAccountRow, row.mailbox_id)
                 if current is not None and (
-                    current.dns_cleanup_pending
-                    or current.provision_error == "dns_cleanup_pending"
+                    current.dns_cleanup_pending or current.provision_error == "dns_cleanup_pending"
                 ):
                     current.dns_cleanup_pending = False
                     if current.provision_error == "dns_cleanup_pending":
@@ -1991,8 +2015,7 @@ class MailService:
                                 PaymentEventRow.resource_path == "/v1/mail/accounts",
                                 PaymentEventRow.extra["mailbox_id"].as_string()
                                 == account.mailbox_id,
-                                PaymentEventRow.extra["quote_id"].as_string()
-                                == account.quote_id,
+                                PaymentEventRow.extra["quote_id"].as_string() == account.quote_id,
                             )
                             .limit(1)
                         )
@@ -2016,13 +2039,61 @@ class MailService:
             await session.commit()
         return result
 
-    async def recover_x402_handoffs(self, *, limit: int = 200) -> int:
+    async def recover_x402_handoffs(
+        self,
+        *,
+        gate: Any | None = None,
+        limit: int = 200,
+    ) -> int:
         """Replay settled activation payments whose state handoff was lost."""
 
         if limit < 1:
             return 0
         recovered = 0
         seen: set[tuple[str, str]] = set()
+        if gate is not None:
+            async with self.db() as session:
+                pending = list(
+                    await session.scalars(
+                        select(MailAccountRow)
+                        .where(
+                            MailAccountRow.status == MailboxStatus.AWAITING_PAYMENT.value,
+                            MailAccountRow.payment_settlement_pending_at.is_not(None),
+                            MailAccountRow.payment_settled_at.is_(None),
+                            MailAccountRow.payment_authorization_header.is_not(None),
+                        )
+                        .order_by(MailAccountRow.payment_settlement_pending_at)
+                        .limit(limit)
+                    )
+                )
+            for pending_account in pending:
+                if (
+                    not pending_account.quote_id
+                    or pending_account.total_amount_usd is None
+                    or not pending_account.payment_authorization_header
+                ):
+                    continue
+                try:
+                    settlement = await gate.reconcile_settlement(
+                        pending_account.payment_authorization_header,
+                        Decimal(pending_account.total_amount_usd),
+                    )
+                    if settlement is None:
+                        continue
+                    await self.record_activation_settlement(
+                        pending_account.mailbox_id,
+                        pending_account.quote_id,
+                        payer=settlement.payer,
+                        tx_hash=settlement.tx_hash,
+                        payment_network=settlement.network,
+                        payment_asset=settlement.asset,
+                    )
+                except Exception:
+                    log.warning(
+                        "mail_payment_authorization_reconciliation_deferred",
+                        mailbox_id=pending_account.mailbox_id,
+                        exc_info=True,
+                    )
         async with self.db() as session:
             durable = list(
                 await session.scalars(
@@ -2220,9 +2291,7 @@ class MailService:
             completed += 1
         return completed
 
-    async def _claim_provisioning(
-        self, mailbox_id: str
-    ) -> tuple[MailAccountRow, str, str] | None:
+    async def _claim_provisioning(self, mailbox_id: str) -> tuple[MailAccountRow, str, str] | None:
         """Lease one provisioning row before any external backend write."""
 
         now = _now()
@@ -2270,9 +2339,7 @@ class MailService:
             await session.commit()
             return row, claim_token, password
 
-    async def _defer_incomplete_dns(
-        self, mailbox_id: str, claim_token: str, reason: str
-    ) -> bool:
+    async def _defer_incomplete_dns(self, mailbox_id: str, claim_token: str, reason: str) -> bool:
         """Record a visible bounded DNS retry, refunding after exhaustion."""
 
         exhausted = False
@@ -2326,6 +2393,11 @@ class MailService:
         claim_token: str,
         password: str,
     ) -> bool:
+        if row.plan == MailboxMode.CUSTOM.value:
+            await self._assert_managed_domain_authority(
+                str(row.domain),
+                str(row.domain_authority_hash or ""),
+            )
         domain_id, records = await self.backend.ensure_domain(str(row.domain))
         backend_id = await self.backend.ensure_account(
             address=row.address,
@@ -2564,6 +2636,40 @@ class MailService:
             raise MailProblem(404, "managed_domain_not_found", "Managed domain not found.")
         return row
 
+    @staticmethod
+    def _domain_authority_matches(
+        row: DomainRow | None,
+        expected_hash: str | None,
+    ) -> bool:
+        return bool(
+            row is not None
+            and str(row.status) in {DomainStatus.ACTIVE.value, DomainStatus.RENEWAL_DUE.value}
+            and expected_hash
+            and row.anon_management_token_hash
+            and secrets.compare_digest(row.anon_management_token_hash, expected_hash)
+        )
+
+    async def _assert_managed_domain_authority(
+        self,
+        domain: str,
+        expected_hash: str,
+    ) -> DomainRow:
+        async with self.db() as session:
+            row = await session.scalar(select(DomainRow).where(DomainRow.fqdn == domain))
+        if not self._domain_authority_matches(row, expected_hash):
+            raise MailProblem(
+                409,
+                "managed_domain_authority_changed",
+                "The managed-domain capability changed; create a new quote.",
+            )
+        assert row is not None
+        return row
+
+    def _storage_quota_label(self) -> str:
+        storage_gib = Decimal(self.mail_config.storage_quota_bytes) / Decimal(1024**3)
+        rendered = format(storage_gib.normalize(), "f")
+        return f"{rendered} GiB ({self.mail_config.storage_quota_bytes} bytes)"
+
     async def _resolve_reply_reference(
         self, account: MailAccountRow, message_id: str, recipient: str
     ) -> str:
@@ -2598,7 +2704,11 @@ class MailService:
         raw_message_ids = payload.get("messageId")
         message_ids = raw_message_ids if isinstance(raw_message_ids, list) else [raw_message_ids]
         reference = next(
-            (str(value).strip() for value in message_ids if isinstance(value, str) and value.strip()),
+            (
+                str(value).strip()
+                for value in message_ids
+                if isinstance(value, str) and value.strip()
+            ),
             "",
         )
         if not reference:
@@ -2702,7 +2812,11 @@ class MailService:
             constraints=(
                 ["one recipient", "no CC/BCC", "no outbound attachments"]
                 if row.kind == "send"
-                else ["30 days", "1 GB", "no auto-renew"]
+                else [
+                    f"{self.mail_config.active_days} days",
+                    self._storage_quota_label(),
+                    "no auto-renew",
+                ]
             ),
         )
 

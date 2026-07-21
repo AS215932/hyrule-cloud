@@ -47,7 +47,7 @@ from hyrule_cloud.domains.wallet_auth import (
     WalletChallengeResponse,
 )
 from hyrule_cloud.middleware.auth import current_account, require_account, require_scope
-from hyrule_cloud.middleware.x402 import PaymentGate
+from hyrule_cloud.middleware.x402 import PaymentGate, canonical_payment_authorization
 from hyrule_cloud.state import AppState, get_app_state
 
 router = APIRouter(prefix="/v1/domains", tags=["domains"])
@@ -110,17 +110,40 @@ async def _settle_x402_order(
     if isinstance(verified, Response):
         return verified
     requirements = verified.matching_requirements
+    payment_authorization = request.headers.get("payment-signature") or request.headers.get(
+        "x-payment"
+    )
+    payment_authorization_fingerprint: str | None = None
+    if payment_authorization is not None:
+        try:
+            payment_authorization_fingerprint = canonical_payment_authorization(
+                payment_authorization
+            ).fingerprint
+        except (TypeError, ValueError) as exc:
+            raise DomainProblem(
+                400,
+                "payment_authorization_invalid",
+                "The payment authorization could not be decoded.",
+            ) from exc
     await service.begin_x402_settlement(
         order.order_id,
         payer=verified.payer or "unknown",
         payment_network=getattr(requirements, "network", None),
         payment_asset=getattr(requirements, "asset", None),
+        payment_authorization_fingerprint=payment_authorization_fingerprint,
+        payment_authorization=payment_authorization,
     )
     if not await gate.settle_verified(
         request,
         verified,
         extra_body=payment_metadata,
     ):
+        if getattr(request.state, "payment_settlement_indeterminate", False):
+            raise DomainProblem(
+                503,
+                pending_code,
+                "Payment outcome is being reconciled; retry this domain order later.",
+            )
         await service.clear_x402_settlement(order.order_id)
         raise DomainProblem(
             402,

@@ -43,6 +43,20 @@ def downgrade() -> None:
         "mail_message_index",
         type_="primary",
     )
+    # The old schema cannot represent the same account-scoped JMAP id twice.
+    # Keep the oldest deterministic row so rollback remains available after
+    # legitimate cross-mailbox collisions have been stored.
+    op.execute(
+        sa.text(
+            """
+            DELETE FROM mail_message_index AS duplicate
+            USING mail_message_index AS keeper
+            WHERE duplicate.message_id = keeper.message_id
+              AND (duplicate.created_at, duplicate.mailbox_id)
+                  > (keeper.created_at, keeper.mailbox_id)
+            """
+        )
+    )
     op.create_primary_key(
         "mail_message_index_pkey",
         "mail_message_index",

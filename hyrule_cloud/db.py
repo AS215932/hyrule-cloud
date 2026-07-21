@@ -311,9 +311,9 @@ class DomainOrderRow(Base):
     payment_asset: Mapped[str | None] = mapped_column(String(66))
     payer: Mapped[str | None] = mapped_column(String(128))
     payment_tx: Mapped[str | None] = mapped_column(String(128), index=True)
-    payment_settlement_pending_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    payment_settlement_pending_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_authorization_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    payment_authorization_header: Mapped[str | None] = mapped_column(Text)
     refund_address: Mapped[str | None] = mapped_column(String(128))
     native_intent_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("crypto_intents.intent_id", ondelete="SET NULL"), index=True
@@ -340,6 +340,10 @@ class DomainOrderRow(Base):
     __table_args__ = (
         UniqueConstraint(
             "owner_account_id", "idempotency_key", name="uq_domain_orders_account_idempotency"
+        ),
+        UniqueConstraint(
+            "payment_authorization_fingerprint",
+            name="uq_domain_orders_payment_authorization",
         ),
     )
 
@@ -813,6 +817,7 @@ class MailAccountRow(Base):
     domain: Mapped[str | None] = mapped_column(String(253), index=True)
     local_part: Mapped[str | None] = mapped_column(String(64))
     domain_order_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    domain_authority_hash: Mapped[str | None] = mapped_column(String(64))
     quote_id: Mapped[str | None] = mapped_column(String(36), index=True)
     idempotency_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
     terms_version: Mapped[str | None] = mapped_column(String(64))
@@ -825,9 +830,7 @@ class MailAccountRow(Base):
     provision_claimed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), index=True
     )
-    provision_retry_count: Mapped[int] = mapped_column(
-        Integer, default=0, server_default="0"
-    )
+    provision_retry_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     provision_next_attempt_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), index=True
     )
@@ -844,12 +847,9 @@ class MailAccountRow(Base):
     payment_tx: Mapped[str | None] = mapped_column(String(128))
     payment_network: Mapped[str | None] = mapped_column(String(64))
     payment_asset: Mapped[str | None] = mapped_column(String(66))
-    payment_settlement_pending_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
-    payment_settled_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), index=True
-    )
+    payment_settlement_pending_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    payment_authorization_header: Mapped[str | None] = mapped_column(Text)
 
 
 class MailDomainRow(Base):
@@ -999,9 +999,7 @@ class MailPaymentAuthorizationRow(Base):
         DateTime(timezone=True), server_default=func.now(), index=True
     )
 
-    __table_args__ = (
-        UniqueConstraint("quote_id", name="uq_mail_payment_authorization_quote"),
-    )
+    __table_args__ = (UniqueConstraint("quote_id", name="uq_mail_payment_authorization_quote"),)
 
 
 class MailWebhookDeliveryRow(Base):

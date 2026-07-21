@@ -27,6 +27,7 @@ from hyrule_cloud.db import (
     DomainQuoteRow,
     DomainRow,
     DomainTLDRow,
+    MailAccountRow,
     PaymentEventRow,
     VMQuoteRow,
     VMRow,
@@ -67,6 +68,7 @@ from hyrule_cloud.domains.wallet_auth import (
     WalletChallengeRequest,
     WalletVerifyRequest,
 )
+from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CryptoIntentStatus,
     DomainMode,
@@ -285,6 +287,21 @@ def test_domain_api_persists_settlement_state_around_the_facilitator_call() -> N
     handoff = source.index("mark_x402_paid", durable)
     assert source.index("begin_x402_settlement") < settlement
     assert settlement < durable < handoff
+    indeterminate = source.index("payment_settlement_indeterminate", settlement)
+    clear = source.index("clear_x402_settlement", settlement)
+    assert indeterminate < clear
+
+
+def test_domain_orders_enforce_unique_payment_authorizations() -> None:
+    constraints = [
+        constraint
+        for constraint in DomainOrderRow.__table__.constraints
+        if constraint.name == "uq_domain_orders_payment_authorization"
+    ]
+    assert len(constraints) == 1
+    assert [column.name for column in constraints[0].columns] == [
+        "payment_authorization_fingerprint"
+    ]
 
 
 def test_native_refund_addresses_are_validated_for_the_selected_asset() -> None:
@@ -1707,6 +1724,157 @@ async def test_order_local_settlement_recovers_without_metrics_ledger(domain_ser
     assert recovered.payment_settlement_pending_at is None
     assert stored_quote.status == "consumed"
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_stored_authorization_recovers_domain_payment_without_metrics_ledger(
+    domain_service,
+):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote(
+        "authorization-recovery.dev",
+        DomainAction.REGISTER,
+        "H1234567890",
+    )
+    order, _created = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="authorization-recovery",
+    )
+    await service.begin_x402_settlement(
+        order.order_id,
+        payer="0x" + "4" * 40,
+        payment_network="eip155:8453",
+        payment_asset="0x" + "5" * 40,
+        payment_authorization_fingerprint="a" * 64,
+        payment_authorization="stored-eip3009-authorization",
+    )
+
+    class _RecoveryGate:
+        async def reconcile_settlement(self, header, amount):
+            assert header == "stored-eip3009-authorization"
+            assert amount == Decimal(order.amount_usd)
+            return SimpleNamespace(
+                payer="0x" + "4" * 40,
+                tx_hash="0xauthorization-recovered",
+                network="eip155:8453",
+                asset="0x" + "5" * 40,
+            )
+
+    assert await service.recover_x402_handoffs(gate=_RecoveryGate()) == 1
+    async with sessions() as session:
+        recovered = await session.get(DomainOrderRow, order.order_id)
+        events = list(await session.scalars(select(PaymentEventRow)))
+    assert recovered is not None
+    assert recovered.status == DomainOrderStatus.QUEUED.value
+    assert recovered.payment_tx == "0xauthorization-recovered"
+    assert recovered.payment_authorization_header is None
+    assert recovered.payment_authorization_fingerprint == "a" * 64
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_domain_order_binds_exactly_one_payment_authorization(domain_service):
+    service, _provider, _sessions = domain_service
+
+    async def create(name: str, key: str):
+        quote = await service.create_quote(
+            name,
+            DomainAction.REGISTER,
+            "H1234567890",
+        )
+        order, _created = await service.create_order(
+            DomainOrderRequest(
+                quote_id=quote.quote_id,
+                payment_method=DomainPaymentMethod.USDC,
+                terms_version=service.domain_config.terms_version,
+            ),
+            owner_account_id="H1234567890",
+            idempotency_key=key,
+        )
+        return order
+
+    first = await create("authorization-one.dev", "authorization-one")
+    second = await create("authorization-two.dev", "authorization-two")
+    await service.begin_x402_settlement(
+        first.order_id,
+        payer="0x" + "4" * 40,
+        payment_network="eip155:8453",
+        payment_asset="0x" + "5" * 40,
+        payment_authorization_fingerprint="a" * 64,
+        payment_authorization="authorization-one",
+    )
+
+    with pytest.raises(DomainProblem) as rebound:
+        await service.begin_x402_settlement(
+            first.order_id,
+            payer="0x" + "6" * 40,
+            payment_network="eip155:8453",
+            payment_asset="0x" + "5" * 40,
+            payment_authorization_fingerprint="b" * 64,
+            payment_authorization="authorization-two",
+        )
+    assert rebound.value.code == "domain_order_payment_bound"
+
+    with pytest.raises(DomainProblem) as reused:
+        await service.begin_x402_settlement(
+            second.order_id,
+            payer="0x" + "4" * 40,
+            payment_network="eip155:8453",
+            payment_asset="0x" + "5" * 40,
+            payment_authorization_fingerprint="a" * 64,
+            payment_authorization="authorization-one",
+        )
+    assert reused.value.code == "payment_authorization_reused"
+
+
+@pytest.mark.asyncio
+async def test_legacy_claim_cannot_revoke_reserved_mail_authority(domain_service):
+    service, _provider, sessions = domain_service
+    token = "hyr_dom_" + "c" * 43
+    now = datetime.now(UTC)
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="mail-authority",
+                extension="dev",
+                fqdn="mail-authority.dev",
+                owner_wallet="0x" + "1" * 40,
+                owner_account_id=None,
+                anon_management_token_hash=hash_anon_token(token),
+                status="active",
+            )
+        )
+        session.add(
+            MailAccountRow(
+                mailbox_id="mbx_mail_authority",
+                address="agent@mail-authority.dev",
+                plan="custom",
+                status="awaiting_payment",
+                domain="mail-authority.dev",
+                capacity_reserved_at=now,
+            )
+        )
+        await session.commit()
+
+    with pytest.raises(DomainProblem) as blocked:
+        await service.claim_legacy_domain(
+            "H1234567890",
+            "mail-authority.dev",
+            token,
+        )
+    assert blocked.value.code == "domain_activation_pending"
+    async with sessions() as session:
+        domain = await session.scalar(
+            select(DomainRow).where(DomainRow.fqdn == "mail-authority.dev")
+        )
+    assert domain is not None
+    assert domain.owner_account_id is None
+    assert domain.anon_management_token_hash == hash_anon_token(token)
 
 
 @pytest.mark.asyncio

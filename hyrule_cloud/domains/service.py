@@ -31,6 +31,7 @@ from hyrule_cloud.db import (
     DomainOrderRow,
     DomainQuoteRow,
     DomainRow,
+    MailAccountRow,
     OpenproviderWebhookRow,
     PaymentEventRow,
     VMQuoteRow,
@@ -825,6 +826,8 @@ class DomainService:
         payer: str,
         payment_network: str | None,
         payment_asset: str | None,
+        payment_authorization_fingerprint: str | None = None,
+        payment_authorization: str | None = None,
     ) -> DomainOrderRow:
         """Persist a domain-payment intent before the facilitator can move money."""
 
@@ -844,14 +847,32 @@ class DomainService:
                     "order_payment_closed",
                     "This domain order is no longer awaiting payment.",
                 )
+            if (
+                order.payment_authorization_fingerprint is not None
+                and order.payment_authorization_fingerprint != payment_authorization_fingerprint
+            ):
+                raise DomainProblem(
+                    409,
+                    "domain_order_payment_bound",
+                    "This order is already bound to another payment authorization; retry the original payment.",
+                )
             if order.paid_at is None:
                 order.payer = payer[:128]
                 order.payment_network = payment_network
                 order.payment_asset = payment_asset
-                order.payment_settlement_pending_at = (
-                    order.payment_settlement_pending_at or _now()
-                )
-                await session.commit()
+                if payment_authorization_fingerprint is not None:
+                    order.payment_authorization_fingerprint = payment_authorization_fingerprint
+                    order.payment_authorization_header = payment_authorization
+                order.payment_settlement_pending_at = order.payment_settlement_pending_at or _now()
+                try:
+                    await session.commit()
+                except IntegrityError as exc:
+                    await session.rollback()
+                    raise DomainProblem(
+                        409,
+                        "payment_authorization_reused",
+                        "This payment authorization is already bound to another domain order.",
+                    ) from exc
             return order
 
     async def clear_x402_settlement(self, order_id: str) -> None:
@@ -863,6 +884,8 @@ class DomainService:
                 order.payer = None
                 order.payment_network = None
                 order.payment_asset = None
+                order.payment_authorization_fingerprint = None
+                order.payment_authorization_header = None
                 order.payment_settlement_pending_at = None
                 await session.commit()
 
@@ -887,10 +910,7 @@ class DomainService:
             ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
-            if (
-                order.status != DomainOrderStatus.AWAITING_PAYMENT.value
-                and order.paid_at is None
-            ):
+            if order.status != DomainOrderStatus.AWAITING_PAYMENT.value and order.paid_at is None:
                 raise DomainProblem(
                     409,
                     "order_payment_closed",
@@ -900,6 +920,7 @@ class DomainService:
             order.payment_tx = tx_hash
             order.payment_network = payment_network
             order.payment_asset = payment_asset
+            order.payment_authorization_header = None
             order.payment_settlement_pending_at = None
             order.paid_at = order.paid_at or _now()
             await session.commit()
@@ -935,10 +956,7 @@ class DomainService:
             ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
-            if (
-                order.payment_settlement_pending_at is not None
-                or order.paid_at is not None
-            ):
+            if order.payment_settlement_pending_at is not None or order.paid_at is not None:
                 return
             quote = await session.get(DomainQuoteRow, order.quote_id)
             if (
@@ -1016,6 +1034,7 @@ class DomainService:
                     order.payment_tx = tx_hash
                     order.payment_network = payment_network
                     order.payment_asset = payment_asset
+                    order.payment_authorization_header = None
                     order.payment_settlement_pending_at = None
                     order.status = DomainOrderStatus.REFUND_DUE.value
                     order.error_code = "late_payment_after_expiry"
@@ -1036,6 +1055,7 @@ class DomainService:
                 order.payment_tx = tx_hash
                 order.payment_network = payment_network
                 order.payment_asset = payment_asset
+                order.payment_authorization_header = None
                 order.payment_settlement_pending_at = None
                 quote = (
                     await session.execute(
@@ -1598,6 +1618,26 @@ class DomainService:
                 raise DomainProblem(404, "domain_not_found", "Domain not found.")
             if row.anon_management_token_hash != hash_anon_token(token):
                 raise DomainProblem(404, "domain_not_found", "Domain not found.")
+            pending_activation = await session.scalar(
+                select(MailAccountRow.mailbox_id)
+                .where(
+                    MailAccountRow.domain == fqdn,
+                    or_(
+                        MailAccountRow.status.in_(["pending_domain", "provisioning"]),
+                        and_(
+                            MailAccountRow.status == "awaiting_payment",
+                            MailAccountRow.capacity_reserved_at.is_not(None),
+                        ),
+                    ),
+                )
+                .limit(1)
+            )
+            if pending_activation is not None:
+                raise DomainProblem(
+                    409,
+                    "domain_activation_pending",
+                    "This domain has a payment-authorized mailbox activation in progress.",
+                )
             row.owner_account_id = owner_account_id
             row.anon_management_token_hash = None
             await session.commit()
@@ -1646,12 +1686,56 @@ class DomainService:
             self.orchestrator.start_provisioning(vm_id)
         return len(vm_ids)
 
-    async def recover_x402_handoffs(self, *, limit: int = 200) -> int:
+    async def recover_x402_handoffs(
+        self,
+        *,
+        gate: Any | None = None,
+        limit: int = 200,
+    ) -> int:
         """Replay settled domain payments whose order transition was lost."""
         if limit < 1:
             return 0
         recovered = 0
         seen: set[str] = set()
+        if gate is not None:
+            async with self.db() as session:
+                pending = list(
+                    await session.scalars(
+                        select(DomainOrderRow)
+                        .where(
+                            DomainOrderRow.status == DomainOrderStatus.AWAITING_PAYMENT.value,
+                            DomainOrderRow.payment_method == DomainPaymentMethod.USDC.value,
+                            DomainOrderRow.payment_settlement_pending_at.is_not(None),
+                            DomainOrderRow.paid_at.is_(None),
+                            DomainOrderRow.payment_authorization_header.is_not(None),
+                        )
+                        .order_by(DomainOrderRow.payment_settlement_pending_at)
+                        .limit(limit)
+                    )
+                )
+            for pending_order in pending:
+                if not pending_order.payment_authorization_header:
+                    continue
+                try:
+                    settlement = await gate.reconcile_settlement(
+                        pending_order.payment_authorization_header,
+                        Decimal(pending_order.amount_usd),
+                    )
+                    if settlement is None:
+                        continue
+                    await self.record_x402_settlement(
+                        pending_order.order_id,
+                        payer=settlement.payer,
+                        tx_hash=settlement.tx_hash,
+                        payment_network=settlement.network,
+                        payment_asset=settlement.asset,
+                    )
+                except Exception:
+                    log.warning(
+                        "domain_payment_authorization_reconciliation_deferred",
+                        order_id=pending_order.order_id,
+                        exc_info=True,
+                    )
         async with self.db() as session:
             durable = list(
                 await session.scalars(
