@@ -49,6 +49,25 @@ def _resource(capability_id: str = "hyrule.dns.lookup") -> CatalogResource:
     )
 
 
+def _payment_context(
+    url: str,
+    amount: str,
+    *,
+    network: str = "eip155:8453",
+    asset: str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+) -> PaymentCreationContext:
+    payment_required = SimpleNamespace(
+        x402_version=2,
+        resource=SimpleNamespace(url=url),
+    )
+    requirements = SimpleNamespace(
+        get_amount=lambda: amount,
+        network=network,
+        asset=asset,
+    )
+    return PaymentCreationContext(payment_required, requirements)  # type: ignore[arg-type]
+
+
 def test_parse_manifest_requires_v2_and_unique_stable_ids() -> None:
     manifest = {
         "x402Version": 2,
@@ -59,6 +78,11 @@ def test_parse_manifest_requires_v2_and_unique_stable_ids() -> None:
                 "path": "/v1/dns/lookup",
                 "intents": ["look up DNS"],
                 "capabilities": ["DNS"],
+                "price": {
+                    "mode": "fixed",
+                    "amount": "0.01",
+                    "currency": "USD",
+                },
                 "inputSchema": {
                     "type": "object",
                     "required": ["name"],
@@ -124,34 +148,24 @@ def test_spend_ledger_reserves_atomically_against_daily_cap(tmp_path: Path) -> N
 
 def test_payment_guard_rejects_origin_path_and_amount_before_signing(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    guard = PaymentGuard(settings, "/v1/dns/lookup", SpendLedger(settings.ledger_path))
+    guard = PaymentGuard(
+        settings,
+        "/v1/dns/lookup",
+        SpendLedger(settings.ledger_path),
+        minimum_amount_atomic=10_000,
+        maximum_amount_atomic=10_000,
+    )
 
-    def context(
-        url: str,
-        amount: str,
-        *,
-        network: str = "eip155:8453",
-        asset: str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-    ) -> PaymentCreationContext:
-        payment_required = SimpleNamespace(
-            x402_version=2,
-            resource=SimpleNamespace(url=url),
-        )
-        requirements = SimpleNamespace(
-            get_amount=lambda: amount,
-            network=network,
-            asset=asset,
-        )
-        return PaymentCreationContext(payment_required, requirements)  # type: ignore[arg-type]
-
-    assert guard(context("https://attacker.test/v1/dns/lookup", "1000")) is not None
-    assert guard(context("https://cloud.hyrule.host/v1/vm/create", "1000")) is not None
-    assert guard(context("https://cloud.hyrule.host/v1/dns/lookup", "100001")) is not None
+    assert guard(_payment_context("https://attacker.test/v1/dns/lookup", "10000")) is not None
+    assert guard(_payment_context("https://cloud.hyrule.host/v1/vm/create", "10000")) is not None
+    assert guard(_payment_context("https://cloud.hyrule.host/v1/dns/lookup", "9999")) is not None
+    assert guard(_payment_context("https://cloud.hyrule.host/v1/dns/lookup", "10001")) is not None
+    assert guard(_payment_context("https://cloud.hyrule.host/v1/dns/lookup", "100001")) is not None
     assert (
         guard(
-            context(
+            _payment_context(
                 "https://cloud.hyrule.host/v1/dns/lookup",
-                "1000",
+                "10000",
                 asset="0x0000000000000000000000000000000000000001",
             )
         )
@@ -159,16 +173,43 @@ def test_payment_guard_rejects_origin_path_and_amount_before_signing(tmp_path: P
     )
     assert (
         guard(
-            context(
+            _payment_context(
                 "https://cloud.hyrule.host/v1/dns/lookup",
-                "1000",
+                "10000",
                 network="eip155:137",
                 asset="0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
             )
         )
         is not None
     )
-    assert guard(context("https://cloud.hyrule.host/v1/dns/lookup", "1000")) is None
+    assert guard(_payment_context("https://cloud.hyrule.host/v1/dns/lookup", "10000")) is None
+
+
+def test_dynamic_manifest_price_bounds_are_enforced_before_signing(tmp_path: Path) -> None:
+    resource = CatalogResource(
+        capability_id="hyrule.dns.lookup",
+        method="POST",
+        path="/v1/dns/lookup",
+        description="lookup",
+        intents=(),
+        capabilities=(),
+        price={"mode": "dynamic", "min": "0.001", "max": "0.005", "currency": "USD"},
+    )
+    minimum, maximum = resource.payment_bounds_atomic()
+    assert (minimum, maximum) == (1_000, 5_000)
+
+    settings = _settings(tmp_path)
+    guard = PaymentGuard(
+        settings,
+        resource.path,
+        SpendLedger(settings.ledger_path),
+        minimum_amount_atomic=minimum,
+        maximum_amount_atomic=maximum,
+    )
+    url = "https://cloud.hyrule.host/v1/dns/lookup"
+    assert guard(_payment_context(url, "999")) is not None
+    assert guard(_payment_context(url, "1000")) is None
+    assert guard(_payment_context(url, "5001")) is not None
 
 
 def test_infrastructure_requires_two_explicit_operator_opt_ins(tmp_path: Path) -> None:
@@ -195,6 +236,8 @@ def test_official_x402_client_builds_with_runtime_wallet_only(tmp_path: Path) ->
         settings,
         allowed_path="/v1/dns/lookup",
         ledger=SpendLedger(settings.ledger_path),
+        minimum_amount_atomic=10_000,
+        maximum_amount_atomic=10_000,
     )
 
     assert client is not None

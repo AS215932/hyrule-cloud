@@ -120,8 +120,7 @@ class Buyer:
                     "followUpUrl": _ROUTER_SNAPSHOT_LIST_PATH,
                     "paymentRequired": False,
                     "description": (
-                        "List live snapshot IDs, sizes, formats, and expiry "
-                        "before purchase."
+                        "List live snapshot IDs, sizes, formats, and expiry before purchase."
                     ),
                 }
             result.append(item)
@@ -173,10 +172,13 @@ class Buyer:
             )
         await self._preflight_download(resource, arguments)
         path, request_kwargs = build_request(resource, arguments)
+        minimum_amount_atomic, maximum_amount_atomic = resource.payment_bounds_atomic()
         x402_client = build_x402_client(
             self.settings,
             allowed_path=path,
             ledger=self.ledger,
+            minimum_amount_atomic=minimum_amount_atomic,
+            maximum_amount_atomic=maximum_amount_atomic,
         )
         async with wrapHttpxWithPayment(
             x402_client,

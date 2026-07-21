@@ -396,8 +396,11 @@ async def x402_manifest():
 
 
 def full_openapi() -> dict:
-    """Build the complete API document with x402 annotations where applicable."""
-    from hyrule_cloud.services.discovery import build_full_openapi
+    """Return a cached complete contract, invalidated by live catalog pricing."""
+    from hyrule_cloud.services.discovery import (
+        build_full_openapi,
+        enabled_paid_operations,
+    )
 
     state = getattr(app.state, "_typed_state", None)
     # Production HTTP requests run inside lifespan and therefore always use the
@@ -406,7 +409,22 @@ def full_openapi() -> dict:
     # providers; it still reads the deployment environment rather than using a
     # separate hard-coded price table.
     config = state.config if state is not None else HyruleConfig()
-    return build_full_openapi(app, config)
+    signature = tuple(
+        (
+            operation.key,
+            tuple(sorted(operation.price.openapi(config.payment).items())),
+        )
+        for operation in enabled_paid_operations()
+    )
+    if (
+        app.openapi_schema is not None
+        and getattr(app.state, "_full_openapi_signature", None) == signature
+    ):
+        return app.openapi_schema
+    schema = build_full_openapi(app, config)
+    app.openapi_schema = schema
+    app.state._full_openapi_signature = signature
+    return schema
 
 
 app.openapi = full_openapi

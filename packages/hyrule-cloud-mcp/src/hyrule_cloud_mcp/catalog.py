@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+from hyrule_cloud_mcp.config import USDC_ATOMIC_UNITS
 
 _PATH_PARAMETER = re.compile(r"\{([^{}]+)\}")
 
@@ -27,6 +30,22 @@ class CatalogResource:
     price: dict[str, Any]
     input_schema: dict[str, Any] = field(default_factory=dict)
     input_example: dict[str, Any] = field(default_factory=dict)
+
+    def payment_bounds_atomic(self) -> tuple[int, int | None]:
+        if self.price.get("currency") != "USD":
+            raise CatalogError("catalog price currency must be USD")
+        mode = self.price.get("mode")
+        if mode == "fixed":
+            amount = _price_atomic(self.price.get("amount"), "amount")
+            return amount, amount
+        if mode != "dynamic":
+            raise CatalogError("catalog price mode must be fixed or dynamic")
+        minimum = _price_atomic(self.price.get("min"), "min")
+        raw_maximum = self.price.get("max")
+        maximum = _price_atomic(raw_maximum, "max") if raw_maximum is not None else None
+        if maximum is not None and maximum < minimum:
+            raise CatalogError("catalog dynamic price max must be at least min")
+        return minimum, maximum
 
     @classmethod
     def from_json(cls, value: object) -> CatalogResource:
@@ -55,7 +74,7 @@ class CatalogResource:
         price = value.get("price")
         input_schema = value.get("inputSchema")
         input_example = value.get("inputExample")
-        return cls(
+        resource = cls(
             capability_id=capability_id,
             method=method,
             path=path,
@@ -66,6 +85,21 @@ class CatalogResource:
             input_schema=input_schema if isinstance(input_schema, dict) else {},
             input_example=input_example if isinstance(input_example, dict) else {},
         )
+        resource.payment_bounds_atomic()
+        return resource
+
+
+def _price_atomic(value: object, field_name: str) -> int:
+    try:
+        decimal = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise CatalogError(f"catalog price {field_name} must be decimal USD") from exc
+    scaled = decimal * USDC_ATOMIC_UNITS
+    if decimal <= 0 or scaled != scaled.to_integral_value():
+        raise CatalogError(
+            f"catalog price {field_name} must be positive with at most six decimal places"
+        )
+    return int(scaled)
 
 
 def parse_manifest(value: object) -> list[CatalogResource]:

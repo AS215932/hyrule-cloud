@@ -102,10 +102,20 @@ class SpendLedger:
 
 
 class PaymentGuard:
-    def __init__(self, settings: Settings, allowed_path: str, ledger: SpendLedger) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        allowed_path: str,
+        ledger: SpendLedger,
+        *,
+        minimum_amount_atomic: int,
+        maximum_amount_atomic: int | None,
+    ) -> None:
         self.settings = settings
         self.allowed_path = allowed_path
         self.ledger = ledger
+        self.minimum_amount_atomic = minimum_amount_atomic
+        self.maximum_amount_atomic = maximum_amount_atomic
         self.expected_origin = urlsplit(settings.base_url)
 
     def __call__(self, context: PaymentCreationContext) -> AbortResult | None:
@@ -136,6 +146,10 @@ class PaymentGuard:
             return AbortResult("payment asset is not the canonical USDC contract")
 
         amount = int(requirements.get_amount())
+        if amount < self.minimum_amount_atomic:
+            return AbortResult("payment is below the live manifest minimum")
+        if self.maximum_amount_atomic is not None and amount > self.maximum_amount_atomic:
+            return AbortResult("payment exceeds the live manifest maximum")
         if amount > self.settings.max_payment_atomic:
             return AbortResult("payment exceeds HYRULE_MCP_MAX_PAYMENT_USD")
         try:
@@ -154,6 +168,8 @@ def build_x402_client(
     *,
     allowed_path: str,
     ledger: SpendLedger,
+    minimum_amount_atomic: int,
+    maximum_amount_atomic: int | None,
 ) -> x402Client:
     if not settings.private_key:
         raise ValueError("EVM_PRIVATE_KEY is required for paid Hyrule calls")
@@ -162,5 +178,13 @@ def build_x402_client(
     register_exact_evm_client(client, EthAccountSigner(account))
     client.register_policy(prefer_network(settings.preferred_network))
     client.register_policy(max_amount(settings.max_payment_atomic))
-    client.on_before_payment_creation(PaymentGuard(settings, allowed_path, ledger))
+    client.on_before_payment_creation(
+        PaymentGuard(
+            settings,
+            allowed_path,
+            ledger,
+            minimum_amount_atomic=minimum_amount_atomic,
+            maximum_amount_atomic=maximum_amount_atomic,
+        )
+    )
     return client

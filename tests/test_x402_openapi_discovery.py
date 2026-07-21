@@ -153,6 +153,38 @@ def test_every_catalog_operation_has_complete_x402_openapi_metadata(
         ), operation.key
 
 
+def test_full_openapi_documents_account_and_worker_authentication() -> None:
+    schema = build_full_openapi(app, HyruleConfig())
+    schemes = schema["components"]["securitySchemes"]
+
+    assert schemes["HyruleApiKey"]["scheme"] == "bearer"
+    assert schemes["HyruleSession"] == {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "hyr_sess",
+        "description": "Opaque Hyrule browser session cookie.",
+    }
+    assert schemes["HyruleBGPIngestToken"]["name"] == "X-Hyrule-BGP-Ingest-Token"
+    assert schema["paths"]["/v1/me"]["get"]["security"] == [
+        {"HyruleApiKey": []},
+        {"HyruleSession": []},
+    ]
+    assert schema["paths"]["/v1/me/password"]["post"]["security"] == [{"HyruleSession": []}]
+    assert schema["paths"]["/v1/internal/bgp/jobs/claim"]["post"]["security"] == [
+        {"HyruleBGPIngestToken": []}
+    ]
+    assert "security" not in schema["paths"]["/v1/auth/login"]["post"]
+
+
+def test_app_openapi_reuses_the_cached_schema() -> None:
+    app.openapi_schema = None
+    first = app.openapi()
+    second = app.openapi()
+
+    assert first is second
+    app.openapi_schema = None
+
+
 def test_post_examples_are_executable_and_marketplace_renderable() -> None:
     """Agentic Market builds its parameter table from ``info.input.body``.
 

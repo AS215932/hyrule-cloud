@@ -21,12 +21,14 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi.openapi.utils import get_openapi
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ValidationError
 from starlette.routing import compile_path
 from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 
 from hyrule_cloud import models
 from hyrule_cloud.config import HyruleConfig, PaymentConfig
+from hyrule_cloud.middleware.auth import require_account, require_browser_session
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -1153,6 +1155,64 @@ _PAYMENT_REQUIRED_SCHEMA = {
     "additionalProperties": True,
 }
 
+_SECURITY_SCHEMES = {
+    "HyruleApiKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "hyr_sk_<secret>",
+        "description": "Scoped Hyrule account API key.",
+    },
+    "HyruleSession": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "hyr_sess",
+        "description": "Opaque Hyrule browser session cookie.",
+    },
+    "HyruleBGPIngestToken": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Hyrule-BGP-Ingest-Token",
+        "description": "Internal BGP worker credential.",
+    },
+}
+
+
+def _dependency_calls(route: APIRoute) -> set[Any]:
+    calls: set[Any] = set()
+
+    def visit(dependant: Any) -> None:
+        for dependency in getattr(dependant, "dependencies", []):
+            call = getattr(dependency, "call", None)
+            if call is not None:
+                calls.add(call)
+            visit(dependency)
+
+    visit(route.dependant)
+    return calls
+
+
+def _annotate_security(schema: dict[str, Any], application: FastAPI) -> None:
+    components = schema.setdefault("components", {})
+    components.setdefault("securitySchemes", {}).update(_SECURITY_SCHEMES)
+    for route in application.routes:
+        if not isinstance(route, APIRoute) or not route.include_in_schema:
+            continue
+        calls = _dependency_calls(route)
+        security: list[dict[str, list[str]]]
+        if route.path.startswith("/v1/internal/bgp"):
+            security = [{"HyruleBGPIngestToken": []}]
+        elif require_browser_session in calls:
+            security = [{"HyruleSession": []}]
+        elif require_account in calls:
+            security = [{"HyruleApiKey": []}, {"HyruleSession": []}]
+        else:
+            continue
+        path_item = schema.get("paths", {}).get(route.path, {})
+        for method in route.methods or set():
+            operation = path_item.get(method.lower())
+            if isinstance(operation, dict):
+                operation["security"] = security
+
 
 def _annotate_operation(
     schema: dict[str, Any],
@@ -1244,6 +1304,7 @@ def build_full_openapi(application: FastAPI, config: HyruleConfig) -> dict[str, 
     schema.setdefault("components", {}).setdefault("schemas", {})["X402PaymentRequired"] = (
         _PAYMENT_REQUIRED_SCHEMA
     )
+    _annotate_security(schema, application)
 
     for operation in enabled:
         _annotate_operation(schema, operation, config.payment)
