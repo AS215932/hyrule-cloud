@@ -203,6 +203,7 @@ def require_scope(*needed: str):
     any required scope. The exception detail names the missing scope so an
     agent can fix its key shape without guesswork.
     """
+
     async def _dep(
         request: Request,
         account: AccountRow = Depends(require_account),
@@ -218,6 +219,7 @@ def require_scope(*needed: str):
             )
         return account
 
+    setattr(_dep, "__hyrule_required_scopes__", tuple(needed))
     return _dep
 
 

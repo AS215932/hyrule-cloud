@@ -280,8 +280,22 @@ async def test_snapshot_discovery_exposes_unpaid_listing_and_preflights_size(
         return {
             "result": {
                 "snapshots": [
-                    {"snapshot_id": "small", "size_bytes": 128},
-                    {"snapshot_id": "large", "size_bytes": 1024},
+                    {
+                        "snapshot_id": "small",
+                        "size_bytes": 128,
+                        "download_available": True,
+                    },
+                    {
+                        "snapshot_id": "large",
+                        "size_bytes": 1024,
+                        "download_available": True,
+                    },
+                    {
+                        "snapshot_id": "stale",
+                        "size_bytes": 128,
+                        "download_available": False,
+                    },
+                    {"snapshot_id": "unconfirmed", "size_bytes": 128},
                 ]
             }
         }
@@ -294,6 +308,9 @@ async def test_snapshot_discovery_exposes_unpaid_listing_and_preflights_size(
         await buyer.call(snapshot_resource.capability_id, {"snapshot_id": "large"})
     with pytest.raises(ValueError, match="live unpaid discovery"):
         await buyer.call(snapshot_resource.capability_id, {"snapshot_id": "fabricated"})
+    for snapshot_id in ("stale", "unconfirmed"):
+        with pytest.raises(ValueError, match="not currently available"):
+            await buyer.call(snapshot_resource.capability_id, {"snapshot_id": snapshot_id})
 
 
 def test_snapshot_listing_is_an_allowed_non_paying_followup() -> None:

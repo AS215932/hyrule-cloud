@@ -1160,7 +1160,10 @@ _SECURITY_SCHEMES = {
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "hyr_sk_<secret>",
-        "description": "Scoped Hyrule account API key.",
+        "description": (
+            "Scoped Hyrule account API key. Each scoped operation publishes its required "
+            "key scopes in x-hyrule-required-api-key-scopes."
+        ),
     },
     "HyruleSession": {
         "type": "apiKey",
@@ -1177,18 +1180,22 @@ _SECURITY_SCHEMES = {
 }
 
 
-def _dependency_calls(route: APIRoute) -> set[Any]:
+def _dependency_metadata(route: APIRoute) -> tuple[set[Any], set[str]]:
     calls: set[Any] = set()
+    scopes: set[str] = set()
 
     def visit(dependant: Any) -> None:
         for dependency in getattr(dependant, "dependencies", []):
             call = getattr(dependency, "call", None)
             if call is not None:
                 calls.add(call)
+                required = getattr(call, "__hyrule_required_scopes__", ())
+                if isinstance(required, (tuple, list, set, frozenset)):
+                    scopes.update(scope for scope in required if isinstance(scope, str))
             visit(dependency)
 
     visit(route.dependant)
-    return calls
+    return calls, scopes
 
 
 def _annotate_security(schema: dict[str, Any], application: FastAPI) -> None:
@@ -1197,7 +1204,7 @@ def _annotate_security(schema: dict[str, Any], application: FastAPI) -> None:
     for route in application.routes:
         if not isinstance(route, APIRoute) or not route.include_in_schema:
             continue
-        calls = _dependency_calls(route)
+        calls, required_scopes = _dependency_metadata(route)
         security: list[dict[str, list[str]]]
         if route.path.startswith("/v1/internal/bgp"):
             security = [{"HyruleBGPIngestToken": []}]
@@ -1212,6 +1219,8 @@ def _annotate_security(schema: dict[str, Any], application: FastAPI) -> None:
             operation = path_item.get(method.lower())
             if isinstance(operation, dict):
                 operation["security"] = security
+                if required_scopes:
+                    operation["x-hyrule-required-api-key-scopes"] = sorted(required_scopes)
 
 
 def _annotate_operation(

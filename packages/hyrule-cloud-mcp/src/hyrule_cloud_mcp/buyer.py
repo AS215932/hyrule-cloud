@@ -149,6 +149,8 @@ class Buyer:
         )
         if snapshot is None:
             raise ValueError("snapshot_id is not present in live unpaid discovery")
+        if snapshot.get("download_available") is not True:
+            raise ValueError("snapshot is not currently available; refusing payment")
         size = snapshot.get("size_bytes")
         if not isinstance(size, int) or isinstance(size, bool) or size < 0:
             raise ValueError("snapshot size is unavailable; refusing payment")
