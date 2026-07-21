@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi.openapi.utils import get_openapi
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from starlette.routing import compile_path
 from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 
@@ -1139,6 +1139,56 @@ def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
     }
 
 
+class X402ManifestPrice(BaseModel):
+    """Configured USD price projection for one discoverable operation."""
+
+    mode: PriceMode
+    currency: str
+    amount: str | None = None
+    min: str | None = None
+    max: str | None = None
+
+
+class X402ManifestNetwork(BaseModel):
+    """Enabled settlement network advertised by the compatibility manifest."""
+
+    network: str
+    asset: str
+    scheme: str
+
+
+class X402ManifestResource(BaseModel):
+    """One payable operation in Hyrule's public x402 catalog."""
+
+    id: str
+    path: str
+    method: str
+    description: str
+    min_price: str = Field(alias="minPrice")
+    max_price: str | None = Field(default=None, alias="maxPrice")
+    price: X402ManifestPrice
+    networks: list[X402ManifestNetwork]
+    discoverable: bool
+    intents: list[str]
+    capabilities: list[str]
+    input_schema: dict[str, Any] = Field(alias="inputSchema")
+    input_example: dict[str, Any] = Field(alias="inputExample")
+    documentation_url: str = Field(alias="documentationUrl")
+
+
+class X402Manifest(BaseModel):
+    """Typed public response for ``/.well-known/x402.json``."""
+
+    x402_version: Literal[2] = Field(alias="x402Version")
+    name: str
+    description: str
+    intents: list[str]
+    capabilities: list[str]
+    resources: list[X402ManifestResource]
+    facilitator: str
+    contact: str
+
+
 _PAYMENT_REQUIRED_SCHEMA = {
     "type": "object",
     "required": ["x402Version", "accepts", "payment_required"],
@@ -1170,6 +1220,20 @@ _SECURITY_SCHEMES = {
         "in": "cookie",
         "name": "hyr_sess",
         "description": "Opaque Hyrule browser session cookie.",
+    },
+    "HyruleVmManagementToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "hyr_vm_<secret>",
+        "description": "One-shot VM management credential returned by the VM order flow.",
+    },
+    "HyruleVmManagementQueryToken": {
+        "type": "apiKey",
+        "in": "query",
+        "name": "token",
+        "description": (
+            "VM management token accepted in management URLs. Prefer the bearer form for agents."
+        ),
     },
     "HyruleBGPIngestToken": {
         "type": "apiKey",
@@ -1212,6 +1276,13 @@ def _annotate_security(schema: dict[str, Any], application: FastAPI) -> None:
             security = [{"HyruleSession": []}]
         elif require_account in calls:
             security = [{"HyruleApiKey": []}, {"HyruleSession": []}]
+        elif any(getattr(call, "__hyrule_vm_management_auth__", False) for call in calls):
+            security = [
+                {"HyruleVmManagementToken": []},
+                {"HyruleVmManagementQueryToken": []},
+                {"HyruleApiKey": []},
+                {"HyruleSession": []},
+            ]
         else:
             continue
         path_item = schema.get("paths", {}).get(route.path, {})

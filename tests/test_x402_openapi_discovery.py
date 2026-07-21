@@ -165,6 +165,15 @@ def test_full_openapi_documents_account_and_worker_authentication() -> None:
         "description": "Opaque Hyrule browser session cookie.",
     }
     assert schemes["HyruleBGPIngestToken"]["name"] == "X-Hyrule-BGP-Ingest-Token"
+    assert schemes["HyruleVmManagementToken"]["bearerFormat"] == "hyr_vm_<secret>"
+    assert schemes["HyruleVmManagementQueryToken"] == {
+        "type": "apiKey",
+        "in": "query",
+        "name": "token",
+        "description": (
+            "VM management token accepted in management URLs. Prefer the bearer form for agents."
+        ),
+    }
     assert schema["paths"]["/v1/me"]["get"]["security"] == [
         {"HyruleApiKey": []},
         {"HyruleSession": []},
@@ -173,6 +182,20 @@ def test_full_openapi_documents_account_and_worker_authentication() -> None:
     assert schema["paths"]["/v1/internal/bgp/jobs/claim"]["post"]["security"] == [
         {"HyruleBGPIngestToken": []}
     ]
+    vm_management_security = [
+        {"HyruleVmManagementToken": []},
+        {"HyruleVmManagementQueryToken": []},
+        {"HyruleApiKey": []},
+        {"HyruleSession": []},
+    ]
+    for method, path in (
+        ("get", "/v1/vm/{vm_id}"),
+        ("get", "/v1/vm/{vm_id}/logs"),
+        ("post", "/v1/vm/{vm_id}/extend"),
+        ("post", "/v1/vm/{vm_id}/reboot"),
+        ("delete", "/v1/vm/{vm_id}"),
+    ):
+        assert schema["paths"][path][method]["security"] == vm_management_security
     assert schema["paths"]["/v1/domains/{domain}/dns"]["get"][
         "x-hyrule-required-api-key-scopes"
     ] == ["domain:dns"]
@@ -180,6 +203,25 @@ def test_full_openapi_documents_account_and_worker_authentication() -> None:
         "x-hyrule-required-api-key-scopes"
     ] == ["domain:nameservers"]
     assert "security" not in schema["paths"]["/v1/auth/login"]["post"]
+
+
+def test_full_openapi_publishes_the_x402_manifest_response_schema() -> None:
+    schema = build_full_openapi(app, HyruleConfig())
+    response = schema["paths"]["/.well-known/x402.json"]["get"]["responses"]["200"]
+    manifest_ref = response["content"]["application/json"]["schema"]["$ref"]
+    manifest = schema["components"]["schemas"][manifest_ref.rsplit("/", 1)[-1]]
+
+    assert set(manifest["required"]) >= {"x402Version", "resources", "intents", "capabilities"}
+    resource_ref = manifest["properties"]["resources"]["items"]["$ref"]
+    resource = schema["components"]["schemas"][resource_ref.rsplit("/", 1)[-1]]
+    assert set(resource["required"]) >= {
+        "path",
+        "method",
+        "price",
+        "networks",
+        "inputSchema",
+        "inputExample",
+    }
 
 
 def test_app_openapi_reuses_the_cached_schema() -> None:

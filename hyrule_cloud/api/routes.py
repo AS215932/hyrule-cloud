@@ -710,6 +710,11 @@ async def _vm_for_management(
     raise HTTPException(404, "VM not found")
 
 
+# OpenAPI generation discovers this dependency recursively and documents all
+# four accepted owner credentials without changing the runtime auth flow.
+setattr(_vm_for_management, "__hyrule_vm_management_auth__", True)
+
+
 # Block A0: public sanitized status view. Returns minimal fields needed
 # for an order-status page — NO ssh, NO firewall, NO error detail. Any
 # caller can fetch this for any vm_id; pre-A0 frontends keep working

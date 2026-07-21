@@ -47,6 +47,7 @@ from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.services.discovery import X402Manifest
 
 # Newline-delimited JSON to stdout per AS215932's application logging
 # contract (hyrule-infra/docs/application-logging.md). systemd-journald
@@ -386,7 +387,11 @@ async def health():
     return {"status": "ok", "service": "hyrule-cloud"}
 
 
-@app.get("/.well-known/x402.json")
+@app.get(
+    "/.well-known/x402.json",
+    response_model=X402Manifest,
+    response_model_exclude_none=True,
+)
 async def x402_manifest():
     """Paid discovery manifest generated from the canonical operation catalog."""
     from hyrule_cloud.services.discovery import build_x402_manifest
