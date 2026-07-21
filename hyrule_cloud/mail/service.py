@@ -108,6 +108,16 @@ def _mailbox_occupies_capacity() -> Any:
     )
 
 
+def _mailbox_occupies_domain() -> Any:
+    """Reserve a custom domain until any service-owned DNS cleanup completes."""
+
+    return or_(
+        _mailbox_occupies_capacity(),
+        MailAccountRow.dns_cleanup_pending.is_(True),
+        MailAccountRow.provision_error == "dns_cleanup_pending",
+    )
+
+
 class MailProblem(DomainProblem):
     pass
 
@@ -226,6 +236,13 @@ class MailService:
         domain_amount = Decimal("0")
         activation_amount = Decimal(self.config.payment.price_mail_activation)
 
+        if body.mode is not MailboxMode.HOSTED and not self.domains.dns.configured:
+            raise MailProblem(
+                503,
+                "managed_dns_not_ready",
+                "Custom-domain Agent Mail is unavailable until managed DNS is configured.",
+                headers={"Retry-After": "3600"},
+            )
         if body.mode is MailboxMode.CUSTOM:
             await self._assert_managed_domain_token(domain, body.domain_management_token or "")
         elif body.mode is MailboxMode.DOMAIN_AND_MAILBOX:
@@ -258,7 +275,7 @@ class MailService:
                     .select_from(MailAccountRow)
                     .where(
                         MailAccountRow.domain == domain,
-                        _mailbox_occupies_capacity(),
+                        _mailbox_occupies_domain(),
                     )
                 )
                 if domain_in_use:
@@ -585,7 +602,7 @@ class MailService:
                         .where(
                             MailAccountRow.mailbox_id != mailbox_id,
                             MailAccountRow.domain == row.domain,
-                            _mailbox_occupies_capacity(),
+                            _mailbox_occupies_domain(),
                         )
                     )
                     or 0
@@ -1221,7 +1238,13 @@ class MailService:
             quote.status = MailQuoteStatus.CONSUMED.value
             quote.consumed_at = now
             quote.request_payload = {"redacted": True}
-            if await session.get(MailMessageIndexRow, message_id) is None:
+            if (
+                await session.get(
+                    MailMessageIndexRow,
+                    (account.mailbox_id, message_id),
+                )
+                is None
+            ):
                 session.add(
                     MailMessageIndexRow(
                         message_id=message_id,
@@ -1300,7 +1323,10 @@ class MailService:
             for payload in payloads:
                 fields = self._message_index_fields(payload)
                 message_id = fields.pop("message_id")
-                row = await session.get(MailMessageIndexRow, message_id)
+                row = await session.get(
+                    MailMessageIndexRow,
+                    (mailbox_id, message_id),
+                )
                 if row is None:
                     row = MailMessageIndexRow(
                         message_id=message_id,
@@ -1308,11 +1334,9 @@ class MailService:
                         **fields,
                     )
                     session.add(row)
-                elif row.mailbox_id == mailbox_id:
+                else:
                     for field, value in fields.items():
                         setattr(row, field, value)
-                else:
-                    continue
                 rows.append(row)
             await session.commit()
         return MailMessagesResponse(
@@ -1348,7 +1372,10 @@ class MailService:
         if authoritative_id != message_id:
             raise MailProblem(404, "message_not_found", "Message not found.")
         async with self.db() as session:
-            indexed = await session.get(MailMessageIndexRow, message_id)
+            indexed = await session.get(
+                MailMessageIndexRow,
+                (mailbox_id, message_id),
+            )
             if indexed is None:
                 indexed = MailMessageIndexRow(
                     message_id=message_id,
@@ -1356,8 +1383,6 @@ class MailService:
                     **fields,
                 )
                 session.add(indexed)
-            elif indexed.mailbox_id != mailbox_id:
-                raise MailProblem(404, "message_not_found", "Message not found.")
             else:
                 for field, value in fields.items():
                     setattr(indexed, field, value)
@@ -1617,7 +1642,10 @@ class MailService:
                             postgresql_insert(MailMessageIndexRow)
                             .values(**index_values)
                             .on_conflict_do_nothing(
-                                index_elements=[MailMessageIndexRow.message_id]
+                                index_elements=[
+                                    MailMessageIndexRow.mailbox_id,
+                                    MailMessageIndexRow.message_id,
+                                ]
                             )
                         )
                     elif dialect == "sqlite":
@@ -1625,10 +1653,19 @@ class MailService:
                             sqlite_insert(MailMessageIndexRow)
                             .values(**index_values)
                             .on_conflict_do_nothing(
-                                index_elements=[MailMessageIndexRow.message_id]
+                                index_elements=[
+                                    MailMessageIndexRow.mailbox_id,
+                                    MailMessageIndexRow.message_id,
+                                ]
                             )
                         )
-                    elif await session.get(MailMessageIndexRow, message_id) is None:
+                    elif (
+                        await session.get(
+                            MailMessageIndexRow,
+                            (account.mailbox_id, message_id),
+                        )
+                        is None
+                    ):
                         session.add(MailMessageIndexRow(**index_values))
                 suspend_reason = self._suspension_reason(raw_type, data)
                 if suspend_reason and account.status not in {
@@ -2531,10 +2568,12 @@ class MailService:
         self, account: MailAccountRow, message_id: str, recipient: str
     ) -> str:
         async with self.db() as session:
-            original = await session.get(MailMessageIndexRow, message_id)
+            original = await session.get(
+                MailMessageIndexRow,
+                (account.mailbox_id, message_id),
+            )
         if (
             original is None
-            or original.mailbox_id != account.mailbox_id
             or original.folder != "inbox"
             or (original.sender or "").lower() != recipient.lower()
         ):

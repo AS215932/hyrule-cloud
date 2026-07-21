@@ -311,6 +311,9 @@ class DomainOrderRow(Base):
     payment_asset: Mapped[str | None] = mapped_column(String(66))
     payer: Mapped[str | None] = mapped_column(String(128))
     payment_tx: Mapped[str | None] = mapped_column(String(128), index=True)
+    payment_settlement_pending_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     refund_address: Mapped[str | None] = mapped_column(String(128))
     native_intent_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("crypto_intents.intent_id", ondelete="SET NULL"), index=True
@@ -1035,8 +1038,8 @@ class MailDeliveryLogRow(Base):
 class MailMessageIndexRow(Base):
     __tablename__ = "mail_message_index"
 
+    mailbox_id: Mapped[str] = mapped_column(String(36), primary_key=True, index=True)
     message_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
     folder: Mapped[str] = mapped_column(String(64), index=True)
     sender: Mapped[str | None] = mapped_column(String(320))
     recipients: Mapped[list | None] = mapped_column(_JSONB)

@@ -185,8 +185,10 @@ class MailSendQuoteRequest(BaseModel):
     mailbox_id: str = Field(min_length=8, max_length=64)
     to: str
     subject: str = Field(min_length=1, max_length=998)
-    text: str = Field(default="", max_length=100_000)
-    html: str | None = Field(default=None, max_length=100_000)
+    # Request parsing accepts the full configuration range. MailService applies
+    # the operator's lower runtime limits before a quote is persisted.
+    text: str = Field(default="", max_length=1_000_000)
+    html: str | None = Field(default=None, max_length=1_000_000)
     in_reply_to: str | None = Field(default=None, max_length=128)
 
     _to = field_validator("to")(normalize_address)

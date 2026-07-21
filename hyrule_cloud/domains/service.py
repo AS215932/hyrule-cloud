@@ -818,6 +818,93 @@ class DomainService:
             await session.commit()
             return current
 
+    async def begin_x402_settlement(
+        self,
+        order_id: str,
+        *,
+        payer: str,
+        payment_network: str | None,
+        payment_asset: str | None,
+    ) -> DomainOrderRow:
+        """Persist a domain-payment intent before the facilitator can move money."""
+
+        async with self.db() as session:
+            order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if order is None:
+                raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            if order.status != DomainOrderStatus.AWAITING_PAYMENT.value:
+                raise DomainProblem(
+                    409,
+                    "order_payment_closed",
+                    "This domain order is no longer awaiting payment.",
+                )
+            if order.paid_at is None:
+                order.payer = payer[:128]
+                order.payment_network = payment_network
+                order.payment_asset = payment_asset
+                order.payment_settlement_pending_at = (
+                    order.payment_settlement_pending_at or _now()
+                )
+                await session.commit()
+            return order
+
+    async def clear_x402_settlement(self, order_id: str) -> None:
+        """Clear an intent after the facilitator definitively rejects settlement."""
+
+        async with self.db() as session:
+            order = await session.get(DomainOrderRow, order_id)
+            if order is not None and order.paid_at is None:
+                order.payer = None
+                order.payment_network = None
+                order.payment_asset = None
+                order.payment_settlement_pending_at = None
+                await session.commit()
+
+    async def record_x402_settlement(
+        self,
+        order_id: str,
+        *,
+        payer: str,
+        tx_hash: str | None,
+        payment_network: str | None,
+        payment_asset: str | None,
+    ) -> DomainOrderRow:
+        """Durably stamp a settled domain payment before fulfillment handoff."""
+
+        async with self.db() as session:
+            order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if order is None:
+                raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            if (
+                order.status != DomainOrderStatus.AWAITING_PAYMENT.value
+                and order.paid_at is None
+            ):
+                raise DomainProblem(
+                    409,
+                    "order_payment_closed",
+                    "This domain order is no longer awaiting payment.",
+                )
+            order.payer = payer[:128]
+            order.payment_tx = tx_hash
+            order.payment_network = payment_network
+            order.payment_asset = payment_asset
+            order.payment_settlement_pending_at = None
+            order.paid_at = order.paid_at or _now()
+            await session.commit()
+            return order
+
     async def mark_x402_paid(
         self,
         order_id: str,
@@ -848,6 +935,11 @@ class DomainService:
             ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            if (
+                order.payment_settlement_pending_at is not None
+                or order.paid_at is not None
+            ):
+                return
             quote = await session.get(DomainQuoteRow, order.quote_id)
             if (
                 quote is None
@@ -892,6 +984,7 @@ class DomainService:
             ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            durable_settlement = order.paid_at is not None
             late_handoff = False
             if (
                 order.status == DomainOrderStatus.EXPIRED.value
@@ -918,11 +1011,12 @@ class DomainService:
                     order.error_detail = None
                     quote.status = "reserved"
                 else:
-                    order.paid_at = _now()
+                    order.paid_at = order.paid_at or _now()
                     order.payer = payer[:128]
                     order.payment_tx = tx_hash
                     order.payment_network = payment_network
                     order.payment_asset = payment_asset
+                    order.payment_settlement_pending_at = None
                     order.status = DomainOrderStatus.REFUND_DUE.value
                     order.error_code = "late_payment_after_expiry"
                     session.add(self._build_refund_event(order, "late_payment_after_expiry"))
@@ -937,11 +1031,12 @@ class DomainService:
             if order.status == DomainOrderStatus.AWAITING_PAYMENT.value:
                 # Persist settlement attribution before any quote validation so
                 # an invalidated quote still produces a usable refund record.
-                order.paid_at = _now()
+                order.paid_at = order.paid_at or _now()
                 order.payer = payer[:128]
                 order.payment_tx = tx_hash
                 order.payment_network = payment_network
                 order.payment_asset = payment_asset
+                order.payment_settlement_pending_at = None
                 quote = (
                     await session.execute(
                         select(DomainQuoteRow)
@@ -952,7 +1047,11 @@ class DomainService:
                 if (
                     quote is None
                     or quote.status not in {"active", "reserved"}
-                    or (_aware(quote.expires_at) <= _now() and not late_handoff)
+                    or (
+                        _aware(quote.expires_at) <= _now()
+                        and not late_handoff
+                        and not durable_settlement
+                    )
                 ):
                     if quote is not None and _aware(quote.expires_at) <= _now():
                         quote.status = "expired"
@@ -1553,6 +1652,29 @@ class DomainService:
             return 0
         recovered = 0
         seen: set[str] = set()
+        async with self.db() as session:
+            durable = list(
+                await session.scalars(
+                    select(DomainOrderRow)
+                    .where(
+                        DomainOrderRow.status == DomainOrderStatus.AWAITING_PAYMENT.value,
+                        DomainOrderRow.payment_method == DomainPaymentMethod.USDC.value,
+                        DomainOrderRow.paid_at.is_not(None),
+                    )
+                    .order_by(DomainOrderRow.paid_at)
+                    .limit(limit)
+                )
+            )
+        for durable_order in durable:
+            seen.add(durable_order.order_id)
+            await self._mark_paid(
+                durable_order.order_id,
+                payer=durable_order.payer or "unknown",
+                tx_hash=durable_order.payment_tx,
+                payment_network=durable_order.payment_network,
+                payment_asset=durable_order.payment_asset,
+            )
+            recovered += 1
         cursor: tuple[datetime, str] | None = None
         while True:
             filters: list[Any] = [
@@ -1593,10 +1715,10 @@ class DomainService:
                     continue
                 seen.add(order_id)
                 async with self.db() as session:
-                    order = await session.get(DomainOrderRow, order_id)
+                    ledger_order = await session.get(DomainOrderRow, order_id)
                     awaiting = bool(
-                        order is not None
-                        and order.status == DomainOrderStatus.AWAITING_PAYMENT.value
+                        ledger_order is not None
+                        and ledger_order.status == DomainOrderStatus.AWAITING_PAYMENT.value
                     )
                 if not awaiting:
                     continue
@@ -1623,6 +1745,8 @@ class DomainService:
                     .join(DomainQuoteRow, DomainQuoteRow.quote_id == DomainOrderRow.quote_id)
                     .where(
                         DomainOrderRow.status == DomainOrderStatus.AWAITING_PAYMENT.value,
+                        DomainOrderRow.payment_settlement_pending_at.is_(None),
+                        DomainOrderRow.paid_at.is_(None),
                         DomainQuoteRow.status.in_(["active", "reserved"]),
                         DomainQuoteRow.expires_at < now,
                     )
@@ -1631,11 +1755,24 @@ class DomainService:
             )
             for order in unpaid_orders:
                 await self._expire_unpaid_order(session, order, now=now)
+            protected_handoff = (
+                select(DomainOrderRow.order_id)
+                .where(
+                    DomainOrderRow.quote_id == DomainQuoteRow.quote_id,
+                    DomainOrderRow.status == DomainOrderStatus.AWAITING_PAYMENT.value,
+                    or_(
+                        DomainOrderRow.payment_settlement_pending_at.is_not(None),
+                        DomainOrderRow.paid_at.is_not(None),
+                    ),
+                )
+                .exists()
+            )
             result = await session.execute(
                 update(DomainQuoteRow)
                 .where(
                     DomainQuoteRow.status.in_(["active", "reserved"]),
                     DomainQuoteRow.expires_at < now,
+                    ~protected_handoff,
                 )
                 .values(status="expired")
             )
@@ -1649,7 +1786,11 @@ class DomainService:
         *,
         now: datetime,
     ) -> None:
-        if order.status != DomainOrderStatus.AWAITING_PAYMENT.value:
+        if (
+            order.status != DomainOrderStatus.AWAITING_PAYMENT.value
+            or order.payment_settlement_pending_at is not None
+            or order.paid_at is not None
+        ):
             return
         order.status = DomainOrderStatus.EXPIRED.value
         order.error_code = "quote_expired"

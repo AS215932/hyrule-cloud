@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
-from hyrule_cloud.db import AccountRow, DomainQuoteRow
+from hyrule_cloud.db import AccountRow, DomainOrderRow, DomainQuoteRow
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.domains.models import (
     AgentDomainOrderRequest,
@@ -78,6 +78,115 @@ def _idempotency(value: str | None) -> str:
             400, "idempotency_key_required", "A valid Idempotency-Key header is required."
         )
     return value
+
+
+async def _settle_x402_order(
+    *,
+    service: DomainService,
+    gate: PaymentGate,
+    request: Request,
+    order: DomainOrderRow,
+    description: str,
+    payment_metadata: dict[str, Any],
+    pending_code: str,
+) -> DomainOrderRow | Response:
+    """Settle only after a recoverable order-local intent is committed."""
+
+    if order.status == "awaiting_payment" and order.paid_at is not None:
+        return await service.mark_x402_paid(
+            order.order_id,
+            payer=order.payer or "unknown",
+            tx_hash=order.payment_tx,
+            payment_network=order.payment_network,
+            payment_asset=order.payment_asset,
+        )
+    await service.assert_x402_payable(order.order_id)
+    verified = await gate.verify_only(
+        request,
+        amount=order.amount_usd,
+        description=description,
+        extra_body=payment_metadata,
+    )
+    if isinstance(verified, Response):
+        return verified
+    requirements = verified.matching_requirements
+    await service.begin_x402_settlement(
+        order.order_id,
+        payer=verified.payer or "unknown",
+        payment_network=getattr(requirements, "network", None),
+        payment_asset=getattr(requirements, "asset", None),
+    )
+    if not await gate.settle_verified(
+        request,
+        verified,
+        extra_body=payment_metadata,
+    ):
+        await service.clear_x402_settlement(order.order_id)
+        raise DomainProblem(
+            402,
+            "payment_settlement_failed",
+            "Payment did not settle; the domain order remains unpaid.",
+        )
+
+    payer = getattr(request.state, "payment_payer", None) or verified.payer or "unknown"
+    durable_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            order = await service.record_x402_settlement(
+                order.order_id,
+                payer=payer,
+                tx_hash=getattr(request.state, "payment_tx", None),
+                payment_network=getattr(request.state, "payment_network", None),
+                payment_asset=getattr(request.state, "payment_asset", None),
+            )
+            durable_error = None
+            break
+        except Exception as exc:
+            durable_error = exc
+            log.warning(
+                "domain_payment_settlement_record_failed",
+                order_id=order.order_id,
+                attempt=attempt + 1,
+                exc_info=True,
+            )
+            if attempt < 2:
+                await asyncio.sleep(0.1 * (attempt + 1))
+    if durable_error is not None:
+        raise DomainProblem(
+            503,
+            pending_code,
+            "Payment settled, but the domain order is pending durable recovery.",
+        ) from durable_error
+
+    handoff_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            order = await service.mark_x402_paid(
+                order.order_id,
+                payer=payer,
+                tx_hash=order.payment_tx,
+                payment_network=order.payment_network,
+                payment_asset=order.payment_asset,
+            )
+            handoff_error = None
+            break
+        except Exception as exc:
+            handoff_error = exc
+            log.warning(
+                "domain_payment_handoff_attempt_failed",
+                order_id=order.order_id,
+                attempt=attempt + 1,
+                exc_info=True,
+            )
+            if attempt < 2:
+                await asyncio.sleep(0.1 * (attempt + 1))
+    if handoff_error is not None:
+        raise DomainProblem(
+            503,
+            pending_code,
+            "Payment settled, but the domain order is pending durable recovery.",
+        ) from handoff_error
+    return order
 
 
 @router.get("/tlds", response_model=DomainTLDListResponse)
@@ -177,51 +286,23 @@ async def create_order(
         response.status_code = 201 if created else 200
         return await service.order_response(order)
     if order.status == "awaiting_payment":
-        await service.assert_x402_payable(order.order_id)
-        paid = await gate.check_payment(
-            request,
-            amount=order.amount_usd,
+        settled = await _settle_x402_order(
+            service=service,
+            gate=gate,
+            request=request,
+            order=order,
             description=f"Hyrule domain order for {order.fqdn}",
-            extra_body={
+            payment_metadata={
                 "order_id": order.order_id,
                 "domain": order.fqdn,
                 "amount_usd": f"{order.amount_usd:.2f}",
                 "quote_id": order.quote_id,
             },
+            pending_code="payment_handoff_pending",
         )
-        if isinstance(paid, Response):
-            return paid
-        handoff_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                order = await service.mark_x402_paid(
-                    order.order_id,
-                    payer=paid,
-                    tx_hash=getattr(request.state, "payment_tx", None),
-                    payment_network=getattr(request.state, "payment_network", None),
-                    payment_asset=getattr(request.state, "payment_asset", None),
-                )
-                handoff_error = None
-                break
-            except Exception as exc:
-                handoff_error = exc
-                log.warning(
-                    "domain_payment_handoff_attempt_failed",
-                    order_id=order.order_id,
-                    attempt=attempt + 1,
-                    exc_info=True,
-                )
-                if attempt < 2:
-                    await asyncio.sleep(0.1 * (attempt + 1))
-        if handoff_error is not None:
-            # PaymentGate persisted the order_id in its settled ledger event;
-            # the worker replays that durable handoff. A 503 also makes a
-            # client retry safe because create_order is idempotent.
-            raise DomainProblem(
-                503,
-                "payment_handoff_pending",
-                "Payment settled, but the order handoff is pending recovery.",
-            ) from handoff_error
+        if isinstance(settled, Response):
+            return settled
+        order = settled
         response.status_code = 202
     else:
         response.status_code = 200
@@ -253,7 +334,6 @@ async def create_agent_order(
         idempotency_key=_idempotency(idempotency_key),
     )
     if order.status == "awaiting_payment":
-        await service.assert_x402_payable(order.order_id)
         payment_metadata = {
             "order_id": order.order_id,
             "domain": order.fqdn,
@@ -262,43 +342,19 @@ async def create_agent_order(
         challenge_metadata = dict(payment_metadata)
         if not isinstance(gate, PaymentGate) or not gate.has_payment_credentials(request):
             challenge_metadata["management_token"] = token
-        paid = await gate.check_payment(
-            request,
-            amount=order.amount_usd,
+        settled = await _settle_x402_order(
+            service=service,
+            gate=gate,
+            request=request,
+            order=order,
             description=f"Hyrule wallet-native domain order for {order.fqdn}",
-            extra_body=challenge_metadata,
+            payment_metadata=challenge_metadata,
+            pending_code="agent_domain_payment_handoff_pending",
         )
-        if isinstance(paid, Response):
-            paid.headers["Cache-Control"] = "no-store"
-            return paid
-        handoff_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                order = await service.mark_x402_paid(
-                    order.order_id,
-                    payer=paid,
-                    tx_hash=getattr(request.state, "payment_tx", None),
-                    payment_network=getattr(request.state, "payment_network", None),
-                    payment_asset=getattr(request.state, "payment_asset", None),
-                )
-                handoff_error = None
-                break
-            except Exception as exc:
-                handoff_error = exc
-                log.warning(
-                    "agent_domain_payment_handoff_attempt_failed",
-                    order_id=order.order_id,
-                    attempt=attempt + 1,
-                    exc_info=True,
-                )
-                if attempt < 2:
-                    await asyncio.sleep(0.1 * (attempt + 1))
-        if handoff_error is not None:
-            raise DomainProblem(
-                503,
-                "agent_domain_payment_handoff_pending",
-                "Payment settled, but the domain order is pending durable recovery.",
-            ) from handoff_error
+        if isinstance(settled, Response):
+            settled.headers["Cache-Control"] = "no-store"
+            return settled
+        order = settled
         response.status_code = 202
     else:
         response.status_code = 201 if created else 200

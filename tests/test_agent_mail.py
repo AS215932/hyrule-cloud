@@ -140,6 +140,7 @@ class _Domains:
     def __init__(self) -> None:
         self.agent_orders: list[dict] = []
         self.paid_orders: list[dict] = []
+        self.dns = SimpleNamespace(configured=True)
 
     async def create_quote(self, domain, action, owner):
         assert action.value == "register"
@@ -254,6 +255,9 @@ def test_agent_mail_review_safety_schema_contracts():
     assert [column.name for column in authorization_quote_constraints[0].columns] == ["quote_id"]
     assert MailAccountRow.__table__.c.dns_cleanup_pending.index is True
     assert MailAccountRow.__table__.c.payment_settled_at.index is True
+    assert [
+        column.name for column in MailMessageIndexRow.__table__.primary_key.columns
+    ] == ["mailbox_id", "message_id"]
 
 
 def test_send_reservation_serializes_the_global_capacity_check():
@@ -312,6 +316,50 @@ def test_payment_fingerprint_uses_canonical_signed_payload_fields():
     changed_authorization = json.loads(json.dumps(first))
     changed_authorization["payload"]["authorization"]["nonce"] = "0x" + "7" * 64
     assert fingerprint(first, compact=True) != fingerprint(changed_authorization, compact=True)
+
+
+@pytest.mark.asyncio
+async def test_send_quote_honors_configured_body_limit_above_100k(mail_service):
+    service, _sessions, _backend, _domains, _refunds = mail_service
+    mailbox_id, token = await _active_hosted(
+        service,
+        local_part="large-body",
+        idempotency_key="large-body-idempotency-0001",
+    )
+    body = MailSendQuoteRequest(
+        mailbox_id=mailbox_id,
+        to="recipient@example.net",
+        subject="Configured body limit",
+        text="x" * 100_001,
+    )
+
+    service.mail_config.max_text_chars = 150_000
+    quote = await service.create_send_quote(body, token)
+    assert quote.kind == "send"
+
+    service.mail_config.max_text_chars = 100_000
+    with pytest.raises(MailProblem) as too_large:
+        await service.create_send_quote(body, token)
+    assert too_large.value.code == "message_too_large"
+
+
+@pytest.mark.asyncio
+async def test_custom_domain_quote_requires_managed_dns(mail_service):
+    service, _sessions, _backend, domains, _refunds = mail_service
+    domains.dns.configured = False
+
+    with pytest.raises(MailProblem) as unavailable:
+        await service.create_account_quote(
+            MailAccountQuoteRequest(
+                local_part="managed-dns-required",
+                mode=MailboxMode.CUSTOM,
+                domain="managed-dns-required.dev",
+                domain_management_token="hyr_identity_" + "x" * 43,
+                terms_version=service.mail_config.terms_version,
+            )
+        )
+
+    assert unavailable.value.code == "managed_dns_not_ready"
 
 
 @pytest.mark.asyncio
@@ -474,6 +522,51 @@ async def test_stalwart_account_deletion_rejects_per_account_failures(monkeypatc
             await client.delete_account("account-1")
         failure = {"type": "notFound"}
         await client.delete_account("account-1")
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stalwart_rejects_standard_jmap_method_errors(monkeypatch):
+    config = HyruleConfig().mail
+    config.backend_url = "https://mail.internal"
+    config.backend_token = "token"
+    client = StalwartClient(config)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "methodResponses": [
+                    [
+                        "error",
+                        {"type": "serverFail", "description": "backend refused mutation"},
+                        "destructive-call",
+                    ]
+                ]
+            },
+        )
+
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def session(_address, _password):
+        return {"apiUrl": "https://mail.internal/jmap"}, None
+
+    monkeypatch.setattr(client, "_session", session)
+    try:
+        with pytest.raises(MailBackendError, match="backend refused mutation"):
+            await client._manage(
+                [["x:Account/set", {"destroy": ["account-1"]}, "destructive-call"]]
+            )
+        with pytest.raises(MailBackendError, match="backend refused mutation"):
+            await client._jmap(
+                "journey@example.test",
+                "generated-secret",
+                [["Email/set", {"destroy": ["message-1"]}, "destructive-call"]],
+                ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            )
     finally:
         await client.close()
 
@@ -1527,11 +1620,40 @@ async def test_failed_activation_persists_and_retries_dns_cleanup(
         assert failed.provision_error == "post-DNS provisioning failure"
         assert failed.dns_cleanup_pending is True
 
+    replacement_quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="dns-cleanup-replacement",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    replacement, _replacement_token, _created = await service.prepare_activation(
+        replacement_quote.quote_id,
+        idempotency_key="dns-cleanup-replacement-idempotency-0001",
+    )
+    async with sessions() as session:
+        replacement_row = await session.get(MailAccountRow, replacement.mailbox_id)
+        replacement_row.plan = MailboxMode.CUSTOM.value
+        replacement_row.domain = "dns-cleanup-retry.dev"
+        await session.commit()
+    with pytest.raises(MailProblem) as still_reserved:
+        await service.reserve_activation_capacity(
+            replacement.mailbox_id,
+            quote_id=replacement_quote.quote_id,
+        )
+    assert still_reserved.value.code == "domain_mailbox_exists"
+
     assert await service.process_lifecycle() == 1
+    await service.reserve_activation_capacity(
+        replacement.mailbox_id,
+        quote_id=replacement_quote.quote_id,
+    )
     async with sessions() as session:
         cleaned = await session.get(MailAccountRow, mailbox_id)
+        replacement_row = await session.get(MailAccountRow, replacement.mailbox_id)
         assert cleaned.provision_error == "post-DNS provisioning failure"
         assert cleaned.dns_cleanup_pending is False
+        assert replacement_row.capacity_reserved_at is not None
     assert attempts == 2
 
 
@@ -2080,7 +2202,10 @@ async def test_message_listing_and_detail_reconcile_from_authoritative_jmap(mail
     listed = await service.list_messages(mailbox_id, token)
     assert [message.message_id for message in listed.messages] == ["jmap-only-message"]
     async with sessions() as session:
-        indexed = await session.get(MailMessageIndexRow, "jmap-only-message")
+        indexed = await session.get(
+            MailMessageIndexRow,
+            (mailbox_id, "jmap-only-message"),
+        )
         assert indexed is not None
         await session.delete(indexed)
         await session.commit()
@@ -2088,7 +2213,60 @@ async def test_message_listing_and_detail_reconcile_from_authoritative_jmap(mail
     detail = await service.get_message(mailbox_id, "jmap-only-message", token)
     assert detail.text == "authoritative body"
     async with sessions() as session:
-        assert await session.get(MailMessageIndexRow, "jmap-only-message") is not None
+        assert (
+            await session.get(
+                MailMessageIndexRow,
+                (mailbox_id, "jmap-only-message"),
+            )
+            is not None
+        )
+
+
+@pytest.mark.asyncio
+async def test_jmap_message_ids_are_scoped_to_each_mailbox(mail_service):
+    service, sessions, backend, _domains, _refunds = mail_service
+    first_id, first_token = await _active_hosted(
+        service,
+        local_part="message-scope-first",
+        idempotency_key="message-scope-first-idempotency-0001",
+    )
+    second_id, second_token = await _active_hosted(
+        service,
+        local_part="message-scope-second",
+        idempotency_key="message-scope-second-idempotency-0001",
+    )
+    backend.authoritative_messages = [
+        {
+            "id": "account-scoped-jmap-id",
+            "messageId": ["<shared-object-id@example.net>"],
+            "folder": "inbox",
+            "from": [{"email": "sender@example.net"}],
+            "to": [{"email": "recipient@example.test"}],
+            "subject": "Same object id in two accounts",
+            "receivedAt": datetime.now(UTC).isoformat(),
+            "textBody": [{"partId": "text"}],
+            "bodyValues": {"text": {"value": "mailbox-local message"}},
+            "attachments": [],
+        }
+    ]
+
+    assert len((await service.list_messages(first_id, first_token)).messages) == 1
+    assert len((await service.list_messages(second_id, second_token)).messages) == 1
+    assert (
+        await service.get_message(second_id, "account-scoped-jmap-id", second_token)
+    ).text == "mailbox-local message"
+
+    async with sessions() as session:
+        first = await session.get(
+            MailMessageIndexRow,
+            (first_id, "account-scoped-jmap-id"),
+        )
+        second = await session.get(
+            MailMessageIndexRow,
+            (second_id, "account-scoped-jmap-id"),
+        )
+    assert first is not None
+    assert second is not None
 
 
 @pytest.mark.asyncio
@@ -2301,7 +2479,13 @@ async def test_retention_deletes_backend_message_before_its_index(mail_service):
     assert len(backend.retention_sweeps) == 1
     assert backend.retention_sweeps[0]["address"] == "journey-agent@agentmail.hyrule.host"
     async with sessions() as session:
-        assert await session.get(MailMessageIndexRow, "retention-message-old") is None
+        assert (
+            await session.get(
+                MailMessageIndexRow,
+                (mailbox_id, "retention-message-old"),
+            )
+            is None
+        )
 
 
 @pytest.mark.asyncio
@@ -2431,7 +2615,10 @@ async def test_receive_event_survives_an_existing_message_index(mail_service):
     )
     async with sessions() as session:
         event = await session.get(MailEventRow, "receive-after-authoritative-poll")
-        index = await session.get(MailMessageIndexRow, "already-polled-message")
+        index = await session.get(
+            MailMessageIndexRow,
+            (mailbox_id, "already-polled-message"),
+        )
         delivery = await session.scalar(
             select(MailWebhookDeliveryRow).where(
                 MailWebhookDeliveryRow.event_id == "receive-after-authoritative-poll"
@@ -2514,4 +2701,10 @@ async def test_stalwart_events_use_directional_mailbox_ownership(mail_service):
         assert delivery.type == "message.delivery"
         assert append.mailbox_id == sender_id
         assert append.type == "mail.system"
-        assert await session.get(MailMessageIndexRow, "directional-append-message") is None
+        assert (
+            await session.get(
+                MailMessageIndexRow,
+                (sender_id, "directional-append-message"),
+            )
+            is None
+        )

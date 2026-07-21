@@ -95,7 +95,7 @@ class StalwartClient:
                 or not isinstance(item[2], str)
             ):
                 raise MailBackendError("Stalwart management method response was malformed")
-            if item[0].endswith("/error"):
+            if item[0] == "error" or item[0].endswith("/error"):
                 raise MailBackendError(str(item[1].get("description") or item[1].get("type")))
         return cast(dict[str, Any], payload)
 
@@ -411,7 +411,7 @@ class StalwartClient:
                 or not isinstance(item[2], str)
             ):
                 raise MailBackendError("Stalwart JMAP method response was malformed")
-            if item[0].endswith("/error"):
+            if item[0] == "error" or item[0].endswith("/error"):
                 raise MailBackendError(str(item[1].get("description") or item[1].get("type")))
         return {"session": session, "response": payload}
 

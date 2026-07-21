@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -32,7 +33,12 @@ from hyrule_cloud.db import (
     create_db_engine,
     create_session_factory,
 )
-from hyrule_cloud.domains.api import get_operation as get_operation_route
+from hyrule_cloud.domains.api import (
+    _settle_x402_order,
+)
+from hyrule_cloud.domains.api import (
+    get_operation as get_operation_route,
+)
 from hyrule_cloud.domains.catalog import parse_iana_root_db
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.domains.models import (
@@ -270,6 +276,15 @@ def test_ascii_second_level_validation_and_pricing():
     config = HyruleConfig().domain
     assert price_domain(Decimal("4"), Decimal("1"), config)[3] == Decimal("7.00")
     assert price_domain(Decimal("20"), Decimal("1"), config)[3] == Decimal("25.00")
+
+
+def test_domain_api_persists_settlement_state_around_the_facilitator_call() -> None:
+    source = inspect.getsource(_settle_x402_order)
+    settlement = source.index("settle_verified")
+    durable = source.index("record_x402_settlement", settlement)
+    handoff = source.index("mark_x402_paid", durable)
+    assert source.index("begin_x402_settlement") < settlement
+    assert settlement < durable < handoff
 
 
 def test_native_refund_addresses_are_validated_for_the_selected_asset() -> None:
@@ -1643,6 +1658,55 @@ async def test_settlement_ledger_recovers_lost_x402_order_handoff(domain_service
     assert current is not None and current.status == "queued"
     assert current.payment_tx == "0xrecover"
     assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_order_local_settlement_recovers_without_metrics_ledger(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote(
+        "durable-domain-settlement.dev",
+        DomainAction.REGISTER,
+        "H1234567890",
+    )
+    order, _created = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="durable-domain-settlement",
+    )
+    await service.begin_x402_settlement(
+        order.order_id,
+        payer="0x" + "4" * 40,
+        payment_network="eip155:8453",
+        payment_asset="0x" + "5" * 40,
+    )
+    async with sessions() as session:
+        stored_quote = await session.get(DomainQuoteRow, quote.quote_id)
+        stored_quote.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+        await session.commit()
+
+    assert await service.expire_quotes() == 0
+    await service.record_x402_settlement(
+        order.order_id,
+        payer="0x" + "4" * 40,
+        tx_hash="0xdurable-domain-settlement",
+        payment_network="eip155:8453",
+        payment_asset="0x" + "5" * 40,
+    )
+    assert await service.recover_x402_handoffs() == 1
+
+    async with sessions() as session:
+        recovered = await session.get(DomainOrderRow, order.order_id)
+        stored_quote = await session.get(DomainQuoteRow, quote.quote_id)
+        events = list(await session.scalars(select(PaymentEventRow)))
+    assert recovered.status == DomainOrderStatus.QUEUED.value
+    assert recovered.payment_tx == "0xdurable-domain-settlement"
+    assert recovered.payment_settlement_pending_at is None
+    assert stored_quote.status == "consumed"
+    assert events == []
 
 
 @pytest.mark.asyncio
