@@ -9,6 +9,11 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 USDC_ATOMIC_UNITS = 1_000_000
+USDC_ASSETS = {
+    "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "eip155:137": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+    "eip155:42161": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+}
 DEFAULT_SAFE_PREFIXES = (
     "hyrule.bgp.",
     "hyrule.dns.",
@@ -42,6 +47,16 @@ def _default_ledger_path() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME")
     root = Path(state_home) if state_home else Path.home() / ".local" / "state"
     return root / "hyrule-cloud-mcp" / "spend.sqlite3"
+
+
+def _positive_int(name: str, raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +106,10 @@ class Settings:
         ledger = Path(
             os.environ.get("HYRULE_MCP_LEDGER_PATH", str(_default_ledger_path()))
         ).expanduser()
+        max_response_bytes = _positive_int(
+            "HYRULE_MCP_MAX_RESPONSE_BYTES",
+            os.environ.get("HYRULE_MCP_MAX_RESPONSE_BYTES", "524288"),
+        )
         return cls(
             base_url=base_url,
             private_key=os.environ.get("EVM_PRIVATE_KEY") or None,
@@ -101,6 +120,7 @@ class Settings:
             capabilities_explicit=bool(raw_capabilities.strip()),
             allow_infrastructure=os.environ.get("HYRULE_MCP_ALLOW_INFRASTRUCTURE") == "1",
             preferred_network=os.environ.get("HYRULE_MCP_PREFERRED_NETWORK", "eip155:8453"),
+            max_response_bytes=max_response_bytes,
         )
 
     def allows(self, capability_id: str) -> bool:

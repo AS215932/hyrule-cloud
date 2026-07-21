@@ -14,7 +14,7 @@ from x402 import AbortResult, PaymentCreationContext, max_amount, prefer_network
 from x402.mechanisms.evm.exact import register_exact_evm_client
 from x402.mechanisms.evm.signers import EthAccountSigner
 
-from hyrule_cloud_mcp.config import Settings
+from hyrule_cloud_mcp.config import USDC_ASSETS, Settings
 
 
 class SpendLimitError(RuntimeError):
@@ -126,7 +126,16 @@ class PaymentGuard:
         ):
             return AbortResult("payment resource is outside the exact allowed origin and path")
 
-        amount = int(context.selected_requirements.get_amount())
+        requirements = context.selected_requirements
+        network = str(getattr(requirements, "network", ""))
+        asset = str(getattr(requirements, "asset", ""))
+        expected_asset = USDC_ASSETS.get(network)
+        if network != self.settings.preferred_network or expected_asset is None:
+            return AbortResult("payment network is outside HYRULE_MCP_PREFERRED_NETWORK")
+        if asset.lower() != expected_asset.lower():
+            return AbortResult("payment asset is not the canonical USDC contract")
+
+        amount = int(requirements.get_amount())
         if amount > self.settings.max_payment_atomic:
             return AbortResult("payment exceeds HYRULE_MCP_MAX_PAYMENT_USD")
         try:

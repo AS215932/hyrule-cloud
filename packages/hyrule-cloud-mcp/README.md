@@ -59,6 +59,7 @@ logs. Use the MCP client's secret environment configuration.
 | `HYRULE_MCP_CAPABILITIES` | safe diagnostics | Optional comma-separated exact capability IDs. |
 | `HYRULE_MCP_ALLOW_INFRASTRUCTURE` | `0` | Second opt-in required for VM/proxy purchases. |
 | `HYRULE_MCP_PREFERRED_NETWORK` | `eip155:8453` | Preferred x402 EVM network. |
+| `HYRULE_MCP_MAX_RESPONSE_BYTES` | `524288` | Maximum streamed result size; snapshot purchases are preflighted against it. |
 
 Reservations are intentionally conservative: a payment amount is counted
 before signing, so a failed retry can reduce the remaining daily budget but

@@ -48,7 +48,8 @@ async def call_hyrule(capability_id: str, arguments: dict[str, Any]) -> str:
 async def follow_hyrule(followup_url: str, arguments: dict[str, Any] | None = None) -> str:
     """Poll a Hyrule status URL or fetch its artifact without making another payment.
 
-    Only returned same-origin job URLs and public VM status URLs are accepted.
+    Only returned same-origin job URLs, the public router-snapshot listing,
+    and public VM status URLs are accepted.
     For token-protected jobs, pass the returned token as ``{"token": "..."}``.
     """
 

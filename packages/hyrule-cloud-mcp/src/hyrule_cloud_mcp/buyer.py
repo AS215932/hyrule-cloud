@@ -19,8 +19,11 @@ from hyrule_cloud_mcp.payments import SpendLedger, build_x402_client
 CatalogLoader = Callable[[str], Awaitable[list[CatalogResource]]]
 _FOLLOWUP_PATH = re.compile(
     r"^/v1/(?:(?:bgp|mx|path|voip|web)/jobs/[A-Za-z0-9_-]+(?:/download)?|"
+    r"bgp/snapshots/router|"
     r"vm/[A-Za-z0-9_-]+/status)$"
 )
+_ROUTER_SNAPSHOT_LIST_PATH = "/v1/bgp/snapshots/router"
+_ROUTER_SNAPSHOT_DOWNLOAD_PATH = "/v1/bgp/snapshots/router/{snapshot_id}/download"
 
 
 async def _read_limited(response: httpx.Response, maximum: int) -> bytes:
@@ -98,23 +101,63 @@ class Buyer:
             ).lower()
             if needle and needle not in haystack:
                 continue
-            result.append(
-                {
-                    "id": resource.capability_id,
-                    "method": resource.method,
-                    "path": resource.path,
-                    "description": resource.description,
-                    "intents": list(resource.intents),
-                    "capabilities": list(resource.capabilities),
-                    "price": resource.price,
-                    "inputSchema": resource.input_schema,
-                    "inputExample": resource.input_example,
-                    "automaticPaymentAllowed": self.settings.allows_resource(
-                        resource.capability_id, resource.path
+            item: dict[str, Any] = {
+                "id": resource.capability_id,
+                "method": resource.method,
+                "path": resource.path,
+                "description": resource.description,
+                "intents": list(resource.intents),
+                "capabilities": list(resource.capabilities),
+                "price": resource.price,
+                "inputSchema": resource.input_schema,
+                "inputExample": resource.input_example,
+                "automaticPaymentAllowed": self.settings.allows_resource(
+                    resource.capability_id, resource.path
+                ),
+            }
+            if resource.path == _ROUTER_SNAPSHOT_DOWNLOAD_PATH:
+                item["prerequisite"] = {
+                    "followUpUrl": _ROUTER_SNAPSHOT_LIST_PATH,
+                    "paymentRequired": False,
+                    "description": (
+                        "List live snapshot IDs, sizes, formats, and expiry "
+                        "before purchase."
                     ),
                 }
-            )
+            result.append(item)
         return result
+
+    async def _preflight_download(
+        self, resource: CatalogResource, arguments: dict[str, Any]
+    ) -> None:
+        if resource.path != _ROUTER_SNAPSHOT_DOWNLOAD_PATH:
+            return
+        snapshot_id = arguments.get("snapshot_id")
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            raise ValueError("snapshot_id is required before purchasing a router snapshot")
+        listing = await self.follow(_ROUTER_SNAPSHOT_LIST_PATH)
+        payload = listing.get("result")
+        snapshots = payload.get("snapshots") if isinstance(payload, dict) else None
+        if not isinstance(snapshots, list):
+            raise ValueError("router snapshot discovery returned an invalid response")
+        snapshot = next(
+            (
+                item
+                for item in snapshots
+                if isinstance(item, dict) and item.get("snapshot_id") == snapshot_id
+            ),
+            None,
+        )
+        if snapshot is None:
+            raise ValueError("snapshot_id is not present in live unpaid discovery")
+        size = snapshot.get("size_bytes")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ValueError("snapshot size is unavailable; refusing payment")
+        if size > self.settings.max_response_bytes:
+            raise ValueError(
+                "snapshot exceeds HYRULE_MCP_MAX_RESPONSE_BYTES; raise the operator-owned "
+                "limit before purchasing"
+            )
 
     async def call(self, capability_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
         resources = await self._catalog()
@@ -128,6 +171,7 @@ class Buyer:
             raise PermissionError(
                 "capability is outside the operator-owned automatic payment allowlist"
             )
+        await self._preflight_download(resource, arguments)
         path, request_kwargs = build_request(resource, arguments)
         x402_client = build_x402_client(
             self.settings,

@@ -10,7 +10,7 @@ import pytest
 from x402 import PaymentCreationContext
 
 import hyrule_cloud_mcp.buyer as buyer_module
-from hyrule_cloud_mcp.buyer import Buyer, _decode_body, _read_limited
+from hyrule_cloud_mcp.buyer import Buyer, _decode_body, _followup_path, _read_limited
 from hyrule_cloud_mcp.catalog import CatalogError, CatalogResource, build_request, parse_manifest
 from hyrule_cloud_mcp.config import Settings
 from hyrule_cloud_mcp.payments import (
@@ -126,17 +126,48 @@ def test_payment_guard_rejects_origin_path_and_amount_before_signing(tmp_path: P
     settings = _settings(tmp_path)
     guard = PaymentGuard(settings, "/v1/dns/lookup", SpendLedger(settings.ledger_path))
 
-    def context(url: str, amount: str) -> PaymentCreationContext:
+    def context(
+        url: str,
+        amount: str,
+        *,
+        network: str = "eip155:8453",
+        asset: str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    ) -> PaymentCreationContext:
         payment_required = SimpleNamespace(
             x402_version=2,
             resource=SimpleNamespace(url=url),
         )
-        requirements = SimpleNamespace(get_amount=lambda: amount)
+        requirements = SimpleNamespace(
+            get_amount=lambda: amount,
+            network=network,
+            asset=asset,
+        )
         return PaymentCreationContext(payment_required, requirements)  # type: ignore[arg-type]
 
     assert guard(context("https://attacker.test/v1/dns/lookup", "1000")) is not None
     assert guard(context("https://cloud.hyrule.host/v1/vm/create", "1000")) is not None
     assert guard(context("https://cloud.hyrule.host/v1/dns/lookup", "100001")) is not None
+    assert (
+        guard(
+            context(
+                "https://cloud.hyrule.host/v1/dns/lookup",
+                "1000",
+                asset="0x0000000000000000000000000000000000000001",
+            )
+        )
+        is not None
+    )
+    assert (
+        guard(
+            context(
+                "https://cloud.hyrule.host/v1/dns/lookup",
+                "1000",
+                network="eip155:137",
+                asset="0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+            )
+        )
+        is not None
+    )
     assert guard(context("https://cloud.hyrule.host/v1/dns/lookup", "1000")) is None
 
 
@@ -181,6 +212,59 @@ async def test_discovery_reports_policy_without_requiring_a_wallet(tmp_path: Pat
     dns = next(item for item in result if item["id"] == "hyrule.dns.lookup")
     assert dns["inputSchema"] == {}
     assert dns["inputExample"] == {}
+
+
+@pytest.mark.asyncio
+async def test_snapshot_discovery_exposes_unpaid_listing_and_preflights_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot_resource = CatalogResource(
+        capability_id="hyrule.bgp.snapshots.router.snapshot_id.download",
+        method="GET",
+        path="/v1/bgp/snapshots/router/{snapshot_id}/download",
+        description="Download a live router snapshot.",
+        intents=("download BGP snapshot",),
+        capabilities=("BGP snapshot",),
+        price={"amount": "0.10"},
+    )
+
+    async def catalog_loader(_base_url: str) -> list[CatalogResource]:
+        return [snapshot_resource]
+
+    buyer = Buyer(_settings(tmp_path, max_response_bytes=512), catalog_loader=catalog_loader)
+
+    async def listing(_path: str, arguments=None) -> dict:
+        return {
+            "result": {
+                "snapshots": [
+                    {"snapshot_id": "small", "size_bytes": 128},
+                    {"snapshot_id": "large", "size_bytes": 1024},
+                ]
+            }
+        }
+
+    monkeypatch.setattr(buyer, "follow", listing)
+
+    discovered = await buyer.discover("snapshot")
+    assert discovered[0]["prerequisite"]["followUpUrl"] == "/v1/bgp/snapshots/router"
+    with pytest.raises(ValueError, match="MAX_RESPONSE_BYTES"):
+        await buyer.call(snapshot_resource.capability_id, {"snapshot_id": "large"})
+    with pytest.raises(ValueError, match="live unpaid discovery"):
+        await buyer.call(snapshot_resource.capability_id, {"snapshot_id": "fabricated"})
+
+
+def test_snapshot_listing_is_an_allowed_non_paying_followup() -> None:
+    assert (
+        _followup_path("https://cloud.hyrule.host", "/v1/bgp/snapshots/router")
+        == "/v1/bgp/snapshots/router"
+    )
+
+
+def test_response_limit_is_operator_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HYRULE_MCP_MAX_RESPONSE_BYTES", "33554432")
+    assert Settings.from_env().max_response_bytes == 33_554_432
 
 
 class _ChunkStream(httpx.AsyncByteStream):
