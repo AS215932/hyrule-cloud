@@ -382,18 +382,19 @@ def _download_operation(
     gate: str = "always",
 ) -> PaidOperation:
     path_examples = {"snapshot_id": "bgpsnap_a1b2c3d4"}
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "snapshot_id": {
+                "type": "string",
+                "description": "Router-table snapshot identifier",
+            }
+        },
+        "required": ["snapshot_id"],
+    }
     output_example = "<gzip-compressed normalized JSONL>"
     declaration = declare_discovery_extension(
-        path_params_schema={
-            "type": "object",
-            "properties": {
-                "snapshot_id": {
-                    "type": "string",
-                    "description": "Router-table snapshot identifier",
-                }
-            },
-            "required": ["snapshot_id"],
-        },
+        path_params_schema=input_schema,
         output=OutputConfig(
             example=output_example,
             schema={"type": "string", "format": "binary"},
@@ -406,8 +407,8 @@ def _download_operation(
         price=price,
         declaration=declaration,
         request_model=None,
-        input_schema=None,
-        input_example=None,
+        input_schema=input_schema,
+        input_example=path_examples,
         output_example=output_example,
         path_examples=path_examples,
         gate=gate,
@@ -1108,6 +1109,8 @@ def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
             "discoverable": True,
             "intents": list(operation.intents),
             "capabilities": list(operation.capabilities),
+            "inputSchema": operation.input_schema or {},
+            "inputExample": operation.input_example or {},
             "documentationUrl": f"{public_base_url}/openapi.json",
         }
         maximum = operation.price.maximum(config.payment)

@@ -37,9 +37,12 @@ uv run --project packages/hyrule-cloud-mcp hyrule-cloud-mcp
 
 The server exposes:
 
-- `discover_hyrule` — reads and filters the live paid manifest without paying;
+- `discover_hyrule` — reads and filters the live paid manifest, including each
+  request schema and example, without paying;
 - `call_hyrule` — resolves a stable capability ID from that manifest, then
-  automatically handles the x402 v2 challenge and paid retry.
+  automatically handles the x402 v2 challenge and paid retry;
+- `follow_hyrule` — polls a same-origin job/VM status URL or retrieves a job
+  artifact through a narrow, non-paying allowlist.
 
 Never place the private key in MCP arguments, prompts, checked-in config, or
 logs. Use the MCP client's secret environment configuration.

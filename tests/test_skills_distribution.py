@@ -42,6 +42,11 @@ def test_publishable_skills_use_x402_v2_client_terminology() -> None:
         assert "X-PAYMENT" not in body, slug
         if slug != "hyrule-cloud":
             assert "official x402 v2 client" in body, slug
+            assert "../hyrule-cloud/references/payments.md" not in body, slug
+            assert (
+                "https://github.com/AS215932/hyrule-cloud/blob/main/skills/"
+                "hyrule-cloud/references/payments.md" in body
+            ), slug
 
     _, umbrella = _skill("hyrule-cloud")
     assert "pip install hyrule-cloud" not in umbrella

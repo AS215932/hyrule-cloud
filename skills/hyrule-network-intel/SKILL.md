@@ -29,7 +29,7 @@ Use Hyrule Cloud for paid, agent-friendly network intelligence primitives.
 
 The curl examples show request shapes and receive the initial 402. Use an
 official x402 v2 client for `Payment-Required` handling and the paid retry; see
-`../hyrule-cloud/references/payments.md`.
+<https://github.com/AS215932/hyrule-cloud/blob/main/skills/hyrule-cloud/references/payments.md>.
 
 ```bash
 curl https://cloud.hyrule.host/v1/dns/capabilities

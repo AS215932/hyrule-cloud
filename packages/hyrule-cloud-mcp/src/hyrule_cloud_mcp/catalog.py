@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
 
@@ -25,6 +25,8 @@ class CatalogResource:
     intents: tuple[str, ...]
     capabilities: tuple[str, ...]
     price: dict[str, Any]
+    input_schema: dict[str, Any] = field(default_factory=dict)
+    input_example: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, value: object) -> CatalogResource:
@@ -39,6 +41,9 @@ class CatalogResource:
             raise CatalogError("buyer MCP only supports GET and POST resources")
         if not isinstance(path, str) or not path.startswith("/v1/") or "//" in path:
             raise CatalogError("catalog resource has an unsafe path")
+        area = path.removeprefix("/v1/").split("/", 1)[0]
+        if not capability_id.startswith(f"hyrule.{area}."):
+            raise CatalogError("catalog capability ID does not match its path")
         intents = value.get("intents") or []
         capabilities = value.get("capabilities") or []
         if not isinstance(intents, list) or not all(isinstance(item, str) for item in intents):
@@ -48,6 +53,8 @@ class CatalogResource:
         ):
             raise CatalogError("catalog resource capabilities must be strings")
         price = value.get("price")
+        input_schema = value.get("inputSchema")
+        input_example = value.get("inputExample")
         return cls(
             capability_id=capability_id,
             method=method,
@@ -56,6 +63,8 @@ class CatalogResource:
             intents=tuple(intents),
             capabilities=tuple(capabilities),
             price=price if isinstance(price, dict) else {},
+            input_schema=input_schema if isinstance(input_schema, dict) else {},
+            input_example=input_example if isinstance(input_example, dict) else {},
         )
 
 

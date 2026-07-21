@@ -24,6 +24,7 @@ DEFAULT_SAFE_PREFIXES = (
     "hyrule.whois.",
 )
 INFRASTRUCTURE_PREFIXES = ("hyrule.vm.", "hyrule.network.")
+INFRASTRUCTURE_PATH_PREFIXES = ("/v1/vm/", "/v1/network/")
 
 
 def _usd_atomic(name: str, raw: str) -> int:
@@ -112,3 +113,15 @@ class Settings:
         if self.capabilities_explicit:
             return capability_id in self.capabilities
         return capability_id.startswith(DEFAULT_SAFE_PREFIXES)
+
+    def allows_resource(self, capability_id: str, path: str) -> bool:
+        area = path.removeprefix("/v1/").split("/", 1)[0]
+        if not path.startswith("/v1/") or not capability_id.startswith(f"hyrule.{area}."):
+            return False
+        if path.startswith(INFRASTRUCTURE_PATH_PREFIXES):
+            return (
+                self.allow_infrastructure
+                and self.capabilities_explicit
+                and capability_id in self.capabilities
+            )
+        return self.allows(capability_id)

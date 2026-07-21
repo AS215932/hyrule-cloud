@@ -22,7 +22,7 @@ curl https://cloud.hyrule.host/v1/ports/pricing
 
 The curl example shows the request shape and receives the initial 402. Use an
 official x402 v2 client for `Payment-Required` handling and the paid retry; see
-`../hyrule-cloud/references/payments.md`.
+<https://github.com/AS215932/hyrule-cloud/blob/main/skills/hyrule-cloud/references/payments.md>.
 
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/ports/check \

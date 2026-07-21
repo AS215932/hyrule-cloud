@@ -245,6 +245,8 @@ def test_manifest_openapi_and_bazaar_share_the_same_enabled_catalog(
     assert all(resource["id"].startswith("hyrule.") for resource in manifest["resources"])
     assert all(resource["intents"] for resource in manifest["resources"])
     assert all(resource["capabilities"] for resource in manifest["resources"])
+    assert all(resource["inputSchema"] for resource in manifest["resources"])
+    assert all(resource["inputExample"] for resource in manifest["resources"])
     assert all(resource["price"]["currency"] == "USD" for resource in manifest["resources"])
     assert all(
         resource["documentationUrl"] == "https://cloud.hyrule.host/openapi.json"

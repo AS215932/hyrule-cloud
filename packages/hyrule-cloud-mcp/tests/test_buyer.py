@@ -5,10 +5,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from x402 import PaymentCreationContext
 
-from hyrule_cloud_mcp.buyer import Buyer
+import hyrule_cloud_mcp.buyer as buyer_module
+from hyrule_cloud_mcp.buyer import Buyer, _decode_body, _read_limited
 from hyrule_cloud_mcp.catalog import CatalogError, CatalogResource, build_request, parse_manifest
 from hyrule_cloud_mcp.config import Settings
 from hyrule_cloud_mcp.payments import (
@@ -57,13 +59,33 @@ def test_parse_manifest_requires_v2_and_unique_stable_ids() -> None:
                 "path": "/v1/dns/lookup",
                 "intents": ["look up DNS"],
                 "capabilities": ["DNS"],
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {"name": {"type": "string"}},
+                },
+                "inputExample": {"name": "example.com"},
             }
         ],
     }
-    assert parse_manifest(manifest)[0].capability_id == "hyrule.dns.lookup"
+    parsed = parse_manifest(manifest)[0]
+    assert parsed.capability_id == "hyrule.dns.lookup"
+    assert parsed.input_schema["required"] == ["name"]
+    assert parsed.input_example == {"name": "example.com"}
     manifest["resources"] = [manifest["resources"][0], manifest["resources"][0]]
     with pytest.raises(CatalogError, match="duplicate"):
         parse_manifest(manifest)
+
+
+def test_catalog_rejects_capability_id_path_mismatch() -> None:
+    with pytest.raises(CatalogError, match="does not match"):
+        CatalogResource.from_json(
+            {
+                "id": "hyrule.dns.lookup",
+                "method": "POST",
+                "path": "/v1/network/request",
+            }
+        )
 
 
 def test_build_request_escapes_path_parameters_and_separates_query() -> None:
@@ -132,6 +154,8 @@ def test_infrastructure_requires_two_explicit_operator_opt_ins(tmp_path: Path) -
         allow_infrastructure=True,
     )
     assert allowed.allows("hyrule.vm.create") is True
+    assert allowed.allows_resource("hyrule.vm.create", "/v1/vm/create") is True
+    assert allowed.allows_resource("hyrule.dns.lookup", "/v1/network/request") is False
 
 
 def test_official_x402_client_builds_with_runtime_wallet_only(tmp_path: Path) -> None:
@@ -154,6 +178,67 @@ async def test_discovery_reports_policy_without_requiring_a_wallet(tmp_path: Pat
     result = await buyer.discover("hyrule")
     policy = {item["id"]: item["automaticPaymentAllowed"] for item in result}
     assert policy == {"hyrule.dns.lookup": True, "hyrule.vm.create": False}
+    dns = next(item for item in result if item["id"] == "hyrule.dns.lookup")
+    assert dns["inputSchema"] == {}
+    assert dns["inputExample"] == {}
+
+
+class _ChunkStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.yielded = 0
+
+    async def __aiter__(self):
+        for chunk in (b"1234", b"5678", b"unreachable"):
+            self.yielded += 1
+            yield chunk
+
+
+@pytest.mark.asyncio
+async def test_response_limit_stops_streaming_immediately() -> None:
+    stream = _ChunkStream()
+    response = httpx.Response(200, stream=stream)
+    with pytest.raises(ValueError, match="response limit"):
+        await _read_limited(response, 5)
+    await response.aclose()
+    assert stream.yielded == 2
+
+
+def test_binary_response_is_losslessly_base64_encoded() -> None:
+    body = b"\x1f\x8b\x08\x00\xff"
+    response = httpx.Response(200, headers={"content-type": "application/gzip"})
+
+    assert _decode_body(response, body) == {
+        "encoding": "base64",
+        "mediaType": "application/gzip",
+        "bytes": len(body),
+        "data": "H4sIAP8=",
+    }
+
+
+@pytest.mark.asyncio
+async def test_followup_is_same_origin_narrow_and_non_paying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/bgp/jobs/bgpj_123"
+        assert request.url.params["token"] == "returned-secret"
+        return httpx.Response(200, json={"status": "completed"})
+
+    def client_factory(**kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(buyer_module.httpx, "AsyncClient", client_factory)
+    buyer = Buyer(_settings(tmp_path))
+
+    result = await buyer.follow("/v1/bgp/jobs/bgpj_123", {"token": "returned-secret"})
+
+    assert result["result"] == {"status": "completed"}
+    with pytest.raises(ValueError, match="configured Hyrule origin"):
+        await buyer.follow("https://attacker.test/v1/bgp/jobs/bgpj_123")
+    with pytest.raises(ValueError, match="not an allowed"):
+        await buyer.follow("/v1/pricing")
 
 
 def test_registry_metadata_matches_package_verification_marker() -> None:
