@@ -243,6 +243,13 @@ def test_agent_mail_review_safety_schema_contracts():
     fingerprint = MailPaymentAuthorizationRow.__table__.c.fingerprint
     assert fingerprint.primary_key is True
     assert fingerprint.type.length == 64
+    authorization_quote_constraints = [
+        constraint
+        for constraint in MailPaymentAuthorizationRow.__table__.constraints
+        if constraint.name == "uq_mail_payment_authorization_quote"
+    ]
+    assert len(authorization_quote_constraints) == 1
+    assert [column.name for column in authorization_quote_constraints[0].columns] == ["quote_id"]
 
 
 @pytest.mark.asyncio
@@ -375,6 +382,38 @@ async def test_stalwart_account_payload_uses_local_part_and_v016_schema(monkeypa
             password="generated-secret",
             quota_bytes=1_073_741_824,
         )
+
+
+@pytest.mark.asyncio
+async def test_stalwart_account_deletion_rejects_per_account_failures(monkeypatch):
+    config = HyruleConfig().mail
+    config.backend_url = "https://mail.internal"
+    config.backend_token = "token"
+    client = StalwartClient(config)
+    failure = {
+        "type": "serverFail",
+        "description": "Account data could not be removed",
+    }
+
+    async def manage(_method_calls):
+        return {
+            "methodResponses": [
+                [
+                    "x:Account/set",
+                    {"notDestroyed": {"account-1": failure}},
+                    "delete-account",
+                ]
+            ]
+        }
+
+    monkeypatch.setattr(client, "_manage", manage)
+    try:
+        with pytest.raises(MailBackendError, match="Account data could not be removed"):
+            await client.delete_account("account-1")
+        failure = {"type": "notFound"}
+        await client.delete_account("account-1")
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
@@ -1157,6 +1196,47 @@ async def test_settlement_ledger_recovers_lost_mail_activation_handoff(mail_serv
 
 
 @pytest.mark.asyncio
+async def test_unpaid_activation_expiry_releases_address_after_handoff_grace(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="released-after-expiry",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    account, _token, _created = await service.prepare_activation(
+        quote.quote_id,
+        idempotency_key="released-after-expiry-first-0001",
+    )
+    async with sessions() as session:
+        stored_quote = await session.get(MailQuoteRow, quote.quote_id)
+        stored_quote.expires_at = datetime.now(UTC) - timedelta(hours=2)
+        await session.commit()
+
+    assert await service.expire_quotes() == 1
+    async with sessions() as session:
+        expired = await session.get(MailAccountRow, account.mailbox_id)
+        assert expired.status == MailboxStatus.DELETED.value
+        assert expired.management_token_ciphertext is None
+        assert expired.deleted_at is not None
+
+    replacement_quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="released-after-expiry",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    replacement, _replacement_token, replacement_created = await service.prepare_activation(
+        replacement_quote.quote_id,
+        idempotency_key="released-after-expiry-second-0002",
+    )
+    assert replacement_created is True
+    assert replacement.mailbox_id == account.mailbox_id
+
+
+@pytest.mark.asyncio
 async def test_historical_payment_cannot_recover_a_reactivated_address(mail_service):
     service, sessions, _backend, _domains, _refunds = mail_service
     first_quote = await service.create_account_quote(
@@ -1368,6 +1448,72 @@ async def test_combined_domain_and_mailbox_quote_is_one_atomic_amount(mail_servi
         stored = await session.get(MailAccountRow, account.mailbox_id)
         assert stored.activation_amount_usd == Decimal("1.00")
         assert stored.total_amount_usd == Decimal("13.00")
+
+
+@pytest.mark.asyncio
+async def test_combined_activation_hashes_maximum_length_domain_idempotency_key(mail_service):
+    service, _sessions, _backend, domains, _refunds = mail_service
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="long-idempotency",
+            mode=MailboxMode.DOMAIN_AND_MAILBOX,
+            domain="long-idempotency.dev",
+            terms_version=service.mail_config.terms_version,
+            domain_terms_version=service.config.domain.terms_version,
+        )
+    )
+    key = "k" * 128
+
+    await service.prepare_activation(quote.quote_id, idempotency_key=key)
+
+    derived = domains.agent_orders[-1]["idempotency_key"]
+    assert derived == f"mail:{hashlib.sha256(key.encode()).hexdigest()}"
+    assert len(derived) <= 128
+
+
+@pytest.mark.asyncio
+async def test_combined_activation_reuses_committed_domain_capability_on_retry(
+    mail_service, monkeypatch
+):
+    service, sessions, _backend, domains, _refunds = mail_service
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="domain-token-replay",
+            mode=MailboxMode.DOMAIN_AND_MAILBOX,
+            domain="domain-token-replay.dev",
+            terms_version=service.mail_config.terms_version,
+            domain_terms_version=service.config.domain.terms_version,
+        )
+    )
+    committed_token: str | None = None
+
+    async def create_committed_order(**kwargs):
+        nonlocal committed_token
+        created = committed_token is None
+        committed_token = committed_token or kwargs["management_token"]
+        if created:
+            service.mail_config.max_active_mailboxes = 0
+        return SimpleNamespace(order_id="do_committed_123"), committed_token, created
+
+    monkeypatch.setattr(domains, "create_agent_order", create_committed_order)
+    key = "domain-token-retry-idempotency-0001"
+    with pytest.raises(MailProblem) as capacity:
+        await service.prepare_activation(quote.quote_id, idempotency_key=key)
+    assert capacity.value.code == "mail_capacity_reached"
+    async with sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(MailAccountRow)) == 0
+
+    service.mail_config.max_active_mailboxes = 20
+    account, replayed_token, created = await service.prepare_activation(
+        quote.quote_id, idempotency_key=key
+    )
+
+    assert created is True
+    assert committed_token is not None
+    assert replayed_token == committed_token
+    async with sessions() as session:
+        stored = await session.get(MailAccountRow, account.mailbox_id)
+        assert service._token_matches(stored, committed_token)
 
 
 @pytest.mark.asyncio
@@ -1604,6 +1750,69 @@ async def test_send_route_verifies_and_reports_the_immutable_quote_amount(mail_s
 
 
 @pytest.mark.asyncio
+async def test_send_route_replays_ledger_settlement_without_a_second_payment(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    mailbox_id, token = await _active_hosted(service)
+    quote = await service.create_send_quote(
+        MailSendQuoteRequest(
+            mailbox_id=mailbox_id,
+            to="proof@example.net",
+            subject="Paid once",
+            text="Do not settle a second authorization",
+        ),
+        token,
+    )
+    sent = await service.deliver_send(quote.quote_id, token)
+    settlement = PaymentLedger(sessions).build_event(
+        event_type="settled",
+        resource_path="/v1/mail/messages/send",
+        method="POST",
+        amount=Decimal(quote.amount_usd),
+        network="eip155:8453",
+        asset="USDC",
+        payer="0x" + "7" * 40,
+        tx_hash="0xsettled-before-attribution",
+        extra={"quote_id": quote.quote_id, "one_recipient": True},
+    )
+    async with sessions() as session:
+        stored_send = await session.get(MailSendRow, sent.send_id)
+        assert stored_send.payment_tx is None
+        session.add(settlement)
+        await session.commit()
+
+    class Gate:
+        async def verify_only(self, *_args, **_kwargs):
+            raise AssertionError("an already-paid quote must not be verified again")
+
+        async def settle_verified(self, *_args, **_kwargs):
+            raise AssertionError("an already-paid quote must not be settled again")
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "https",
+            "server": ("cloud.hyrule.host", 443),
+            "path": "/v1/mail/messages/send",
+            "query_string": b"",
+            "headers": [
+                (b"authorization", f"Bearer {token}".encode()),
+                (b"payment-signature", b"a-new-signed-authorization"),
+            ],
+        }
+    )
+
+    replay = await send_message_route(
+        MailSendRequest(quote_id=quote.quote_id),
+        request,
+        service=service,
+        gate=Gate(),
+    )
+    assert not isinstance(replay, Response)
+    assert replay.send_id == sent.send_id
+
+
+@pytest.mark.asyncio
 async def test_payment_authorization_is_durably_bound_to_one_send_quote(mail_service):
     service, sessions, _backend, _domains, _refunds = mail_service
     fingerprint = hashlib.sha256(b"one-valid-payment-authorization").hexdigest()
@@ -1612,8 +1821,14 @@ async def test_payment_authorization_is_durably_bound_to_one_send_quote(mail_ser
     await service.bind_send_payment_authorization(fingerprint, "mailq_first_send")
     with pytest.raises(MailProblem) as reused:
         await service.bind_send_payment_authorization(fingerprint, "mailq_second_send")
+    with pytest.raises(MailProblem) as quote_rebound:
+        await service.bind_send_payment_authorization(
+            hashlib.sha256(b"a-distinct-valid-payment-authorization").hexdigest(),
+            "mailq_first_send",
+        )
 
     assert reused.value.code == "payment_authorization_reused"
+    assert quote_rebound.value.code == "mail_quote_payment_bound"
     async with sessions() as session:
         bindings = list(await session.scalars(select(MailPaymentAuthorizationRow)))
     assert [(row.fingerprint, row.quote_id) for row in bindings] == [

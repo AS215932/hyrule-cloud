@@ -987,6 +987,10 @@ class MailPaymentAuthorizationRow(Base):
         DateTime(timezone=True), server_default=func.now(), index=True
     )
 
+    __table_args__ = (
+        UniqueConstraint("quote_id", name="uq_mail_payment_authorization_quote"),
+    )
+
 
 class MailWebhookDeliveryRow(Base):
     __tablename__ = "mail_webhook_deliveries"

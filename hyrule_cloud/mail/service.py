@@ -384,14 +384,18 @@ class MailService:
         activation_amount = Decimal(str(payload["activation_amount_usd"]))
         domain_order_id: str | None = None
         if mode is MailboxMode.DOMAIN_AND_MAILBOX:
-            order, _domain_token, _created = await self.domains.create_agent_order(
+            order, domain_token, _created = await self.domains.create_agent_order(
                 quote_id=str(payload["domain_quote_id"]),
                 terms_version=str(payload["domain_terms_version"]),
-                idempotency_key=f"mail:{idempotency_key}",
+                idempotency_key=f"mail:{idem_hash}",
                 additional_amount_usd=activation_amount,
                 management_token=token,
             )
             domain_order_id = order.order_id
+            # The domain order may have committed before a previous mailbox
+            # insert failed. Its replayed capability remains authoritative so
+            # both resources continue to share one recoverable identity token.
+            token = domain_token
 
         now = _now()
         mailbox = MailAccountRow(
@@ -620,13 +624,34 @@ class MailService:
                 return
             except IntegrityError:
                 await session.rollback()
-            existing = await session.get(MailPaymentAuthorizationRow, fingerprint)
-            if existing is None or existing.quote_id != quote_id:
+            existing_fingerprint = await session.get(
+                MailPaymentAuthorizationRow, fingerprint
+            )
+            if existing_fingerprint is not None:
+                if existing_fingerprint.quote_id == quote_id:
+                    return
                 raise MailProblem(
                     409,
                     "payment_authorization_reused",
                     "This payment authorization is already bound to another mail send.",
                 )
+            existing_quote = await session.scalar(
+                select(MailPaymentAuthorizationRow).where(
+                    MailPaymentAuthorizationRow.quote_id == quote_id
+                )
+            )
+            if existing_quote is not None:
+                raise MailProblem(
+                    409,
+                    "mail_quote_payment_bound",
+                    "This send quote is already bound to another payment authorization; "
+                    "retry the original authorization.",
+                )
+            raise MailProblem(
+                409,
+                "payment_authorization_conflict",
+                "The payment authorization could not be bound to this send quote.",
+            )
 
     async def mark_activation_paid(
         self,
@@ -780,6 +805,37 @@ class MailService:
         if send.status == "accepted":
             return self._send_response(send)
         return await self._submit_send_intent(send.send_id)
+
+    async def settled_send_response(
+        self, quote_id: str, token: str
+    ) -> MailSendResponse | None:
+        """Return an already-paid send without asking the payer to settle again."""
+
+        async with self.db() as session:
+            quote = await session.get(MailQuoteRow, quote_id)
+            if quote is None or quote.kind != "send" or not quote.mailbox_id:
+                raise MailProblem(404, "mail_quote_not_found", "Mail send quote not found.")
+            account = await session.get(MailAccountRow, quote.mailbox_id)
+            if account is None or not self._token_matches(account, token):
+                raise MailProblem(404, "mail_quote_not_found", "Mail send quote not found.")
+            send = await session.scalar(
+                select(MailSendRow).where(MailSendRow.quote_id == quote_id)
+            )
+            if send is None or send.status != "accepted":
+                return None
+            if send.payment_tx:
+                return self._send_response(send)
+            settlement = await session.scalar(
+                select(PaymentEventRow.event_id)
+                .where(
+                    PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
+                    PaymentEventRow.resource_path == "/v1/mail/messages/send",
+                    PaymentEventRow.amount_usd == send.amount_usd,
+                    PaymentEventRow.extra["quote_id"].as_string() == quote_id,
+                )
+                .limit(1)
+            )
+            return self._send_response(send) if settlement is not None else None
 
     async def _reserve_send_intent(self, quote_id: str) -> MailSendRow:
         """Commit the paid operation intent before the first external write."""
@@ -1770,9 +1826,18 @@ class MailService:
                             continue
                     row.status = MailQuoteStatus.EXPIRED.value
                     if account is not None:
-                        account.status = MailboxStatus.FAILED.value
+                        # The one-hour handoff grace and durable-ledger lookup
+                        # above protect settled payments. A still-unpaid row is
+                        # now a tombstone, releasing its address while keeping
+                        # the old idempotency key permanently closed.
+                        account.status = MailboxStatus.DELETED.value
                         account.provision_error = "payment_window_expired"
+                        account.deleted_at = now
+                        account.management_token_ciphertext = None
                         account.capacity_reserved_at = None
+                        account.provision_claim_token = None
+                        account.provision_claimed_at = None
+                        account.provision_next_attempt_at = None
                     result += 1
             await session.commit()
         return result

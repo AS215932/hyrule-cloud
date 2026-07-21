@@ -226,6 +226,10 @@ async def send_message(
     quote = await service.get_quote(body.quote_id)
     if quote.kind != "send":
         raise MailProblem(422, "wrong_quote_kind", "A send quote is required.")
+    token = _token(request)
+    settled = await service.settled_send_response(body.quote_id, token)
+    if settled is not None:
+        return settled
     payment_metadata = {"quote_id": body.quote_id, "one_recipient": True}
     verified = await gate.verify_only(
         request,
@@ -238,7 +242,7 @@ async def send_message(
     fingerprint = _mail_payment_authorization_fingerprint(request)
     if fingerprint is not None:
         await service.bind_send_payment_authorization(fingerprint, body.quote_id)
-    result = await service.deliver_send(body.quote_id, _token(request))
+    result = await service.deliver_send(body.quote_id, token)
     if not await gate.settle_verified(request, verified, extra_body=payment_metadata):
         raise MailProblem(
             402,

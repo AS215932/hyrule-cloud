@@ -252,7 +252,15 @@ class StalwartClient:
         )
 
     async def delete_account(self, account_id: str) -> None:
-        await self._manage([["x:Account/set", {"destroy": [account_id]}, "delete-account"]])
+        result = await self._manage(
+            [["x:Account/set", {"destroy": [account_id]}, "delete-account"]]
+        )
+        response = self._method_data(result, "delete-account")
+        failure = (response.get("notDestroyed") or {}).get(account_id)
+        if failure and failure.get("type") != "notFound":
+            raise MailBackendError(
+                str(failure.get("description") or failure.get("type") or "Account deletion failed")
+            )
 
     async def delete_message(self, *, address: str, password: str, message_id: str) -> None:
         session, _auth = await self._session(address, password)
