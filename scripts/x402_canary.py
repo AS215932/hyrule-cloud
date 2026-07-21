@@ -14,13 +14,15 @@ Usage
   export CANARY_KEY=0x<private key of a funded Base wallet (USDC + gas)>
   # optional: export HYRULE_API_URL=https://cloud.hyrule.host
   # optional (vm): export SSH_PUBKEY="ssh-ed25519 AAAA... you@host"
-  # domain: export HYRULE_API_KEY=<account key with domain purchase/read/dns scopes>
+  # domain launch: set distinct CANARY_KEY_API and CANARY_KEY_WEB wallets
 
   python x402_canary.py list                 # show tests + prices, no spend
   python x402_canary.py dns                  # cheapest first live spend ($0.001)
   python x402_canary.py intel                # every network-intel probe (~$0.06)
   python x402_canary.py proxy                # direct + tor network requests
-  python x402_canary.py domain --name mytest12345   # REAL account-owned registration
+  python x402_canary.py domain --name launch-20260719 # TWO real .xyz registrations, max $20
+  python x402_canary.py domain-api --name api-only    # direct endpoint only, max $10
+  python x402_canary.py domain-web --name web-only    # hyrule-web proxy only, max $10
   python x402_canary.py vm                   # provision a real VM + print SSH target
   python x402_canary.py vm --quote --destroy # via the locked-quote flow, then tear down
   python x402_canary.py path-report          # gated probe: run by name once a prober is live
@@ -41,6 +43,7 @@ import json
 import math
 import os
 import sys
+import uuid
 from decimal import Decimal
 
 import httpx
@@ -53,6 +56,7 @@ from x402.mechanisms.evm.exact import register_exact_evm_client
 from x402.mechanisms.evm.signers import EthAccountSigner
 
 API = os.environ.get("HYRULE_API_URL", "https://cloud.hyrule.host").rstrip("/")
+WEB = os.environ.get("HYRULE_WEB_URL", "https://hyrule.host").rstrip("/")
 SSH_PUBKEY = os.environ.get("SSH_PUBKEY", "")
 
 # (method, path, body, price_usd, group). Bodies mirror the manifest's Bazaar
@@ -172,13 +176,18 @@ TESTS: dict[str, dict] = {
         "usd": "0.05",
         "group": "proxy",
     },
-    # --- 3c domain (REAL registration, side effects) ---
-    # The dedicated runner performs check -> quote -> authenticated x402 order
-    # -> durable poll -> revisioned managed-DNS write -> public resolution.
-    "domain": {
-        "path": "/v1/domains/orders",
+    # --- 3c domain (two REAL registrations, $10 hard cap each) ---
+    "domain-api": {
+        "path": "/v1/domains/registrations",
         "body": {},
-        "usd": "15.00",
+        "usd": "10.00",
+        "group": "domain",
+        "spendy": True,
+    },
+    "domain-web": {
+        "path": "/api/domains/registrations",
+        "body": {},
+        "usd": "10.00",
         "group": "domain",
         "spendy": True,
     },
@@ -205,19 +214,31 @@ def _cap_units(usd: str) -> int:
     return math.ceil(Decimal(usd) * Decimal("1.10") * Decimal(10**6))
 
 
-def _client(usd: str, network: str) -> x402Client:
-    key = os.environ.get("CANARY_KEY")
+def _client(
+    usd: str,
+    network: str,
+    *,
+    key_env: str = "CANARY_KEY",
+    hard_cap_usd: str | None = None,
+) -> x402Client:
+    key = os.environ.get(key_env) or os.environ.get("CANARY_KEY")
     if not key:
-        sys.exit(f"ERROR: set CANARY_KEY to a wallet private key (0x...) funded on {network}.")
+        sys.exit(
+            f"ERROR: set {key_env} (or CANARY_KEY) to a wallet private key "
+            f"funded on {network}."
+        )
     signer = EthAccountSigner(Account.from_key(key))
     client = x402Client()
     # Pin to ONE chain (--network, default Base mainnet) + a per-call
     # max-amount guardrail. Without the pin the SDK would sign for whatever
     # EVM chain the API advertises first, causing a false failure or a
     # wrong-chain spend from an unfunded/differently-funded wallet.
-    register_exact_evm_client(
-        client, signer, networks=network, policies=[max_amount(_cap_units(usd))]
+    cap = (
+        int(Decimal(hard_cap_usd) * Decimal(10**6))
+        if hard_cap_usd is not None
+        else _cap_units(usd)
     )
+    register_exact_evm_client(client, signer, networks=network, policies=[max_amount(cap)])
     return client
 
 
@@ -284,8 +305,8 @@ async def _run_one(
     network: str = "eip155:8453",
 ) -> bool:
     t = TESTS[name]
-    if name == "domain":
-        return await _run_domain(domain_name, network)
+    if name in {"domain-api", "domain-web"}:
+        return await _run_domain(name, domain_name, network)
     body = json.loads(json.dumps(t["body"]))  # deep copy
     quote_id: str | None = None
     if name == "vm":
@@ -359,17 +380,18 @@ async def _create_quote(order_payload: dict) -> str | None:
     return quote_id
 
 
-async def _run_domain(domain_name: str | None, network: str) -> bool:
-    """Run the account-owned managed-domain contract end to end."""
+async def _run_domain(test_name: str, domain_name: str | None, network: str) -> bool:
+    """Buy one wallet-owned domain through the direct API or hyrule-web."""
     if not domain_name:
-        sys.exit("ERROR: domain test needs --name <label> (registers <label>.dev for REAL money).")
-    api_key = os.environ.get("HYRULE_API_KEY")
-    if not api_key:
         sys.exit(
-            "ERROR: set HYRULE_API_KEY to an account key with "
-            "domain:purchase, domain:read, and domain:dns scopes."
+            "ERROR: domain test needs --name <label> "
+            "(registers <label>-api.xyz / <label>-web.xyz for REAL money)."
         )
-    fqdn = f"{domain_name}.dev"
+    suffix = "api" if test_name == "domain-api" else "web"
+    label = f"{domain_name.lower()}-{suffix}"
+    if len(label) > 63 or not label.replace("-", "").isalnum():
+        sys.exit("ERROR: --name must produce a DNS-safe label of at most 63 characters.")
+    fqdn = f"{label}.xyz"
     quote = await _create_domain_quote(fqdn)
     if quote is None:
         print("    !! no payable domain quote; refusing to sign blind. FAILING.")
@@ -379,7 +401,7 @@ async def _run_domain(domain_name: str | None, network: str) -> bool:
     except (KeyError, TypeError, ArithmeticError, ValueError):
         print("    !! domain quote has no valid total_usd; refusing to sign. FAILING.")
         return False
-    ceiling = Decimal(TESTS["domain"]["usd"])
+    ceiling = Decimal(TESTS[test_name]["usd"])
     if price > ceiling:
         print(
             f"    !! domain price ${price} exceeds the ${ceiling} canary ceiling; "
@@ -387,22 +409,30 @@ async def _run_domain(domain_name: str | None, network: str) -> bool:
         )
         return False
     body = {
+        "domain": fqdn,
+        "client_order_id": f"canary-{suffix}-{uuid.uuid4()}",
+        "accept_terms": True,
         "quote_id": quote["quote_id"],
-        "payment_method": "usdc",
-        "terms_version": quote["terms_version"],
+        "max_price_usd": f"{price:.2f}",
     }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Idempotency-Key": f"canary-domain-{quote['quote_id']}",
-    }
+    through_web = test_name == "domain-web"
+    base_url = WEB if through_web else API
+    path = TESTS[test_name]["path"]
+    key_env = "CANARY_KEY_WEB" if through_web else "CANARY_KEY_API"
     print(
-        f"\n=== domain  POST /v1/domains/orders  (${price})  cap={_cap_units(str(price))} units ==="
+        f"\n=== {test_name}  POST {base_url}{path}  "
+        f"(${price})  hard-cap={int(ceiling * Decimal(10**6))} units ==="
     )
     print(f"    domain: {fqdn}  quote_id: {quote['quote_id']}")
-    client = _client(str(price), network)
-    async with x402HttpxClient(client, base_url=API, timeout=60.0) as http:
+    client = _client(
+        str(price),
+        network,
+        key_env=key_env,
+        hard_cap_usd=str(ceiling),
+    )
+    async with x402HttpxClient(client, base_url=base_url, timeout=60.0) as http:
         try:
-            response = await http.post("/v1/domains/orders", json=body, headers=headers)
+            response = await http.post(path, json=body)
         except Exception as e:
             print(f"    !! domain order failed: {e!r}")
             return False
@@ -412,166 +442,49 @@ async def _run_domain(domain_name: str | None, network: str) -> bool:
     if response.status_code >= 400 or not settled_ok:
         print("    !! domain order was not accepted with a successful settlement. FAILING.")
         return False
-    order_id = response.json().get("order_id")
-    if not order_id:
-        print("    !! domain order response omitted order_id. FAILING.")
+    result = response.json()
+    status_url = result.get("status_url")
+    if not isinstance(status_url, str) or not status_url.startswith(
+        "/v1/domains/registrations/status/"
+    ):
+        print("    !! domain response omitted its opaque status_url. FAILING.")
         return False
-    return await _poll_domain_order(str(order_id), fqdn, api_key)
+    return await _poll_marketplace_domain(status_url, fqdn)
 
 
-async def _poll_domain_order(order_id: str, fqdn: str, api_key: str) -> bool:
-    """Wait for durable registrar/DNS fulfillment before mutating the zone."""
-    headers = {"Authorization": f"Bearer {api_key}"}
+async def _poll_marketplace_domain(status_url: str, fqdn: str) -> bool:
+    """Wait for registrar/DNS fulfillment using only the opaque public ID."""
+
     previous: str | None = None
-    async with httpx.AsyncClient(base_url=API, timeout=30.0, headers=headers) as http:
+    async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
         for attempt in range(120):  # up to ten minutes
             if attempt:
                 await asyncio.sleep(5)
             try:
-                response = await http.get(f"/v1/domains/orders/{order_id}")
-            except Exception as e:
-                print(f"    [{attempt}] order poll error: {e!r}")
+                response = await http.get(status_url)
+            except Exception as exc:
+                print(f"    [{attempt}] public status poll error: {exc!r}")
                 continue
             if response.status_code >= 400:
                 print(
-                    f"    [{attempt}] order poll HTTP {response.status_code}: {response.text[:200]}"
+                    f"    [{attempt}] public status HTTP {response.status_code}: "
+                    f"{response.text[:200]}"
                 )
                 continue
             data = response.json()
             status = str(data.get("status") or "unknown")
             if status != previous:
-                print(f"    [{attempt}] domain order status={status}")
+                print(f"    [{attempt}] {fqdn} status={status}")
                 previous = status
             if status == "active":
-                return await _write_domain_dns(fqdn, api_key)
+                return True
             if status in {"refund_due", "refunded", "failed", "cancelled", "expired"}:
-                print(
-                    f"    !! domain order reached terminal status={status}: "
-                    f"{data.get('error_code')}; FAILING."
-                )
+                print(f"    !! registration reached terminal status={status}; FAILING.")
                 return False
     print(
-        "    !! domain order did not become active within ten minutes; "
-        "leave it for reconciliation and do not repurchase. FAILING."
+        "    !! registration did not become active within ten minutes; "
+        "do not repurchase this client order. FAILING."
     )
-    return False
-
-
-async def _write_domain_dns(zone: str, api_key: str) -> bool:
-    """Write one revision-checked AAAA RRset, then verify public DNS."""
-    record = {
-        "action": "upsert",
-        "rrset": {
-            "type": "AAAA",
-            "name": "canary",
-            "values": ["2a0c:b641:b50::1"],
-            "ttl": 300,
-        },
-    }
-    auth = {"Authorization": f"Bearer {api_key}"}
-    print(f"    --- writing AAAA canary.{zone} -> {record['rrset']['values'][0]} ---")
-    async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
-        try:
-            current = await http.get(f"/v1/domains/{zone}/dns", headers=auth)
-            if current.status_code >= 400:
-                print(f"    !! DNS read HTTP {current.status_code}: {current.text[:200]}")
-                return False
-            revision = current.json().get("revision")
-            if not isinstance(revision, int):
-                print("    !! DNS response omitted numeric revision. FAILING.")
-                return False
-            resp = await http.post(
-                f"/v1/domains/{zone}/dns/changesets",
-                json={"changes": [record]},
-                headers={
-                    **auth,
-                    "If-Match": str(revision),
-                    "Idempotency-Key": f"canary-dns-{zone}-{revision}",
-                },
-            )
-        except Exception as e:
-            print(f"    !! managed-DNS request failed: {e!r}")
-            return False
-    print(f"    DNS changeset -> HTTP {resp.status_code} {resp.text[:200]}")
-    if resp.status_code >= 400:
-        return False
-    fqdn = f"canary.{zone}"
-    expected = record["rrset"]["values"][0]
-    print(f"    --- polling public DNS for {fqdn} AAAA {expected} ---")
-    if await _resolve_aaaa(fqdn, expected, zone):
-        print(f"    ✅ {fqdn} resolves to {expected}")
-        return True
-    # The Phase-3c gate requires public resolution, not just a 2xx write — a
-    # broken delegation or propagation failure must fail the canary.
-    print(
-        f"    !! {fqdn} did not resolve to {expected} in time (delegation/propagation?); FAILING."
-    )
-    return False
-
-
-async def _authoritative_aaaa(fqdn: str, zone: str):
-    """AAAA values for ``fqdn`` seen by querying the zone's OWN nameservers
-    directly. This bypasses recursive negative caches — a recursive resolver
-    that cached NXDOMAIN before the domain was registered can outlast a short
-    poll window, but the authoritative servers reflect the RFC2136 write at
-    once (subject only to registry NS delegation being visible)."""
-    import ipaddress
-
-    import dns.asyncresolver
-
-    found: set = set()
-    try:
-        ns_answer = await dns.asyncresolver.resolve(zone, "NS")
-    except Exception:
-        return found  # delegation not visible yet
-    for ns in ns_answer:
-        ns_host = str(ns.target).rstrip(".")
-        ns_addrs: list[str] = []
-        for rtype in ("AAAA", "A"):
-            try:
-                ns_addrs += [a.address for a in await dns.asyncresolver.resolve(ns_host, rtype)]
-            except Exception:
-                pass
-        if not ns_addrs:
-            continue
-        direct = dns.asyncresolver.Resolver(configure=False)
-        direct.nameservers = ns_addrs
-        try:
-            ans = await direct.resolve(fqdn, "AAAA")
-            found |= {ipaddress.IPv6Address(a.address) for a in ans}
-        except Exception:
-            continue
-    return found
-
-
-async def _resolve_aaaa(
-    fqdn: str, expected: str, zone: str, *, attempts: int = 20, delay: float = 15.0
-) -> bool:
-    """Poll public DNS until ``fqdn`` resolves to the expected AAAA, via the
-    zone's authoritative nameservers AND the default recursive resolver. Returns
-    True once seen, False after ~attempts*delay seconds.
-
-    A freshly registered domain needs registry delegation plus recursive cache
-    expiry, which routinely outlasts 60s; the default deadline here is ~5 min and
-    the authoritative path avoids waiting on recursive negative-cache TTLs."""
-    import ipaddress
-
-    import dns.asyncresolver
-
-    want = ipaddress.IPv6Address(expected)
-    resolver = dns.asyncresolver.Resolver()
-    for i in range(attempts):
-        got: set = set()
-        try:
-            got |= {ipaddress.IPv6Address(a.address) for a in await resolver.resolve(fqdn, "AAAA")}
-        except Exception as e:
-            print(f"    [dns {i}] recursive {fqdn} AAAA not resolvable yet: {e}")
-        got |= await _authoritative_aaaa(fqdn, zone)
-        if got:
-            print(f"    [dns {i}] {fqdn} AAAA -> {sorted(str(g) for g in got)}")
-        if want in got:
-            return True
-        await asyncio.sleep(delay)
     return False
 
 
@@ -721,6 +634,21 @@ async def _main() -> None:
         return
 
     names = _select(args.target)
+    if {"domain-api", "domain-web"}.issubset(names):
+        api_key = os.environ.get("CANARY_KEY_API")
+        web_key = os.environ.get("CANARY_KEY_WEB")
+        if not api_key or not web_key:
+            sys.exit(
+                "ERROR: the two-purchase domain gate requires CANARY_KEY_API and "
+                "CANARY_KEY_WEB; both spends must use explicitly funded wallets."
+            )
+        try:
+            api_wallet = Account.from_key(api_key).address.lower()
+            web_wallet = Account.from_key(web_key).address.lower()
+        except Exception as exc:
+            raise SystemExit(f"ERROR: invalid domain canary private key: {exc}") from exc
+        if api_wallet == web_wallet:
+            sys.exit("ERROR: direct and web domain canaries must use distinct payer wallets.")
     # Fail fast BEFORE any paid provisioning: an unattended --destroy without
     # --yes can't answer the teardown prompt, so _maybe_destroy would refuse and
     # leave a billable VM running behind a failed gate. Reject up front instead.

@@ -4,6 +4,7 @@ import enum
 import secrets
 import string
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 
 from bip_utils import (
@@ -60,6 +61,14 @@ def generate_domain_quote_id() -> str:
 
 def generate_domain_order_id() -> str:
     return _id("do_")
+
+
+def generate_domain_registration_id() -> str:
+    return _id("dr_")
+
+
+def generate_domain_status_id() -> str:
+    return _id("ds_")
 
 
 def generate_domain_operation_id() -> str:
@@ -187,6 +196,50 @@ class DomainQuoteResponse(BaseModel):
     available: bool
     expires_at: datetime
     terms_version: str
+
+
+class DomainRegistrationRequest(BaseModel):
+    """One-year, wallet-owned registration sold through x402."""
+
+    domain: FQDN
+    client_order_id: str = Field(min_length=16, max_length=128)
+    accept_terms: Literal[True]
+    quote_id: str | None = Field(default=None, min_length=8, max_length=40)
+    max_price_usd: Decimal | None = Field(default=None, ge=Decimal("0"))
+
+
+class DomainRegistrationResponse(BaseModel):
+    registration_id: str
+    order_id: str
+    domain: str
+    status: str
+    amount_usd: str
+    owner_wallet: str
+    terms_version: str
+    status_url: str
+    management_url: str
+    operation_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DomainRegistrationStatusResponse(BaseModel):
+    registration_id: str
+    domain: str
+    status: str
+    operation_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DomainSalesStatusResponse(BaseModel):
+    enabled: bool
+    registration_period_years: Literal[1] = 1
+    payment_method: Literal["USDC"] = "USDC"
+    terms_version: str
+    minimum_hyrule_fee_usd: str
+    eligible_tld_count: int
+    max_registrations_per_wallet_24h: int
 
 
 class NativePaymentInstructions(BaseModel):

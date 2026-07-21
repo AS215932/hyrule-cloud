@@ -11,12 +11,14 @@ import pytest_asyncio
 from cryptography.fernet import Fernet
 from eth_account import Account
 from eth_account.messages import encode_defunct
+from fastapi import Request, Response
 from pydantic import ValidationError
 from sqlalchemy import select
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
     AccountRow,
+    AccountWalletRow,
     Base,
     CryptoIntentRow,
     DomainDNSRecordRow,
@@ -32,7 +34,13 @@ from hyrule_cloud.db import (
     create_db_engine,
     create_session_factory,
 )
-from hyrule_cloud.domains.api import get_operation as get_operation_route
+from hyrule_cloud.domains.api import (
+    _REGISTRATION_PREFLIGHTS,
+    register_domain_x402,
+)
+from hyrule_cloud.domains.api import (
+    get_operation as get_operation_route,
+)
 from hyrule_cloud.domains.catalog import parse_iana_root_db
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.domains.models import (
@@ -46,6 +54,7 @@ from hyrule_cloud.domains.models import (
     DomainFailurePolicy,
     DomainOrderRequest,
     DomainPaymentMethod,
+    DomainRegistrationRequest,
     ManagedRecordType,
     NameserverMode,
     NameserverUpdateRequest,
@@ -327,6 +336,355 @@ async def test_domain_purchase_launch_requires_every_approval(domain_service):
     with pytest.raises(DomainProblem) as tax:
         service.require_purchase_launch("H1234567890")
     assert tax.value.code == "launch_approval_pending"
+
+
+@pytest.mark.asyncio
+async def test_marketplace_registration_is_wallet_bound_idempotent_and_rate_limited(
+    domain_service,
+):
+    service, _provider, _sessions = domain_service
+    service.domain_config.marketplace_sales_enabled = True
+    service.domain_config.tld_allowlist = ["dev"]
+    payer = "0x" + "1" * 40
+    body = DomainRegistrationRequest(
+        domain="wallet-owned.dev",
+        client_order_id="registration-client-order-0001",
+        accept_terms=True,
+        max_price_usd=Decimal("13.00"),
+    )
+
+    intent, quote, order = await service.prepare_registration(
+        body, request_account_id=None
+    )
+    assert order is None
+    assert Decimal(quote.total_usd) == Decimal("13.00")
+    replay, replay_quote, _ = await service.prepare_registration(
+        body, request_account_id=None
+    )
+    assert replay.registration_id == intent.registration_id
+    assert replay_quote.quote_id == quote.quote_id
+
+    reserved, order, created = await service.create_marketplace_order(
+        intent.registration_id,
+        owner_account_id="H1234567890",
+        payer_address=payer,
+        payment_authorization_hash="a" * 64,
+    )
+    assert created is True
+    assert reserved.payer_address == payer
+    assert order.status == "awaiting_payment"
+    same, same_order, replay_created = await service.create_marketplace_order(
+        intent.registration_id,
+        owner_account_id="H1234567890",
+        payer_address=payer,
+        payment_authorization_hash="a" * 64,
+    )
+    assert replay_created is False
+    assert same_order.order_id == order.order_id
+    assert same.settlement_state == "settlement_pending"
+    with pytest.raises(DomainProblem) as competing_payment:
+        await service.create_marketplace_order(
+            intent.registration_id,
+            owner_account_id="H1234567890",
+            payer_address=payer,
+            payment_authorization_hash="b" * 64,
+        )
+    assert competing_payment.value.code == "payment_in_progress"
+
+    paid = await service.mark_registration_paid(
+        intent.registration_id,
+        payer=payer,
+        tx_hash="0xsettled",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+    assert paid.status == "queued"
+    result = await service.registration_response(intent.registration_id)
+    assert result.owner_wallet == payer
+    assert result.amount_usd == "13.00"
+    public = await service.get_registration_status(intent.public_status_id)
+    assert public.status == "queued"
+    assert public.domain == "wallet-owned.dev"
+    assert not hasattr(public, "owner_wallet")
+
+    # Pending reservations count alongside settled sales, closing the race in
+    # which several authorizations arrive before the first registrar job runs.
+    for number in range(2, 6):
+        next_body = DomainRegistrationRequest(
+            domain=f"wallet-owned-{number}.dev",
+            client_order_id=f"registration-client-order-{number:04d}",
+            accept_terms=True,
+            max_price_usd=Decimal("13.00"),
+        )
+        next_intent, _, _ = await service.prepare_registration(
+            next_body, request_account_id=None
+        )
+        await service.create_marketplace_order(
+            next_intent.registration_id,
+            owner_account_id="H1234567890",
+            payer_address=payer,
+            payment_authorization_hash=f"{number:064x}",
+        )
+
+    blocked_body = DomainRegistrationRequest(
+        domain="wallet-owned-6.dev",
+        client_order_id="registration-client-order-0006",
+        accept_terms=True,
+        max_price_usd=Decimal("13.00"),
+    )
+    blocked_intent, _, _ = await service.prepare_registration(
+        blocked_body, request_account_id=None
+    )
+    with pytest.raises(DomainProblem) as limited:
+        await service.create_marketplace_order(
+            blocked_intent.registration_id,
+            owner_account_id="H1234567890",
+            payer_address=payer,
+            payment_authorization_hash="f" * 64,
+        )
+    assert limited.value.status == 429
+    assert limited.value.code == "registration_limit_reached"
+
+
+@pytest.mark.asyncio
+async def test_marketplace_quote_cap_and_client_order_binding_fail_before_payment(
+    domain_service,
+):
+    service, _provider, _sessions = domain_service
+    service.domain_config.marketplace_sales_enabled = True
+    service.domain_config.tld_allowlist = ["dev"]
+    body = DomainRegistrationRequest(
+        domain="price-cap.dev",
+        client_order_id="registration-price-cap-0001",
+        accept_terms=True,
+        max_price_usd=Decimal("12.99"),
+    )
+    with pytest.raises(DomainProblem) as cap:
+        await service.prepare_registration(body, request_account_id=None)
+    assert cap.value.code == "price_above_maximum"
+
+    accepted = body.model_copy(update={"max_price_usd": Decimal("13.00")})
+    await service.prepare_registration(accepted, request_account_id=None)
+    with pytest.raises(DomainProblem) as rebound:
+        await service.prepare_registration(
+            accepted.model_copy(update={"domain": "another.dev"}),
+            request_account_id=None,
+        )
+    assert rebound.value.code == "client_order_id_conflict"
+
+
+@pytest.mark.asyncio
+async def test_verified_payer_resolution_links_browser_but_never_api_key(
+    domain_service,
+):
+    service, _provider, sessions = domain_service
+    wallet_auth = WalletAuthService(service.config, sessions)
+    async with sessions() as session:
+        browser_account = await session.get(AccountRow, "H1234567890")
+    assert browser_account is not None
+
+    owner, wallet, created = await wallet_auth.resolve_x402_owner(
+        address="0x" + "A" * 40,
+        chain_id=8453,
+        account=browser_account,
+        allow_link=True,
+    )
+    assert created is False
+    assert owner.account_id == browser_account.account_id
+    assert wallet.address == "0x" + "a" * 40
+
+    async with sessions() as session:
+        second = AccountRow(
+            account_id="H0987654321",
+            password_hash=hash_password("another sufficiently long test password"),
+        )
+        session.add(second)
+        await session.commit()
+    with pytest.raises(DomainProblem) as mismatch:
+        await wallet_auth.resolve_x402_owner(
+            address="0x" + "A" * 40,
+            chain_id=8453,
+            account=second,
+            allow_link=True,
+        )
+    assert mismatch.value.code == "wallet_account_mismatch"
+    with pytest.raises(DomainProblem) as api_link:
+        await wallet_auth.resolve_x402_owner(
+            address="0x" + "B" * 40,
+            chain_id=8453,
+            account=second,
+            allow_link=False,
+        )
+    assert api_link.value.code == "browser_session_required"
+
+    anonymous, anonymous_wallet, anonymous_created = (
+        await wallet_auth.resolve_x402_owner(
+            address="0x" + "C" * 40,
+            chain_id=8453,
+            account=None,
+            allow_link=False,
+        )
+    )
+    assert anonymous_created is True
+    assert anonymous.account_id == anonymous_wallet.account_id
+    async with sessions() as session:
+        stored = await session.get(AccountWalletRow, anonymous_wallet.wallet_id)
+    assert stored is not None
+
+
+@pytest.mark.asyncio
+async def test_public_registration_route_settles_once_and_issues_management_session(
+    domain_service,
+):
+    service, _provider, sessions = domain_service
+    service.domain_config.marketplace_sales_enabled = True
+    service.domain_config.tld_allowlist = ["dev"]
+    wallet_auth = WalletAuthService(service.config, sessions)
+    _REGISTRATION_PREFLIGHTS.clear()
+
+    class Gate:
+        def __init__(self) -> None:
+            self.settlements = 0
+            self.verifications = 0
+            self.config = service.config.payment
+
+        async def verify_only(self, *_args, **_kwargs):
+            self.verifications += 1
+            return SimpleNamespace(
+                payer="0x" + "1" * 40,
+                dev_bypass=True,
+                matching_requirements=None,
+            )
+
+        @staticmethod
+        def payment_authorization_hash(_request):
+            return "a" * 64
+
+        async def settle_verified(self, request, _verified, extra):
+            self.settlements += 1
+            request.state.payment_tx = "0xroute"
+            request.state.payment_network = "eip155:8453"
+            request.state.payment_asset = "USDC"
+            request.state.payment_settlement_ambiguous = False
+            self.extra = extra
+            return True
+
+    gate = Gate()
+    body = DomainRegistrationRequest(
+        domain="route-owned.dev",
+        client_order_id="route-registration-client-0001",
+        accept_terms=True,
+        max_price_usd=Decimal("13.00"),
+    )
+
+    def make_request() -> Request:
+        return Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "https",
+                "path": "/v1/domains/registrations",
+                "raw_path": b"/v1/domains/registrations",
+                "query_string": b"",
+                "headers": [(b"user-agent", b"pytest")],
+                "client": ("2001:db8::1", 12345),
+                "server": ("cloud.hyrule.host", 443),
+            }
+        )
+
+    first_response = Response()
+    first = await register_domain_x402(
+        body,
+        make_request(),
+        first_response,
+        account=None,
+        service=service,
+        wallet_auth=wallet_auth,
+        gate=gate,  # type: ignore[arg-type]
+    )
+    assert first_response.status_code == 202
+    assert first.status == "queued"
+    assert first.owner_wallet == "0x" + "d" * 40
+    assert gate.verifications == 1
+    assert gate.settlements == 1
+    assert gate.extra["order_id"] == first.order_id
+    assert any(name == b"set-cookie" for name, _ in first_response.raw_headers)
+
+    # Idempotent delivery is bound to the terms accepted by the paid order;
+    # a later terms release must not make the settled response unrecoverable.
+    service.domain_config.terms_version = "2026-08-01"
+    replay_response = Response()
+    replay = await register_domain_x402(
+        body,
+        make_request(),
+        replay_response,
+        account=None,
+        service=service,
+        wallet_auth=wallet_auth,
+        gate=gate,  # type: ignore[arg-type]
+    )
+    assert replay_response.status_code == 200
+    assert replay.order_id == first.order_id
+    assert gate.verifications == 1
+    assert gate.settlements == 1
+
+
+@pytest.mark.asyncio
+async def test_marketplace_payment_after_quote_expiry_becomes_refund_obligation(
+    domain_service,
+):
+    service, _provider, sessions = domain_service
+    service.domain_config.marketplace_sales_enabled = True
+    service.domain_config.tld_allowlist = ["dev"]
+    body = DomainRegistrationRequest(
+        domain="late-settlement.dev",
+        client_order_id="late-settlement-client-order-0001",
+        accept_terms=True,
+        max_price_usd=Decimal("13.00"),
+    )
+    intent, _, _ = await service.prepare_registration(body, request_account_id=None)
+    _, order, _ = await service.create_marketplace_order(
+        intent.registration_id,
+        owner_account_id="H1234567890",
+        payer_address="0x" + "1" * 40,
+        payment_authorization_hash="a" * 64,
+    )
+    async with sessions() as session:
+        stored_order = await session.get(DomainOrderRow, order.order_id)
+        stored_quote = await session.get(DomainQuoteRow, order.quote_id)
+        assert stored_order is not None and stored_quote is not None
+        stored_order.status = "expired"
+        stored_quote.status = "expired"
+        await session.commit()
+
+    paid = await service.mark_registration_paid(
+        intent.registration_id,
+        payer="0x" + "1" * 40,
+        tx_hash="0xlate",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+
+    assert paid.status == "refund_due"
+    assert paid.error_code == "payment_after_expiry"
+    response = await service.registration_response(intent.registration_id)
+    assert response.status == "refund_due"
+    async with sessions() as session:
+        refunds = list(
+            await session.scalars(
+                select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
+            )
+        )
+        jobs = list(
+            await session.scalars(
+                select(DomainJobRow).where(DomainJobRow.resource_id == order.order_id)
+            )
+        )
+    assert len(refunds) == 1
+    assert refunds[0].error_reason == "payment_after_expiry"
+    assert refunds[0].extra["order_id"] == order.order_id
+    assert jobs == []
 
 
 @pytest.mark.asyncio
