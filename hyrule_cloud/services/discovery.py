@@ -897,6 +897,22 @@ def discovery_for(method: str, path: str) -> dict[str, Any] | None:
     return operation.declaration
 
 
+def match_paid_operation(method: str, concrete_path: str) -> PaidOperation | None:
+    """Match any catalog operation without applying its readiness gate.
+
+    Admin payment waivers classify risk at the handler boundary, where even a
+    deployment-gated operation must retain its explicit cost classification.
+    Public discovery and preflight challenges must use ``match_enabled_operation``.
+    """
+
+    wanted_method = method.upper()
+    normalized_path = concrete_path.rstrip("/") or "/"
+    for operation, path_regex in _PATH_MATCHERS:
+        if operation.method == wanted_method and path_regex.fullmatch(normalized_path):
+            return operation
+    return None
+
+
 def match_enabled_operation(method: str, concrete_path: str) -> PaidOperation | None:
     """Match a request URL to an enabled catalog path template."""
 
