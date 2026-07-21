@@ -63,7 +63,11 @@ from hyrule_cloud.mail.models import (
 )
 from hyrule_cloud.mail.security import hash_token
 from hyrule_cloud.mail.service import MailProblem, MailService
-from hyrule_cloud.middleware.x402 import PaymentGate
+from hyrule_cloud.middleware.x402 import (
+    PaymentGate,
+    PaymentReconciliation,
+    RecoveredPayment,
+)
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
 
@@ -415,6 +419,16 @@ async def test_pricing_and_activation_quote_use_configured_term_and_storage(mail
     assert pricing.storage_bytes == 1_610_612_736
     assert "45 days" in quote.constraints
     assert "1.5 GiB (1610612736 bytes)" in quote.constraints
+
+
+def test_custom_mail_catalog_does_not_depend_on_domain_sales(mail_service):
+    service, _sessions, _backend, _domains, _refunds = mail_service
+    service.config.domain.agent_purchases_enabled = False
+
+    products = {product.id: product for product in service.products().products}
+
+    assert products["agent-mail-custom"].available is True
+    assert products["agent-mail-domain-bundle"].available is False
 
 
 @pytest.mark.asyncio
@@ -1530,14 +1544,17 @@ async def test_stored_authorization_recovers_mail_payment_without_metrics_ledger
     )
 
     class _RecoveryGate:
-        async def reconcile_settlement(self, header, amount):
+        async def reconcile_settlement(self, header, amount, *, pending_since):
             assert header == "stored-eip3009-authorization"
             assert amount == Decimal(quote.amount_usd)
-            return SimpleNamespace(
-                payer="0x" + "4" * 40,
-                tx_hash="0xauthorization-recovered",
-                network="eip155:8453",
-                asset="0x" + "5" * 40,
+            assert pending_since is not None
+            return PaymentReconciliation(
+                payment=RecoveredPayment(
+                    payer="0x" + "4" * 40,
+                    tx_hash="0xauthorization-recovered",
+                    network="eip155:8453",
+                    asset="0x" + "5" * 40,
+                )
             )
 
     assert await service.recover_x402_handoffs(gate=_RecoveryGate()) == 1
@@ -1549,6 +1566,54 @@ async def test_stored_authorization_recovers_mail_payment_without_metrics_ledger
     assert recovered.payment_tx == "0xauthorization-recovered"
     assert recovered.payment_authorization_header is None
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_authorization_releases_mail_capacity(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="terminal-authorization",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    account, _token, _created = await service.prepare_activation(
+        quote.quote_id,
+        idempotency_key="terminal-authorization-idempotency-0001",
+    )
+    await service.reserve_activation_capacity(account.mailbox_id, quote_id=quote.quote_id)
+    await service.begin_activation_settlement(
+        account.mailbox_id,
+        quote.quote_id,
+        payer="0x" + "4" * 40,
+        payment_network="eip155:8453",
+        payment_asset="0x" + "5" * 40,
+        payment_authorization="expired-authorization",
+    )
+
+    class _ExpiredGate:
+        async def reconcile_settlement(self, header, amount, *, pending_since):
+            assert header == "expired-authorization"
+            assert amount == Decimal(quote.amount_usd)
+            assert pending_since is not None
+            return PaymentReconciliation(
+                terminal_unsettled=True,
+                reason="expired",
+            )
+
+    assert await service.recover_x402_handoffs(gate=_ExpiredGate()) == 0
+    async with sessions() as session:
+        closed = await session.get(MailAccountRow, account.mailbox_id)
+        closed_quote = await session.get(MailQuoteRow, quote.quote_id)
+    assert closed is not None
+    assert closed.status == MailboxStatus.DELETED.value
+    assert closed.capacity_reserved_at is None
+    assert closed.payment_settlement_pending_at is None
+    assert closed.payment_authorization_header is None
+    assert closed.provision_error == "payment_authorization_expired"
+    assert closed_quote is not None
+    assert closed_quote.status == "expired"
 
 
 @pytest.mark.asyncio
@@ -2460,6 +2525,73 @@ async def test_webhooks_require_active_mailbox_and_enforce_cap(mail_service, mon
             )
             == 1
         )
+
+
+@pytest.mark.asyncio
+async def test_webhook_delivery_tries_every_validated_address(mail_service, monkeypatch):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    mailbox_id, token = await _active_hosted(
+        service,
+        local_part="webhook-address-failover",
+        idempotency_key="webhook-address-failover-idempotency-0001",
+    )
+    addresses = ["2001:db8::10", "203.0.113.10"]
+
+    async def safe_url(url):
+        return url, addresses
+
+    monkeypatch.setattr("hyrule_cloud.mail.service.validate_webhook_url", safe_url)
+    await service.create_webhook(
+        mailbox_id,
+        token,
+        MailWebhookCreateRequest(
+            url="https://hooks.example.net/mail",
+            events=["message.received"],
+        ),
+    )
+    async with sessions() as session:
+        account = await session.get(MailAccountRow, mailbox_id)
+    assert account is not None
+    assert (
+        await service.ingest_stalwart_events(
+            [
+                {
+                    "id": "webhook-address-failover-event",
+                    "type": "store.ingest",
+                    "data": {
+                        "from": "sender@example.net",
+                        "to": [account.address],
+                        "messageId": "webhook-address-failover-message",
+                        "subject": "Address failover",
+                    },
+                }
+            ]
+        )
+        == 1
+    )
+    attempted: list[str] = []
+
+    async def post_pinned(url, address, body, signature, event_id):
+        attempted.append(address)
+        assert url == "https://hooks.example.net/mail"
+        assert body and signature
+        assert event_id == "webhook-address-failover-event"
+        if address == addresses[0]:
+            raise RuntimeError("IPv6 route unavailable")
+
+    monkeypatch.setattr(service, "_post_pinned", post_pinned)
+
+    assert await service.deliver_webhooks() == 1
+    assert attempted == addresses
+    async with sessions() as session:
+        delivery = await session.scalar(
+            select(MailWebhookDeliveryRow).where(
+                MailWebhookDeliveryRow.event_id == "webhook-address-failover-event"
+            )
+        )
+    assert delivery is not None
+    assert delivery.status == "delivered"
+    assert delivery.attempt_count == 1
 
 
 @pytest.mark.asyncio

@@ -79,6 +79,7 @@ from hyrule_cloud.domains.validation import (
     validate_rrset,
 )
 from hyrule_cloud.middleware.anon_token import hash_anon_token
+from hyrule_cloud.middleware.x402 import PaymentReconciliation
 from hyrule_cloud.models import (
     CryptoIntentStatus,
     DomainMode,
@@ -888,6 +889,36 @@ class DomainService:
                 order.payment_authorization_header = None
                 order.payment_settlement_pending_at = None
                 await session.commit()
+
+    async def fail_x402_settlement(self, order_id: str, *, reason: str) -> None:
+        """Close an authorization that provably can no longer pay this order."""
+
+        async with self.db() as session:
+            order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                order is None
+                or order.status != DomainOrderStatus.AWAITING_PAYMENT.value
+                or order.paid_at is not None
+            ):
+                return
+            order.payer = None
+            order.payment_network = None
+            order.payment_asset = None
+            order.payment_authorization_fingerprint = None
+            order.payment_authorization_header = None
+            order.payment_settlement_pending_at = None
+            await self._expire_unpaid_order(session, order, now=_now())
+            order.error_code = f"payment_authorization_{reason}"[:64]
+            quote = await session.get(DomainQuoteRow, order.quote_id)
+            if quote is not None and quote.status in {"active", "reserved"}:
+                quote.status = "expired"
+            await session.commit()
 
     async def record_x402_settlement(
         self,
@@ -1717,10 +1748,18 @@ class DomainService:
                 if not pending_order.payment_authorization_header:
                     continue
                 try:
-                    settlement = await gate.reconcile_settlement(
+                    reconciliation: PaymentReconciliation = await gate.reconcile_settlement(
                         pending_order.payment_authorization_header,
                         Decimal(pending_order.amount_usd),
+                        pending_since=_aware(pending_order.payment_settlement_pending_at),
                     )
+                    if reconciliation.terminal_unsettled:
+                        await self.fail_x402_settlement(
+                            pending_order.order_id,
+                            reason=reconciliation.reason or "unsettled",
+                        )
+                        continue
+                    settlement = reconciliation.payment
                     if settlement is None:
                         continue
                     await self.record_x402_settlement(

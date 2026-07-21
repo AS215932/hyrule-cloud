@@ -69,6 +69,7 @@ from hyrule_cloud.mail.models import (
     generate_mail_id,
 )
 from hyrule_cloud.mail.security import hash_token, sanitize_html, validate_webhook_url
+from hyrule_cloud.middleware.x402 import PaymentReconciliation
 from hyrule_cloud.models import DomainStatus
 from hyrule_cloud.services.refunds import RefundService
 
@@ -170,6 +171,7 @@ class MailService:
 
     def products(self) -> MailProductsResponse:
         ready = self.mail_config.public_ready
+        custom_ready = ready and self.domains.dns.configured
         constraints = [
             "API-only submission and retrieval; no public SMTP submission, IMAP, or webmail",
             (
@@ -202,7 +204,7 @@ class MailService:
                         f"{self.mail_config.active_days} days; "
                         "domain quote plus activation; no auto-renew"
                     ),
-                    available=ready and self.config.domain.agent_purchases_enabled,
+                    available=custom_ready,
                     constraints=constraints,
                 ),
                 MailProduct(
@@ -213,7 +215,7 @@ class MailService:
                         f"{self.mail_config.active_days} days; "
                         "live domain quote plus activation; no auto-renew"
                     ),
-                    available=ready and self.config.domain.agent_purchases_enabled,
+                    available=custom_ready and self.config.domain.agent_purchases_enabled,
                     constraints=constraints,
                 ),
             ],
@@ -725,6 +727,46 @@ class MailService:
                 row.payment_authorization_header = None
                 row.payment_settlement_pending_at = None
                 await session.commit()
+
+    async def fail_activation_settlement(
+        self,
+        mailbox_id: str,
+        quote_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Close an authorization that provably can no longer pay this quote."""
+
+        async with self.db() as session:
+            row = (
+                await session.execute(
+                    select(MailAccountRow)
+                    .where(MailAccountRow.mailbox_id == mailbox_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                row is None
+                or row.quote_id != quote_id
+                or row.status != MailboxStatus.AWAITING_PAYMENT.value
+                or row.payment_settled_at is not None
+            ):
+                return
+            row.owner_wallet = None
+            row.payment_network = None
+            row.payment_asset = None
+            row.payment_authorization_header = None
+            row.payment_settlement_pending_at = None
+            row.capacity_reserved_at = None
+            row.status = MailboxStatus.DELETED.value
+            row.provision_error = f"payment_authorization_{reason}"[:2000]
+            row.deleted_at = _now()
+            row.management_token_ciphertext = None
+            quote = await session.get(MailQuoteRow, quote_id)
+            if quote is not None:
+                quote.status = MailQuoteStatus.EXPIRED.value
+                quote.request_payload = {"redacted": True}
+            await session.commit()
 
     async def record_activation_settlement(
         self,
@@ -2074,10 +2116,19 @@ class MailService:
                 ):
                     continue
                 try:
-                    settlement = await gate.reconcile_settlement(
+                    reconciliation: PaymentReconciliation = await gate.reconcile_settlement(
                         pending_account.payment_authorization_header,
                         Decimal(pending_account.total_amount_usd),
+                        pending_since=_aware(pending_account.payment_settlement_pending_at),
                     )
+                    if reconciliation.terminal_unsettled:
+                        await self.fail_activation_settlement(
+                            pending_account.mailbox_id,
+                            pending_account.quote_id,
+                            reason=reconciliation.reason or "unsettled",
+                        )
+                        continue
+                    settlement = reconciliation.payment
                     if settlement is None:
                         continue
                     await self.record_activation_settlement(
@@ -2258,7 +2309,24 @@ class MailService:
             signature = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
             try:
                 url, addresses = await validate_webhook_url(hook.url)
-                await self._post_pinned(url, addresses[0], raw, signature, event.event_id)
+                last_error: Exception | None = None
+                for address in addresses:
+                    try:
+                        await self._post_pinned(
+                            url,
+                            address,
+                            raw,
+                            signature,
+                            event.event_id,
+                        )
+                    except Exception as exc:
+                        last_error = exc
+                        continue
+                    break
+                else:
+                    raise last_error or RuntimeError(
+                        "webhook hostname has no reachable validated address"
+                    )
             except Exception as exc:
                 attempts = int(delivery.attempt_count or 0) + 1
                 if attempts >= 5:

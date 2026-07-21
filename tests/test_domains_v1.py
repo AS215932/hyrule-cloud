@@ -69,6 +69,7 @@ from hyrule_cloud.domains.wallet_auth import (
     WalletVerifyRequest,
 )
 from hyrule_cloud.middleware.anon_token import hash_anon_token
+from hyrule_cloud.middleware.x402 import PaymentReconciliation, RecoveredPayment
 from hyrule_cloud.models import (
     CryptoIntentStatus,
     DomainMode,
@@ -1755,14 +1756,17 @@ async def test_stored_authorization_recovers_domain_payment_without_metrics_ledg
     )
 
     class _RecoveryGate:
-        async def reconcile_settlement(self, header, amount):
+        async def reconcile_settlement(self, header, amount, *, pending_since):
             assert header == "stored-eip3009-authorization"
             assert amount == Decimal(order.amount_usd)
-            return SimpleNamespace(
-                payer="0x" + "4" * 40,
-                tx_hash="0xauthorization-recovered",
-                network="eip155:8453",
-                asset="0x" + "5" * 40,
+            assert pending_since is not None
+            return PaymentReconciliation(
+                payment=RecoveredPayment(
+                    payer="0x" + "4" * 40,
+                    tx_hash="0xauthorization-recovered",
+                    network="eip155:8453",
+                    asset="0x" + "5" * 40,
+                )
             )
 
     assert await service.recover_x402_handoffs(gate=_RecoveryGate()) == 1
@@ -1775,6 +1779,56 @@ async def test_stored_authorization_recovers_domain_payment_without_metrics_ledg
     assert recovered.payment_authorization_header is None
     assert recovered.payment_authorization_fingerprint == "a" * 64
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_authorization_closes_domain_order(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote(
+        "terminal-authorization.dev",
+        DomainAction.REGISTER,
+        "H1234567890",
+    )
+    order, _created = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="terminal-authorization",
+    )
+    await service.begin_x402_settlement(
+        order.order_id,
+        payer="0x" + "4" * 40,
+        payment_network="eip155:8453",
+        payment_asset="0x" + "5" * 40,
+        payment_authorization_fingerprint="f" * 64,
+        payment_authorization="expired-authorization",
+    )
+
+    class _ExpiredGate:
+        async def reconcile_settlement(self, header, amount, *, pending_since):
+            assert header == "expired-authorization"
+            assert amount == Decimal(order.amount_usd)
+            assert pending_since is not None
+            return PaymentReconciliation(
+                terminal_unsettled=True,
+                reason="expired",
+            )
+
+    assert await service.recover_x402_handoffs(gate=_ExpiredGate()) == 0
+    async with sessions() as session:
+        closed = await session.get(DomainOrderRow, order.order_id)
+        closed_quote = await session.get(DomainQuoteRow, quote.quote_id)
+    assert closed is not None
+    assert closed.status == DomainOrderStatus.EXPIRED.value
+    assert closed.payment_settlement_pending_at is None
+    assert closed.payment_authorization_header is None
+    assert closed.payment_authorization_fingerprint is None
+    assert closed.error_code == "payment_authorization_expired"
+    assert closed_quote is not None
+    assert closed_quote.status == "expired"
 
 
 @pytest.mark.asyncio

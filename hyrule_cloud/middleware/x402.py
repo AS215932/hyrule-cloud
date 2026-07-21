@@ -23,6 +23,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -66,6 +67,13 @@ _ALLOWED_FACILITATOR_HOSTS = {
     _PAYAI_FACILITATOR_HOST,
     _CDP_FACILITATOR_HOST,
 }
+_AUTHORIZATION_STATE_SELECTOR = "e94a0102"
+_AUTHORIZATION_USED_TOPIC = "0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5"
+_AUTHORIZATION_CANCELED_TOPIC = "0x1cdd46ff242716cdaa72d159d339a485b3438398348d68f09d7c8c0a59353d81"
+_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+_RECOVERY_CONFIRMATIONS = 12
+_RECOVERY_LOG_BLOCKS = 50_000
+_RECOVERY_CLOCK_SKEW = timedelta(minutes=5)
 
 
 class CdpFacilitatorAuthProvider:
@@ -185,6 +193,19 @@ class RecoveredPayment:
     tx_hash: str | None
     network: str
     asset: str
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentReconciliation:
+    payment: RecoveredPayment | None = None
+    terminal_unsettled: bool = False
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorizationChainOutcome:
+    state: str
+    tx_hash: str | None = None
 
 
 def canonical_payment_authorization(header: str) -> CanonicalPaymentAuthorization:
@@ -949,65 +970,98 @@ class PaymentGate:
         self,
         payment_header: str,
         amount: Decimal,
-    ) -> RecoveredPayment | None:
-        """Replay a stored authorization, then verify nonce use on-chain.
+        *,
+        pending_since: datetime | None = None,
+    ) -> PaymentReconciliation:
+        """Replay a stored authorization, then prove its outcome on-chain.
 
         EIP-3009 authorizations are single-use. Re-submitting the same signed
-        authorization cannot charge twice; if the facilitator cannot return
-        the original success, ``authorizationState`` is the authoritative
-        fallback for a response lost after settlement.
+        authorization cannot charge twice. If the facilitator cannot return
+        the original success, a confirmed AuthorizationUsed event and matching
+        USDC Transfer receipt distinguish payment from nonce cancellation.
         """
 
         try:
             authorization = canonical_payment_authorization(payment_header)
             payment_payload = decode_payment_signature_header(payment_header)
             if not isinstance(payment_payload, PaymentPayload):
-                return None
+                return PaymentReconciliation()
+        except (TypeError, ValueError):
+            log.warning("payment_reconciliation_payload_invalid", exc_info=True)
+            return PaymentReconciliation()
+
+        # x402 2.10 requires initialization before requirement construction.
+        # The worker owns a fresh gate after every restart, so doing this first
+        # is essential for durable handoff recovery.
+        if not await self._ensure_initialized():
+            return PaymentReconciliation()
+        try:
             requirements = self._build_requirements(amount)
             matching = self.server.find_matching_requirements(
                 requirements,
                 payment_payload,
             )
             if matching is None:
-                return None
-        except (TypeError, ValueError):
-            log.warning("payment_reconciliation_payload_invalid", exc_info=True)
-            return None
-
-        if await self._ensure_initialized():
-            try:
-                settlement = await self.server.settle_payment(
-                    payment_payload,
-                    matching,
+                return PaymentReconciliation()
+            if authorization.pay_to != str(matching.pay_to).lower() or int(
+                authorization.value
+            ) != int(matching.amount):
+                return PaymentReconciliation(
+                    terminal_unsettled=True,
+                    reason="authorization_mismatch",
                 )
-            except Exception:
-                log.warning("payment_reconciliation_facilitator_failed", exc_info=True)
-            else:
-                if settlement.success:
-                    return RecoveredPayment(
+        except (RuntimeError, TypeError, ValueError):
+            log.warning("payment_reconciliation_requirements_failed", exc_info=True)
+            return PaymentReconciliation()
+
+        try:
+            settlement = await self.server.settle_payment(
+                payment_payload,
+                matching,
+            )
+        except Exception:
+            log.warning("payment_reconciliation_facilitator_failed", exc_info=True)
+        else:
+            if settlement.success:
+                return PaymentReconciliation(
+                    payment=RecoveredPayment(
                         payer=settlement.payer or authorization.payer,
                         tx_hash=settlement.transaction or None,
                         network=matching.network,
                         asset=matching.asset,
                     )
+                )
 
-        if not await self._authorization_consumed_onchain(authorization):
-            return None
-        return RecoveredPayment(
-            payer=authorization.payer,
-            tx_hash=None,
-            network=authorization.network,
-            asset=authorization.asset,
+        outcome = await self._authorization_outcome_onchain(
+            authorization,
+            pending_since=pending_since,
         )
+        if outcome.state == "transferred":
+            return PaymentReconciliation(
+                payment=RecoveredPayment(
+                    payer=authorization.payer,
+                    tx_hash=outcome.tx_hash,
+                    network=authorization.network,
+                    asset=authorization.asset,
+                )
+            )
+        if outcome.state in {"canceled", "expired", "consumed_without_payment"}:
+            return PaymentReconciliation(
+                terminal_unsettled=True,
+                reason=outcome.state,
+            )
+        return PaymentReconciliation()
 
-    async def _authorization_consumed_onchain(
+    async def _authorization_outcome_onchain(
         self,
         authorization: CanonicalPaymentAuthorization,
-    ) -> bool:
+        *,
+        pending_since: datetime | None,
+    ) -> _AuthorizationChainOutcome:
         network = next(
             (
                 item
-                for item in self.config.enabled_networks()
+                for item in self.config.payment_networks
                 if item.caip2.lower() == authorization.network
                 and item.token_address.lower() == authorization.asset
             ),
@@ -1018,37 +1072,200 @@ class PaymentGate:
             or not network.rpc_url
             or authorization.pay_to != self.config.receiver_address.lower()
         ):
-            return False
+            return _AuthorizationChainOutcome("unknown")
         payer = authorization.payer.removeprefix("0x")
+        pay_to = authorization.pay_to.removeprefix("0x")
         nonce = authorization.nonce.removeprefix("0x")
-        if len(payer) != 40 or len(nonce) != 64:
-            return False
-        call_data = "0xe94a0102" + payer.zfill(64) + nonce
+        if len(payer) != 40 or len(pay_to) != 40 or len(nonce) != 64:
+            return _AuthorizationChainOutcome("unknown")
+        call_data = "0x" + _AUTHORIZATION_STATE_SELECTOR + payer.zfill(64) + nonce
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(
+                latest_raw = await self._rpc_call(
+                    client,
                     network.rpc_url,
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "eth_call",
-                        "params": [
-                            {"to": authorization.asset, "data": call_data},
-                            "latest",
-                        ],
-                    },
+                    "eth_blockNumber",
+                    [],
                 )
-                response.raise_for_status()
-                payload = response.json()
-            result = payload.get("result") if isinstance(payload, dict) else None
-            return isinstance(result, str) and int(result, 16) != 0
-        except (httpx.HTTPError, TypeError, ValueError):
+                latest_block = int(str(latest_raw), 16)
+                confirmed_block = max(0, latest_block - _RECOVERY_CONFIRMATIONS)
+                confirmed_tag = hex(confirmed_block)
+                block = await self._rpc_call(
+                    client,
+                    network.rpc_url,
+                    "eth_getBlockByNumber",
+                    [confirmed_tag, False],
+                )
+                if not isinstance(block, dict):
+                    return _AuthorizationChainOutcome("unknown")
+                chain_timestamp = int(str(block.get("timestamp")), 16)
+                state_raw = await self._rpc_call(
+                    client,
+                    network.rpc_url,
+                    "eth_call",
+                    [
+                        {"to": authorization.asset, "data": call_data},
+                        confirmed_tag,
+                    ],
+                )
+                consumed = int(str(state_raw), 16) != 0
+                if not consumed:
+                    if chain_timestamp > int(authorization.valid_before):
+                        return _AuthorizationChainOutcome("expired")
+                    return _AuthorizationChainOutcome("unused")
+
+                first_block = await self._first_recovery_block(
+                    client,
+                    network.rpc_url,
+                    confirmed_block,
+                    pending_since,
+                )
+                events: list[dict[str, Any]] = []
+                for start in range(
+                    first_block,
+                    confirmed_block + 1,
+                    _RECOVERY_LOG_BLOCKS,
+                ):
+                    end = min(confirmed_block, start + _RECOVERY_LOG_BLOCKS - 1)
+                    result = await self._rpc_call(
+                        client,
+                        network.rpc_url,
+                        "eth_getLogs",
+                        [
+                            {
+                                "address": authorization.asset,
+                                "fromBlock": hex(start),
+                                "toBlock": hex(end),
+                                "topics": [
+                                    [
+                                        _AUTHORIZATION_USED_TOPIC,
+                                        _AUTHORIZATION_CANCELED_TOPIC,
+                                    ],
+                                    "0x" + payer.zfill(64),
+                                    "0x" + nonce,
+                                ],
+                            }
+                        ],
+                    )
+                    if not isinstance(result, list):
+                        return _AuthorizationChainOutcome("unknown")
+                    events.extend(item for item in result if isinstance(item, dict))
+
+                events.sort(
+                    key=lambda item: (
+                        int(str(item.get("blockNumber", "0x0")), 16),
+                        int(str(item.get("logIndex", "0x0")), 16),
+                    )
+                )
+                for event in events:
+                    topics = event.get("topics")
+                    if not isinstance(topics, list) or not topics:
+                        continue
+                    event_topic = str(topics[0]).lower()
+                    if event_topic == _AUTHORIZATION_CANCELED_TOPIC:
+                        return _AuthorizationChainOutcome("canceled")
+                    if event_topic != _AUTHORIZATION_USED_TOPIC:
+                        continue
+                    tx_hash = event.get("transactionHash")
+                    if not isinstance(tx_hash, str) or not tx_hash:
+                        return _AuthorizationChainOutcome("unknown")
+                    receipt = await self._rpc_call(
+                        client,
+                        network.rpc_url,
+                        "eth_getTransactionReceipt",
+                        [tx_hash],
+                    )
+                    if not isinstance(receipt, dict):
+                        return _AuthorizationChainOutcome("unknown")
+                    if self._receipt_has_matching_transfer(receipt, authorization):
+                        return _AuthorizationChainOutcome("transferred", tx_hash)
+                    return _AuthorizationChainOutcome("consumed_without_payment")
+            return _AuthorizationChainOutcome("unknown")
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
             log.warning(
-                "payment_authorization_state_lookup_failed",
+                "payment_authorization_outcome_lookup_failed",
                 network=authorization.network,
                 exc_info=True,
             )
+            return _AuthorizationChainOutcome("unknown")
+
+    @staticmethod
+    async def _rpc_call(
+        client: httpx.AsyncClient,
+        url: str,
+        method: str,
+        params: list[Any],
+    ) -> Any:
+        response = await client.post(
+            url,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("error") is not None:
+            raise ValueError(f"JSON-RPC {method} failed")
+        return payload.get("result")
+
+    async def _first_recovery_block(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        confirmed_block: int,
+        pending_since: datetime | None,
+    ) -> int:
+        if pending_since is None:
+            return 0
+        if pending_since.tzinfo is None:
+            pending_since = pending_since.replace(tzinfo=UTC)
+        target = int((pending_since - _RECOVERY_CLOCK_SKEW).timestamp())
+        low = 0
+        high = confirmed_block
+        while low < high:
+            middle = (low + high) // 2
+            block = await self._rpc_call(
+                client,
+                url,
+                "eth_getBlockByNumber",
+                [hex(middle), False],
+            )
+            if not isinstance(block, dict):
+                raise ValueError("block lookup returned no block")
+            timestamp = int(str(block.get("timestamp")), 16)
+            if timestamp < target:
+                low = middle + 1
+            else:
+                high = middle
+        return max(0, low - _RECOVERY_CONFIRMATIONS)
+
+    @staticmethod
+    def _receipt_has_matching_transfer(
+        receipt: dict[str, Any],
+        authorization: CanonicalPaymentAuthorization,
+    ) -> bool:
+        if int(str(receipt.get("status", "0x0")), 16) != 1:
             return False
+        payer = authorization.payer.removeprefix("0x").lower()
+        pay_to = authorization.pay_to.removeprefix("0x").lower()
+        for item in receipt.get("logs", []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("address", "")).lower() != authorization.asset:
+                continue
+            topics = item.get("topics")
+            if not isinstance(topics, list) or len(topics) < 3:
+                continue
+            if str(topics[0]).lower() != _TRANSFER_TOPIC:
+                continue
+            if not str(topics[1]).lower().endswith(payer):
+                continue
+            if not str(topics[2]).lower().endswith(pay_to):
+                continue
+            try:
+                if int(str(item.get("data", "0x0")), 16) == int(authorization.value):
+                    return True
+            except ValueError:
+                continue
+        return False
 
     @staticmethod
     def _extract_wallet(payment_header: str) -> str | None:
