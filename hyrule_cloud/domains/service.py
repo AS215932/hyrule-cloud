@@ -1229,6 +1229,12 @@ class DomainService:
                     )
                 key = (rrset.name, rrset.type.value)
                 existing = desired.get(key)
+                if existing is not None and existing.managed_by != "customer":
+                    raise DomainProblem(
+                        409,
+                        "service_dns_record_managed",
+                        "This DNS record is managed by an attached service; remove the service before changing it.",
+                    )
                 if change.action is DNSChangeAction.DELETE:
                     if existing is not None:
                         await session.delete(existing)

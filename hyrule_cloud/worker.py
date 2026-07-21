@@ -108,6 +108,10 @@ async def run_worker() -> None:
                     await mail.recover_x402_handoffs()
                 except Exception:
                     log.exception("mail_payment_handoff_recovery_failed")
+                try:
+                    await mail.reconcile_send_intents()
+                except Exception:
+                    log.exception("mail_send_intent_reconciliation_failed")
                 next_payment_handoffs = now + timedelta(seconds=15)
             if now >= next_jobs:
                 try:

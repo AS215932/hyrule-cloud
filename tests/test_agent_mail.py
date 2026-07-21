@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 
 import httpx
@@ -15,7 +16,14 @@ from sqlalchemy import func, select
 from starlette.requests import Request
 from starlette.responses import Response
 
-from hyrule_cloud.api.mail import create_account, ingest_events, internal_router
+from hyrule_cloud.api.mail import (
+    create_account,
+    ingest_events,
+    internal_router,
+)
+from hyrule_cloud.api.mail import (
+    send_message as send_message_route,
+)
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
     Base,
@@ -40,12 +48,14 @@ from hyrule_cloud.mail.models import (
     MailboxMode,
     MailboxStatus,
     MailSendQuoteRequest,
+    MailSendRequest,
     StalwartEventEnvelope,
     generate_mail_id,
 )
 from hyrule_cloud.mail.service import MailProblem, MailService
 from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.services.payments_ledger import PaymentLedger
+from hyrule_cloud.services.refunds import RefundService
 
 
 class _Backend:
@@ -56,6 +66,7 @@ class _Backend:
         self.accounts: list[dict] = []
         self.retention_sweeps: list[dict] = []
         self.retention_delete_count = 0
+        self.messages_by_send_id: dict[str, str] = {}
 
     async def ready(self) -> bool:
         return True
@@ -82,7 +93,12 @@ class _Backend:
 
     async def send_message(self, **kwargs):
         self.sent.append(kwargs)
-        return f"message-{len(self.sent)}"
+        message_id = f"message-{len(self.sent)}"
+        self.messages_by_send_id[kwargs["send_id"]] = message_id
+        return message_id
+
+    async def find_message_by_send_id(self, **kwargs):
+        return self.messages_by_send_id.get(kwargs["send_id"])
 
     async def get_message(self, **kwargs):
         return {
@@ -119,15 +135,6 @@ class _Domains:
         return None
 
 
-class _Refunds:
-    def __init__(self) -> None:
-        self.owed: list[dict] = []
-
-    async def record_owed(self, **kwargs):
-        self.owed.append(kwargs)
-        return True
-
-
 @pytest_asyncio.fixture
 async def mail_service(tmp_path):
     database = tmp_path / "mail.db"
@@ -147,29 +154,34 @@ async def mail_service(tmp_path):
     config.domain.agent_purchases_enabled = True
     backend = _Backend()
     domains = _Domains()
-    refunds = _Refunds()
+    refunds = RefundService(PaymentLedger(sessions))
     service = MailService(config, sessions, domains, refunds, backend=backend)
     yield service, sessions, backend, domains, refunds
     await service.close()
     await engine.dispose()
 
 
-async def _active_hosted(service: MailService):
+async def _active_hosted(
+    service: MailService,
+    *,
+    local_part: str = "journey-agent",
+    idempotency_key: str = "hosted-activation-idempotency-0001",
+):
     quote = await service.create_account_quote(
         MailAccountQuoteRequest(
-            local_part="journey-agent",
+            local_part=local_part,
             mode=MailboxMode.HOSTED,
             terms_version=service.mail_config.terms_version,
         )
     )
     account, token, created = await service.prepare_activation(
         quote.quote_id,
-        idempotency_key="hosted-activation-idempotency-0001",
+        idempotency_key=idempotency_key,
     )
     assert created is True
     replay, replay_token, replay_created = await service.prepare_activation(
         quote.quote_id,
-        idempotency_key="hosted-activation-idempotency-0001",
+        idempotency_key=idempotency_key,
     )
     assert replay.mailbox_id == account.mailbox_id
     assert replay_token == token
@@ -407,6 +419,7 @@ async def test_stalwart_send_requires_submission_acceptance(monkeypatch):
     config.backend_url = "https://mail.internal"
     config.backend_token = "token"
     client = StalwartClient(config)
+    submitted_calls: list[list[list]] = []
 
     async def session(_address, _password):
         return (
@@ -424,6 +437,7 @@ async def test_stalwart_send_requires_submission_acceptance(monkeypatch):
                     ]
                 }
             }
+        submitted_calls.append(method_calls)
         return {
             "response": {
                 "methodResponses": [
@@ -460,9 +474,52 @@ async def test_stalwart_send_requires_submission_acceptance(monkeypatch):
                 text="hello",
                 html=None,
                 in_reply_to=None,
+                send_id="send_submission_acceptance",
             )
     finally:
         await client.close()
+    created_email = submitted_calls[0][0][1]["create"]["draft"]
+    assert created_email["header:X-Hyrule-Send-ID:asText"] == "send_submission_acceptance"
+
+
+@pytest.mark.asyncio
+async def test_stalwart_send_reconciliation_queries_the_stable_header(monkeypatch):
+    config = HyruleConfig().mail
+    config.backend_url = "https://mail.internal"
+    config.backend_token = "token"
+    client = StalwartClient(config)
+    calls: list[list[list]] = []
+
+    async def session(_address, _password):
+        return (
+            {"primaryAccounts": {"urn:ietf:params:jmap:mail": "account-1"}},
+            None,
+        )
+
+    async def jmap(_address, _password, method_calls, _using):
+        calls.append(method_calls)
+        return {
+            "response": {
+                "methodResponses": [
+                    ["Email/query", {"ids": ["message-recovered"]}, "send-intent-query"]
+                ]
+            }
+        }
+
+    monkeypatch.setattr(client, "_session", session)
+    monkeypatch.setattr(client, "_jmap", jmap)
+    try:
+        assert (
+            await client.find_message_by_send_id(
+                address="journey@example.test",
+                password="generated-secret",
+                send_id="send_recovery_123",
+            )
+            == "message-recovered"
+        )
+    finally:
+        await client.close()
+    assert calls[0][0][1]["filter"] == {"header": ["X-Hyrule-Send-ID", "send_recovery_123"]}
 
 
 @pytest.mark.asyncio
@@ -528,6 +585,39 @@ async def test_hosted_activation_is_idempotent_and_never_exposes_mail_protocols(
     assert capabilities.outbound_attachments is False
     assert capabilities.inbound_attachment_max_bytes == 26_214_400
     await _active_hosted(service)
+
+
+@pytest.mark.asyncio
+async def test_activation_capacity_is_rechecked_when_the_quote_is_reserved(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    service.mail_config.max_active_mailboxes = 1
+    first = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="capacity-first",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    second = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="capacity-second",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    await service.prepare_activation(
+        first.quote_id,
+        idempotency_key="capacity-first-idempotency-0001",
+    )
+    with pytest.raises(MailProblem) as full:
+        await service.prepare_activation(
+            second.quote_id,
+            idempotency_key="capacity-second-idempotency-0001",
+        )
+    assert full.value.code == "mail_capacity_reached"
+    async with sessions() as session:
+        stored = await session.get(MailQuoteRow, second.quote_id)
+        assert stored.status == "active"
 
 
 @pytest.mark.asyncio
@@ -599,15 +689,59 @@ async def test_settlement_ledger_recovers_lost_mail_activation_handoff(mail_serv
         extra={"mailbox_id": account.mailbox_id, "address": account.address},
     )
     async with sessions() as session:
+        stored_quote = await session.get(MailQuoteRow, quote.quote_id)
+        stored_quote.expires_at = datetime.now(UTC) - timedelta(hours=2)
         session.add(event)
         await session.commit()
 
+    assert await service.expire_quotes() == 0
+    async with sessions() as session:
+        preserved = await session.get(MailAccountRow, account.mailbox_id)
+        assert preserved.status == MailboxStatus.AWAITING_PAYMENT.value
+        assert preserved.management_token_ciphertext
     assert await service.recover_x402_handoffs() == 1
     assert await service.recover_x402_handoffs() == 0
     async with sessions() as session:
         recovered = await session.get(MailAccountRow, account.mailbox_id)
         assert recovered.status == MailboxStatus.PROVISIONING.value
         assert recovered.payment_tx == "0xmail-recover"
+
+
+@pytest.mark.asyncio
+async def test_paid_activation_failure_commits_refund_obligation_with_terminal_state(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="refund-atomic",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    account, _token, _created = await service.prepare_activation(
+        quote.quote_id,
+        idempotency_key="refund-atomic-idempotency-0001",
+    )
+    await service.mark_activation_paid(
+        account.mailbox_id,
+        payer="0x" + "5" * 40,
+        tx_hash="0xrefund-source",
+        payment_network="eip155:8453",
+        payment_asset="0x" + "a" * 40,
+    )
+    await service._fail_activation(account.mailbox_id, "backend failed", refund=True)
+
+    async with sessions() as session:
+        failed = await session.get(MailAccountRow, account.mailbox_id)
+        obligation = await session.scalar(
+            select(PaymentEventRow).where(
+                PaymentEventRow.event_type == "refund_owed",
+                PaymentEventRow.extra["mailbox_id"].as_string() == account.mailbox_id,
+            )
+        )
+        assert failed.status == MailboxStatus.REFUND_DUE.value
+        assert obligation is not None
+        assert obligation.asset == "0x" + "a" * 40
+        assert obligation.tx_hash == "0xrefund-source"
 
 
 @pytest.mark.asyncio
@@ -719,6 +853,94 @@ async def test_send_payload_is_locked_sanitized_and_rate_limited(mail_service):
         await service.deliver_send(second.quote_id, token)
     assert limited.value.code == "mailbox_send_limit"
     assert len(backend.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_intent_reconciles_after_acceptance_without_duplicate_submission(
+    mail_service, monkeypatch
+):
+    service, sessions, backend, _domains, _refunds = mail_service
+    mailbox_id, token = await _active_hosted(service)
+    quote = await service.create_send_quote(
+        MailSendQuoteRequest(
+            mailbox_id=mailbox_id,
+            to="proof@example.net",
+            subject="Crash-safe",
+            text="Send exactly once",
+        ),
+        token,
+    )
+    original_finalize = service._finalize_send
+
+    async def interrupted_finalize(_send_id, _message_id):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(service, "_finalize_send", interrupted_finalize)
+    with pytest.raises(KeyboardInterrupt):
+        await service.deliver_send(quote.quote_id, token)
+    assert len(backend.sent) == 1
+    async with sessions() as session:
+        intent = await session.scalar(
+            select(MailSendRow).where(MailSendRow.quote_id == quote.quote_id)
+        )
+        assert intent.status == "submitting"
+        assert intent.submission_started_at is not None
+        assert intent.amount_usd == Decimal(quote.amount_usd)
+
+    monkeypatch.setattr(service, "_finalize_send", original_finalize)
+    assert await service.reconcile_send_intents() == 1
+    replay = await service.deliver_send(quote.quote_id, token)
+    assert replay.status == "accepted"
+    assert replay.charged_amount_usd == quote.amount_usd
+    assert len(backend.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_route_verifies_and_reports_the_immutable_quote_amount(mail_service):
+    service, _sessions, _backend, _domains, _refunds = mail_service
+    mailbox_id, token = await _active_hosted(service)
+    quote = await service.create_send_quote(
+        MailSendQuoteRequest(
+            mailbox_id=mailbox_id,
+            to="proof@example.net",
+            subject="Locked price",
+            text="Use the quote price",
+        ),
+        token,
+    )
+    service.config.payment.price_mail_send = Decimal("9.99")
+
+    class Gate:
+        amount: Decimal | None = None
+
+        async def verify_only(self, _request, *, amount, **_kwargs):
+            self.amount = amount
+            return object()
+
+        async def settle_verified(self, _request, _verified):
+            return True
+
+    gate = Gate()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "https",
+            "server": ("cloud.hyrule.host", 443),
+            "path": "/v1/mail/messages/send",
+            "query_string": b"",
+            "headers": [(b"authorization", f"Bearer {token}".encode())],
+        }
+    )
+    result = await send_message_route(
+        MailSendRequest(quote_id=quote.quote_id),
+        request,
+        service=service,
+        gate=gate,
+    )
+    assert not isinstance(result, Response)
+    assert gate.amount == Decimal(quote.amount_usd)
+    assert result.charged_amount_usd == quote.amount_usd
 
 
 @pytest.mark.asyncio
@@ -930,3 +1152,78 @@ async def test_official_stalwart_signature_and_abuse_event_suspend_mailbox(mail_
     route = next(route for route in internal_router.routes if route.path.endswith("/events"))
     aliases = {parameter.alias for parameter in route.dependant.header_params}
     assert "X-Signature" in aliases
+
+
+@pytest.mark.asyncio
+async def test_stalwart_events_use_directional_mailbox_ownership(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    sender_id, _sender_token = await _active_hosted(
+        service,
+        local_part="event-sender",
+        idempotency_key="event-sender-idempotency-0001",
+    )
+    recipient_id, _recipient_token = await _active_hosted(
+        service,
+        local_part="event-recipient",
+        idempotency_key="event-recipient-idempotency-0001",
+    )
+    async with sessions() as session:
+        sender = await session.get(MailAccountRow, sender_id)
+        recipient = await session.get(MailAccountRow, recipient_id)
+
+    assert (
+        await service.ingest_stalwart_events(
+            [
+                {
+                    "id": "directional-inbound",
+                    "type": "store.ingest",
+                    "data": {
+                        "from": sender.address,
+                        "to": [recipient.address],
+                        "messageId": "directional-inbound-message",
+                    },
+                },
+                {
+                    "id": "directional-delivery",
+                    "type": "delivery.delivered",
+                    "data": {
+                        "from": sender.address,
+                        "to": [recipient.address],
+                        "messageId": "directional-delivery-message",
+                    },
+                },
+                {
+                    "id": "directional-append",
+                    "type": "message-ingest.jmap-append",
+                    "data": {
+                        "accountId": sender.backend_id,
+                        "messageId": "directional-append-message",
+                    },
+                },
+            ]
+        )
+        == 3
+    )
+    assert (
+        await service.ingest_stalwart_events(
+            [
+                {
+                    "id": "ambiguous-append",
+                    "type": "message-ingest.imap-append",
+                    "data": {"from": sender.address, "to": [recipient.address]},
+                }
+            ]
+        )
+        == 0
+    )
+    async with sessions() as session:
+        inbound = await session.get(MailEventRow, "directional-inbound")
+        delivery = await session.get(MailEventRow, "directional-delivery")
+        append = await session.get(MailEventRow, "directional-append")
+        assert inbound.mailbox_id == recipient_id
+        assert inbound.type == "message.received"
+        assert delivery.mailbox_id == sender_id
+        assert delivery.type == "message.delivery"
+        assert append.mailbox_id == sender_id
+        assert append.type == "mail.system"
+        assert await session.get(MailMessageIndexRow, "directional-append-message") is None

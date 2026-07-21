@@ -9,6 +9,7 @@ import json
 from base64 import b64encode
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from typing import Annotated
 
 import structlog
@@ -231,7 +232,7 @@ async def send_message(
             raise MailProblem(422, "wrong_quote_kind", "A send quote is required.")
         verified = await gate.verify_only(
             request,
-            amount=service.config.payment.price_mail_send,
+            amount=Decimal(quote.amount_usd),
             description="Send one Agent Mail message",
             extra_body={"quote_id": body.quote_id, "one_recipient": True},
         )

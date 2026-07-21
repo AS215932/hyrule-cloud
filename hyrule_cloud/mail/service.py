@@ -70,6 +70,19 @@ from hyrule_cloud.services.refunds import RefundService
 
 log = structlog.get_logger().bind(component="agent_mail")
 
+_MAIL_CAPACITY_LOCK_ID = 0x4D41494C
+_MAIL_CAPACITY_STATUSES = (
+    MailboxStatus.AWAITING_PAYMENT.value,
+    MailboxStatus.PENDING_DOMAIN.value,
+    MailboxStatus.PROVISIONING.value,
+    MailboxStatus.ACTIVE.value,
+    MailboxStatus.SUSPENDED.value,
+    MailboxStatus.GRACE.value,
+)
+_SEND_RESERVED_STATUSES = ("pending", "submitting", "accepted")
+_SEND_SUBMISSION_LEASE = timedelta(minutes=5)
+_PAYMENT_HANDOFF_GRACE = timedelta(hours=1)
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -380,6 +393,31 @@ class MailService:
             created_at=now,
         )
         async with self.db() as session:
+            winner = await session.scalar(
+                select(MailAccountRow).where(MailAccountRow.idempotency_hash == idem_hash)
+            )
+            if winner is not None:
+                if winner.quote_id != quote_id:
+                    raise MailProblem(
+                        409,
+                        "idempotency_conflict",
+                        "This Idempotency-Key is bound to another activation.",
+                    )
+                return winner, self._decrypt(fernet, winner.management_token_ciphertext), False
+            if session.get_bind().dialect.name == "postgresql":
+                await session.execute(select(func.pg_advisory_xact_lock(_MAIL_CAPACITY_LOCK_ID)))
+            active_count = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(MailAccountRow)
+                    .where(MailAccountRow.status.in_(_MAIL_CAPACITY_STATUSES))
+                )
+                or 0
+            )
+            if active_count >= self.mail_config.max_active_mailboxes:
+                raise MailProblem(
+                    503, "mail_capacity_reached", "Agent Mail launch capacity is full."
+                )
             reserved = await session.execute(
                 update(MailQuoteRow)
                 .where(
@@ -440,7 +478,12 @@ class MailService:
                     .with_for_update()
                 )
             ).scalar_one()
-            if row.status == MailboxStatus.AWAITING_PAYMENT.value:
+            recoverable_expiry = (
+                row.status == MailboxStatus.FAILED.value
+                and row.provision_error == "payment_window_expired"
+                and bool(row.management_token_ciphertext)
+            )
+            if row.status == MailboxStatus.AWAITING_PAYMENT.value or recoverable_expiry:
                 row.owner_wallet = payer[:64]
                 row.payment_tx = tx_hash
                 row.payment_network = payment_network
@@ -513,28 +556,45 @@ class MailService:
             row = await session.get(MailAccountRow, quote.mailbox_id)
             if row is None or not self._token_matches(row, token):
                 raise MailProblem(404, "mail_quote_not_found", "Mail send quote not found.")
-            existing = await session.scalar(
+            existing: MailSendRow | None = await session.scalar(
                 select(MailSendRow).where(MailSendRow.quote_id == quote_id)
             )
-            if existing is not None:
-                return self._send_response(existing)
+        send = existing or await self._reserve_send_intent(quote_id)
+        if send.status == "accepted":
+            return self._send_response(send)
+        return await self._submit_send_intent(send.send_id)
+
+    async def _reserve_send_intent(self, quote_id: str) -> MailSendRow:
+        """Commit the paid operation intent before the first external write."""
 
         now = _now()
         day_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
         async with self.db() as session:
-            account = (
-                await session.execute(
-                    select(MailAccountRow)
-                    .where(MailAccountRow.mailbox_id == quote.mailbox_id)
-                    .with_for_update()
-                )
-            ).scalar_one()
-            self._assert_sendable(account)
+            winner: MailSendRow | None = await session.scalar(
+                select(MailSendRow).where(MailSendRow.quote_id == quote_id)
+            )
+            if winner is not None:
+                return winner
             locked_quote = (
                 await session.execute(
                     select(MailQuoteRow).where(MailQuoteRow.quote_id == quote_id).with_for_update()
                 )
             ).scalar_one()
+            existing: MailSendRow | None = await session.scalar(
+                select(MailSendRow).where(MailSendRow.quote_id == quote_id)
+            )
+            if existing is not None:
+                return existing
+            if not locked_quote.mailbox_id:
+                raise MailProblem(404, "mail_quote_not_found", "Mail send quote not found.")
+            account = (
+                await session.execute(
+                    select(MailAccountRow)
+                    .where(MailAccountRow.mailbox_id == locked_quote.mailbox_id)
+                    .with_for_update()
+                )
+            ).scalar_one()
+            self._assert_sendable(account)
             quote_expires_at = _aware(locked_quote.expires_at)
             if (
                 locked_quote.status != MailQuoteStatus.ACTIVE.value
@@ -549,7 +609,7 @@ class MailService:
                     .where(
                         MailSendRow.mailbox_id == account.mailbox_id,
                         MailSendRow.created_at >= day_start,
-                        MailSendRow.status == "accepted",
+                        MailSendRow.status.in_(_SEND_RESERVED_STATUSES),
                     )
                 )
                 or 0
@@ -558,7 +618,10 @@ class MailService:
                 await session.scalar(
                     select(func.count())
                     .select_from(MailSendRow)
-                    .where(MailSendRow.created_at >= day_start, MailSendRow.status == "accepted")
+                    .where(
+                        MailSendRow.created_at >= day_start,
+                        MailSendRow.status.in_(_SEND_RESERVED_STATUSES),
+                    )
                 )
                 or 0
             )
@@ -590,70 +653,229 @@ class MailService:
                     )
                     or 0
                 )
+                pending_recipients = set(
+                    await session.scalars(
+                        select(MailSendRow.recipient).where(
+                            MailSendRow.mailbox_id == account.mailbox_id,
+                            MailSendRow.created_at >= day_start,
+                            MailSendRow.status.in_(("pending", "submitting")),
+                        )
+                    )
+                )
+                new_count += len(pending_recipients)
                 if new_count >= self.mail_config.mailbox_new_recipient_limit_per_day:
                     raise MailProblem(
                         429,
                         "new_recipient_limit",
                         "The mailbox daily new-recipient limit is reached.",
                     )
-            password = self._decrypt(self._fernet(), account.backend_credential_ciphertext)
-            try:
-                message_id = await self.backend.send_message(
-                    address=account.address,
-                    password=password,
-                    recipient=recipient,
-                    subject=str(payload["subject"]),
-                    text=str(payload.get("text") or ""),
-                    html=payload.get("html"),
-                    in_reply_to=payload.get("in_reply_to"),
-                )
-            except MailBackendError as exc:
-                raise MailProblem(
-                    502, "mail_submission_failed", "The message was not accepted."
-                ) from exc
             send = MailSendRow(
                 send_id=generate_mail_id("send"),
                 mailbox_id=account.mailbox_id,
                 quote_id=quote_id,
                 recipient=recipient,
-                message_id=message_id,
                 in_reply_to=payload.get("in_reply_to"),
-                status="accepted",
+                status="pending",
+                amount_usd=locked_quote.amount_usd,
                 created_at=now,
-                accepted_at=now,
             )
             session.add(send)
+            locked_quote.status = "reserved"
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                winner = await session.scalar(
+                    select(MailSendRow).where(MailSendRow.quote_id == quote_id)
+                )
+                if winner is None:
+                    raise
+                return winner
+            return send
+
+    async def _submit_send_intent(self, send_id: str) -> MailSendResponse:
+        async with self.db() as session:
+            send = await session.get(MailSendRow, send_id)
+            if send is None:
+                raise MailProblem(404, "mail_send_not_found", "Mail send not found.")
+            if send.status == "accepted":
+                return self._send_response(send)
+            account = await session.get(MailAccountRow, send.mailbox_id)
+            quote = await session.get(MailQuoteRow, send.quote_id)
+            if account is None or quote is None:
+                raise MailProblem(
+                    409, "mail_send_state_unavailable", "Mail send state is incomplete."
+                )
+            self._assert_sendable(account)
+            password = self._decrypt(self._fernet(), account.backend_credential_ciphertext)
+            address = account.address
+            payload = dict(quote.request_payload)
+
+        try:
+            recovered_id = await self.backend.find_message_by_send_id(
+                address=address, password=password, send_id=send_id
+            )
+        except MailBackendError as exc:
+            raise MailProblem(
+                502,
+                "mail_submission_status_unavailable",
+                "Message submission status is unavailable.",
+            ) from exc
+        if recovered_id:
+            return await self._finalize_send(send_id, recovered_id)
+
+        now = _now()
+        async with self.db() as session:
+            current = (
+                await session.execute(
+                    select(MailSendRow).where(MailSendRow.send_id == send_id).with_for_update()
+                )
+            ).scalar_one()
+            if current.status == "accepted":
+                return self._send_response(current)
+            started_at = _aware(current.submission_started_at)
+            if (
+                current.status == "submitting"
+                and started_at is not None
+                and started_at > now - _SEND_SUBMISSION_LEASE
+            ):
+                raise MailProblem(
+                    409,
+                    "mail_submission_in_flight",
+                    "This message submission is still being reconciled.",
+                    headers={"Retry-After": "15"},
+                )
+            current.status = "submitting"
+            current.submission_started_at = now
+            current.error = None
+            await session.commit()
+
+        try:
+            message_id = await self.backend.send_message(
+                address=address,
+                password=password,
+                recipient=send.recipient,
+                subject=str(payload["subject"]),
+                text=str(payload.get("text") or ""),
+                html=payload.get("html"),
+                in_reply_to=payload.get("in_reply_to"),
+                send_id=send_id,
+            )
+        except MailBackendError as exc:
+            async with self.db() as session:
+                failed_send = await session.get(MailSendRow, send_id)
+                if failed_send is not None and failed_send.status != "accepted":
+                    failed_send.error = str(exc)[:2000]
+                    await session.commit()
+            raise MailProblem(
+                502, "mail_submission_failed", "The message was not accepted."
+            ) from exc
+        return await self._finalize_send(send_id, message_id)
+
+    async def _finalize_send(self, send_id: str, message_id: str) -> MailSendResponse:
+        now = _now()
+        async with self.db() as session:
+            send = (
+                await session.execute(
+                    select(MailSendRow).where(MailSendRow.send_id == send_id).with_for_update()
+                )
+            ).scalar_one()
+            if send.status == "accepted":
+                return self._send_response(send)
+            account = (
+                await session.execute(
+                    select(MailAccountRow)
+                    .where(MailAccountRow.mailbox_id == send.mailbox_id)
+                    .with_for_update()
+                )
+            ).scalar_one()
+            quote = (
+                await session.execute(
+                    select(MailQuoteRow)
+                    .where(MailQuoteRow.quote_id == send.quote_id)
+                    .with_for_update()
+                )
+            ).scalar_one()
+            payload = dict(quote.request_payload)
+            if payload.get("redacted"):
+                raise MailProblem(
+                    409, "mail_send_state_unavailable", "Mail send payload is unavailable."
+                )
+            recipient_row = await session.scalar(
+                select(MailRecipientRow).where(
+                    MailRecipientRow.mailbox_id == account.mailbox_id,
+                    MailRecipientRow.recipient == send.recipient,
+                )
+            )
             if recipient_row is None:
                 session.add(
                     MailRecipientRow(
                         mailbox_id=account.mailbox_id,
-                        recipient=recipient,
+                        recipient=send.recipient,
                         first_sent_at=now,
                         last_sent_at=now,
                     )
                 )
             else:
                 recipient_row.last_sent_at = now
-            locked_quote.status = MailQuoteStatus.CONSUMED.value
-            locked_quote.consumed_at = now
-            # The immutable hash remains as the audit/idempotency proof; full
-            # message bodies do not belong in the payment database forever.
-            locked_quote.request_payload = {"redacted": True}
-            session.add(
-                MailMessageIndexRow(
-                    message_id=message_id,
-                    mailbox_id=account.mailbox_id,
-                    folder="sent",
-                    sender=account.address,
-                    recipients=[recipient],
-                    subject=str(payload["subject"]),
-                    flags=["$seen"],
-                    has_attachments=False,
-                    created_at=now,
+            send.message_id = message_id
+            send.status = "accepted"
+            send.error = None
+            send.accepted_at = now
+            quote.status = MailQuoteStatus.CONSUMED.value
+            quote.consumed_at = now
+            quote.request_payload = {"redacted": True}
+            if await session.get(MailMessageIndexRow, message_id) is None:
+                session.add(
+                    MailMessageIndexRow(
+                        message_id=message_id,
+                        mailbox_id=account.mailbox_id,
+                        folder="sent",
+                        sender=account.address,
+                        recipients=[send.recipient],
+                        subject=str(payload["subject"]),
+                        flags=["$seen"],
+                        has_attachments=False,
+                        created_at=now,
+                    )
+                )
+            await session.commit()
+            return self._send_response(send)
+
+    async def reconcile_send_intents(self, *, limit: int = 100) -> int:
+        """Finalize submissions accepted by Stalwart before a process interruption."""
+
+        if limit < 1:
+            return 0
+        async with self.db() as session:
+            send_ids = list(
+                await session.scalars(
+                    select(MailSendRow.send_id)
+                    .where(MailSendRow.status == "submitting")
+                    .order_by(MailSendRow.created_at)
+                    .limit(limit)
                 )
             )
-            await session.commit()
-        return self._send_response(send)
+        reconciled = 0
+        for send_id in send_ids:
+            try:
+                async with self.db() as session:
+                    send = await session.get(MailSendRow, send_id)
+                    account = await session.get(MailAccountRow, send.mailbox_id) if send else None
+                if send is None or account is None or not account.backend_credential_ciphertext:
+                    continue
+                password = self._decrypt(self._fernet(), account.backend_credential_ciphertext)
+                message_id = await self.backend.find_message_by_send_id(
+                    address=account.address,
+                    password=password,
+                    send_id=send_id,
+                )
+                if message_id:
+                    await self._finalize_send(send_id, message_id)
+                    reconciled += 1
+            except Exception:
+                log.exception("mail_send_intent_reconciliation_failed", send_id=send_id)
+        return reconciled
 
     async def attribute_send_payment(self, send_id: str, tx_hash: str | None) -> None:
         async with self.db() as session:
@@ -866,8 +1088,9 @@ class MailService:
                 if isinstance(raw_data, dict)
                 else {}
             )
+            raw_type = str(event.get("type") or "unknown")
             backend_id = str(data.get("accountId") or data.get("account_id") or "")
-            addresses = self._event_addresses(data)
+            addresses = self._directional_event_addresses(raw_type, data)
             async with self.db() as session:
                 query = select(MailAccountRow)
                 if backend_id:
@@ -876,8 +1099,11 @@ class MailService:
                     query = query.where(MailAccountRow.address.in_(addresses))
                 else:
                     continue
-                account = await session.scalar(query)
-                if account is None or account.status in {
+                matches = list(await session.scalars(query.limit(2)))
+                if len(matches) != 1:
+                    continue
+                account = matches[0]
+                if account.status in {
                     MailboxStatus.DELETED.value,
                     MailboxStatus.FAILED.value,
                     MailboxStatus.REFUND_DUE.value,
@@ -893,7 +1119,6 @@ class MailService:
                 )
                 if await session.get(MailEventRow, event_id) is not None:
                     continue
-                raw_type = str(event.get("type") or "unknown")
                 public_type = self._public_event_type(raw_type)
                 message_id = str(data.get("messageId") or data.get("emailId") or "") or None
                 stored = MailEventRow(
@@ -1180,27 +1405,53 @@ class MailService:
 
     async def expire_quotes(self) -> int:
         result = 0
+        now = _now()
         async with self.db() as session:
             rows = list(
                 await session.scalars(
                     select(MailQuoteRow).where(
                         MailQuoteRow.status.in_([MailQuoteStatus.ACTIVE.value, "reserved"]),
-                        MailQuoteRow.expires_at <= _now(),
+                        MailQuoteRow.expires_at <= now,
                     )
                 )
             )
             for row in rows:
+                if row.kind == "send":
+                    send = await session.scalar(
+                        select(MailSendRow).where(MailSendRow.quote_id == row.quote_id)
+                    )
+                    if send is not None and send.status in {"pending", "submitting"}:
+                        continue
+                    row.status = MailQuoteStatus.EXPIRED.value
+                    row.request_payload = {"redacted": True}
+                    result += 1
+                    continue
                 account = await session.scalar(
                     select(MailAccountRow).where(MailAccountRow.quote_id == row.quote_id)
                 )
                 if account is None or account.status == MailboxStatus.AWAITING_PAYMENT.value:
+                    expires_at = _aware(row.expires_at)
+                    if account is not None and (
+                        expires_at is None or expires_at > now - _PAYMENT_HANDOFF_GRACE
+                    ):
+                        continue
+                    if account is not None:
+                        settled = await session.scalar(
+                            select(PaymentEventRow.event_id)
+                            .where(
+                                PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
+                                PaymentEventRow.resource_path == "/v1/mail/accounts",
+                                PaymentEventRow.extra["mailbox_id"].as_string()
+                                == account.mailbox_id,
+                            )
+                            .limit(1)
+                        )
+                        if settled is not None:
+                            continue
                     row.status = MailQuoteStatus.EXPIRED.value
-                    if row.kind == "send":
-                        row.request_payload = {"redacted": True}
                     if account is not None:
                         account.status = MailboxStatus.FAILED.value
                         account.provision_error = "payment_window_expired"
-                        account.management_token_ciphertext = None
                     result += 1
             await session.commit()
         return result
@@ -1253,7 +1504,14 @@ class MailService:
                     account = await session.get(MailAccountRow, mailbox_id)
                     awaiting = bool(
                         account is not None
-                        and account.status == MailboxStatus.AWAITING_PAYMENT.value
+                        and (
+                            account.status == MailboxStatus.AWAITING_PAYMENT.value
+                            or (
+                                account.status == MailboxStatus.FAILED.value
+                                and account.provision_error == "payment_window_expired"
+                                and account.management_token_ciphertext
+                            )
+                        )
                     )
                 if not awaiting:
                     continue
@@ -1399,6 +1657,33 @@ class MailService:
                 MailboxStatus.DELETED.value,
             }:
                 return
+            refund_event = None
+            if refund:
+                refund_event = self.refunds.build_owed_event(
+                    resource_path="/v1/mail/accounts",
+                    payer=row.owner_wallet,
+                    amount=Decimal(row.activation_amount_usd or 0),
+                    original_tx=row.payment_tx,
+                    network=row.payment_network,
+                    asset=row.payment_asset,
+                    reason="mailbox_provisioning_failed",
+                    extra={
+                        "mailbox_id": row.mailbox_id,
+                        "domain_order_id": row.domain_order_id,
+                    },
+                )
+                if (
+                    row.owner_wallet
+                    and Decimal(row.activation_amount_usd or 0) > 0
+                    and refund_event is None
+                ):
+                    log.error(
+                        "mailbox_refund_ledger_unavailable",
+                        mailbox_id=row.mailbox_id,
+                    )
+                    return
+                if refund_event is not None:
+                    session.add(refund_event)
             row.status = MailboxStatus.REFUND_DUE.value if refund else MailboxStatus.FAILED.value
             row.provision_error = reason[:2000]
             await session.commit()
@@ -1428,17 +1713,6 @@ class MailService:
                     current.backend_id = None
                     current.backend_credential_ciphertext = None
                     await session.commit()
-        if refund:
-            await self.refunds.record_owed(
-                resource_path="/v1/mail/accounts",
-                payer=row.owner_wallet,
-                amount=Decimal(row.activation_amount_usd or 0),
-                original_tx=row.payment_tx,
-                network=row.payment_network,
-                asset=row.payment_asset,
-                reason="mailbox_provisioning_failed",
-                extra={"mailbox_id": row.mailbox_id, "domain_order_id": row.domain_order_id},
-            )
 
     async def _authorized_account(
         self, mailbox_id: str, token: str, *, allow_grace: bool = False
@@ -1573,7 +1847,7 @@ class MailService:
             status=row.status,
             recipient=row.recipient,
             accepted_at=row.accepted_at,
-            charged_amount_usd=amount(self.config.payment.price_mail_send),
+            charged_amount_usd=amount(Decimal(row.amount_usd)),
         )
 
     @staticmethod
@@ -1595,8 +1869,6 @@ class MailService:
         if lower == "store.ingest" or lower in {
             "message-ingest.ham",
             "message-ingest.spam",
-            "message-ingest.imap-append",
-            "message-ingest.jmap-append",
         }:
             return "message.received"
         if any(
@@ -1646,6 +1918,39 @@ class MailService:
             if "@" in normalized and normalized not in addresses:
                 addresses.append(normalized)
         return addresses
+
+    @classmethod
+    def _directional_event_addresses(cls, event_type: str, data: dict[str, Any]) -> list[str]:
+        lower = event_type.lower()
+        keys: tuple[str, ...]
+        if lower == "store.ingest" or lower in {
+            "message-ingest.ham",
+            "message-ingest.spam",
+        }:
+            keys = ("recipient", "to", "address")
+        elif lower in {
+            "message-ingest.imap-append",
+            "message-ingest.jmap-append",
+        }:
+            # Appends are not directional. They must carry the backend account id.
+            return []
+        elif any(
+            token in lower
+            for token in (
+                "delivery",
+                "dsn",
+                "bounce",
+                "complaint",
+                "abuse-report",
+                "fraud-report",
+                "malware",
+                "virus-report",
+            )
+        ):
+            keys = ("from", "sender", "address")
+        else:
+            keys = ("address",)
+        return cls._event_addresses({key: data.get(key) for key in keys})
 
     async def _post_pinned(
         self, url: str, address: str, body: bytes, signature: str, event_id: str

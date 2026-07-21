@@ -1171,6 +1171,77 @@ async def test_dns_changeset_uses_optimistic_revision(domain_service):
 
 
 @pytest.mark.asyncio
+async def test_dns_changeset_cannot_modify_service_owned_rrsets(domain_service):
+    service, _provider, sessions = domain_service
+    async with sessions() as session:
+        session.add(
+            DomainRow(
+                name="service-owned",
+                extension="dev",
+                fqdn="service-owned.dev",
+                owner_wallet="0x" + "1" * 40,
+                owner_account_id="H1234567890",
+                status="active",
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+            )
+        )
+        session.add(
+            DomainDNSRecordRow(
+                fqdn="service-owned.dev",
+                name="mail",
+                type="A",
+                ttl=300,
+                values=["192.0.2.10"],
+                managed_by="agent_mail",
+            )
+        )
+        await session.commit()
+
+    for index, action in enumerate((DNSChangeAction.DELETE, DNSChangeAction.UPSERT), start=1):
+        with pytest.raises(DomainProblem) as managed:
+            await service.apply_changeset(
+                "H1234567890",
+                "service-owned.dev",
+                1,
+                DNSChangesetRequest(
+                    changes=[
+                        DNSChange(
+                            action=action,
+                            rrset=DNSRRSet(
+                                name="mail",
+                                type=ManagedRecordType.A,
+                                ttl=300,
+                                values=["192.0.2.20"],
+                            ),
+                        )
+                    ]
+                ),
+                idempotency_key=f"service-owned-change-{index}",
+            )
+        assert managed.value.status == 409
+        assert managed.value.code == "service_dns_record_managed"
+
+    async with sessions() as session:
+        record = await session.scalar(
+            select(DomainDNSRecordRow).where(
+                DomainDNSRecordRow.fqdn == "service-owned.dev",
+                DomainDNSRecordRow.name == "mail",
+                DomainDNSRecordRow.type == "A",
+            )
+        )
+        assert record.values == ["192.0.2.10"]
+        assert record.managed_by == "agent_mail"
+    assert service.dns.zones == {}
+
+
+def test_domain_order_payment_asset_accepts_evm_token_addresses():
+    assert DomainOrderRow.__table__.c.payment_asset.type.length == 66
+
+
+@pytest.mark.asyncio
 async def test_dns_changeset_rejects_cname_owner_conflicts(domain_service):
     service, _provider, sessions = domain_service
     async with sessions() as session:

@@ -23,6 +23,13 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     op.alter_column("domain_orders", "owner_account_id", existing_type=sa.String(11), nullable=True)
     op.alter_column(
+        "domain_orders",
+        "payment_asset",
+        existing_type=sa.String(16),
+        type_=sa.String(66),
+        existing_nullable=True,
+    )
+    op.alter_column(
         "domain_operations", "owner_account_id", existing_type=sa.String(11), nullable=True
     )
     for column in (
@@ -138,8 +145,10 @@ def upgrade() -> None:
         sa.Column("message_id", sa.String(128)),
         sa.Column("in_reply_to", sa.String(128)),
         sa.Column("status", sa.String(32), nullable=False),
+        sa.Column("amount_usd", sa.Numeric(12, 6), nullable=False, server_default="0"),
         sa.Column("payment_tx", sa.String(128)),
         sa.Column("error", sa.Text()),
+        sa.Column("submission_started_at", sa.DateTime(timezone=True)),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("accepted_at", sa.DateTime(timezone=True)),
     )
@@ -216,4 +225,11 @@ def downgrade() -> None:
     )
     op.alter_column(
         "domain_orders", "owner_account_id", existing_type=sa.String(11), nullable=False
+    )
+    op.alter_column(
+        "domain_orders",
+        "payment_asset",
+        existing_type=sa.String(66),
+        type_=sa.String(16),
+        existing_nullable=True,
     )

@@ -308,7 +308,7 @@ class DomainOrderRow(Base):
     )
     payment_method: Mapped[str] = mapped_column(String(8))
     payment_network: Mapped[str | None] = mapped_column(String(64))
-    payment_asset: Mapped[str | None] = mapped_column(String(16))
+    payment_asset: Mapped[str | None] = mapped_column(String(66))
     payer: Mapped[str | None] = mapped_column(String(128))
     payment_tx: Mapped[str | None] = mapped_column(String(128), index=True)
     refund_address: Mapped[str | None] = mapped_column(String(128))
@@ -951,8 +951,12 @@ class MailSendRow(Base):
     message_id: Mapped[str | None] = mapped_column(String(128), index=True)
     in_reply_to: Mapped[str | None] = mapped_column(String(128), index=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
+    amount_usd: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0"), server_default="0"
+    )
     payment_tx: Mapped[str | None] = mapped_column(String(128))
     error: Mapped[str | None] = mapped_column(Text)
+    submission_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )

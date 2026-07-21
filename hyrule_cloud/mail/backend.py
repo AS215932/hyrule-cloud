@@ -408,6 +408,7 @@ class StalwartClient:
         text: str,
         html: str | None,
         in_reply_to: str | None,
+        send_id: str,
     ) -> str:
         session, _auth = await self._session(address, password)
         account_id = str(session.get("primaryAccounts", {}).get("urn:ietf:params:jmap:mail", ""))
@@ -448,6 +449,7 @@ class StalwartClient:
             "subject": subject,
             "bodyValues": body_values,
             "textBody": [{"partId": "text", "type": "text/plain"}],
+            "header:X-Hyrule-Send-ID:asText": send_id,
         }
         if html:
             body_values["html"] = {"value": html, "isTruncated": False}
@@ -498,6 +500,34 @@ class StalwartClient:
                 )
             )
         return message_id
+
+    async def find_message_by_send_id(
+        self, *, address: str, password: str, send_id: str
+    ) -> str | None:
+        """Find a previously submitted message using its durable send intent id."""
+
+        session, _auth = await self._session(address, password)
+        account_id = str(session.get("primaryAccounts", {}).get("urn:ietf:params:jmap:mail", ""))
+        if not account_id:
+            raise MailBackendError("Mailbox has no JMAP mail account")
+        result = await self._jmap(
+            address,
+            password,
+            [
+                [
+                    "Email/query",
+                    {
+                        "accountId": account_id,
+                        "filter": {"header": ["X-Hyrule-Send-ID", send_id]},
+                        "limit": 1,
+                    },
+                    "send-intent-query",
+                ]
+            ],
+            ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        )
+        ids = self._method_data(result["response"], "send-intent-query").get("ids", [])
+        return str(ids[0]) if ids else None
 
     async def get_message(self, *, address: str, password: str, message_id: str) -> dict[str, Any]:
         session, _auth = await self._session(address, password)
