@@ -236,9 +236,16 @@ async def _apply_account_operation(
             for mailbox in mailboxes:
                 mailbox_row = await session.get(MailAccountRow, mailbox.mailbox_id)
                 if mailbox_row is not None and mailbox_row.suspension_reason == "account_disabled":
-                    mailbox_row.status = "active"
-                    mailbox_row.suspension_reason = None
+                    if (
+                        mailbox_row.expires_at is not None
+                        and _aware(mailbox_row.expires_at) <= now
+                    ):
+                        mailbox_row.status = "suspended"
+                        mailbox_row.suspension_reason = "expired"
+                    else:
+                        mailbox_row.status = "active"
+                        mailbox_row.suspension_reason = None
+                        mail_count += 1
                     mailbox_row.suspended_by_account_id = None
-                    mail_count += 1
             await session.commit()
     return {"vms": vm_count, "mailboxes": mail_count}

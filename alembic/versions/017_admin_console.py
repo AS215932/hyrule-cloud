@@ -36,6 +36,13 @@ def upgrade() -> None:
 
     op.add_column("sessions", sa.Column("csrf_token_hash", sa.String(64)))
     op.add_column("sessions", sa.Column("admin_elevated_at", sa.DateTime(timezone=True)))
+    op.add_column(
+        "sessions",
+        sa.Column("admin_step_up_attempts", sa.Integer(), nullable=False, server_default="0"),
+    )
+    op.add_column(
+        "sessions", sa.Column("admin_step_up_window_started_at", sa.DateTime(timezone=True))
+    )
 
     op.add_column(
         "vms", sa.Column("billing_mode", sa.String(24), nullable=False, server_default="charged")
@@ -219,6 +226,8 @@ def downgrade() -> None:
     op.drop_column("vms", "retail_cost_total")
     op.drop_column("vms", "billing_mode")
 
+    op.drop_column("sessions", "admin_step_up_window_started_at")
+    op.drop_column("sessions", "admin_step_up_attempts")
     op.drop_column("sessions", "admin_elevated_at")
     op.drop_column("sessions", "csrf_token_hash")
 

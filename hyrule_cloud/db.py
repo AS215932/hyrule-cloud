@@ -1002,6 +1002,12 @@ class SessionRow(Base):
     # digest is persisted and it is tied to this exact opaque session row.
     csrf_token_hash: Mapped[str | None] = mapped_column(String(64))
     admin_elevated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    admin_step_up_attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    admin_step_up_window_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
 
 
 class AdminAuditRow(Base):

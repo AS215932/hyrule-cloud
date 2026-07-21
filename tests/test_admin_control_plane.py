@@ -15,6 +15,8 @@ from x402.http import PAYMENT_SIGNATURE_HEADER
 from hyrule_cloud.api.admin import (
     OwnershipTransferRequest,
     ReasonRequest,
+    StepUpRequest,
+    step_up,
     transfer_domain,
     transfer_vm,
     vm_action,
@@ -25,6 +27,7 @@ from hyrule_cloud.db import (
     AccountRow,
     AccountWalletRow,
     AdminAuditRow,
+    AdminBypassUsageRow,
     AdminOperationRow,
     Base,
     DomainRow,
@@ -151,6 +154,32 @@ async def test_admin_waiver_fails_closed_when_audit_persistence_fails(admin_fact
 
 
 @pytest.mark.asyncio
+async def test_deferred_admin_waiver_fails_closed_when_audit_persistence_fails(
+    admin_factory,
+) -> None:
+    credentials = await _admin_credentials(admin_factory, elevated=True)
+    gate = _admin_gate(admin_factory)
+    request = _browser_request(credentials, path="/v1/network/request")
+
+    verified = await gate.verify_only(request, Decimal("0.01"), "Network request")
+    assert not isinstance(verified, Response)
+    assert verified.admin_bypass is True
+
+    class FailingLedger:
+        async def record(self, **kwargs) -> None:
+            assert kwargs["required"] is True
+            raise RuntimeError("payment_events unavailable")
+
+    gate.ledger = FailingLedger()  # type: ignore[assignment]
+    with pytest.raises(HTTPException) as exc:
+        await gate.settle_verified(request, verified)
+
+    assert exc.value.status_code == 503
+    assert exc.value.detail == "Admin waiver audit unavailable"
+    assert not hasattr(request.state, "payment_mode")
+
+
+@pytest.mark.asyncio
 async def test_real_cost_waiver_requires_recent_password_step_up(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
     gate = _admin_gate(admin_factory)
@@ -238,6 +267,35 @@ async def test_admin_waiver_limit_is_database_enforced(admin_factory) -> None:
         )
 
     assert exc.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_admin_waiver_usage_prunes_expired_windows(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    old_window = datetime.now(UTC) - timedelta(days=3)
+    async with admin_factory() as session:
+        session.add(
+            AdminBypassUsageRow(
+                actor_account_id="HAAAAAAAAAA",
+                operation_class="diagnostic",
+                window_started_at=old_window,
+                count=99,
+                updated_at=old_window,
+            )
+        )
+        await session.commit()
+
+    gate = _admin_gate(admin_factory)
+    await gate.check_payment(
+        _browser_request(credentials, path="/v1/dns/lookup"),
+        Decimal("0.01"),
+        "DNS lookup",
+    )
+
+    async with admin_factory() as session:
+        windows = list(await session.scalars(select(AdminBypassUsageRow)))
+    assert len(windows) == 1
+    assert windows[0].count == 1
 
 
 @pytest.mark.asyncio
@@ -366,8 +424,79 @@ async def test_admin_overview_and_step_up_are_browser_only(admin_factory) -> Non
 
 
 @pytest.mark.asyncio
+async def test_admin_step_up_rate_limits_argon_checks_per_session(
+    admin_factory,
+    monkeypatch,
+) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        session_row = (
+            await session.execute(
+                select(SessionRow).where(SessionRow.account_id == "HAAAAAAAAAA")
+            )
+        ).scalar_one()
+        token_hash = session_row.token_hash
+    assert actor is not None
+
+    verification_calls = 0
+
+    def fake_verify(_password_hash: str, password: str) -> bool:
+        nonlocal verification_calls
+        verification_calls += 1
+        return password == "correct horse battery staple"
+
+    monkeypatch.setattr("hyrule_cloud.api.admin.verify_password", fake_verify)
+    state = AppState(
+        config=SimpleNamespace(admin_step_up_seconds=600),
+        orchestrator=SimpleNamespace(),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    request = _browser_request(credentials, path="/v1/admin/step-up")
+    request.state.session_token_hash = token_hash
+
+    for _ in range(5):
+        with pytest.raises(HTTPException) as exc:
+            await step_up(StepUpRequest(password="incorrect"), request, actor, state)
+        assert exc.value.status_code == 401
+
+    with pytest.raises(HTTPException) as exc:
+        await step_up(
+            StepUpRequest(password="correct horse battery staple"),
+            request,
+            actor,
+            state,
+        )
+    assert exc.value.status_code == 429
+    assert verification_calls == 5
+
+    async with admin_factory() as session:
+        row = await session.get(SessionRow, token_hash)
+        assert row is not None
+        row.admin_step_up_window_started_at = datetime.now(UTC) - timedelta(minutes=16)
+        await session.commit()
+
+    result = await step_up(
+        StepUpRequest(password="correct horse battery staple"),
+        request,
+        actor,
+        state,
+    )
+    assert result["status"] == "ok"
+    assert verification_calls == 6
+    async with admin_factory() as session:
+        row = await session.get(SessionRow, token_hash)
+        assert row is not None
+        assert row.admin_step_up_attempts == 0
+        assert row.admin_step_up_window_started_at is None
+
+
+@pytest.mark.asyncio
 async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
+    xcpng = _AdminXCPNG()
     async with admin_factory() as session:
         actor = await session.get(AccountRow, "HAAAAAAAAAA")
         assert actor is not None
@@ -392,7 +521,11 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
                     owner_wallet="0x2222222222222222222222222222222222222222",
                     owner_account_id="HBBBBBBBBBB",
                     anon_management_token_hash="a" * 64,
-                    status="ready",
+                    xcpng_uuid="uuid-transfer-direct",
+                    status="suspended",
+                    suspension_reason="account_disabled",
+                    suspended_by_account_id="HAAAAAAAAAA",
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
                 ),
                 DomainRow(
                     name="direct",
@@ -409,7 +542,11 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
                     owner_wallet="0x3333333333333333333333333333333333333333",
                     owner_account_id="HBBBBBBBBBB",
                     anon_management_token_hash="c" * 64,
-                    status="ready",
+                    xcpng_uuid="uuid-transfer-attached",
+                    status="suspended",
+                    suspension_reason="account_disabled",
+                    suspended_by_account_id="HAAAAAAAAAA",
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
                 ),
                 DomainRow(
                     name="attached",
@@ -421,13 +558,27 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
                     anon_management_token_hash="d" * 64,
                     status="active",
                 ),
+                VMRow(
+                    vm_id="vm_transfer_manual",
+                    owner_wallet="0x4444444444444444444444444444444444444444",
+                    owner_account_id="HBBBBBBBBBB",
+                    anon_management_token_hash="e" * 64,
+                    xcpng_uuid="uuid-transfer-manual",
+                    status="suspended",
+                    suspension_reason="manual_admin",
+                    suspended_by_account_id="HAAAAAAAAAA",
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                ),
             ]
         )
         await session.commit()
 
     state = AppState(
         config=SimpleNamespace(),
-        orchestrator=SimpleNamespace(),
+        orchestrator=SimpleNamespace(
+            xcpng=xcpng,
+            start_provisioning=lambda _vm_id: None,
+        ),
         payment_gate=None,
         network_provider=None,
         session_factory=admin_factory,
@@ -450,10 +601,21 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
         actor,
         state,
     )
+    await transfer_vm(
+        "vm_transfer_manual",
+        body,
+        _browser_request(credentials, path="/v1/admin/vms/vm_transfer_manual/transfer"),
+        actor,
+        state,
+    )
 
     target_wallet = "0x1111111111111111111111111111111111111111"
     async with admin_factory() as session:
-        for vm_id in ("vm_transfer_direct", "vm_transfer_attached"):
+        for vm_id in (
+            "vm_transfer_direct",
+            "vm_transfer_attached",
+            "vm_transfer_manual",
+        ):
             vm = await session.get(VMRow, vm_id)
             assert vm is not None and vm.owner_account_id == "HCCCCCCCCCC"
             assert vm.owner_wallet == target_wallet
@@ -466,6 +628,16 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
             assert domain.owner_wallet == target_wallet
             assert domain.anon_management_token_hash is None
 
+        direct = await session.get(VMRow, "vm_transfer_direct")
+        attached = await session.get(VMRow, "vm_transfer_attached")
+        manual = await session.get(VMRow, "vm_transfer_manual")
+        assert direct is not None and str(direct.status) == "running"
+        assert direct.suspension_reason is None
+        assert attached is not None and str(attached.status) == "running"
+        assert attached.suspension_reason is None
+        assert manual is not None and str(manual.status) == "suspended"
+        assert manual.suspension_reason == "manual_admin"
+
         stored_actor = await session.get(AccountRow, "HAAAAAAAAAA")
         assert stored_actor is not None
         await session.delete(stored_actor)
@@ -474,6 +646,7 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
 
     assert not AdminAuditRow.__table__.c.actor_account_id.foreign_keys
     assert {row.actor_account_id for row in audits} == {"HAAAAAAAAAA"}
+    assert xcpng.started == ["uuid-transfer-direct", "uuid-transfer-attached"]
 
 
 @pytest.mark.asyncio
@@ -591,6 +764,14 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
                     plan="basic",
                     status="active",
                 ),
+                MailAccountRow(
+                    mailbox_id="mailbox-expired",
+                    address="expired@example.test",
+                    owner_account_id="HBBBBBBBBBB",
+                    plan="basic",
+                    status="active",
+                    expires_at=datetime.now(UTC) - timedelta(minutes=1),
+                ),
                 AdminOperationRow(
                     operation_id="operation-suspend",
                     kind="suspend_account_resources",
@@ -608,6 +789,7 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         manual = await session.get(VMRow, "vm_manual")
         provisioning = await session.get(VMRow, "vm_provisioning")
         mailbox = await session.get(MailAccountRow, "mailbox-1")
+        expired_mailbox = await session.get(MailAccountRow, "mailbox-expired")
         operation = await session.get(AdminOperationRow, "operation-suspend")
         assert active is not None and str(active.status) == "suspended"
         assert active.suspension_reason == "account_disabled"
@@ -615,6 +797,10 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         assert provisioning is not None and str(provisioning.status) == "provisioning"
         assert provisioning.suspension_reason == "account_disabled"
         assert mailbox is not None and mailbox.suspension_reason == "account_disabled"
+        assert (
+            expired_mailbox is not None
+            and expired_mailbox.suspension_reason == "account_disabled"
+        )
         assert operation is not None and operation.status == "completed"
         session.add(
             AdminOperationRow(
@@ -636,6 +822,7 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         manual = await session.get(VMRow, "vm_manual")
         provisioning = await session.get(VMRow, "vm_provisioning")
         mailbox = await session.get(MailAccountRow, "mailbox-1")
+        expired_mailbox = await session.get(MailAccountRow, "mailbox-expired")
         operation = await session.get(AdminOperationRow, "operation-resume")
         assert active is not None and str(active.status) == "running"
         assert active.suspension_reason is None
@@ -643,6 +830,8 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         assert provisioning is not None and str(provisioning.status) == "provisioning"
         assert provisioning.suspension_reason is None
         assert mailbox is not None and mailbox.status == "active"
+        assert expired_mailbox is not None and expired_mailbox.status == "suspended"
+        assert expired_mailbox.suspension_reason == "expired"
         assert operation is not None and operation.status == "completed"
 
     assert xcpng.suspended == ["uuid-active"]

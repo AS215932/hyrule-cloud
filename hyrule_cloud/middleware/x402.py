@@ -22,7 +22,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 
 import structlog
 from fastapi import HTTPException, Request, Response
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from x402.extensions.bazaar import bazaar_resource_server_extension
 from x402.http import (
@@ -64,6 +64,8 @@ if TYPE_CHECKING:
     from hyrule_cloud.services.payments_ledger import PaymentLedger
 
 log = structlog.get_logger()
+
+_ADMIN_BYPASS_RETENTION = timedelta(days=2)
 
 LEGACY_PAYMENT_REQUIRED_HEADER = "X-PAYMENT-REQUIRED"
 ADMIN_PAYMENT_MODE_HEADER = "X-Hyrule-Payment-Mode"
@@ -496,6 +498,21 @@ class PaymentGate:
             dialect = session.get_bind().dialect.name
             stored_window = window.replace(tzinfo=None) if dialect == "sqlite" else window
             stored_now = now.replace(tzinfo=None) if dialect == "sqlite" else now
+            retention_cutoff = now - _ADMIN_BYPASS_RETENTION
+            stored_retention_cutoff = (
+                retention_cutoff.replace(tzinfo=None)
+                if dialect == "sqlite"
+                else retention_cutoff
+            )
+            # Fixed-window rows no longer participate in enforcement once they
+            # are outside the retention horizon. Prune them opportunistically
+            # under the same transaction so sustained diagnostic usage cannot
+            # grow this table without bound.
+            await session.execute(
+                delete(AdminBypassUsageRow).where(
+                    AdminBypassUsageRow.window_started_at < stored_retention_cutoff
+                )
+            )
             values = {
                 "actor_account_id": context.account_id,
                 "operation_class": context.operation_class,
@@ -1062,12 +1079,7 @@ class PaymentGate:
 
         if verified.admin_bypass:
             tx_hash = f"admin_bypass_{secrets.token_hex(16)}"
-            request.state.payment_tx = tx_hash
-            request.state.payment_network = "admin-bypass"
-            request.state.payment_asset = None
-            request.state.payment_mode = "admin-bypass"
-            request.state.payment_response_headers = {ADMIN_PAYMENT_MODE_HEADER: "admin-bypass"}
-            await self._record(
+            await self._record_required(
                 "admin_bypass",
                 request,
                 verified.amount,
@@ -1080,6 +1092,11 @@ class PaymentGate:
                     "retail_amount_usd": str(verified.amount),
                 },
             )
+            request.state.payment_tx = tx_hash
+            request.state.payment_network = "admin-bypass"
+            request.state.payment_asset = None
+            request.state.payment_mode = "admin-bypass"
+            request.state.payment_response_headers = {ADMIN_PAYMENT_MODE_HEADER: "admin-bypass"}
             return True
 
         try:

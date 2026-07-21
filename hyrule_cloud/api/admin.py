@@ -55,6 +55,9 @@ router = APIRouter(
     include_in_schema=False,
 )
 
+_ADMIN_STEP_UP_ATTEMPT_LIMIT = 5
+_ADMIN_STEP_UP_ATTEMPT_WINDOW = timedelta(minutes=15)
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -233,16 +236,46 @@ async def step_up(
     account: AccountRow = Depends(require_admin_csrf),
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
-    if not verify_password(account.password_hash, body.password):
-        raise HTTPException(401, "Password is incorrect")
     token_hash = getattr(request.state, "session_token_hash", None)
     if not token_hash:
         raise HTTPException(401, "Browser session required")
     now = _now()
     async with _factory(state)() as session:
-        row = await session.get(SessionRow, token_hash)
+        row = (
+            await session.execute(
+                select(SessionRow)
+                .where(SessionRow.token_hash == token_hash)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         if row is None or row.account_id != account.account_id:
             raise HTTPException(401, "Session expired")
+        window_started_at = row.admin_step_up_window_started_at
+        if (
+            window_started_at is None
+            or now - _aware(window_started_at) >= _ADMIN_STEP_UP_ATTEMPT_WINDOW
+        ):
+            row.admin_step_up_attempts = 0
+            row.admin_step_up_window_started_at = now
+        if row.admin_step_up_attempts >= _ADMIN_STEP_UP_ATTEMPT_LIMIT:
+            raise HTTPException(429, "Too many step-up attempts; try again later")
+
+        # Hold the session row lock across Argon verification so concurrent
+        # requests cannot each slip through the same pre-verification limit.
+        row.admin_step_up_attempts += 1
+        if not verify_password(account.password_hash, body.password):
+            _audit(
+                session,
+                request,
+                account,
+                "admin.step_up_failed",
+                target_type="session",
+            )
+            await session.commit()
+            raise HTTPException(401, "Password is incorrect")
+
+        row.admin_step_up_attempts = 0
+        row.admin_step_up_window_started_at = None
         row.admin_elevated_at = now
         _audit(session, request, account, "admin.step_up", target_type="session")
         await session.commit()
@@ -667,6 +700,16 @@ async def _enabled_admin_count(session: AsyncSession, *, lock: bool = False) -> 
     )
 
 
+async def _locked_account(session: AsyncSession, account_id: str) -> AccountRow | None:
+    return (
+        await session.execute(
+            select(AccountRow)
+            .where(AccountRow.account_id == account_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+
+
 @router.post("/accounts/{account_id}/disable")
 async def disable_account(
     account_id: str,
@@ -677,9 +720,8 @@ async def disable_account(
 ) -> dict[str, Any]:
     if account_id == actor.account_id:
         raise HTTPException(409, "You cannot disable your current Admin account")
-    now = _now()
     async with _factory(state)() as session:
-        target = await session.get(AccountRow, account_id)
+        target = await _locked_account(session, account_id)
         if target is None:
             raise HTTPException(404, "Account not found")
         if (
@@ -688,6 +730,7 @@ async def disable_account(
             and await _enabled_admin_count(session, lock=True) <= 1
         ):
             raise HTTPException(409, "At least one enabled Admin must remain")
+        now = _now()
         target.disabled_at = now
         target.disabled_reason = body.reason
         target.disabled_by_account_id = actor.account_id
@@ -703,6 +746,7 @@ async def disable_account(
             account_id=account_id,
             actor_account_id=actor.account_id,
             reason=body.reason,
+            created_at=now,
         )
         session.add(operation)
         _audit(
@@ -727,9 +771,10 @@ async def enable_account(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
-        target = await session.get(AccountRow, account_id)
+        target = await _locked_account(session, account_id)
         if target is None:
             raise HTTPException(404, "Account not found")
+        now = _now()
         target.disabled_at = None
         target.disabled_reason = None
         target.disabled_by_account_id = None
@@ -739,6 +784,7 @@ async def enable_account(
             account_id=account_id,
             actor_account_id=actor.account_id,
             reason=body.reason,
+            created_at=now,
         )
         session.add(operation)
         _audit(
@@ -922,6 +968,65 @@ async def _transfer_wallet_identity(session: AsyncSession, account_id: str) -> s
     return address or f"account:{account_id}"
 
 
+async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
+    """Clear an old owner's account suspension after a successful transfer."""
+    restart_provisioning = False
+    async with _factory(state)() as session:
+        current = (
+            await session.execute(
+                select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if current is None or current.suspension_reason != "account_disabled":
+            return
+        if current.expires_at is not None and _aware(current.expires_at) <= _now():
+            current.suspension_reason = "expired"
+            current.suspended_by_account_id = None
+            await session.commit()
+            return
+
+        status = str(current.status)
+        if status in {VMStatus.DESTROYED.value, VMStatus.FAILED.value}:
+            return
+        if status == VMStatus.PROVISIONING.value:
+            # The in-flight provisioner will observe the cleared marker and
+            # complete normally for the enabled recipient.
+            current.suspension_reason = None
+            current.suspended_by_account_id = None
+        elif status == VMStatus.SUSPENDED.value and current.xcpng_uuid:
+            orchestrator = state.orchestrator
+            if orchestrator is None:
+                raise HTTPException(503, "VM service unavailable")
+            # The transfer audit is committed before this provider call. Keep
+            # the row locked so no concurrent Admin action can overwrite it.
+            await orchestrator.xcpng.start_vm(current.xcpng_uuid)
+            current.status = VMStatus.RUNNING
+            current.suspension_reason = None
+            current.suspended_by_account_id = None
+        elif status == VMStatus.SUSPENDED.value:
+            orchestrator = state.orchestrator
+            if orchestrator is None:
+                raise HTTPException(503, "VM service unavailable")
+            current.status = VMStatus.PROVISIONING
+            current.suspension_reason = None
+            current.suspended_by_account_id = None
+            current.error = None
+            restart_provisioning = True
+        else:
+            # A stale provenance marker on an already-live VM should not block
+            # the recipient, but it does not require a provider transition.
+            current.suspension_reason = None
+            current.suspended_by_account_id = None
+        await session.commit()
+
+    if restart_provisioning:
+        # The branch above validated the service before committing the queued
+        # state; AppState does not replace a live orchestrator at runtime.
+        orchestrator = state.orchestrator
+        assert orchestrator is not None
+        orchestrator.start_provisioning(vm_id)
+
+
 async def _pending_domain_operation(session: AsyncSession, fqdn: str) -> bool:
     return (
         await session.scalar(
@@ -981,6 +1086,7 @@ async def transfer_vm(
             },
         )
         await session.commit()
+    await _resume_transferred_vm(state, vm_id)
     return {"vm_id": vm_id, "owner_account_id": body.target_account_id}
 
 
@@ -993,6 +1099,7 @@ async def transfer_domain(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     fqdn = fqdn.lower().rstrip(".")
+    attached_vm_id: str | None = None
     async with _factory(state)() as session:
         await _assert_transfer_target(session, body.target_account_id)
         new_owner_wallet = await _transfer_wallet_identity(session, body.target_account_id)
@@ -1008,6 +1115,7 @@ async def transfer_domain(
         domain.owner_wallet = new_owner_wallet
         domain.anon_management_token_hash = None
         if domain.vm_id:
+            attached_vm_id = domain.vm_id
             vm = (
                 await session.execute(
                     select(VMRow).where(VMRow.vm_id == domain.vm_id).with_for_update()
@@ -1032,6 +1140,8 @@ async def transfer_domain(
             },
         )
         await session.commit()
+    if attached_vm_id is not None:
+        await _resume_transferred_vm(state, attached_vm_id)
     return {"domain": fqdn, "owner_account_id": body.target_account_id}
 
 
