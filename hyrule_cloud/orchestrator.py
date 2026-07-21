@@ -258,6 +258,9 @@ class Orchestrator:
         vm_id: str | None = None,
         pricing_snapshot: dict | None = None,
         legacy_billing: bool = False,
+        payment_tx: str | None = None,
+        retail_amount: Decimal | None = None,
+        admin_waived: bool = False,
     ) -> tuple[VMRow, str]:
         """Persist a VM row and atomically claim a customer /64 (unique index).
 
@@ -346,6 +349,13 @@ class Orchestrator:
                     existing = await session.get(VMRow, candidate_vm_id)
                     if existing is not None:
                         self._validate_replayed_vm(existing, request, owner_account_id)
+                        self._apply_payment_billing(
+                            existing,
+                            retail_amount=retail_amount,
+                            admin_waived=admin_waived,
+                            payment_tx=payment_tx,
+                        )
+                        await session.commit()
                         return existing, ""
                 prefix_index, prefix = await self._allocate_customer_prefix(
                     session, candidate_vm_id
@@ -376,6 +386,12 @@ class Orchestrator:
                     expires_at=expires_at,
                     cost_total=total,
                     retail_cost_total=total,
+                )
+                self._apply_payment_billing(
+                    row,
+                    retail_amount=retail_amount,
+                    admin_waived=admin_waived,
+                    payment_tx=payment_tx,
                 )
                 session.add(row)
                 try:
@@ -450,6 +466,9 @@ class Orchestrator:
         start_provisioning: bool = True,
         pricing_snapshot: dict | None = None,
         legacy_billing: bool = False,
+        payment_tx: str | None = None,
+        retail_amount: Decimal | None = None,
+        admin_waived: bool = False,
     ) -> tuple[VMRow, str]:
         """Create a VM record in DB and start background provisioning.
 
@@ -475,6 +494,9 @@ class Orchestrator:
             vm_id=vm_id,
             pricing_snapshot=pricing_snapshot,
             legacy_billing=legacy_billing,
+            payment_tx=payment_tx,
+            retail_amount=retail_amount,
+            admin_waived=admin_waived,
         )
         if start_provisioning:
             self._spawn_provisioning(row.vm_id)
@@ -579,6 +601,8 @@ class Orchestrator:
         payment_tx: str | None = None,
         *,
         start_provisioning: bool = True,
+        retail_amount: Decimal | None = None,
+        admin_waived: bool = False,
     ) -> VMRow | None:
         """Attach the settled payment to a reservation and start provisioning.
 
@@ -587,12 +611,40 @@ class Orchestrator:
         locked quote amount, so the link must be committed before it starts.
         """
         async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
+            # Account disable takes the account lock before touching owned VMs.
+            # Read the reservation only to discover its owner, then acquire the
+            # same locks in that order so settlement cannot deadlock with (or
+            # slip past) an administrative disable.
+            candidate = await session.get(VMRow, vm_id)
+            if candidate is None:
+                return None
+            expected_owner_account_id = candidate.owner_account_id
+            if expected_owner_account_id is not None:
+                owner = (
+                    await session.execute(
+                        select(AccountRow)
+                        .where(AccountRow.account_id == expected_owner_account_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if owner is None or owner.disabled_at is not None:
+                    raise AccountDisabledError("VM owner account is disabled")
+            row = (
+                await session.execute(
+                    select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                )
+            ).scalar_one_or_none()
             if row is None:
                 return None
+            if row.owner_account_id != expected_owner_account_id:
+                raise RuntimeError("VM reservation owner changed during payment")
             row.owner_wallet = owner_wallet
-            if payment_tx:
-                row.payment_tx = payment_tx
+            self._apply_payment_billing(
+                row,
+                retail_amount=retail_amount,
+                admin_waived=admin_waived,
+                payment_tx=payment_tx,
+            )
             await session.commit()
             await session.refresh(row)
         if start_provisioning:
@@ -995,21 +1047,36 @@ class Orchestrator:
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if row is not None:
-                dev_bypass = bool(payment_tx and payment_tx.startswith("dev_bypass"))
-                row.retail_cost_total = retail_amount
-                row.cost_total = (
-                    Decimal("0") if admin_waived or dev_bypass else retail_amount
+                self._apply_payment_billing(
+                    row,
+                    retail_amount=retail_amount,
+                    admin_waived=admin_waived,
+                    payment_tx=payment_tx,
                 )
-                row.billing_mode = (
-                    "admin_waived"
-                    if admin_waived
-                    else "dev_bypass"
-                    if dev_bypass
-                    else "charged"
-                )
-                if payment_tx:
-                    row.payment_tx = payment_tx
                 await session.commit()
+
+    @staticmethod
+    def _apply_payment_billing(
+        row: VMRow,
+        *,
+        retail_amount: Decimal | None,
+        admin_waived: bool,
+        payment_tx: str | None,
+    ) -> None:
+        """Apply settlement metadata as part of the caller's DB transaction."""
+        if retail_amount is not None:
+            dev_bypass = bool(payment_tx and payment_tx.startswith("dev_bypass"))
+            row.retail_cost_total = retail_amount
+            row.cost_total = Decimal("0") if admin_waived or dev_bypass else retail_amount
+            row.billing_mode = (
+                "admin_waived"
+                if admin_waived
+                else "dev_bypass"
+                if dev_bypass
+                else "charged"
+            )
+        if payment_tx:
+            row.payment_tx = payment_tx
 
     async def record_create_failure_refund(
         self,

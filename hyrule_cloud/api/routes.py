@@ -59,7 +59,7 @@ from hyrule_cloud.models import (
     VMStatus,
     VMStatusResponse,
 )
-from hyrule_cloud.orchestrator import VMCapacityError
+from hyrule_cloud.orchestrator import AccountDisabledError, VMCapacityError
 from hyrule_cloud.providers.base import ProviderError
 from hyrule_cloud.providers.network_config import (
     RESERVED_PREFIX_INDEXES,
@@ -1004,13 +1004,17 @@ async def create_vm(
     # never be dropped.
     row: VMRow | None = None
     management_token: str | None = None
+    payment_tx = getattr(request.state, "payment_tx", None)
+    retail_amount = quote_row.amount_usd if quote_row is not None else total
     try:
         if reservation_row is not None:
             activated = await orch.activate_vm_reservation(
                 reservation_row.vm_id,
                 owner_wallet=wallet,
-                payment_tx=getattr(request.state, "payment_tx", None),
+                payment_tx=payment_tx,
                 start_provisioning=False,
+                retail_amount=retail_amount,
+                admin_waived=admin_waived,
             )
             if activated is not None:
                 row, management_token = activated, reservation_token
@@ -1026,8 +1030,10 @@ async def create_vm(
                     start_provisioning=False,
                     pricing_snapshot=pricing_snapshot,
                     legacy_billing=quote_row is not None and quote_row.pricing_snapshot is None,
+                    payment_tx=payment_tx,
+                    retail_amount=retail_amount,
+                    admin_waived=admin_waived,
                 )
-                row.payment_tx = getattr(request.state, "payment_tx", None)
         else:
             row, management_token = await orch.create_vm(
                 order,
@@ -1036,19 +1042,15 @@ async def create_vm(
                 start_provisioning=False,
                 pricing_snapshot=pricing_snapshot,
                 legacy_billing=quote_row is not None and quote_row.pricing_snapshot is None,
+                payment_tx=payment_tx,
+                retail_amount=retail_amount,
+                admin_waived=admin_waived,
             )
-            row.payment_tx = getattr(request.state, "payment_tx", None)
-        await orch.persist_payment_billing(
-            row.vm_id,
-            quote_row.amount_usd if quote_row is not None else total,
-            admin_waived=admin_waived,
-            payment_tx=getattr(request.state, "payment_tx", None),
-        )
         if quote_row is not None:
             # Persist the locked charged amount first so a later refund is
             # accurate even if the quote link below fails.
-            # persist_payment_billing above keeps the locked retail quote while
-            # recording zero charged revenue for an administrator waiver.
+            # Reservation activation persisted the locked retail quote and its
+            # billing mode atomically with payment acceptance above.
             # The consumed-quote replay path can only rediscover this paid VM
             # once the quote carries its vm_id, so retry a transient link failure
             # before giving up rather than leaving the quote consumed-but-unlinked.
@@ -1085,6 +1087,24 @@ async def create_vm(
         orch.start_provisioning(row.vm_id)
     except HTTPException:
         raise
+    except AccountDisabledError as exc:
+        failed_vm_id = reservation_row.vm_id if reservation_row is not None else None
+        log.warning("vm_owner_disabled_post_charge", vm_id=failed_vm_id)
+        await orch.record_create_failure_refund(
+            owner_wallet=wallet,
+            payment_tx=payment_tx,
+            charged_amount=total,
+            reason="vm_owner_disabled_during_payment",
+            vm_id=failed_vm_id,
+        )
+        if failed_vm_id is not None:
+            await orch.mark_vm_failed(failed_vm_id, str(exc))
+        detail = (
+            "Account was disabled before provisioning; no payment was taken."
+            if admin_waived
+            else "Account was disabled before provisioning; a refund has been recorded."
+        )
+        raise HTTPException(status_code=409, detail=detail) from exc
     except Exception as exc:
         # Post-charge, pre-provision failure: no background task exists to record
         # the refund, so record it here before surfacing the error.

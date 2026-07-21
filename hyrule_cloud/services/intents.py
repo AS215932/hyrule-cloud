@@ -629,11 +629,27 @@ async def _trigger_provisioning(
         # Convert the unpaid reservation into a paid VM but DON'T start
         # provisioning yet: link the intent first, so an immediate XO/API
         # failure can always find the paying record and issue a refund.
-        vm_row = await orch.activate_vm_reservation(
-            reservation_row.vm_id,
-            row.intent_id,
-            start_provisioning=False,
-        )
+        try:
+            vm_row = await orch.activate_vm_reservation(
+                reservation_row.vm_id,
+                row.intent_id,
+                payment_tx=row.tx_hash,
+                start_provisioning=False,
+                retail_amount=row.amount_usd,
+            )
+        except AccountDisabledError:
+            log.warning(
+                "native_vm_owner_disabled_before_activation",
+                intent_id=intent_id,
+            )
+            if claimed_domain and domains is not None:
+                await domains.release_vm_attachment_claim(planned_vm_id)
+            await orch.record_native_intent_refund(
+                intent_id,
+                reason="account_disabled_at_settlement",
+                vm_id=planned_vm_id,
+            )
+            return
         if vm_row is None:
             raise RuntimeError("native VM reservation disappeared before activation")
         await _require_current_vm_handoff(
