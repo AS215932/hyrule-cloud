@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
+    AccountRow,
     CryptoIntentRow,
     DomainOrderRow,
     DomainRow,
@@ -77,6 +78,10 @@ _VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable cross-worker PostgreSQL lock k
 
 class VMCapacityError(RuntimeError):
     """The requested VM cannot fit within the configured live headroom."""
+
+
+class AccountDisabledError(RuntimeError):
+    """A VM reservation was fenced by its disabled owner account."""
 
 
 def _now() -> datetime:
@@ -327,6 +332,16 @@ class Orchestrator:
             hostname = f"{hostname_prefix}.{self.config.deploy_domain}"
 
             async with self.db() as session:
+                if owner_account_id is not None:
+                    owner = (
+                        await session.execute(
+                            select(AccountRow)
+                            .where(AccountRow.account_id == owner_account_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if owner is not None and owner.disabled_at is not None:
+                        raise AccountDisabledError("VM owner account is disabled")
                 if requested_vm_id:
                     existing = await session.get(VMRow, candidate_vm_id)
                     if existing is not None:
@@ -980,9 +995,18 @@ class Orchestrator:
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if row is not None:
+                dev_bypass = bool(payment_tx and payment_tx.startswith("dev_bypass"))
                 row.retail_cost_total = retail_amount
-                row.cost_total = Decimal("0") if admin_waived else retail_amount
-                row.billing_mode = "admin_waived" if admin_waived else "charged"
+                row.cost_total = (
+                    Decimal("0") if admin_waived or dev_bypass else retail_amount
+                )
+                row.billing_mode = (
+                    "admin_waived"
+                    if admin_waived
+                    else "dev_bypass"
+                    if dev_bypass
+                    else "charged"
+                )
                 if payment_tx:
                     row.payment_tx = payment_tx
                 await session.commit()

@@ -102,6 +102,10 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _is_waived_billing(mode: str) -> bool:
+    return mode in {"admin_waived", "dev_bypass"}
+
+
 @overload
 def _aware(value: datetime) -> datetime: ...
 
@@ -738,11 +742,11 @@ class DomainService:
                         quote.status = "expired"
                     order.status = (
                         DomainOrderStatus.FAILED.value
-                        if order.billing_mode == "admin_waived"
+                        if _is_waived_billing(order.billing_mode)
                         else DomainOrderStatus.REFUND_DUE.value
                     )
                     order.error_code = "quote_already_consumed"
-                    if order.billing_mode != "admin_waived":
+                    if not _is_waived_billing(order.billing_mode):
                         session.add(self._build_refund_event(order, "quote_already_consumed"))
                     await session.commit()
                     return order
@@ -753,11 +757,11 @@ class DomainService:
                     if vm_quote is None or vm_quote.status != QuoteStatus.CONSUMED:
                         order.status = (
                             DomainOrderStatus.FAILED.value
-                            if order.billing_mode == "admin_waived"
+                            if _is_waived_billing(order.billing_mode)
                             else DomainOrderStatus.REFUND_DUE.value
                         )
                         order.error_code = "vm_quote_already_consumed"
-                        if order.billing_mode != "admin_waived":
+                        if not _is_waived_billing(order.billing_mode):
                             session.add(
                                 self._build_refund_event(order, "vm_quote_already_consumed")
                             )
@@ -1301,6 +1305,8 @@ class DomainService:
                     billing_mode=(
                         "admin_waived"
                         if event.event_type == "admin_bypass"
+                        else "dev_bypass"
+                        if event.event_type == "dev_bypass"
                         else "charged"
                     ),
                 )
@@ -2273,7 +2279,7 @@ class DomainService:
                 return
             current.status = (
                 DomainOrderStatus.FAILED.value
-                if current.billing_mode == "admin_waived"
+                if _is_waived_billing(current.billing_mode)
                 else DomainOrderStatus.REFUND_DUE.value
             )
             current.error_code = code
@@ -2295,7 +2301,7 @@ class DomainService:
             if domain is not None and domain.openprovider_id is None:
                 domain.status = DomainStatus.FAILED
                 domain.error = detail[:1000]
-            if current.billing_mode != "admin_waived":
+            if not _is_waived_billing(current.billing_mode):
                 session.add(self._build_refund_event(current, code, amount=refund_amount))
             await session.commit()
 
@@ -2982,7 +2988,10 @@ class DomainService:
                                     bundle_vm.error = str(exc)[:1000]
                                     bundle_vm.ipv6_prefix_index = None
                                     bundle_vm.ipv6_prefix = None
-                        if Decimal(order.vm_amount_usd) > 0:
+                        if (
+                            Decimal(order.vm_amount_usd) > 0
+                            and not _is_waived_billing(order.billing_mode)
+                        ):
                             # The terminal job/order state and the partial refund
                             # obligation are one atomic commit. If ledger event
                             # construction or persistence fails, neither side is

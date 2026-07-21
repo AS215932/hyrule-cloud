@@ -137,6 +137,7 @@ async def test_dev_bypass_writes_dev_bypass(session_factory) -> None:
     result = await gate.check_payment(req, Decimal("0.05"), "VM creation")
 
     assert result == "0xDEV_TEST_WALLET"
+    assert req.state.payment_mode == "dev-bypass"
     events = await _events(session_factory)
     assert [e.event_type for e in events] == ["dev_bypass"]
 

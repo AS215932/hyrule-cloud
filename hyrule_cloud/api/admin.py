@@ -740,6 +740,25 @@ async def disable_account(
             .where(ApiKeyRow.account_id == account_id, ApiKeyRow.revoked_at.is_(None))
             .values(revoked_at=now)
         )
+        # Account-owned resources still accept their one-time bearer tokens as
+        # an alternative to the browser session. Revoke those credentials in
+        # the same transaction as sessions and API keys so disable is a real
+        # access fence, not merely a UI logout.
+        await session.execute(
+            update(VMRow)
+            .where(VMRow.owner_account_id == account_id)
+            .values(anon_management_token_hash=None)
+        )
+        await session.execute(
+            update(DomainRow)
+            .where(DomainRow.owner_account_id == account_id)
+            .values(anon_management_token_hash=None)
+        )
+        await session.execute(
+            update(MailAccountRow)
+            .where(MailAccountRow.owner_account_id == account_id)
+            .values(management_token_hash=None)
+        )
         operation = AdminOperationRow(
             operation_id=str(uuid.uuid4()),
             kind="suspend_account_resources",
@@ -1027,9 +1046,14 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
         orchestrator.start_provisioning(vm_id)
 
 
-async def _pending_domain_operation(session: AsyncSession, fqdn: str) -> bool:
-    return (
-        await session.scalar(
+async def _pending_domain_work(
+    session: AsyncSession,
+    *,
+    fqdn: str | None,
+    vm_id: str | None,
+) -> bool:
+    if fqdn is not None:
+        operation_id = await session.scalar(
             select(DomainOperationRow.operation_id)
             .where(
                 DomainOperationRow.fqdn == fqdn,
@@ -1037,7 +1061,21 @@ async def _pending_domain_operation(session: AsyncSession, fqdn: str) -> bool:
             )
             .limit(1)
         )
-    ) is not None
+        if operation_id is not None:
+            return True
+
+    resource_ids = [value for value in (fqdn, vm_id) if value is not None]
+    if not resource_ids:
+        return False
+    job_id = await session.scalar(
+        select(DomainJobRow.job_id)
+        .where(
+            DomainJobRow.resource_id.in_(resource_ids),
+            DomainJobRow.status.in_(["queued", "running"]),
+        )
+        .limit(1)
+    )
+    return job_id is not None
 
 
 @router.post("/vms/{vm_id}/transfer")
@@ -1061,7 +1099,11 @@ async def transfer_vm(
                 select(DomainRow).where(DomainRow.vm_id == vm_id).with_for_update()
             )
         ).scalar_one_or_none()
-        if domain is not None and await _pending_domain_operation(session, domain.fqdn):
+        if await _pending_domain_work(
+            session,
+            fqdn=domain.fqdn if domain is not None else None,
+            vm_id=vm_id,
+        ):
             raise HTTPException(409, "Attached domain has a pending operation")
         previous_account_id = vm.owner_account_id
         vm.owner_account_id = body.target_account_id
@@ -1108,7 +1150,7 @@ async def transfer_domain(
         ).scalar_one_or_none()
         if domain is None:
             raise HTTPException(404, "Domain not found")
-        if await _pending_domain_operation(session, fqdn):
+        if await _pending_domain_work(session, fqdn=fqdn, vm_id=domain.vm_id):
             raise HTTPException(409, "Domain has a pending operation")
         previous_account_id = domain.owner_account_id
         domain.owner_account_id = body.target_account_id

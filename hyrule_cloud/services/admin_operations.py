@@ -204,6 +204,14 @@ async def _apply_account_operation(
                 ).scalar_one_or_none()
                 if current is None or current.suspension_reason != "account_disabled":
                     continue
+                if str(current.status) in {
+                    VMStatus.DESTROYED.value,
+                    VMStatus.FAILED.value,
+                }:
+                    # A provisioning failure can retain the disable marker and
+                    # even a provider UUID. Terminal rows may already carry a
+                    # refund obligation and must never be revived by enable.
+                    continue
                 if current.expires_at is not None and _aware(current.expires_at) <= now:
                     current.suspension_reason = "expired"
                     current.suspended_by_account_id = None

@@ -737,6 +737,7 @@ class PaymentGate:
                 request.state.payment_tx = "dev_bypass_0x0"
                 request.state.payment_network = "dev-bypass"
                 request.state.payment_asset = "USDC"
+                request.state.payment_mode = "dev-bypass"
                 await self._record(
                     "dev_bypass",
                     request,
@@ -1068,6 +1069,9 @@ class PaymentGate:
         """
         if verified.dev_bypass:
             request.state.payment_tx = "dev_bypass_0x0"
+            request.state.payment_network = "dev-bypass"
+            request.state.payment_asset = "USDC"
+            request.state.payment_mode = "dev-bypass"
             await self._record(
                 "dev_bypass",
                 request,

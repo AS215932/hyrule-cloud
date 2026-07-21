@@ -200,6 +200,8 @@ async def create_order(
                     billing_mode=(
                         "admin_waived"
                         if getattr(request.state, "payment_mode", None) == "admin-bypass"
+                        else "dev_bypass"
+                        if getattr(request.state, "payment_mode", None) == "dev-bypass"
                         else "charged"
                     ),
                 )

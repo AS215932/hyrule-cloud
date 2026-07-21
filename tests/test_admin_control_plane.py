@@ -30,6 +30,7 @@ from hyrule_cloud.db import (
     AdminBypassUsageRow,
     AdminOperationRow,
     Base,
+    DomainJobRow,
     DomainRow,
     MailAccountRow,
     PaymentEventRow,
@@ -343,6 +344,30 @@ async def test_admin_overview_and_step_up_are_browser_only(admin_factory) -> Non
                     reason="old enable attempt",
                     error="provider unavailable",
                 ),
+                VMRow(
+                    vm_id="vm_disable_tokens",
+                    owner_wallet="0xowner",
+                    owner_account_id="HBBBBBBBBBB",
+                    anon_management_token_hash="a" * 64,
+                    status="ready",
+                ),
+                DomainRow(
+                    name="disable-tokens",
+                    extension="example",
+                    fqdn="disable-tokens.example",
+                    owner_wallet="0xowner",
+                    owner_account_id="HBBBBBBBBBB",
+                    anon_management_token_hash="b" * 64,
+                    status="active",
+                ),
+                MailAccountRow(
+                    mailbox_id="mail-disable-tokens",
+                    address="disabled@example.test",
+                    owner_account_id="HBBBBBBBBBB",
+                    management_token_hash="c" * 64,
+                    plan="basic",
+                    status="active",
+                ),
             ]
         )
         await session.commit()
@@ -405,6 +430,28 @@ async def test_admin_overview_and_step_up_are_browser_only(admin_factory) -> Non
             )
             assert disabled.status_code == 200
             assert disabled.json()["status"] == "disabled"
+
+            async with admin_factory() as session:
+                disabled_vm = await session.get(VMRow, "vm_disable_tokens")
+                disabled_domain = (
+                    await session.execute(
+                        select(DomainRow).where(
+                            DomainRow.fqdn == "disable-tokens.example"
+                        )
+                    )
+                ).scalar_one()
+                disabled_mailbox = await session.get(
+                    MailAccountRow, "mail-disable-tokens"
+                )
+            assert disabled_vm is not None and disabled_vm.anon_management_token_hash is None
+            assert (
+                disabled_domain is not None
+                and disabled_domain.anon_management_token_hash is None
+            )
+            assert (
+                disabled_mailbox is not None
+                and disabled_mailbox.management_token_hash is None
+            )
 
             obsolete_retry = await client.post(
                 "/v1/admin/operations/operation-obsolete-resume/retry",
@@ -650,6 +697,92 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
 
 
 @pytest.mark.asyncio
+async def test_transfers_block_active_domain_attachment_jobs(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add_all(
+            [
+                AccountRow(
+                    account_id="HBBBBBBBBBB",
+                    password_hash=hash_password("another sufficiently long password"),
+                ),
+                AccountRow(
+                    account_id="HCCCCCCCCCC",
+                    password_hash=hash_password("third sufficiently long password"),
+                ),
+                VMRow(
+                    vm_id="vm_pending_attachment",
+                    owner_wallet="0xowner",
+                    owner_account_id="HBBBBBBBBBB",
+                    status="ready",
+                ),
+                DomainRow(
+                    name="pending-attachment",
+                    extension="example",
+                    fqdn="pending-attachment.example",
+                    vm_id="vm_pending_attachment",
+                    owner_wallet="0xowner",
+                    owner_account_id="HBBBBBBBBBB",
+                    status="active",
+                ),
+                DomainJobRow(
+                    job_id="job_pending_attachment",
+                    kind="attach_vm",
+                    resource_id="vm_pending_attachment",
+                    dedupe_key="attach_vm:vm_pending_attachment",
+                    payload={
+                        "owner_account_id": "HBBBBBBBBBB",
+                        "fqdn": "pending-attachment.example",
+                        "vm_id": "vm_pending_attachment",
+                        "ipv6": "2001:db8::1",
+                    },
+                    status="queued",
+                ),
+            ]
+        )
+        await session.commit()
+
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    body = OwnershipTransferRequest(
+        target_account_id="HCCCCCCCCCC",
+        reason="customer-approved transfer",
+    )
+    with pytest.raises(HTTPException) as vm_error:
+        await transfer_vm(
+            "vm_pending_attachment",
+            body,
+            _browser_request(
+                credentials,
+                path="/v1/admin/vms/vm_pending_attachment/transfer",
+            ),
+            actor,
+            state,
+        )
+    assert vm_error.value.status_code == 409
+
+    with pytest.raises(HTTPException) as domain_error:
+        await transfer_domain(
+            "pending-attachment.example",
+            body,
+            _browser_request(
+                credentials,
+                path="/v1/admin/domains/pending-attachment.example/transfer",
+            ),
+            actor,
+            state,
+        )
+    assert domain_error.value.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_vm_action_audit_is_durable_before_provider_dispatch(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
     async with admin_factory() as session:
@@ -757,6 +890,14 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
                     status="provisioning",
                     expires_at=datetime.now(UTC) + timedelta(days=1),
                 ),
+                VMRow(
+                    vm_id="vm_failed_disabled",
+                    owner_wallet="0xowner",
+                    owner_account_id="HBBBBBBBBBB",
+                    xcpng_uuid="uuid-failed-disabled",
+                    status="failed",
+                    suspension_reason="account_disabled",
+                ),
                 MailAccountRow(
                     mailbox_id="mailbox-1",
                     address="agent@example.test",
@@ -788,6 +929,7 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         active = await session.get(VMRow, "vm_active")
         manual = await session.get(VMRow, "vm_manual")
         provisioning = await session.get(VMRow, "vm_provisioning")
+        failed_disabled = await session.get(VMRow, "vm_failed_disabled")
         mailbox = await session.get(MailAccountRow, "mailbox-1")
         expired_mailbox = await session.get(MailAccountRow, "mailbox-expired")
         operation = await session.get(AdminOperationRow, "operation-suspend")
@@ -796,6 +938,8 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         assert manual is not None and manual.suspension_reason == "manual_admin"
         assert provisioning is not None and str(provisioning.status) == "provisioning"
         assert provisioning.suspension_reason == "account_disabled"
+        assert failed_disabled is not None and str(failed_disabled.status) == "failed"
+        assert failed_disabled.suspension_reason == "account_disabled"
         assert mailbox is not None and mailbox.suspension_reason == "account_disabled"
         assert (
             expired_mailbox is not None
@@ -821,6 +965,7 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         active = await session.get(VMRow, "vm_active")
         manual = await session.get(VMRow, "vm_manual")
         provisioning = await session.get(VMRow, "vm_provisioning")
+        failed_disabled = await session.get(VMRow, "vm_failed_disabled")
         mailbox = await session.get(MailAccountRow, "mailbox-1")
         expired_mailbox = await session.get(MailAccountRow, "mailbox-expired")
         operation = await session.get(AdminOperationRow, "operation-resume")
@@ -829,6 +974,8 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         assert manual is not None and manual.suspension_reason == "manual_admin"
         assert provisioning is not None and str(provisioning.status) == "provisioning"
         assert provisioning.suspension_reason is None
+        assert failed_disabled is not None and str(failed_disabled.status) == "failed"
+        assert failed_disabled.suspension_reason == "account_disabled"
         assert mailbox is not None and mailbox.status == "active"
         assert expired_mailbox is not None and expired_mailbox.status == "suspended"
         assert expired_mailbox.suspension_reason == "expired"
@@ -889,6 +1036,37 @@ async def test_admin_suspension_blocks_orchestrator_extension(admin_factory) -> 
         assert row is not None and row.expires_at is not None
         stored_expiry = row.expires_at.replace(tzinfo=UTC) if row.expires_at.tzinfo is None else row.expires_at
         assert stored_expiry == expires_at
+
+
+@pytest.mark.asyncio
+async def test_dev_bypass_vm_billing_records_zero_charged_revenue(admin_factory) -> None:
+    async with admin_factory() as session:
+        session.add(
+            VMRow(
+                vm_id="vm_dev_bypass_billing",
+                owner_wallet="0xDEV_TEST_WALLET",
+                status="provisioning",
+                cost_total=Decimal("1.25"),
+                retail_cost_total=Decimal("1.25"),
+                billing_mode="charged",
+            )
+        )
+        await session.commit()
+
+    await Orchestrator.persist_payment_billing(
+        SimpleNamespace(db=admin_factory),
+        "vm_dev_bypass_billing",
+        Decimal("1.25"),
+        admin_waived=False,
+        payment_tx="dev_bypass_0x0",
+    )
+
+    async with admin_factory() as session:
+        row = await session.get(VMRow, "vm_dev_bypass_billing")
+    assert row is not None
+    assert row.retail_cost_total == Decimal("1.25")
+    assert row.cost_total == Decimal("0")
+    assert row.billing_mode == "dev_bypass"
 
 
 @pytest.mark.asyncio

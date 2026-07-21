@@ -217,6 +217,13 @@ class _StubOrchestrator:
         vm_id: str | None = None,
         **kwargs,
     ):
+        if owner_account_id is not None:
+            async with self.db() as db:
+                owner = await db.get(AccountRow, owner_account_id)
+            if owner is not None and owner.disabled_at is not None:
+                from hyrule_cloud.orchestrator import AccountDisabledError
+
+                raise AccountDisabledError("VM owner account is disabled")
         capacity_error = getattr(self, "capacity_error", None)
         if capacity_error is not None:
             raise capacity_error
@@ -452,6 +459,7 @@ async def _seed_intent(
     amount_crypto: Decimal | None = None,
     amount_usd: Decimal | None = None,
     rate_valid_until: datetime | None = None,
+    owner_account_id: str | None = None,
 ):
     intent_state_provider = state.native_crypto
     if asset == "BTC":
@@ -466,7 +474,7 @@ async def _seed_intent(
         order_payload=_vm_create_request(),
         amount_usd=amount_usd or Decimal("0.05"),
         client_order_id=None,
-        owner_account_id=None,
+        owner_account_id=owner_account_id,
     )
     if rate_valid_until is not None:
         async with state.orchestrator.db() as db:
@@ -1757,6 +1765,49 @@ async def test_native_intent_refunds_when_atomic_capacity_reservation_fails(
     async with intent_state.orchestrator.db() as db:
         intent = await db.get(CryptoIntentRow, row.intent_id)
         assert intent.status == CryptoIntentStatus.REFUND_MANUAL
+
+
+@pytest.mark.asyncio
+async def test_paid_native_intent_refunds_when_owner_was_disabled(intent_state):
+    account_id = "HDDDDDDDDDD"
+    async with intent_state.orchestrator.db() as db:
+        db.add(
+            AccountRow(
+                account_id=account_id,
+                password_hash="not-used-in-intent-test",
+            )
+        )
+        await db.commit()
+    row = await _seed_intent(
+        intent_state,
+        asset="BTC",
+        owner_account_id=account_id,
+    )
+    async with intent_state.orchestrator.db() as db:
+        owner = await db.get(AccountRow, account_id)
+        assert owner is not None
+        owner.disabled_at = _now()
+        await db.commit()
+    intent_state.native_crypto.scan_results[row.address] = AddressScanResult(
+        address=row.address,
+        received_total=row.amount_crypto * Decimal("1.20"),
+        confirmations=2,
+    )
+
+    await poll_one_intent(
+        intent_id=row.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    assert intent_state.orchestrator.native_refunds == [row.intent_id]
+    assert (
+        intent_state.orchestrator.native_refund_reasons[row.intent_id]
+        == "account_disabled_at_settlement"
+    )
+    assert intent_state.orchestrator.created_vms == []
 
 
 @pytest.mark.asyncio

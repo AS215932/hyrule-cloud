@@ -34,6 +34,7 @@ from hyrule_cloud.models import (
     VMCreateRequest,
     generate_vm_id,
 )
+from hyrule_cloud.orchestrator import AccountDisabledError
 from hyrule_cloud.providers.native_crypto import AddressScanResult, NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
 from hyrule_cloud.services.quotes import (
@@ -556,6 +557,17 @@ async def _trigger_provisioning(
                 pricing_snapshot=row.pricing_snapshot,
                 legacy_billing=row.pricing_snapshot is None,
             )
+        except AccountDisabledError:
+            log.warning(
+                "native_vm_owner_disabled_at_settlement",
+                intent_id=intent_id,
+            )
+            await orch.record_native_intent_refund(
+                intent_id,
+                reason="account_disabled_at_settlement",
+                vm_id=planned_vm_id,
+            )
+            return
         except RuntimeError:
             log.warning(
                 "native_vm_capacity_unavailable_at_settlement",

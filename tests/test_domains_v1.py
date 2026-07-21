@@ -2228,6 +2228,93 @@ async def test_partial_bundle_refund_commits_atomically_with_terminal_job(
 
 
 @pytest.mark.asyncio
+async def test_admin_waived_bundle_failure_creates_no_refund_obligation(
+    domain_service,
+):
+    service, _provider, sessions = domain_service
+    fqdn = "waived-bundle-failure.dev"
+    quote = await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890")
+    vm_quote_id = "vmq_waived_bundle_failure"
+    async with sessions() as session:
+        session.add(
+            VMQuoteRow(
+                quote_id=vm_quote_id,
+                order_payload=_bundle_spec(fqdn).model_dump(mode="json", exclude={"quote_id"}),
+                amount_usd=Decimal("5"),
+                status=QuoteStatus.CREATED,
+                owner_account_id="H1234567890",
+                expires_at=datetime.now(UTC) + timedelta(minutes=15),
+            )
+        )
+        await session.commit()
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+            vm_quote_id=vm_quote_id,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="waived-bundle-failure",
+    )
+    await service.mark_x402_paid(
+        order.order_id,
+        payer="admin:H1234567890",
+        tx_hash="admin_bypass_waived_bundle",
+        payment_network="admin-bypass",
+        payment_asset=None,
+        billing_mode="admin_waived",
+    )
+    async with sessions() as session:
+        stored_order = await session.get(DomainOrderRow, order.order_id)
+        assert stored_order is not None
+        stored_order.vm_id = "vm_waived_bundle_failure"
+        session.add(
+            DomainRow(
+                name="waived-bundle-failure",
+                extension="dev",
+                fqdn=fqdn,
+                owner_wallet="admin:H1234567890",
+                owner_account_id="H1234567890",
+                status="active",
+                openprovider_id=7003,
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+                vm_id="vm_waived_bundle_failure",
+            )
+        )
+        job = (
+            await session.execute(
+                select(DomainJobRow).where(DomainJobRow.resource_id == order.order_id)
+            )
+        ).scalar_one()
+        job.status = "running"
+        job.attempts = 10
+        job_id = job.job_id
+        await session.commit()
+
+    await service._retry_or_fail_job(job_id, RuntimeError("bundle VM failed"))
+
+    async with sessions() as session:
+        failed_job = await session.get(DomainJobRow, job_id)
+        active_order = await session.get(DomainOrderRow, order.order_id)
+        active_domain = (
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
+        ).scalar_one()
+        refund_events = list(
+            await session.scalars(
+                select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
+            )
+        )
+    assert failed_job is not None and failed_job.status == "failed"
+    assert active_order is not None and active_order.status == "active"
+    assert active_domain.vm_id is None
+    assert refund_events == []
+
+
+@pytest.mark.asyncio
 async def test_read_only_operation_poll_does_not_consume_transfer_secret(domain_service):
     service, _provider, sessions = domain_service
     key = Fernet.generate_key()
