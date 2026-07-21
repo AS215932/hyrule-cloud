@@ -16,8 +16,10 @@ from x402.http import PAYMENT_SIGNATURE_HEADER
 from hyrule_cloud.api.admin import (
     OwnershipTransferRequest,
     ReasonRequest,
+    RefundResolutionRequest,
     StepUpRequest,
     _assert_transfer_target,
+    resolve_refund,
     retry_job,
     step_up,
     transfer_domain,
@@ -251,6 +253,57 @@ async def test_elevated_admin_can_waive_real_cost_without_settlement(admin_facto
     assert payer == "admin:HAAAAAAAAAA"
     assert request.state.payment_tx.startswith("admin_bypass_")
     assert server.settle_payment_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("revocation", "expected_detail"),
+    [
+        ("demote", "Admin waiver authorization expired"),
+        ("disable", "Account disabled"),
+        ("session", "Admin waiver authorization expired"),
+        ("csrf", "CSRF validation failed"),
+        ("step_up", "admin_step_up_required"),
+    ],
+)
+async def test_admin_waiver_revalidates_cached_security_context(
+    admin_factory,
+    revocation: str,
+    expected_detail: str,
+) -> None:
+    credentials = await _admin_credentials(admin_factory, elevated=True)
+    gate = _admin_gate(admin_factory)
+    request = _browser_request(credentials, path="/v1/vm/create")
+    assert await gate.has_payment_credentials(request) is True
+
+    async with admin_factory() as session:
+        account = await session.get(AccountRow, "HAAAAAAAAAA")
+        session_row = (
+            await session.execute(
+                select(SessionRow).where(SessionRow.account_id == "HAAAAAAAAAA")
+            )
+        ).scalar_one()
+        assert account is not None
+        if revocation == "demote":
+            account.is_admin = False
+        elif revocation == "disable":
+            account.disabled_at = datetime.now(UTC)
+        elif revocation == "session":
+            await session.delete(session_row)
+        elif revocation == "csrf":
+            session_row.csrf_token_hash = "0" * 64
+        else:
+            session_row.admin_elevated_at = datetime.now(UTC) - timedelta(hours=1)
+        await session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await gate.check_payment(request, Decimal("1.00"), "VM")
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == expected_detail
+    async with admin_factory() as session:
+        assert list(await session.scalars(select(AdminBypassUsageRow))) == []
+        assert list(await session.scalars(select(PaymentEventRow))) == []
 
 
 @pytest.mark.asyncio
@@ -562,6 +615,64 @@ async def test_admin_overview_and_step_up_are_browser_only(admin_factory) -> Non
             delattr(app.state, "_typed_state")
         else:
             app.state._typed_state = previous
+
+
+@pytest.mark.asyncio
+async def test_each_refund_event_can_be_resolved_for_the_same_vm(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory, elevated=True)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        for event_id in ("refund-repeat-one", "refund-repeat-two"):
+            session.add(
+                PaymentEventRow(
+                    event_id=event_id,
+                    event_type="refund_owed",
+                    resource_path="/v1/vm/vm_repeat_refund/extend",
+                    method="POST",
+                    service_group="vm",
+                    amount_usd=Decimal("0.60"),
+                    payer_wallet="0x1111111111111111111111111111111111111111",
+                    tx_hash=f"0x{event_id}",
+                    extra={"vm_id": "vm_repeat_refund"},
+                )
+            )
+        await session.commit()
+
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    resolution_ids: list[str] = []
+    for event_id in ("refund-repeat-one", "refund-repeat-two"):
+        result = await resolve_refund(
+            event_id,
+            RefundResolutionRequest(
+                status="resolved",
+                external_reference=f"operator-{event_id}",
+                reason="sent to original payer",
+            ),
+            _browser_request(
+                credentials,
+                path=f"/v1/admin/refunds/{event_id}/resolve",
+            ),
+            actor,
+            state,
+        )
+        resolution_ids.append(result["resolution_id"])
+
+    assert len(set(resolution_ids)) == 2
+    async with admin_factory() as session:
+        resolutions = list(await session.scalars(select(RefundResolutionRow)))
+    assert len(resolutions) == 2
+    assert {row.payment_event_id for row in resolutions} == {
+        "refund-repeat-one",
+        "refund-repeat-two",
+    }
+    assert {row.resource_id for row in resolutions} == {"vm_repeat_refund"}
 
 
 @pytest.mark.asyncio
@@ -1258,6 +1369,58 @@ async def test_admin_start_updates_vm_while_owner_fence_is_held(admin_factory) -
     assert row.suspension_reason is None
     assert row.suspended_by_account_id is None
     assert audit.succeeded is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "destroyed", "provisioning"])
+async def test_admin_start_rejects_non_startable_vm_states(
+    admin_factory,
+    status: str,
+) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add(
+            VMRow(
+                vm_id=f"vm_admin_start_{status}",
+                owner_wallet="0xowner",
+                owner_account_id="HAAAAAAAAAA",
+                xcpng_uuid=f"uuid-admin-start-{status}",
+                status=status,
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+        await session.commit()
+
+    xcpng = _AdminXCPNG()
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(xcpng=xcpng),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await vm_action(
+            f"vm_admin_start_{status}",
+            "start",
+            ReasonRequest(reason="manual recovery"),
+            _browser_request(
+                credentials,
+                path=f"/v1/admin/vms/vm_admin_start_{status}/actions/start",
+            ),
+            actor,
+            state,
+        )
+
+    assert exc.value.status_code == 409
+    assert xcpng.started == []
+    async with admin_factory() as session:
+        row = await session.get(VMRow, f"vm_admin_start_{status}")
+        audits = list(await session.scalars(select(AdminAuditRow)))
+    assert row is not None and str(row.status) == status
+    assert audits == []
 
 
 @pytest.mark.asyncio

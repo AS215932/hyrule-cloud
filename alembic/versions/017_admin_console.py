@@ -196,10 +196,9 @@ def upgrade() -> None:
         sa.Column(
             "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
         ),
-        sa.UniqueConstraint("resource_type", "resource_id", name="uq_refund_resolution_resource"),
+        sa.UniqueConstraint("payment_event_id", name="uq_refund_resolution_payment_event"),
     )
     for column in (
-        "payment_event_id",
         "resource_type",
         "resource_id",
         "status",

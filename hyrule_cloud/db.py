@@ -1060,7 +1060,7 @@ class RefundResolutionRow(Base):
 
     resolution_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     payment_event_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("payment_events.event_id", ondelete="SET NULL"), index=True
+        String(36), ForeignKey("payment_events.event_id", ondelete="SET NULL")
     )
     resource_type: Mapped[str] = mapped_column(String(32), index=True)
     resource_id: Mapped[str] = mapped_column(String(128), index=True)
@@ -1077,7 +1077,7 @@ class RefundResolutionRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint("resource_type", "resource_id", name="uq_refund_resolution_resource"),
+        UniqueConstraint("payment_event_id", name="uq_refund_resolution_payment_event"),
     )
 
 

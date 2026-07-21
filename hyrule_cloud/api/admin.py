@@ -1060,6 +1060,11 @@ async def vm_action(
                 raise HTTPException(404, "VM not found")
             if current.owner_account_id != owner_account_id:
                 raise HTTPException(409, "VM ownership changed; retry the action")
+            status = str(current.status)
+            if status in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
+                raise HTTPException(409, "Terminal VMs cannot be started")
+            if status == VMStatus.PROVISIONING.value:
+                raise HTTPException(409, "Provisioning VMs cannot be started manually")
             if current.expires_at is not None and _aware(current.expires_at) <= _now():
                 raise HTTPException(409, "Expired VMs cannot be started")
             if current.suspension_reason == "account_disabled":
@@ -1607,7 +1612,13 @@ async def resolve_refund(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
-        event = await session.get(PaymentEventRow, event_id)
+        event = (
+            await session.execute(
+                select(PaymentEventRow)
+                .where(PaymentEventRow.event_id == event_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         if event is None or event.event_type != "refund_owed":
             raise HTTPException(404, "Refund obligation not found")
         existing = await session.scalar(

@@ -431,10 +431,15 @@ class PaymentGate:
     def _aware(value: datetime) -> datetime:
         return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
-    async def _admin_context(self, request: Request) -> AdminBypassContext | None:
+    async def _admin_context(
+        self,
+        request: Request,
+        *,
+        force_refresh: bool = False,
+    ) -> AdminBypassContext | None:
         """Resolve a browser Admin waiver and validate session-bound CSRF."""
         cached = getattr(request.state, "admin_bypass_context", None)
-        if isinstance(cached, AdminBypassContext):
+        if not force_refresh and isinstance(cached, AdminBypassContext):
             return cached
         if not self.admin_bypass_enabled or self.session_factory is None:
             return None
@@ -637,6 +642,15 @@ class PaymentGate:
         context: AdminBypassContext,
         extra_body: dict[str, Any] | None,
     ) -> str:
+        # The outer discovery middleware may have cached this context before
+        # FastAPI reads a slow request body. Re-read every security-bearing
+        # field immediately before consuming quota or granting the waiver so a
+        # revoked session, demotion, disable, CSRF rotation, or expired step-up
+        # cannot ride that stale authorization into provider work.
+        live_context = await self._admin_context(request, force_refresh=True)
+        if live_context is None or live_context != context:
+            raise HTTPException(status_code=403, detail="Admin waiver authorization expired")
+        context = live_context
         quota_window = await self._consume_admin_quota(context)
         tx_hash = f"admin_bypass_{secrets.token_hex(16)}"
         payer = f"admin:{context.account_id}"

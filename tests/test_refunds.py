@@ -164,6 +164,53 @@ async def test_extension_rejected_after_settlement_records_refund(
     assert event.error_reason == "vm_extension_rejected_post_settlement"
 
 
+@pytest.mark.asyncio
+async def test_rejected_waived_extension_does_not_claim_a_refund(
+    session_factory,
+    monkeypatch,
+) -> None:
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+    monkeypatch.setattr(orch, "extend_vm", AsyncMock(return_value=None))
+
+    class WaivedGate:
+        async def check_payment(self, request, **_kwargs):
+            request.state.payment_tx = "admin_bypass_extension"
+            request.state.payment_mode = "admin-bypass"
+            return "admin:HAAAAAAAAAA"
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/vm/vm_waived_extension/extend",
+            "headers": [],
+        }
+    )
+    row = VMRow(
+        vm_id="vm_waived_extension",
+        owner_wallet="admin:HAAAAAAAAAA",
+        status=VMStatus.SUSPENDED,
+        size=VMSize.XS,
+        expires_at=datetime.now(UTC) + timedelta(days=1),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await extend_vm_route(
+            "vm_waived_extension",
+            VMExtendRequest(days=3),
+            request,
+            row,
+            orch,
+            cfg,
+            WaivedGate(),
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "VM extension was rejected; no payment was taken"
+    assert await _events(session_factory) == []
+
+
 def _paid_provisioning_vm(vm_id: str, *, wallet: str, tx: str | None, cost: str) -> VMRow:
     return VMRow(
         vm_id=vm_id,

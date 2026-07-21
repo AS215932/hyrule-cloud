@@ -1265,6 +1265,10 @@ async def extend_vm(
         return result
 
     payment_tx = getattr(request.state, "payment_tx", None)
+    payment_waived = bool(
+        payment_tx
+        and payment_tx.startswith(("dev_bypass", "admin_bypass"))
+    )
     try:
         updated = await orch.extend_vm(vm_id, body.days)
     except Exception as exc:
@@ -1275,7 +1279,12 @@ async def extend_vm(
             charged_amount=total,
             reason=f"vm_extension_failed: {exc}",
         )
-        raise HTTPException(500, "Failed to extend VM; a refund has been recorded") from exc
+        detail = (
+            "Failed to extend VM; no payment was taken"
+            if payment_waived
+            else "Failed to extend VM; a refund has been recorded"
+        )
+        raise HTTPException(500, detail) from exc
     if not updated:
         await orch.record_extension_failure_refund(
             vm_id=vm_id,
@@ -1284,7 +1293,12 @@ async def extend_vm(
             charged_amount=total,
             reason="vm_extension_rejected_post_settlement",
         )
-        raise HTTPException(409, "VM extension was rejected; a refund has been recorded")
+        detail = (
+            "VM extension was rejected; no payment was taken"
+            if payment_waived
+            else "VM extension was rejected; a refund has been recorded"
+        )
+        raise HTTPException(409, detail)
 
     return {
         "vm_id": vm_id,
