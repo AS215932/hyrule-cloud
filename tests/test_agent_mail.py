@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -32,6 +33,7 @@ from hyrule_cloud.db import (
     MailMessageIndexRow,
     MailPaymentAuthorizationRow,
     MailQuoteRow,
+    MailRecipientRow,
     MailSendRow,
     MailWebhookDeliveryRow,
     MailWebhookRow,
@@ -213,6 +215,7 @@ async def _active_hosted(
     assert replay_created is False
     await service.mark_activation_paid(
         account.mailbox_id,
+        quote.quote_id,
         payer="0x1234567890abcdef",
         tx_hash="0xpaid",
         payment_network="eip155:8453",
@@ -234,6 +237,9 @@ def test_generated_mail_ids_fit_postgres_columns():
 
 def test_agent_mail_review_safety_schema_contracts():
     assert MailAccountRow.__table__.c.capacity_reserved_at.index is True
+    assert MailAccountRow.__table__.c.provision_claimed_at.index is True
+    assert MailAccountRow.__table__.c.provision_next_attempt_at.index is True
+    assert MailAccountRow.__table__.c.provision_retry_count.server_default is not None
     fingerprint = MailPaymentAuthorizationRow.__table__.c.fingerprint
     assert fingerprint.primary_key is True
     assert fingerprint.type.length == 64
@@ -841,6 +847,7 @@ async def test_incomplete_mail_dns_keeps_provisioning_retryable(mail_service):
     )
     await service.mark_activation_paid(
         account.mailbox_id,
+        quote.quote_id,
         payer="0x" + "d" * 40,
         tx_hash="0xdns-retry",
         payment_network="eip155:8453",
@@ -861,10 +868,67 @@ async def test_incomplete_mail_dns_keeps_provisioning_retryable(mail_service):
             .where(PaymentEventRow.event_type == "refund_owed")
         )
         assert pending.status == MailboxStatus.PROVISIONING.value
+        assert pending.provision_retry_count == 1
+        assert pending.provision_next_attempt_at is not None
+        assert "1/15 attempts" in pending.provision_error
         assert refunds == 0
+        pending.provision_next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
 
     backend.ensure_domain = original_ensure_domain
     assert await service.provision_pending() == 1
+
+
+@pytest.mark.asyncio
+async def test_incomplete_mail_dns_eventually_fails_and_refunds(mail_service):
+    service, sessions, backend, _domains, _refunds = mail_service
+    service.mail_config.provision_dns_max_attempts = 2
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="dns-exhausted",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    account, token, _ = await service.prepare_activation(
+        quote.quote_id,
+        idempotency_key="dns-exhausted-idempotency-0001",
+    )
+    await service.mark_activation_paid(
+        account.mailbox_id,
+        quote.quote_id,
+        payer="0x" + "e" * 40,
+        tx_hash="0xdns-exhausted",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+
+    async def incomplete_domain(_domain):
+        raise MailDNSIncompleteError("generated zone is incomplete")
+
+    backend.ensure_domain = incomplete_domain
+    assert await service.provision_pending() == 0
+    async with sessions() as session:
+        pending = await session.get(MailAccountRow, account.mailbox_id)
+        pending.provision_next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    assert await service.provision_pending() == 1
+    async with sessions() as session:
+        failed = await session.get(MailAccountRow, account.mailbox_id)
+        refund = await session.scalar(
+            select(PaymentEventRow).where(
+                PaymentEventRow.event_type == "refund_owed",
+                PaymentEventRow.extra["mailbox_id"].as_string() == account.mailbox_id,
+            )
+        )
+        assert failed.status == MailboxStatus.REFUND_DUE.value
+        assert failed.provision_retry_count == 2
+        assert failed.provision_error == "mailbox_dns_incomplete_after_2_attempts"
+        assert refund is not None
+    with pytest.raises(MailProblem) as closed:
+        await service.get_account(account.mailbox_id, token)
+    assert closed.value.code == "mailbox_activation_failed"
 
 
 @pytest.mark.asyncio
@@ -913,6 +977,7 @@ async def test_provisioning_reuses_password_after_process_interruption(mail_serv
     )
     await service.mark_activation_paid(
         account.mailbox_id,
+        quote.quote_id,
         payer="0x1234567890abcdef",
         tx_hash="0xpaid-crash-safe",
         payment_network="eip155:8453",
@@ -932,12 +997,115 @@ async def test_provisioning_reuses_password_after_process_interruption(mail_serv
         interrupted = await session.get(MailAccountRow, account.mailbox_id)
         assert interrupted.backend_credential_ciphertext
         assert interrupted.status == MailboxStatus.PROVISIONING.value
+        interrupted.provision_claimed_at = datetime.now(UTC) - timedelta(
+            seconds=service.mail_config.provision_lease_seconds + 1
+        )
+        await session.commit()
 
     backend.ensure_account = original_ensure
     await service._provision_one(account.mailbox_id)
     assert backend.accounts[-1]["password"] == first_passwords[0]
     current = await service.get_account(account.mailbox_id, _token)
     assert current.status is MailboxStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_provisioning_lease_prevents_concurrent_backend_cleanup(mail_service):
+    service, _sessions, backend, _domains, _refunds = mail_service
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="leased-provisioning",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    account, token, _ = await service.prepare_activation(
+        quote.quote_id,
+        idempotency_key="leased-provisioning-idempotency-0001",
+    )
+    await service.mark_activation_paid(
+        account.mailbox_id,
+        quote.quote_id,
+        payer="0x" + "7" * 40,
+        tx_hash="0xleased-provisioning",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_ensure = backend.ensure_account
+
+    async def slow_ensure(**kwargs):
+        entered.set()
+        await release.wait()
+        return await original_ensure(**kwargs)
+
+    backend.ensure_account = slow_ensure
+    first = asyncio.create_task(service._provision_one(account.mailbox_id))
+    await entered.wait()
+    assert await service._provision_one(account.mailbox_id) is False
+    release.set()
+    assert await first is True
+
+    current = await service.get_account(account.mailbox_id, token)
+    assert current.status is MailboxStatus.ACTIVE
+    assert len(backend.accounts) == 1
+    assert backend.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_expired_provisioning_lease_never_deletes_the_winners_account(mail_service):
+    service, sessions, backend, _domains, _refunds = mail_service
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="expired-lease",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    account, token, _ = await service.prepare_activation(
+        quote.quote_id,
+        idempotency_key="expired-lease-idempotency-0001",
+    )
+    await service.mark_activation_paid(
+        account.mailbox_id,
+        quote.quote_id,
+        payer="0x" + "8" * 40,
+        tx_hash="0xexpired-lease",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    original_ensure = backend.ensure_account
+    calls = 0
+
+    async def stale_first_ensure(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_entered.set()
+            await release_first.wait()
+        return await original_ensure(**kwargs)
+
+    backend.ensure_account = stale_first_ensure
+    stale_worker = asyncio.create_task(service._provision_one(account.mailbox_id))
+    await first_entered.wait()
+    async with sessions() as session:
+        claimed = await session.get(MailAccountRow, account.mailbox_id)
+        claimed.provision_claimed_at = datetime.now(UTC) - timedelta(
+            seconds=service.mail_config.provision_lease_seconds + 1
+        )
+        await session.commit()
+
+    assert await service._provision_one(account.mailbox_id) is True
+    release_first.set()
+    assert await stale_worker is False
+
+    current = await service.get_account(account.mailbox_id, token)
+    assert current.status is MailboxStatus.ACTIVE
+    assert len(backend.accounts) == 2
+    assert backend.deleted == []
 
 
 @pytest.mark.asyncio
@@ -963,7 +1131,11 @@ async def test_settlement_ledger_recovers_lost_mail_activation_handoff(mail_serv
         asset="USDC",
         payer="0x" + "4" * 40,
         tx_hash="0xmail-recover",
-        extra={"mailbox_id": account.mailbox_id, "address": account.address},
+        extra={
+            "mailbox_id": account.mailbox_id,
+            "quote_id": quote.quote_id,
+            "address": account.address,
+        },
     )
     async with sessions() as session:
         stored_quote = await session.get(MailQuoteRow, quote.quote_id)
@@ -985,6 +1157,64 @@ async def test_settlement_ledger_recovers_lost_mail_activation_handoff(mail_serv
 
 
 @pytest.mark.asyncio
+async def test_historical_payment_cannot_recover_a_reactivated_address(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    first_quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="historical-payment",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    first, _first_token, _ = await service.prepare_activation(
+        first_quote.quote_id,
+        idempotency_key="historical-payment-first-0001",
+    )
+    historical = PaymentLedger(sessions).build_event(
+        event_type="settled",
+        resource_path="/v1/mail/accounts",
+        method="POST",
+        amount=Decimal(first_quote.amount_usd),
+        network="eip155:8453",
+        asset="USDC",
+        payer="0x" + "6" * 40,
+        tx_hash="0xhistorical-payment",
+        extra={
+            "mailbox_id": first.mailbox_id,
+            "quote_id": first_quote.quote_id,
+            "address": first.address,
+        },
+    )
+    async with sessions() as session:
+        tombstone = await session.get(MailAccountRow, first.mailbox_id)
+        tombstone.status = MailboxStatus.DELETED.value
+        tombstone.management_token_ciphertext = None
+        tombstone.deleted_at = datetime.now(UTC)
+        session.add(historical)
+        await session.commit()
+
+    second_quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="historical-payment",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    second, _second_token, _ = await service.prepare_activation(
+        second_quote.quote_id,
+        idempotency_key="historical-payment-second-0002",
+    )
+    assert second.mailbox_id == first.mailbox_id
+
+    assert await service.recover_x402_handoffs() == 0
+    async with sessions() as session:
+        awaiting = await session.get(MailAccountRow, second.mailbox_id)
+        assert awaiting.quote_id == second_quote.quote_id
+        assert awaiting.status == MailboxStatus.AWAITING_PAYMENT.value
+        assert awaiting.payment_tx is None
+
+
+@pytest.mark.asyncio
 async def test_paid_activation_failure_commits_refund_obligation_with_terminal_state(mail_service):
     service, sessions, _backend, _domains, _refunds = mail_service
     quote = await service.create_account_quote(
@@ -1000,6 +1230,7 @@ async def test_paid_activation_failure_commits_refund_obligation_with_terminal_s
     )
     await service.mark_activation_paid(
         account.mailbox_id,
+        quote.quote_id,
         payer="0x" + "5" * 40,
         tx_hash="0xrefund-source",
         payment_network="eip155:8453",
@@ -1019,6 +1250,43 @@ async def test_paid_activation_failure_commits_refund_obligation_with_terminal_s
         assert obligation is not None
         assert obligation.asset == "0x" + "a" * 40
         assert obligation.tx_hash == "0xrefund-source"
+
+
+@pytest.mark.asyncio
+async def test_failed_activation_retries_backend_cleanup_and_closes_reads(mail_service):
+    service, sessions, backend, _domains, _refunds = mail_service
+    mailbox_id, token = await _active_hosted(
+        service,
+        local_part="cleanup-retry",
+        idempotency_key="cleanup-retry-idempotency-0001",
+    )
+    async with sessions() as session:
+        active = await session.get(MailAccountRow, mailbox_id)
+        backend_id = active.backend_id
+    original_delete = backend.delete_account
+
+    async def unavailable_delete(_backend_id):
+        raise MailBackendError("backend temporarily unavailable")
+
+    backend.delete_account = unavailable_delete
+    await service._fail_activation(mailbox_id, "post-create failure", refund=True)
+
+    with pytest.raises(MailProblem) as closed:
+        await service.get_account(mailbox_id, token)
+    assert closed.value.code == "mailbox_activation_failed"
+    async with sessions() as session:
+        failed = await session.get(MailAccountRow, mailbox_id)
+        assert failed.status == MailboxStatus.REFUND_DUE.value
+        assert failed.backend_id == backend_id
+        assert failed.backend_credential_ciphertext
+
+    backend.delete_account = original_delete
+    assert await service.retry_failed_backend_cleanup() == 1
+    async with sessions() as session:
+        cleaned = await session.get(MailAccountRow, mailbox_id)
+        assert cleaned.backend_id is None
+        assert cleaned.backend_credential_ciphertext is None
+    assert backend.deleted == [backend_id]
 
 
 @pytest.mark.asyncio
@@ -1061,13 +1329,14 @@ async def test_paid_activation_never_writes_capability_to_payment_ledger(mail_se
         )
     assert event is not None
     assert event.extra["mailbox_id"] == result.mailbox_id
+    assert event.extra["quote_id"] == quote.quote_id
     assert "management_token" not in event.extra
     assert result.management_token not in json.dumps(event.extra)
 
 
 @pytest.mark.asyncio
 async def test_combined_domain_and_mailbox_quote_is_one_atomic_amount(mail_service):
-    service, _sessions, _backend, domains, _refunds = mail_service
+    service, sessions, _backend, domains, _refunds = mail_service
     quote = await service.create_account_quote(
         MailAccountQuoteRequest(
             local_part="agent",
@@ -1080,6 +1349,11 @@ async def test_combined_domain_and_mailbox_quote_is_one_atomic_amount(mail_servi
     assert quote.domain_amount_usd == "12.00"
     assert quote.activation_amount_usd == "1.00"
     assert quote.amount_usd == "13.00"
+    service.config.payment.price_mail_activation = Decimal("9.99")
+    unchanged = await service.get_quote(quote.quote_id)
+    assert unchanged.domain_amount_usd == "12.00"
+    assert unchanged.activation_amount_usd == "1.00"
+    assert unchanged.amount_usd == "13.00"
     account, token, _ = await service.prepare_activation(
         quote.quote_id,
         idempotency_key="atomic-domain-mail-idempotency-0001",
@@ -1087,9 +1361,57 @@ async def test_combined_domain_and_mailbox_quote_is_one_atomic_amount(mail_servi
     assert account.domain_order_id == "do_atomic_123456"
     assert (
         domains.agent_orders[0]["additional_amount_usd"]
-        == service.config.payment.price_mail_activation
+        == Decimal("1.00")
     )
     assert domains.agent_orders[0]["management_token"] == token
+    async with sessions() as session:
+        stored = await session.get(MailAccountRow, account.mailbox_id)
+        assert stored.activation_amount_usd == Decimal("1.00")
+        assert stored.total_amount_usd == Decimal("13.00")
+
+
+@pytest.mark.asyncio
+async def test_activation_quote_is_rejected_after_mail_terms_change(mail_service):
+    service, sessions, _backend, domains, _refunds = mail_service
+    accepted_terms = service.mail_config.terms_version
+    prepared_quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="terms-snapshot",
+            mode=MailboxMode.HOSTED,
+            terms_version=accepted_terms,
+        )
+    )
+    unprepared_quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="terms-snapshot-unprepared",
+            mode=MailboxMode.HOSTED,
+            terms_version=accepted_terms,
+        )
+    )
+    prepared, _token, _ = await service.prepare_activation(
+        prepared_quote.quote_id,
+        idempotency_key="terms-snapshot-idempotency-0001",
+    )
+    service.mail_config.terms_version = "2026-08-05"
+
+    with pytest.raises(MailProblem) as changed_before_prepare:
+        await service.prepare_activation(
+            unprepared_quote.quote_id,
+            idempotency_key="terms-snapshot-unprepared-idempotency-0002",
+        )
+    with pytest.raises(MailProblem) as changed_after_prepare:
+        await service.prepare_activation(
+            prepared_quote.quote_id,
+            idempotency_key="terms-snapshot-idempotency-0001",
+        )
+
+    assert changed_before_prepare.value.code == "terms_changed"
+    assert changed_after_prepare.value.code == "terms_changed"
+    assert domains.agent_orders == []
+    async with sessions() as session:
+        stored = await session.get(MailAccountRow, prepared.mailbox_id)
+        assert stored.terms_version == accepted_terms
+        assert await session.scalar(select(func.count()).select_from(MailAccountRow)) == 1
 
 
 @pytest.mark.asyncio
@@ -1130,6 +1452,67 @@ async def test_send_payload_is_locked_sanitized_and_rate_limited(mail_service):
         await service.deliver_send(second.quote_id, token)
     assert limited.value.code == "mailbox_send_limit"
     assert len(backend.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_new_recipient_limit_excludes_known_and_duplicate_pending_addresses(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    service.mail_config.mailbox_send_limit_per_day = 10
+    service.mail_config.mailbox_new_recipient_limit_per_day = 2
+    mailbox_id, token = await _active_hosted(
+        service,
+        local_part="recipient-union",
+        idempotency_key="recipient-union-idempotency-0001",
+    )
+    now = datetime.now(UTC)
+    async with sessions() as session:
+        session.add_all(
+            [
+                MailRecipientRow(
+                    mailbox_id=mailbox_id,
+                    recipient="known@example.net",
+                    first_sent_at=now - timedelta(days=2),
+                    last_sent_at=now,
+                ),
+                MailRecipientRow(
+                    mailbox_id=mailbox_id,
+                    recipient="today@example.net",
+                    first_sent_at=now,
+                    last_sent_at=now,
+                ),
+                MailSendRow(
+                    send_id="send_pending_known",
+                    mailbox_id=mailbox_id,
+                    quote_id="mailq_pending_known",
+                    recipient="known@example.net",
+                    status="pending",
+                    created_at=now,
+                ),
+                MailSendRow(
+                    send_id="send_pending_today",
+                    mailbox_id=mailbox_id,
+                    quote_id="mailq_pending_today",
+                    recipient="today@example.net",
+                    status="submitting",
+                    created_at=now,
+                ),
+            ]
+        )
+        await session.commit()
+    quote = await service.create_send_quote(
+        MailSendQuoteRequest(
+            mailbox_id=mailbox_id,
+            to="genuinely-new@example.net",
+            subject="Union count",
+            text="Only the distinct genuinely new recipients count.",
+        ),
+        token,
+    )
+
+    sent = await service.deliver_send(quote.quote_id, token)
+
+    assert sent.status == "accepted"
+    assert sent.recipient == "genuinely-new@example.net"
 
 
 @pytest.mark.asyncio
@@ -1610,6 +1993,72 @@ async def test_official_stalwart_signature_and_abuse_event_suspend_mailbox(mail_
     route = next(route for route in internal_router.routes if route.path.endswith("/events"))
     aliases = {parameter.alias for parameter in route.dependant.header_params}
     assert "X-Signature" in aliases
+
+
+@pytest.mark.asyncio
+async def test_receive_event_survives_an_existing_message_index(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    mailbox_id, _token = await _active_hosted(
+        service,
+        local_part="receive-upsert",
+        idempotency_key="receive-upsert-idempotency-0001",
+    )
+    async with sessions() as session:
+        account = await session.get(MailAccountRow, mailbox_id)
+        session.add(
+            MailMessageIndexRow(
+                message_id="already-polled-message",
+                mailbox_id=mailbox_id,
+                folder="inbox",
+                sender="sender@example.net",
+                recipients=[account.address],
+                subject="Authoritative poll",
+                flags=[],
+                has_attachments=False,
+                created_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            MailWebhookRow(
+                webhook_id="wh_receive_upsert",
+                mailbox_id=mailbox_id,
+                url="https://hooks.example.net/mail",
+                events=["message.received"],
+                status="active",
+                failure_count=0,
+                created_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+
+    assert (
+        await service.ingest_stalwart_events(
+            [
+                {
+                    "id": "receive-after-authoritative-poll",
+                    "type": "store.ingest",
+                    "data": {
+                        "from": "sender@example.net",
+                        "to": [account.address],
+                        "messageId": "already-polled-message",
+                        "subject": "Delayed event",
+                    },
+                }
+            ]
+        )
+        == 1
+    )
+    async with sessions() as session:
+        event = await session.get(MailEventRow, "receive-after-authoritative-poll")
+        index = await session.get(MailMessageIndexRow, "already-polled-message")
+        delivery = await session.scalar(
+            select(MailWebhookDeliveryRow).where(
+                MailWebhookDeliveryRow.event_id == "receive-after-authoritative-poll"
+            )
+        )
+        assert event is not None
+        assert delivery is not None
+        assert index.subject == "Authoritative poll"
 
 
 @pytest.mark.asyncio

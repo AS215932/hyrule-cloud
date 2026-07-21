@@ -127,6 +127,7 @@ async def create_account(
             )
         payment_metadata = {
             "mailbox_id": account.mailbox_id,
+            "quote_id": body.quote_id,
             "address": account.address,
             "status_url": f"/v1/mail/accounts/{account.mailbox_id}",
             "domain_order_id": account.domain_order_id,
@@ -149,7 +150,9 @@ async def create_account(
         if isinstance(verified, Response):
             verified.headers["Cache-Control"] = "no-store"
             return verified
-        await service.reserve_activation_capacity(account.mailbox_id)
+        await service.reserve_activation_capacity(
+            account.mailbox_id, quote_id=body.quote_id
+        )
         if not await gate.settle_verified(
             request, verified, extra_body=payment_metadata
         ):
@@ -165,6 +168,7 @@ async def create_account(
             try:
                 account = await service.mark_activation_paid(
                     account.mailbox_id,
+                    body.quote_id,
                     payer=payer,
                     tx_hash=getattr(request.state, "payment_tx", None),
                     payment_network=getattr(request.state, "payment_network", None),

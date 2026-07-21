@@ -818,6 +818,16 @@ class MailAccountRow(Base):
     capacity_reserved_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), index=True
     )
+    provision_claim_token: Mapped[str | None] = mapped_column(String(64))
+    provision_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    provision_retry_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    provision_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     grace_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

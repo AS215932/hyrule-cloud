@@ -263,6 +263,8 @@ async def test_metrics_renders_ledger_and_fleet_counters(metrics_app_state) -> N
     assert 'hyrule_vms_active{status="ready"} 1' in body
     assert 'hyrule_vm_provision_total{result="ready"} 0' in body
     assert 'hyrule_vm_provision_total{result="failed"} 0' in body
+    assert "# TYPE hyrule_mail_activation_outcomes gauge" in body
+    assert "hyrule_mail_activation_outcomes_total" not in body
     assert "# TYPE hyrule_mail_messages_current gauge" in body
     assert 'hyrule_mail_messages_current{status="accepted"} 1' in body
     assert "hyrule_mail_messages_total" not in body

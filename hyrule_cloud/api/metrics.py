@@ -211,9 +211,9 @@ async def _render(session_factory: Any) -> str:
 
         _metric(
             lines,
-            "hyrule_mail_activation_outcomes_total",
-            "Durable Agent Mail activation outcomes inferred from retained mailbox rows.",
-            "counter",
+            "hyrule_mail_activation_outcomes",
+            "Current Agent Mail activation outcomes inferred from retained mailbox rows.",
+            "gauge",
         )
         activated = await session.scalar(
             select(func.count())
@@ -225,8 +225,8 @@ async def _render(session_factory: Any) -> str:
             .select_from(MailAccountRow)
             .where(MailAccountRow.status.in_(["failed", "refund_due"]))
         )
-        lines.append(f'hyrule_mail_activation_outcomes_total{{result="activated"}} {activated or 0}')
-        lines.append(f'hyrule_mail_activation_outcomes_total{{result="failed"}} {failed or 0}')
+        lines.append(f'hyrule_mail_activation_outcomes{{result="activated"}} {activated or 0}')
+        lines.append(f'hyrule_mail_activation_outcomes{{result="failed"}} {failed or 0}')
 
         _metric(
             lines,

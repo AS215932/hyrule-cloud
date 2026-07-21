@@ -246,6 +246,9 @@ class MailConfig(BaseSettings):
     retention_days: int = Field(default=30, ge=1, le=365)
     quote_ttl_seconds: int = Field(default=900, ge=60, le=3600)
     worker_poll_seconds: int = Field(default=5, ge=1, le=60)
+    provision_lease_seconds: int = Field(default=300, ge=30, le=1800)
+    provision_dns_retry_seconds: int = Field(default=60, ge=1, le=3600)
+    provision_dns_max_attempts: int = Field(default=15, ge=1, le=100)
 
     mailbox_send_limit_per_day: int = Field(default=20, ge=1, le=100)
     mailbox_new_recipient_limit_per_day: int = Field(default=5, ge=1, le=25)

@@ -14,6 +14,8 @@ import httpx
 import structlog
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -221,6 +223,7 @@ class MailService:
         address = f"{body.local_part}@{domain}"
         domain_quote_id: str | None = None
         domain_amount = Decimal("0")
+        activation_amount = Decimal(self.config.payment.price_mail_activation)
 
         if body.mode is MailboxMode.CUSTOM:
             await self._assert_managed_domain_token(domain, body.domain_management_token or "")
@@ -280,10 +283,11 @@ class MailService:
                 "mode": body.mode.value,
                 "domain_quote_id": domain_quote_id,
                 "domain_terms_version": body.domain_terms_version,
+                "activation_amount_usd": str(activation_amount),
             }
             canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
             now = _now()
-            total = domain_amount + self.config.payment.price_mail_activation
+            total = domain_amount + activation_amount
             row = MailQuoteRow(
                 quote_id=generate_mail_id("mailq"),
                 kind="activation",
@@ -340,6 +344,15 @@ class MailService:
                         "idempotency_conflict",
                         "This Idempotency-Key is bound to another activation.",
                     )
+                if (
+                    existing.status == MailboxStatus.AWAITING_PAYMENT.value
+                    and existing.terms_version != self.mail_config.terms_version
+                ):
+                    raise MailProblem(
+                        409,
+                        "terms_changed",
+                        "The Agent Mail terms changed; review and re-quote.",
+                    )
                 if not existing.management_token_ciphertext:
                     status = 410 if existing.status == MailboxStatus.DELETED.value else 409
                     raise MailProblem(
@@ -358,17 +371,24 @@ class MailService:
                 or quote_expires_at <= _now()
             ):
                 raise MailProblem(409, "mail_quote_expired", "This mail quote is not payable.")
+            if quote.terms_version != self.mail_config.terms_version:
+                raise MailProblem(
+                    409,
+                    "terms_changed",
+                    "The Agent Mail terms changed; review and re-quote.",
+                )
             payload = dict(quote.request_payload)
 
         token = "hyr_identity_" + secrets.token_urlsafe(32)
         mode = MailboxMode(payload["mode"])
+        activation_amount = Decimal(str(payload["activation_amount_usd"]))
         domain_order_id: str | None = None
         if mode is MailboxMode.DOMAIN_AND_MAILBOX:
             order, _domain_token, _created = await self.domains.create_agent_order(
                 quote_id=str(payload["domain_quote_id"]),
                 terms_version=str(payload["domain_terms_version"]),
                 idempotency_key=f"mail:{idempotency_key}",
-                additional_amount_usd=self.config.payment.price_mail_activation,
+                additional_amount_usd=activation_amount,
                 management_token=token,
             )
             domain_order_id = order.order_id
@@ -393,8 +413,8 @@ class MailService:
             domain_order_id=domain_order_id,
             quote_id=quote_id,
             idempotency_hash=idem_hash,
-            terms_version=self.mail_config.terms_version,
-            activation_amount_usd=self.config.payment.price_mail_activation,
+            terms_version=quote.terms_version,
+            activation_amount_usd=activation_amount,
             total_amount_usd=quote.amount_usd,
             created_at=now,
         )
@@ -474,6 +494,10 @@ class MailService:
                 ):
                     setattr(deleted_account, field, getattr(mailbox, field))
                 deleted_account.capacity_reserved_at = None
+                deleted_account.provision_claim_token = None
+                deleted_account.provision_claimed_at = None
+                deleted_account.provision_retry_count = 0
+                deleted_account.provision_next_attempt_at = None
                 deleted_account.activated_at = None
                 deleted_account.grace_ends_at = None
                 deleted_account.deleted_at = None
@@ -498,7 +522,9 @@ class MailService:
                 return winner, self._decrypt(fernet, winner.management_token_ciphertext), False
         return mailbox, token, True
 
-    async def reserve_activation_capacity(self, mailbox_id: str) -> MailAccountRow:
+    async def reserve_activation_capacity(
+        self, mailbox_id: str, *, quote_id: str | None = None
+    ) -> MailAccountRow:
         """Reserve paid launch capacity before x402 settlement."""
 
         async with self.db() as session:
@@ -513,6 +539,12 @@ class MailService:
             ).scalar_one_or_none()
             if row is None:
                 raise MailProblem(404, "mailbox_not_found", "Mailbox not found.")
+            if quote_id is not None and row.quote_id != quote_id:
+                raise MailProblem(
+                    409,
+                    "mail_activation_superseded",
+                    "This payment belongs to an earlier mailbox activation.",
+                )
             recoverable_expiry = (
                 row.status == MailboxStatus.FAILED.value
                 and row.provision_error == "payment_window_expired"
@@ -599,17 +631,24 @@ class MailService:
     async def mark_activation_paid(
         self,
         mailbox_id: str,
+        quote_id: str,
         *,
         payer: str,
         tx_hash: str | None,
         payment_network: str | None,
         payment_asset: str | None,
     ) -> MailAccountRow:
-        await self.reserve_activation_capacity(mailbox_id)
+        await self.reserve_activation_capacity(mailbox_id, quote_id=quote_id)
         async with self.db() as session:
             row = await session.get(MailAccountRow, mailbox_id)
             if row is None:
                 raise MailProblem(404, "mailbox_not_found", "Mailbox not found.")
+            if row.quote_id != quote_id:
+                raise MailProblem(
+                    409,
+                    "mail_activation_superseded",
+                    "This payment belongs to an earlier mailbox activation.",
+                )
             domain_order_id = row.domain_order_id
         if domain_order_id:
             domain_order = await self.domains.mark_x402_paid(
@@ -641,6 +680,12 @@ class MailService:
                     .with_for_update()
                 )
             ).scalar_one()
+            if row.quote_id != quote_id:
+                raise MailProblem(
+                    409,
+                    "mail_activation_superseded",
+                    "This payment belongs to an earlier mailbox activation.",
+                )
             recoverable_expiry = (
                 row.status == MailboxStatus.FAILED.value
                 and row.provision_error == "payment_window_expired"
@@ -652,6 +697,10 @@ class MailService:
                 row.payment_network = payment_network
                 row.payment_asset = payment_asset
                 row.capacity_reserved_at = None
+                row.provision_claim_token = None
+                row.provision_claimed_at = None
+                row.provision_retry_count = 0
+                row.provision_next_attempt_at = None
                 row.status = (
                     MailboxStatus.PENDING_DOMAIN.value
                     if row.domain_order_id
@@ -810,16 +859,20 @@ class MailService:
                 )
             )
             if recipient_row is None and not payload.get("in_reply_to"):
-                new_count = int(
-                    await session.scalar(
-                        select(func.count())
-                        .select_from(MailRecipientRow)
-                        .where(
+                known_recipients = set(
+                    await session.scalars(
+                        select(MailRecipientRow.recipient).where(
+                            MailRecipientRow.mailbox_id == account.mailbox_id
+                        )
+                    )
+                )
+                new_recipients_today = set(
+                    await session.scalars(
+                        select(MailRecipientRow.recipient).where(
                             MailRecipientRow.mailbox_id == account.mailbox_id,
                             MailRecipientRow.first_sent_at >= day_start,
                         )
                     )
-                    or 0
                 )
                 pending_recipients = set(
                     await session.scalars(
@@ -830,7 +883,9 @@ class MailService:
                         )
                     )
                 )
-                new_count += len(pending_recipients)
+                new_count = len(
+                    new_recipients_today | (pending_recipients - known_recipients)
+                )
                 if new_count >= self.mail_config.mailbox_new_recipient_limit_per_day:
                     raise MailProblem(
                         429,
@@ -1372,19 +1427,36 @@ class MailService:
                         {"from": data.get("sender") or data.get("from")}
                     )
                     sender = senders[0] if senders else None
-                    session.add(
-                        MailMessageIndexRow(
-                            message_id=message_id,
-                            mailbox_id=account.mailbox_id,
-                            folder="inbox",
-                            sender=sender,
-                            recipients=[account.address],
-                            subject=str(data.get("subject") or "") or None,
-                            flags=[],
-                            has_attachments=bool(data.get("hasAttachments")),
-                            created_at=_now(),
+                    index_values = {
+                        "message_id": message_id,
+                        "mailbox_id": account.mailbox_id,
+                        "folder": "inbox",
+                        "sender": sender,
+                        "recipients": [account.address],
+                        "subject": str(data.get("subject") or "") or None,
+                        "flags": [],
+                        "has_attachments": bool(data.get("hasAttachments")),
+                        "created_at": _now(),
+                    }
+                    dialect = session.get_bind().dialect.name
+                    if dialect == "postgresql":
+                        await session.execute(
+                            postgresql_insert(MailMessageIndexRow)
+                            .values(**index_values)
+                            .on_conflict_do_nothing(
+                                index_elements=[MailMessageIndexRow.message_id]
+                            )
                         )
-                    )
+                    elif dialect == "sqlite":
+                        await session.execute(
+                            sqlite_insert(MailMessageIndexRow)
+                            .values(**index_values)
+                            .on_conflict_do_nothing(
+                                index_elements=[MailMessageIndexRow.message_id]
+                            )
+                        )
+                    elif await session.get(MailMessageIndexRow, message_id) is None:
+                        session.add(MailMessageIndexRow(**index_values))
                 suspend_reason = self._suspension_reason(raw_type, data)
                 if suspend_reason and account.status not in {
                     MailboxStatus.DELETED.value,
@@ -1428,7 +1500,11 @@ class MailService:
                     .where(
                         MailAccountRow.status.in_(
                             [MailboxStatus.PENDING_DOMAIN.value, MailboxStatus.PROVISIONING.value]
-                        )
+                        ),
+                        or_(
+                            MailAccountRow.provision_next_attempt_at.is_(None),
+                            MailAccountRow.provision_next_attempt_at <= _now(),
+                        ),
                     )
                     .order_by(MailAccountRow.created_at)
                     .limit(limit)
@@ -1467,17 +1543,12 @@ class MailService:
                 else:
                     continue
             try:
-                await self._provision_one(row.mailbox_id)
-            except MailDNSIncompleteError:
-                log.warning(
-                    "mailbox_dns_not_ready",
+                changed += int(await self._provision_one(row.mailbox_id))
+            except Exception:
+                log.exception(
+                    "mailbox_provision_orchestration_failed",
                     mailbox_id=row.mailbox_id,
                 )
-                continue
-            except Exception as exc:
-                log.exception("mailbox_provision_failed", mailbox_id=row.mailbox_id)
-                await self._fail_activation(row.mailbox_id, str(exc), refund=True)
-            changed += 1
         return changed
 
     async def sweep_retention(self) -> int:
@@ -1690,6 +1761,8 @@ class MailService:
                                 PaymentEventRow.resource_path == "/v1/mail/accounts",
                                 PaymentEventRow.extra["mailbox_id"].as_string()
                                 == account.mailbox_id,
+                                PaymentEventRow.extra["quote_id"].as_string()
+                                == account.quote_id,
                             )
                             .limit(1)
                         )
@@ -1710,7 +1783,7 @@ class MailService:
         if limit < 1:
             return 0
         recovered = 0
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
         cursor: tuple[datetime, str] | None = None
         while True:
             filters = [
@@ -1745,13 +1818,18 @@ class MailService:
             for event in events:
                 extra = event.extra if isinstance(event.extra, dict) else {}
                 mailbox_id = str(extra.get("mailbox_id") or "")
-                if not mailbox_id or mailbox_id in seen:
+                quote_id = str(extra.get("quote_id") or "")
+                activation = (mailbox_id, quote_id)
+                if not mailbox_id or not quote_id or activation in seen:
                     continue
-                seen.add(mailbox_id)
                 async with self.db() as session:
                     account = await session.get(MailAccountRow, mailbox_id)
                     awaiting = bool(
                         account is not None
+                        and account.quote_id == quote_id
+                        and account.total_amount_usd is not None
+                        and event.amount_usd is not None
+                        and Decimal(account.total_amount_usd) == Decimal(event.amount_usd)
                         and (
                             account.status == MailboxStatus.AWAITING_PAYMENT.value
                             or (
@@ -1763,9 +1841,11 @@ class MailService:
                     )
                 if not awaiting:
                     continue
+                seen.add(activation)
                 try:
                     await self.mark_activation_paid(
                         mailbox_id,
+                        quote_id,
                         payer=event.payer_wallet or "unknown",
                         tx_hash=event.tx_hash,
                         payment_network=event.network,
@@ -1860,22 +1940,112 @@ class MailService:
             completed += 1
         return completed
 
-    async def _provision_one(self, mailbox_id: str) -> None:
+    async def _claim_provisioning(
+        self, mailbox_id: str
+    ) -> tuple[MailAccountRow, str, str] | None:
+        """Lease one provisioning row before any external backend write."""
+
+        now = _now()
+        stale_before = now - timedelta(seconds=self.mail_config.provision_lease_seconds)
+        claim_token = generate_mail_id("pclaim")
         async with self.db() as session:
+            claimed = await session.execute(
+                update(MailAccountRow)
+                .where(
+                    MailAccountRow.mailbox_id == mailbox_id,
+                    MailAccountRow.status == MailboxStatus.PROVISIONING.value,
+                    or_(
+                        MailAccountRow.provision_next_attempt_at.is_(None),
+                        MailAccountRow.provision_next_attempt_at <= now,
+                    ),
+                    or_(
+                        MailAccountRow.provision_claim_token.is_(None),
+                        MailAccountRow.provision_claimed_at.is_(None),
+                        MailAccountRow.provision_claimed_at <= stale_before,
+                    ),
+                )
+                .values(
+                    provision_claim_token=claim_token,
+                    provision_claimed_at=now,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if int(getattr(claimed, "rowcount", 0) or 0) != 1:
+                await session.rollback()
+                return None
             row = await session.get(MailAccountRow, mailbox_id)
-            if row is None or row.status != MailboxStatus.PROVISIONING.value:
-                return
+            if row is None:
+                await session.rollback()
+                return None
             if row.backend_credential_ciphertext:
                 password = self._decrypt(self._fernet(), row.backend_credential_ciphertext)
             else:
-                # Persist the credential before the first external write. A
-                # process death after Stalwart creates the account can then
+                # Persist the credential in the same transaction as the lease.
+                # A process death after Stalwart creates the account can then
                 # replay with the same password instead of orphaning it.
                 password = secrets.token_urlsafe(36)
                 row.backend_credential_ciphertext = (
                     self._fernet().encrypt(password.encode()).decode()
                 )
-                await session.commit()
+            await session.commit()
+            return row, claim_token, password
+
+    async def _defer_incomplete_dns(
+        self, mailbox_id: str, claim_token: str, reason: str
+    ) -> bool:
+        """Record a visible bounded DNS retry, refunding after exhaustion."""
+
+        exhausted = False
+        attempts = 0
+        async with self.db() as session:
+            current = (
+                await session.execute(
+                    select(MailAccountRow)
+                    .where(MailAccountRow.mailbox_id == mailbox_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                current is None
+                or current.status != MailboxStatus.PROVISIONING.value
+                or current.provision_claim_token != claim_token
+            ):
+                return False
+            attempts = int(current.provision_retry_count or 0) + 1
+            current.provision_retry_count = attempts
+            exhausted = attempts >= self.mail_config.provision_dns_max_attempts
+            current.provision_error = (
+                f"mailbox DNS remained incomplete after {attempts}/"
+                f"{self.mail_config.provision_dns_max_attempts} attempts: {reason}"
+            )[:2000]
+            if not exhausted:
+                current.provision_claim_token = None
+                current.provision_claimed_at = None
+                current.provision_next_attempt_at = _now() + timedelta(
+                    seconds=self.mail_config.provision_dns_retry_seconds
+                )
+            await session.commit()
+        log.warning(
+            "mailbox_dns_not_ready",
+            mailbox_id=mailbox_id,
+            attempt=attempts,
+            max_attempts=self.mail_config.provision_dns_max_attempts,
+        )
+        if exhausted:
+            return await self._fail_activation(
+                mailbox_id,
+                f"mailbox_dns_incomplete_after_{attempts}_attempts",
+                refund=True,
+                claim_token=claim_token,
+            )
+        return False
+
+    async def _run_claimed_provisioning(
+        self,
+        row: MailAccountRow,
+        claim_token: str,
+        password: str,
+    ) -> bool:
         domain_id, records = await self.backend.ensure_domain(str(row.domain))
         backend_id = await self.backend.ensure_account(
             address=row.address,
@@ -1884,12 +2054,19 @@ class MailService:
             quota_bytes=self.mail_config.storage_quota_bytes,
         )
         async with self.db() as session:
-            current = await session.get(MailAccountRow, mailbox_id)
-            if current is None or current.status != MailboxStatus.PROVISIONING.value:
-                await self.backend.delete_account(backend_id)
-                return
-            # Make cleanup recoverable before the DNS control-plane write.
+            current = await session.get(MailAccountRow, row.mailbox_id)
+            if (
+                current is None
+                or current.status != MailboxStatus.PROVISIONING.value
+                or current.provision_claim_token != claim_token
+            ):
+                # Another worker may have completed the same idempotent backend
+                # account after this lease expired. Never delete that account.
+                return False
+            # Make cleanup recoverable before the DNS control-plane write and
+            # refresh the lease for that final external operation.
             current.backend_id = backend_id
+            current.provision_claimed_at = _now()
             await session.commit()
         if row.plan != MailboxMode.HOSTED.value:
             await self.domains.replace_service_records(
@@ -1897,18 +2074,56 @@ class MailService:
             )
         now = _now()
         async with self.db() as session:
-            current = await session.get(MailAccountRow, mailbox_id)
-            if current is None:
-                return
+            current = await session.get(MailAccountRow, row.mailbox_id)
+            if (
+                current is None
+                or current.status != MailboxStatus.PROVISIONING.value
+                or current.provision_claim_token != claim_token
+            ):
+                return False
             current.backend_id = backend_id
             current.status = MailboxStatus.ACTIVE.value
             current.activated_at = now
             current.expires_at = now + timedelta(days=self.mail_config.active_days)
             current.grace_ends_at = current.expires_at + timedelta(days=self.mail_config.grace_days)
             current.provision_error = None
+            current.provision_claim_token = None
+            current.provision_claimed_at = None
+            current.provision_retry_count = 0
+            current.provision_next_attempt_at = None
             await session.commit()
+        return True
 
-    async def _fail_activation(self, mailbox_id: str, reason: str, *, refund: bool) -> None:
+    async def _provision_one(self, mailbox_id: str) -> bool:
+        claimed = await self._claim_provisioning(mailbox_id)
+        if claimed is None:
+            return False
+        row, claim_token, password = claimed
+        try:
+            return await self._run_claimed_provisioning(
+                row,
+                claim_token,
+                password,
+            )
+        except MailDNSIncompleteError as exc:
+            return await self._defer_incomplete_dns(mailbox_id, claim_token, str(exc))
+        except Exception as exc:
+            log.exception("mailbox_provision_failed", mailbox_id=mailbox_id)
+            return await self._fail_activation(
+                mailbox_id,
+                str(exc),
+                refund=True,
+                claim_token=claim_token,
+            )
+
+    async def _fail_activation(
+        self,
+        mailbox_id: str,
+        reason: str,
+        *,
+        refund: bool,
+        claim_token: str | None = None,
+    ) -> bool:
         async with self.db() as session:
             row = await session.get(MailAccountRow, mailbox_id)
             if row is None or row.status in {
@@ -1916,7 +2131,9 @@ class MailService:
                 MailboxStatus.FAILED.value,
                 MailboxStatus.DELETED.value,
             }:
-                return
+                return False
+            if claim_token is not None and row.provision_claim_token != claim_token:
+                return False
             refund_event = None
             if refund:
                 refund_event = self.refunds.build_owed_event(
@@ -1929,6 +2146,7 @@ class MailService:
                     reason="mailbox_provisioning_failed",
                     extra={
                         "mailbox_id": row.mailbox_id,
+                        "quote_id": row.quote_id,
                         "domain_order_id": row.domain_order_id,
                     },
                 )
@@ -1941,12 +2159,15 @@ class MailService:
                         "mailbox_refund_ledger_unavailable",
                         mailbox_id=row.mailbox_id,
                     )
-                    return
+                    return False
                 if refund_event is not None:
                     session.add(refund_event)
             row.status = MailboxStatus.REFUND_DUE.value if refund else MailboxStatus.FAILED.value
             row.provision_error = reason[:2000]
             row.capacity_reserved_at = None
+            row.provision_claim_token = None
+            row.provision_claimed_at = None
+            row.provision_next_attempt_at = None
             await session.commit()
         backend_deleted = not row.backend_id
         if row.backend_id:
@@ -1974,6 +2195,53 @@ class MailService:
                     current.backend_id = None
                     current.backend_credential_ciphertext = None
                     await session.commit()
+        return True
+
+    async def retry_failed_backend_cleanup(self, *, limit: int = 20) -> int:
+        """Retry deletion of backend accounts retained by terminal activations."""
+
+        async with self.db() as session:
+            rows = list(
+                await session.scalars(
+                    select(MailAccountRow)
+                    .where(
+                        MailAccountRow.status.in_(
+                            [
+                                MailboxStatus.FAILED.value,
+                                MailboxStatus.REFUND_DUE.value,
+                            ]
+                        ),
+                        MailAccountRow.backend_id.is_not(None),
+                    )
+                    .order_by(MailAccountRow.created_at)
+                    .limit(limit)
+                )
+            )
+        cleaned = 0
+        for row in rows:
+            backend_id = str(row.backend_id)
+            try:
+                await self.backend.delete_account(backend_id)
+            except MailBackendError:
+                log.exception(
+                    "mailbox_failed_activation_cleanup_retry_failed",
+                    mailbox_id=row.mailbox_id,
+                    backend_id=backend_id,
+                )
+                continue
+            async with self.db() as session:
+                current = await session.get(MailAccountRow, row.mailbox_id)
+                if (
+                    current is not None
+                    and current.status
+                    in {MailboxStatus.FAILED.value, MailboxStatus.REFUND_DUE.value}
+                    and current.backend_id == backend_id
+                ):
+                    current.backend_id = None
+                    current.backend_credential_ciphertext = None
+                    await session.commit()
+                    cleaned += 1
+        return cleaned
 
     async def _authorized_account(
         self, mailbox_id: str, token: str, *, allow_grace: bool = False
@@ -1984,6 +2252,15 @@ class MailService:
             raise MailProblem(404, "mailbox_not_found", "Mailbox not found.")
         if row.status == MailboxStatus.DELETED.value:
             raise MailProblem(410, "mailbox_deleted", "Mailbox data has been deleted.")
+        if row.status in {
+            MailboxStatus.FAILED.value,
+            MailboxStatus.REFUND_DUE.value,
+        }:
+            raise MailProblem(
+                410,
+                "mailbox_activation_failed",
+                "Mailbox activation failed and backend access is closed.",
+            )
         if not allow_grace and row.status == MailboxStatus.GRACE.value:
             raise MailProblem(
                 402, "mailbox_expired", "Mailbox send access expired; reads remain in grace."
@@ -2111,9 +2388,9 @@ class MailService:
         payload = dict(row.request_payload)
         if row.kind == "activation":
             mode = MailboxMode(payload["mode"])
-            domain_amount = Decimal(row.amount_usd) - self.config.payment.price_mail_activation
+            activation_amount = Decimal(str(payload["activation_amount_usd"]))
+            domain_amount = Decimal(row.amount_usd) - activation_amount
             path = "/v1/mail/accounts"
-            activation_amount = self.config.payment.price_mail_activation
             outbound_amount = Decimal("0")
             address = str(row.address)
         else:

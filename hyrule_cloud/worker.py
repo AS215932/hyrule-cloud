@@ -153,6 +153,7 @@ async def run_worker() -> None:
             if now >= next_mail:
                 try:
                     await mail.provision_pending(limit=10)
+                    await mail.retry_failed_backend_cleanup(limit=20)
                     await mail.process_lifecycle()
                     await mail.expire_quotes()
                 except Exception:
