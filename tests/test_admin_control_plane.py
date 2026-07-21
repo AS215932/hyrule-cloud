@@ -35,6 +35,7 @@ from hyrule_cloud.db import (
     Base,
     BGPJobRow,
     DomainJobRow,
+    DomainOperationRow,
     DomainOrderRow,
     DomainRow,
     MailAccountRow,
@@ -43,6 +44,7 @@ from hyrule_cloud.db import (
     SessionRow,
     VMRow,
 )
+from hyrule_cloud.domains.models import DomainOperationStatus
 from hyrule_cloud.middleware.x402 import ADMIN_PAYMENT_MODE_HEADER, PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.services.admin_operations import (
@@ -782,9 +784,14 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
         await session.delete(stored_actor)
         await session.commit()
         audits = list(await session.scalars(select(AdminAuditRow)))
+        retained_manual = await session.get(VMRow, "vm_transfer_manual")
 
     assert not AdminAuditRow.__table__.c.actor_account_id.foreign_keys
+    assert not VMRow.__table__.c.suspended_by_account_id.foreign_keys
+    assert not MailAccountRow.__table__.c.suspended_by_account_id.foreign_keys
     assert {row.actor_account_id for row in audits} == {"HAAAAAAAAAA"}
+    assert retained_manual is not None
+    assert retained_manual.suspended_by_account_id == "HAAAAAAAAAA"
     assert xcpng.started == ["uuid-transfer-direct", "uuid-transfer-attached"]
 
 
@@ -1004,6 +1011,90 @@ async def test_admin_retry_rejects_terminal_fulfillment_job(admin_factory) -> No
         assert job is not None and job.status == "failed"
         assert order is not None and order.status == "refund_due"
         assert list(await session.scalars(select(AdminAuditRow))) == []
+
+
+@pytest.mark.asyncio
+async def test_admin_retry_reopens_domain_operation_and_blocks_owner_transfer(
+    admin_factory,
+) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add_all(
+            [
+                AccountRow(account_id="HBBBBBBBBBB", password_hash="unused"),
+                AccountRow(account_id="HCCCCCCCCCC", password_hash="unused"),
+                DomainRow(
+                    name="retry-owner",
+                    extension="example",
+                    fqdn="retry-owner.example",
+                    owner_wallet="0xowner",
+                    owner_account_id="HBBBBBBBBBB",
+                    status="active",
+                ),
+                DomainOperationRow(
+                    operation_id="dop_retry_owner",
+                    fqdn="retry-owner.example",
+                    owner_account_id="HBBBBBBBBBB",
+                    kind="nameservers",
+                    status=DomainOperationStatus.FAILED.value,
+                    request_payload={"mode": "managed"},
+                    error_code="provider_error",
+                    error_detail="temporary failure",
+                    result_payload={"stale": True},
+                ),
+                DomainJobRow(
+                    job_id="djob_retry_owner",
+                    kind="nameservers",
+                    resource_id="dop_retry_owner",
+                    dedupe_key="nameservers:dop_retry_owner",
+                    status="failed",
+                    last_error="temporary failure",
+                ),
+            ]
+        )
+        await session.commit()
+
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    await retry_job(
+        "djob_retry_owner",
+        ReasonRequest(reason="provider recovered"),
+        _browser_request(credentials, path="/v1/admin/jobs/djob_retry_owner/retry"),
+        actor,
+        state,
+    )
+
+    async with admin_factory() as session:
+        operation = await session.get(DomainOperationRow, "dop_retry_owner")
+        job = await session.get(DomainJobRow, "djob_retry_owner")
+        assert operation is not None and operation.status == DomainOperationStatus.QUEUED.value
+        assert operation.error_code is None
+        assert operation.error_detail is None
+        assert operation.result_payload is None
+        assert job is not None and job.status == "queued"
+
+    with pytest.raises(HTTPException) as exc:
+        await transfer_domain(
+            "retry-owner.example",
+            OwnershipTransferRequest(
+                target_account_id="HCCCCCCCCCC",
+                reason="customer-approved transfer",
+            ),
+            _browser_request(
+                credentials,
+                path="/v1/admin/domains/retry-owner.example/transfer",
+            ),
+            actor,
+            state,
+        )
+    assert exc.value.status_code == 409
 
 
 class _AdminXCPNG:

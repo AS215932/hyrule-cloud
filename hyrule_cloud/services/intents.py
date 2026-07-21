@@ -644,6 +644,7 @@ async def _trigger_provisioning(
             )
             if claimed_domain and domains is not None:
                 await domains.release_vm_attachment_claim(planned_vm_id)
+            await orch.release_vm_reservation(planned_vm_id)
             await orch.record_native_intent_refund(
                 intent_id,
                 reason="account_disabled_at_settlement",

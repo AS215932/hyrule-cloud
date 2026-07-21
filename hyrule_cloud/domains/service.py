@@ -2229,6 +2229,8 @@ class DomainService:
                 owner_wallet=order.payer or order.order_id,
                 payment_tx=order.payment_tx,
                 start_provisioning=False,
+                retail_amount=Decimal(order.vm_amount_usd),
+                admin_waived=order.billing_mode == "admin_waived",
             )
             if vm is None:
                 raise RuntimeError("the bundle VM reservation disappeared")
@@ -2237,12 +2239,6 @@ class DomainService:
             if not fallback_auto_domain:
                 await self.release_vm_attachment_claim(planned_vm_id)
             raise
-        await self.orchestrator.persist_payment_billing(
-            vm.vm_id,
-            Decimal(order.vm_amount_usd),
-            admin_waived=order.billing_mode == "admin_waived",
-            payment_tx=order.payment_tx,
-        )
         await link_quote_vm(self.db, quote.quote_id, vm.vm_id)
         async with self.db() as session:
             current = await session.get(DomainOrderRow, order_id)
@@ -2838,15 +2834,31 @@ class DomainService:
         self, operation_id: str
     ) -> tuple[DomainOperationRow, DomainRow]:
         async with self.db() as session:
-            operation = await session.get(DomainOperationRow, operation_id)
+            operation = (
+                await session.execute(
+                    select(DomainOperationRow)
+                    .where(DomainOperationRow.operation_id == operation_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if operation is None:
                 raise RuntimeError("domain operation disappeared")
-            operation.status = DomainOperationStatus.RUNNING.value
             domain = (
-                await session.execute(select(DomainRow).where(DomainRow.fqdn == operation.fqdn))
+                await session.execute(
+                    select(DomainRow)
+                    .where(DomainRow.fqdn == operation.fqdn)
+                    .with_for_update()
+                )
             ).scalar_one_or_none()
             if domain is None:
                 raise RuntimeError("managed domain disappeared")
+            if operation.owner_account_id != domain.owner_account_id:
+                raise DomainProblem(
+                    409,
+                    "domain_owner_changed",
+                    "The domain changed owner after this operation was queued.",
+                )
+            operation.status = DomainOperationStatus.RUNNING.value
             await session.commit()
             return operation, domain
 

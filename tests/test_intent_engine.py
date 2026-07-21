@@ -244,14 +244,22 @@ class _StubOrchestrator:
         self,
         vm_id: str,
         owner_wallet: str,
+        payment_tx: str | None = None,
         *,
         start_provisioning: bool = True,
+        retail_amount: Decimal | None = None,
+        admin_waived: bool = False,
     ):
         async with self.db() as db:
             row = await db.get(VMRow, vm_id)
             if row is None:
                 return None
             row.owner_wallet = owner_wallet
+            row.payment_tx = payment_tx
+            if retail_amount is not None:
+                row.retail_cost_total = retail_amount
+                row.cost_total = Decimal("0") if admin_waived else retail_amount
+                row.billing_mode = "admin_waived" if admin_waived else "charged"
             await db.commit()
             await db.refresh(row)
         self.created_vms.append((vm_id, row.owner_account_id))

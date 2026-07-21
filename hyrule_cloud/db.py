@@ -155,9 +155,9 @@ class VMRow(Base):
     # Suspension provenance lets account re-enablement resume only resources
     # suspended by an administrator. Expiry and manual suspensions stay put.
     suspension_reason: Mapped[str | None] = mapped_column(String(32), index=True)
-    suspended_by_account_id: Mapped[str | None] = mapped_column(
-        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL")
-    )
+    # Immutable provenance: deleting an administrator must not erase who
+    # suspended the resource.
+    suspended_by_account_id: Mapped[str | None] = mapped_column(String(11))
 
     # Extensible metadata
     metadata_: Mapped[dict | None] = mapped_column("metadata", _JSONB)
@@ -794,9 +794,8 @@ class MailAccountRow(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     payment_tx: Mapped[str | None] = mapped_column(String(128))
     suspension_reason: Mapped[str | None] = mapped_column(String(32), index=True)
-    suspended_by_account_id: Mapped[str | None] = mapped_column(
-        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL")
-    )
+    # Immutable provenance, deliberately not an account foreign key.
+    suspended_by_account_id: Mapped[str | None] = mapped_column(String(11))
 
 
 class MailDomainRow(Base):

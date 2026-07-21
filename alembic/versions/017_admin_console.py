@@ -92,14 +92,6 @@ def upgrade() -> None:
     )
     op.add_column("vms", sa.Column("suspension_reason", sa.String(32)))
     op.add_column("vms", sa.Column("suspended_by_account_id", sa.String(11)))
-    op.create_foreign_key(
-        "fk_vms_suspended_by",
-        "vms",
-        "accounts",
-        ["suspended_by_account_id"],
-        ["account_id"],
-        ondelete="SET NULL",
-    )
     op.create_index("ix_vms_billing_mode", "vms", ["billing_mode"])
     op.create_index("ix_vms_suspension_reason", "vms", ["suspension_reason"])
 
@@ -127,14 +119,6 @@ def upgrade() -> None:
 
     op.add_column("mail_accounts", sa.Column("suspension_reason", sa.String(32)))
     op.add_column("mail_accounts", sa.Column("suspended_by_account_id", sa.String(11)))
-    op.create_foreign_key(
-        "fk_mail_accounts_suspended_by",
-        "mail_accounts",
-        "accounts",
-        ["suspended_by_account_id"],
-        ["account_id"],
-        ondelete="SET NULL",
-    )
     op.create_index("ix_mail_accounts_suspension_reason", "mail_accounts", ["suspension_reason"])
 
     op.create_table(
@@ -260,7 +244,6 @@ def downgrade() -> None:
     op.drop_table("admin_audit")
 
     op.drop_index("ix_mail_accounts_suspension_reason", table_name="mail_accounts")
-    op.drop_constraint("fk_mail_accounts_suspended_by", "mail_accounts", type_="foreignkey")
     op.drop_column("mail_accounts", "suspended_by_account_id")
     op.drop_column("mail_accounts", "suspension_reason")
 
@@ -272,7 +255,6 @@ def downgrade() -> None:
 
     op.drop_index("ix_vms_suspension_reason", table_name="vms")
     op.drop_index("ix_vms_billing_mode", table_name="vms")
-    op.drop_constraint("fk_vms_suspended_by", "vms", type_="foreignkey")
     op.drop_column("vms", "suspended_by_account_id")
     op.drop_column("vms", "suspension_reason")
     op.drop_column("vms", "retail_cost_total")

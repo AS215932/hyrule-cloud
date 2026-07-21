@@ -39,6 +39,7 @@ from hyrule_cloud.db import (
 from hyrule_cloud.domains.models import (
     DNSChangesetRequest,
     DNSSECUpdateRequest,
+    DomainOperationStatus,
     DomainOrderStatus,
     NameserverUpdateRequest,
 )
@@ -806,13 +807,17 @@ async def disable_account(
     if account_id == actor.account_id:
         raise HTTPException(409, "You cannot disable your current Admin account")
     async with _factory(state)() as session:
+        # Always acquire the common enabled-Admin lock set before the target
+        # row. Concurrent requests disabling different Admins must share one
+        # lock order or each can hold its target while waiting on the other.
+        enabled_admin_count = await _enabled_admin_count(session, lock=True)
         target = await _locked_account(session, account_id)
         if target is None:
             raise HTTPException(404, "Account not found")
         if (
             target.is_admin
             and target.disabled_at is None
-            and await _enabled_admin_count(session, lock=True) <= 1
+            and enabled_admin_count <= 1
         ):
             raise HTTPException(409, "At least one enabled Admin must remain")
         now = _now()
@@ -915,14 +920,20 @@ async def set_account_role(
     if account_id == actor.account_id and not body.is_admin:
         raise HTTPException(409, "You cannot demote your current Admin account")
     async with _factory(state)() as session:
-        target = await session.get(AccountRow, account_id)
+        # Demotions use the same enabled-Admin lock set and ordering as account
+        # disable. Promotions only increase the invariant and need the target.
+        enabled_admin_count = (
+            await _enabled_admin_count(session, lock=True) if not body.is_admin else None
+        )
+        target = await _locked_account(session, account_id)
         if target is None:
             raise HTTPException(404, "Account not found")
         if (
             target.is_admin
             and not body.is_admin
             and target.disabled_at is None
-            and await _enabled_admin_count(session, lock=True) <= 1
+            and enabled_admin_count is not None
+            and enabled_admin_count <= 1
         ):
             raise HTTPException(409, "At least one enabled Admin must remain")
         target.is_admin = body.is_admin
@@ -1456,6 +1467,20 @@ async def retry_job(
                 DomainOrderStatus.EXPIRED.value,
             }:
                 raise HTTPException(409, "Terminal fulfillment jobs cannot be retried")
+        elif job.kind in {"nameservers", "dnssec", "transfer_out"}:
+            operation = (
+                await session.execute(
+                    select(DomainOperationRow)
+                    .where(DomainOperationRow.operation_id == job.resource_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if operation is None:
+                raise HTTPException(409, "Domain operation no longer exists")
+            operation.status = DomainOperationStatus.QUEUED.value
+            operation.error_code = None
+            operation.error_detail = None
+            operation.result_payload = None
         job.status = "queued"
         job.available_at = _now()
         job.locked_at = None

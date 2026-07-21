@@ -1047,7 +1047,7 @@ class Orchestrator:
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if row is not None:
-                self._apply_payment_billing(
+                Orchestrator._apply_payment_billing(
                     row,
                     retail_amount=retail_amount,
                     admin_waived=admin_waived,

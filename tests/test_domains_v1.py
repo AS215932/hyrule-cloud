@@ -255,6 +255,47 @@ async def domain_service(tmp_path):
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_operation_execution_rejects_domain_owner_change(domain_service):
+    service, _provider, sessions = domain_service
+    async with sessions() as session:
+        session.add(
+            AccountRow(
+                account_id="H0987654321",
+                password_hash=hash_password("another sufficiently long test password"),
+            )
+        )
+        session.add(
+            DomainRow(
+                name="owner-changed",
+                extension="dev",
+                fqdn="owner-changed.dev",
+                owner_wallet="0xowner",
+                owner_account_id="H0987654321",
+                status="active",
+            )
+        )
+        session.add(
+            DomainOperationRow(
+                operation_id="dop_owner_changed",
+                fqdn="owner-changed.dev",
+                owner_account_id="H1234567890",
+                kind="nameservers",
+                status="queued",
+                request_payload={"mode": "managed"},
+            )
+        )
+        await session.commit()
+
+    with pytest.raises(DomainProblem) as exc:
+        await service._operation_and_domain("dop_owner_changed")
+    assert exc.value.code == "domain_owner_changed"
+
+    async with sessions() as session:
+        operation = await session.get(DomainOperationRow, "dop_owner_changed")
+        assert operation is not None and operation.status == "queued"
+
+
 def test_ascii_second_level_validation_and_pricing():
     assert normalize_registrable_domain("Example.DEV.") == ("example", "dev", "example.dev")
     with pytest.raises(DomainProblem) as nested:
