@@ -38,12 +38,29 @@ def _stun_host() -> str:
     return HyruleConfig().stun_test_host
 
 
+def _stun_host_valid() -> bool:
+    """Whether a STUN host is configured AND parses to a usable host:port. A
+    malformed value must not admit the paid STUN check (it would raise after
+    settlement and 500)."""
+    host = _stun_host()
+    if not host:
+        return False
+    from hyrule_cloud.services.voip.stun_probe import split_host_port
+
+    try:
+        _, port = split_host_port(host)
+    except (ValueError, OverflowError):
+        return False
+    return 1 <= port <= 65535
+
+
 def voip_sources() -> dict[str, SourceHealth]:
-    stun_source = (
-        source_ok()
-        if _stun_host()
-        else source_not_configured("STUN active tester is not configured (set HYRULE_STUN_TEST_HOST).")
-    )
+    if not _stun_host():
+        stun_source = source_not_configured("STUN active tester is not configured (set HYRULE_STUN_TEST_HOST).")
+    elif not _stun_host_valid():
+        stun_source = source_not_configured("HYRULE_STUN_TEST_HOST is misconfigured (bad host:port).")
+    else:
+        stun_source = source_ok()
     sources = {
         "dns": source_ok(),
         "sip_tls": source_ok(),
@@ -80,7 +97,7 @@ def voip_check_has_live_backend(checks: list[VoIPCheck]) -> bool:
     becomes live once a public STUN responder is configured.
     """
     live = set(_LIVE_VOIP_CHECKS)
-    if _stun_host():
+    if _stun_host_valid():  # only admit STUN when a VALID responder is configured
         live.add(VoIPCheck.STUN_TURN)
     return any(check in live for check in checks)
 

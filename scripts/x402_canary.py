@@ -323,6 +323,16 @@ async def _run_one(
     settled_ok, settle_detail = _settlement(r)
     print(f"    HTTP {r.status_code}   {settle_detail}")
     text = r.text
+    if name == "tunnel":
+        # The tunnel response carries the one-time token (SSH username + mgmt
+        # credential) in both `token` and `ssh_command`; redact before any log so
+        # a failed cleanup can't leave a live credential in CI logs.
+        try:
+            tok = r.json().get("token")
+            if tok:
+                text = text.replace(tok, "<redacted-token>")
+        except Exception:
+            pass
     print(f"    body: {text[:600]}{'...' if len(text) > 600 else ''}")
     if r.status_code == 501:
         # 501 is the intentional "not launched yet" signal (PR #42: a diagnostic

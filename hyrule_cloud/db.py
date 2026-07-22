@@ -493,8 +493,12 @@ class ReverseTunnelRow(Base):
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
     # sha256 of the x402 payment authorization; makes create idempotent so a
     # client retry (after a lost response) recovers the same tunnel + token
-    # instead of paying again or leaking a port.
-    idempotency_key: Mapped[str | None] = mapped_column(String(64), index=True)
+    # instead of paying again or leaking a port. UNIQUE so two concurrent
+    # replicas with the same authorization cannot both provision.
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    # x402 settlement response header from the original create, replayed on an
+    # idempotent retry so a standard x402 client sees settlement proof.
+    settlement_header: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

@@ -14,6 +14,7 @@ from typing import cast
 import structlog
 from sqlalchemy import delete as sql_delete
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
@@ -22,6 +23,14 @@ from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.providers.tunnel_client import LeaseResult, TunnelDaemonError, TunnelProvider
 
 log = structlog.get_logger()
+
+
+class TunnelReconcileError(Exception):
+    """The daemon applied a change but persisting it failed — needs refund/alert."""
+
+
+class TunnelIdempotencyConflictError(Exception):
+    """Another replica won the create idempotency race; recover the winning row."""
 
 
 def new_tunnel_id() -> str:
@@ -53,7 +62,9 @@ class TunnelService:
 
     async def recover_lease(self, tunnel_id: str) -> LeaseResult | None:
         """Re-fetch the daemon lease (idempotent create) to recover its token for
-        an idempotent create replay. Returns None if the daemon no longer has it.
+        an idempotent create replay. Returns None only if the row is gone;
+        propagates TunnelDaemonError on an operational failure so the caller can
+        return a retryable 503 rather than a permanent-looking gone response.
         """
         row = await self.get(tunnel_id)
         if row is None:
@@ -62,10 +73,7 @@ class TunnelService:
         if expires.tzinfo is None:  # SQLite (tests) returns naive; Postgres keeps tz
             expires = expires.replace(tzinfo=UTC)
         duration = max(1, int((expires - _now()).total_seconds()))
-        try:
-            return await self.provider.create_lease(tunnel_id, duration, row.allowlist_cidrs)
-        except TunnelDaemonError:
-            return None
+        return await self.provider.create_lease(tunnel_id, duration, row.allowlist_cidrs)
 
     async def provision(
         self,
@@ -88,7 +96,13 @@ class TunnelService:
         if not lease.token:
             # No token means the customer could neither connect nor manage the
             # tunnel; treat as a provisioning failure and free the daemon lease.
-            await self.provider.revoke_lease(tunnel_id)
+            # If the revoke doesn't confirm, persist a provisional row so the
+            # sweep retries the daemon teardown (otherwise the port would be
+            # untracked and pinned for the full lease).
+            if not await self.provider.revoke_lease(tunnel_id):
+                await self._persist_provisional_marker(
+                    tunnel_id, lease, owner_wallet, owner_account_id, allowlist_cidrs, hours
+                )
             raise TunnelDaemonError("daemon returned a lease without a token")
         row = ReverseTunnelRow(
             tunnel_id=tunnel_id,
@@ -108,6 +122,12 @@ class TunnelService:
             async with self.session_factory() as session:
                 session.add(row)
                 await session.commit()
+        except IntegrityError:
+            # Another replica committed first with the same idempotency key
+            # (unique). Free our just-allocated daemon lease and tell the caller
+            # to recover the winning row instead of provisioning a duplicate.
+            await self.provider.revoke_lease(tunnel_id)
+            raise TunnelIdempotencyConflictError from None
         except Exception:
             # The daemon already allocated a port; a persistence failure would
             # otherwise leak it (unpaid retries could exhaust the range). Best-
@@ -117,14 +137,60 @@ class TunnelService:
             raise
         return row, lease
 
-    async def mark_settled(self, tunnel_id: str, payment_tx: str) -> None:
-        async with self.session_factory() as session:
-            await session.execute(
-                update(ReverseTunnelRow)
-                .where(ReverseTunnelRow.tunnel_id == tunnel_id)
-                .values(payment_tx=payment_tx)
-            )
-            await session.commit()
+    async def _persist_provisional_marker(
+        self,
+        tunnel_id: str,
+        lease: LeaseResult,
+        owner_wallet: str,
+        owner_account_id: str | None,
+        allowlist_cidrs: list[str] | None,
+        hours: int,
+    ) -> None:
+        """Record a provisional row for a daemon lease whose immediate cleanup
+        failed, so sweep_expiries retries the teardown (payment_tx stays NULL, so
+        the provisional reap picks it up)."""
+        try:
+            async with self.session_factory() as session:
+                session.add(
+                    ReverseTunnelRow(
+                        tunnel_id=tunnel_id,
+                        owner_wallet=owner_wallet or "",
+                        owner_account_id=owner_account_id,
+                        token_hash=hash_anon_token(lease.token or ""),
+                        allocated_port=lease.port,
+                        endpoint_host=lease.endpoint_host,
+                        ssh_port=lease.ssh_port,
+                        allowlist_cidrs=allowlist_cidrs,
+                        status="provisioning",
+                        expires_at=_parse_ts(lease.expires_at, default=_now() + timedelta(hours=hours)),
+                        payment_tx=None,
+                    )
+                )
+                await session.commit()
+        except Exception:
+            log.error("tunnel_provisional_marker_failed", tunnel_id=tunnel_id, exc_info=True)
+
+    async def mark_settled(
+        self, tunnel_id: str, payment_tx: str, settlement_header: str | None = None
+    ) -> bool:
+        """Stamp payment_tx (+ the replayable settlement header) after settlement.
+        Retries transient DB failures; returns whether the stamp was persisted.
+        A settled row must not look provisional to the sweep.
+        """
+        for attempt in range(5):
+            try:
+                async with self.session_factory() as session:
+                    await session.execute(
+                        update(ReverseTunnelRow)
+                        .where(ReverseTunnelRow.tunnel_id == tunnel_id)
+                        .values(payment_tx=payment_tx, settlement_header=settlement_header)
+                    )
+                    await session.commit()
+                return True
+            except Exception:
+                log.warning("tunnel_mark_settled_retry", tunnel_id=tunnel_id, attempt=attempt)
+        log.error("tunnel_mark_settled_failed", tunnel_id=tunnel_id)
+        return False
 
     async def revoke(self, tunnel_id: str) -> bool:
         """Strictly tear down a tunnel: delete the row ONLY after the daemon has
@@ -143,15 +209,28 @@ class TunnelService:
         return True
 
     async def extend(self, tunnel_id: str, hours: int) -> ReverseTunnelRow | None:
+        """Extend the daemon lease, then persist the new expiry (with retry). If
+        the daemon succeeds but the DB write ultimately fails, raise
+        TunnelReconcileError — the daemon has the paid time but the sweep would
+        revoke early off the stale DB expiry, so the caller must refund/alert.
+        Raises TunnelDaemonError if the daemon extend fails (before any DB write).
+        """
         lease = await self.provider.extend_lease(tunnel_id, hours * 3600)
-        async with self.session_factory() as session:
-            row = await session.get(ReverseTunnelRow, tunnel_id)
-            if row is None:
-                return None
-            row.expires_at = _parse_ts(lease.expires_at, default=row.expires_at)
-            await session.commit()
-            await session.refresh(row)
-            return row
+        for attempt in range(5):
+            try:
+                async with self.session_factory() as session:
+                    row = await session.get(ReverseTunnelRow, tunnel_id)
+                    if row is None:
+                        return None
+                    row.expires_at = _parse_ts(lease.expires_at, default=row.expires_at)
+                    await session.commit()
+                    await session.refresh(row)
+                    return row
+            except Exception:
+                log.warning("tunnel_extend_persist_retry", tunnel_id=tunnel_id, attempt=attempt)
+        raise TunnelReconcileError(
+            f"daemon extended {tunnel_id} but the DB expiry write failed"
+        )
 
     async def get(self, tunnel_id: str) -> ReverseTunnelRow | None:
         async with self.session_factory() as session:

@@ -22,6 +22,12 @@ def test_split_host_port():
     assert split_host_port("[2001:db8::1]") == ("2001:db8::1", 3478)
 
 
+def test_split_host_port_bad_port_raises():
+    import pytest
+    with pytest.raises(ValueError):
+        split_host_port("stun.example:abc")
+
+
 def _success_with_xor_mapped(txid: bytes, ip: str, port: int, family: int = 0x01) -> bytes:
     xport = port ^ (_MAGIC_COOKIE >> 16)
     if family == 0x01:

@@ -215,6 +215,7 @@ class MockGate:
         self.settled += 1
         if self.settle_ok:
             request.state.payment_tx = "0xMockHash"
+            request.state.payment_response_headers = {"X-PAYMENT-RESPONSE": "proof"}
         return self.settle_ok
 
     async def check_payment(self, request, amount, description="", extra_body=None):
@@ -475,6 +476,8 @@ async def test_create_is_idempotent_on_payment_auth(wired):
     assert second.json()["token"] == tok1
     assert gate.settled == settled_after_first  # no double charge
     assert len(provider.leases) == 1
+    # The replay carries the original settlement proof so an x402 client accepts it.
+    assert second.headers.get("X-PAYMENT-RESPONSE") == "proof"
 
 
 @pytest.mark.asyncio
