@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from hyrule_cloud.orchestrator import Orchestrator
     from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
     from hyrule_cloud.providers.network_client import NetworkProvider
+    from hyrule_cloud.providers.prober_client import ProberProvider
     from hyrule_cloud.providers.rates import RateProvider
 
 
@@ -22,6 +23,10 @@ class AppState:
     orchestrator: Orchestrator
     payment_gate: PaymentGate
     network_provider: NetworkProvider
+    # Internal prober sidecar for /v1/path/* active measurements. Optional so
+    # tests can construct AppState without it; path routes treat None as
+    # "prober not configured" and refuse before charging.
+    prober_provider: ProberProvider | None = field(default=None)
     # Block E: native crypto path. Optional so existing tests can wire only
     # what they need; routes that require them check for None.
     native_crypto: NativeCryptoProvider | None = field(default=None)
