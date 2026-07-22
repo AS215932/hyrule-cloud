@@ -143,6 +143,21 @@ class VMRow(Base):
     # Payment
     payment_tx: Mapped[str | None] = mapped_column(String(128))
     cost_total: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+    # ``charged`` rows represent money that actually settled. ``admin_waived``
+    # rows retain their retail value without ever entering revenue/refund sums.
+    billing_mode: Mapped[str] = mapped_column(
+        String(24), default="charged", server_default="charged", index=True
+    )
+    retail_cost_total: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0"), server_default="0"
+    )
+
+    # Suspension provenance lets account re-enablement resume only resources
+    # suspended by an administrator. Expiry and manual suspensions stay put.
+    suspension_reason: Mapped[str | None] = mapped_column(String(32), index=True)
+    # Immutable provenance: deleting an administrator must not erase who
+    # suspended the resource.
+    suspended_by_account_id: Mapped[str | None] = mapped_column(String(11))
 
     # Extensible metadata
     metadata_: Mapped[dict | None] = mapped_column("metadata", _JSONB)
@@ -285,6 +300,9 @@ class DomainOrderRow(Base):
     payment_asset: Mapped[str | None] = mapped_column(String(16))
     payer: Mapped[str | None] = mapped_column(String(128))
     payment_tx: Mapped[str | None] = mapped_column(String(128), index=True)
+    billing_mode: Mapped[str] = mapped_column(
+        String(24), default="charged", server_default="charged", index=True
+    )
     refund_address: Mapped[str | None] = mapped_column(String(128))
     native_intent_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("crypto_intents.intent_id", ondelete="SET NULL"), index=True
@@ -554,7 +572,8 @@ class PaymentEventRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )
-    # required_402 | verify_failed | settle_failed | settled | dev_bypass
+    # required_402 | verify_failed | settle_failed | settled | dev_bypass |
+    # admin_bypass | refund_owed
     event_type: Mapped[str] = mapped_column(String(16), index=True)
     resource_path: Mapped[str] = mapped_column(String(256))
     method: Mapped[str] = mapped_column(String(8))
@@ -569,6 +588,10 @@ class PaymentEventRow(Base):
     facilitator_host: Mapped[str | None] = mapped_column(String(64))
     error_reason: Mapped[str | None] = mapped_column(String(256))
     extra: Mapped[dict | None] = mapped_column(_JSONB)
+    # Populated for browser-only administrator waivers and administrative
+    # adjustments. This is immutable actor attribution, never a payer identity;
+    # deliberately not a foreign key so account deletion cannot erase history.
+    actor_account_id: Mapped[str | None] = mapped_column(String(11), index=True)
 
     __table_args__ = (
         Index("ix_payment_events_type_created", "event_type", "created_at"),
@@ -770,6 +793,9 @@ class MailAccountRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     payment_tx: Mapped[str | None] = mapped_column(String(128))
+    suspension_reason: Mapped[str | None] = mapped_column(String(32), index=True)
+    # Immutable provenance, deliberately not an account foreign key.
+    suspended_by_account_id: Mapped[str | None] = mapped_column(String(11))
 
 
 class MailDomainRow(Base):
@@ -945,6 +971,11 @@ class AccountRow(Base):
     )
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    disabled_reason: Mapped[str | None] = mapped_column(Text)
+    disabled_by_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL")
+    )
 
 
 class SessionRow(Base):
@@ -966,6 +997,116 @@ class SessionRow(Base):
     user_agent: Mapped[str | None] = mapped_column(String(256))
     # sha256(/64 IPv6 prefix + pepper). Abuse-only; we do not store full IPs.
     ip_prefix_hash: Mapped[str | None] = mapped_column(String(64))
+    # The readable cookie contains a separate high-entropy value. Only its
+    # digest is persisted and it is tied to this exact opaque session row.
+    csrf_token_hash: Mapped[str | None] = mapped_column(String(64))
+    admin_elevated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    admin_step_up_attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    admin_step_up_window_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class AdminAuditRow(Base):
+    """Append-only record of administrator-visible and privileged activity."""
+
+    __tablename__ = "admin_audit"
+
+    audit_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # Keep the immutable identifier after an operator account is offboarded.
+    actor_account_id: Mapped[str] = mapped_column(String(11), index=True)
+    action: Mapped[str] = mapped_column(String(96), index=True)
+    target_type: Mapped[str | None] = mapped_column(String(32), index=True)
+    target_id: Mapped[str | None] = mapped_column(String(256), index=True)
+    reason: Mapped[str | None] = mapped_column(Text)
+    details: Mapped[dict | None] = mapped_column(_JSONB)
+    succeeded: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    ip_prefix_hash: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class AdminOperationRow(Base):
+    """Durable bulk resource operation triggered by an account state change."""
+
+    __tablename__ = "admin_operations"
+
+    operation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    account_id: Mapped[str] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="CASCADE"), index=True
+    )
+    actor_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), default="queued", server_default="queued", index=True
+    )
+    reason: Mapped[str | None] = mapped_column(Text)
+    progress: Mapped[dict | None] = mapped_column(_JSONB)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RefundResolutionRow(Base):
+    """Operator record for an externally completed or rejected refund."""
+
+    __tablename__ = "refund_resolutions"
+
+    resolution_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    payment_event_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("payment_events.event_id", ondelete="SET NULL")
+    )
+    resource_type: Mapped[str] = mapped_column(String(32), index=True)
+    resource_id: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    amount_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    network: Mapped[str | None] = mapped_column(String(64))
+    payer_wallet: Mapped[str | None] = mapped_column(String(128))
+    external_reference: Mapped[str | None] = mapped_column(String(256))
+    transaction_hash: Mapped[str | None] = mapped_column(String(128))
+    reason: Mapped[str] = mapped_column(Text)
+    actor_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("payment_event_id", name="uq_refund_resolution_payment_event"),
+    )
+
+
+class AdminBypassUsageRow(Base):
+    """Database-atomic fixed-window usage counter for admin x402 waivers."""
+
+    __tablename__ = "admin_bypass_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    actor_account_id: Mapped[str] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="CASCADE"), index=True
+    )
+    operation_class: Mapped[str] = mapped_column(String(24))
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_account_id",
+            "operation_class",
+            "window_started_at",
+            name="uq_admin_bypass_usage_window",
+        ),
+    )
+
+
 
 
 class ApiKeyRow(Base):

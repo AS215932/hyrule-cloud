@@ -59,7 +59,7 @@ from hyrule_cloud.models import (
     VMStatus,
     VMStatusResponse,
 )
-from hyrule_cloud.orchestrator import VMCapacityError
+from hyrule_cloud.orchestrator import AccountDisabledError, VMCapacityError
 from hyrule_cloud.providers.base import ProviderError
 from hyrule_cloud.providers.network_config import (
     RESERVED_PREFIX_INDEXES,
@@ -902,7 +902,7 @@ async def create_vm(
     # isinstance on purpose: reservation semantics are coupled to the real
     # gate; test doubles (mocks / X-Mock-Paid fakes) keep the legacy
     # allocate-after-payment path.
-    if isinstance(gate, PaymentGate) and gate.has_payment_credentials(request):
+    if isinstance(gate, PaymentGate) and await gate.has_payment_credentials(request):
         try:
             reservation_row, reservation_token = await orch.reserve_vm_with_capacity(
                 order,
@@ -945,19 +945,27 @@ async def create_vm(
         # currently fit.
         await _enforce_compute_capacity(orch, order)
 
-    result = await gate.check_payment(
-        request,
-        amount=total,
-        description=(
-            f"Hyrule Cloud VM ({VM_PROFILE_LABELS[order.size]}) "
-            f"for {order.duration_days} days"
-        ),
-        extra_body={
-            "cost_breakdown": breakdown.model_dump(),
-            "specs": {**specs, "ipv6": True, "ipv4": False, "region": "eu-west"},
-            "estimated_provision_time_seconds": 60,
-        },
-    )
+    try:
+        result = await gate.check_payment(
+            request,
+            amount=total,
+            description=(
+                f"Hyrule Cloud VM ({VM_PROFILE_LABELS[order.size]}) "
+                f"for {order.duration_days} days"
+            ),
+            extra_body={
+                "cost_breakdown": breakdown.model_dump(),
+                "specs": {**specs, "ipv6": True, "ipv4": False, "region": "eu-west"},
+                "estimated_provision_time_seconds": 60,
+            },
+        )
+    except Exception:
+        # Admin quota and required-audit failures raise instead of returning a
+        # 402. They must release the unpaid capacity reservation just like the
+        # ordinary Response path below.
+        if reservation_row is not None:
+            await orch.release_vm_reservation(reservation_row.vm_id)
+        raise
 
     if isinstance(result, Response):
         # No/invalid payment yet (402) — the quote stays CREATED so the EVM
@@ -967,6 +975,7 @@ async def create_vm(
         return result
 
     wallet = result
+    admin_waived = getattr(request.state, "payment_mode", None) == "admin-bypass"
     # Issue #14 / Sourcery (#16): claim the quote atomically BEFORE provisioning
     # so two concurrent paid creates for the same quote can't each provision a VM
     # — only the winner of the CREATED → CONSUMED flip proceeds.
@@ -995,13 +1004,17 @@ async def create_vm(
     # never be dropped.
     row: VMRow | None = None
     management_token: str | None = None
+    payment_tx = getattr(request.state, "payment_tx", None)
+    retail_amount = quote_row.amount_usd if quote_row is not None else total
     try:
         if reservation_row is not None:
             activated = await orch.activate_vm_reservation(
                 reservation_row.vm_id,
                 owner_wallet=wallet,
-                payment_tx=getattr(request.state, "payment_tx", None),
+                payment_tx=payment_tx,
                 start_provisioning=False,
+                retail_amount=retail_amount,
+                admin_waived=admin_waived,
             )
             if activated is not None:
                 row, management_token = activated, reservation_token
@@ -1017,8 +1030,10 @@ async def create_vm(
                     start_provisioning=False,
                     pricing_snapshot=pricing_snapshot,
                     legacy_billing=quote_row is not None and quote_row.pricing_snapshot is None,
+                    payment_tx=payment_tx,
+                    retail_amount=retail_amount,
+                    admin_waived=admin_waived,
                 )
-                row.payment_tx = getattr(request.state, "payment_tx", None)
         else:
             row, management_token = await orch.create_vm(
                 order,
@@ -1027,12 +1042,15 @@ async def create_vm(
                 start_provisioning=False,
                 pricing_snapshot=pricing_snapshot,
                 legacy_billing=quote_row is not None and quote_row.pricing_snapshot is None,
+                payment_tx=payment_tx,
+                retail_amount=retail_amount,
+                admin_waived=admin_waived,
             )
-            row.payment_tx = getattr(request.state, "payment_tx", None)
         if quote_row is not None:
             # Persist the locked charged amount first so a later refund is
             # accurate even if the quote link below fails.
-            await orch.persist_charged_amount(row.vm_id, quote_row.amount_usd)
+            # Reservation activation persisted the locked retail quote and its
+            # billing mode atomically with payment acceptance above.
             # The consumed-quote replay path can only rediscover this paid VM
             # once the quote carries its vm_id, so retry a transient link failure
             # before giving up rather than leaving the quote consumed-but-unlinked.
@@ -1069,6 +1087,24 @@ async def create_vm(
         orch.start_provisioning(row.vm_id)
     except HTTPException:
         raise
+    except AccountDisabledError as exc:
+        failed_vm_id = reservation_row.vm_id if reservation_row is not None else None
+        log.warning("vm_owner_disabled_post_charge", vm_id=failed_vm_id)
+        await orch.record_create_failure_refund(
+            owner_wallet=wallet,
+            payment_tx=payment_tx,
+            charged_amount=total,
+            reason="vm_owner_disabled_during_payment",
+            vm_id=failed_vm_id,
+        )
+        if failed_vm_id is not None:
+            await orch.mark_vm_failed(failed_vm_id, str(exc))
+        detail = (
+            "Account was disabled before provisioning; no payment was taken."
+            if admin_waived
+            else "Account was disabled before provisioning; a refund has been recorded."
+        )
+        raise HTTPException(status_code=409, detail=detail) from exc
     except Exception as exc:
         # Post-charge, pre-provision failure: no background task exists to record
         # the refund, so record it here before surfacing the error.
@@ -1097,10 +1133,12 @@ async def create_vm(
             # PROVISIONING pinning its customer /64 (the sweeper won't reclaim a
             # row with an owner_wallet).
             await orch.mark_vm_failed(failed_vm_id, f"create failed post-charge: {exc}")
-        raise HTTPException(
-            status_code=500,
-            detail="Provisioning failed after payment; a refund has been recorded and will be processed.",
+        detail = (
+            "Provisioning failed; no payment was taken."
+            if admin_waived
+            else "Provisioning failed after payment; a refund has been recorded and will be processed."
         )
+        raise HTTPException(status_code=500, detail=detail)
 
     # The except above re-raises on any failure, so a fall-through here means the
     # VM row was created and provisioning was scheduled.
@@ -1207,6 +1245,9 @@ async def extend_vm(
     # create/quote/intent. Refuse before check_payment so no money moves.
     _require_vm_service_open(gate)
 
+    if row.suspension_reason in {"account_disabled", "manual_admin"}:
+        raise HTTPException(409, "Admin-suspended VMs cannot be extended")
+
     total = current_daily_price_for_vm(row, cfg.payment) * body.days
 
     result = await gate.check_payment(
@@ -1223,9 +1264,41 @@ async def extend_vm(
     if isinstance(result, Response):
         return result
 
-    updated = await orch.extend_vm(vm_id, body.days)
+    payment_tx = getattr(request.state, "payment_tx", None)
+    payment_waived = bool(
+        payment_tx
+        and payment_tx.startswith(("dev_bypass", "admin_bypass"))
+    )
+    try:
+        updated = await orch.extend_vm(vm_id, body.days)
+    except Exception as exc:
+        await orch.record_extension_failure_refund(
+            vm_id=vm_id,
+            owner_wallet=result,
+            payment_tx=payment_tx,
+            charged_amount=total,
+            reason=f"vm_extension_failed: {exc}",
+        )
+        detail = (
+            "Failed to extend VM; no payment was taken"
+            if payment_waived
+            else "Failed to extend VM; a refund has been recorded"
+        )
+        raise HTTPException(500, detail) from exc
     if not updated:
-        raise HTTPException(500, "Failed to extend VM")
+        await orch.record_extension_failure_refund(
+            vm_id=vm_id,
+            owner_wallet=result,
+            payment_tx=payment_tx,
+            charged_amount=total,
+            reason="vm_extension_rejected_post_settlement",
+        )
+        detail = (
+            "VM extension was rejected; no payment was taken"
+            if payment_waived
+            else "VM extension was rejected; a refund has been recorded"
+        )
+        raise HTTPException(409, detail)
 
     return {
         "vm_id": vm_id,

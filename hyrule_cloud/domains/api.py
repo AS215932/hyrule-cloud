@@ -197,6 +197,13 @@ async def create_order(
                     tx_hash=getattr(request.state, "payment_tx", None),
                     payment_network=getattr(request.state, "payment_network", None),
                     payment_asset=getattr(request.state, "payment_asset", None),
+                    billing_mode=(
+                        "admin_waived"
+                        if getattr(request.state, "payment_mode", None) == "admin-bypass"
+                        else "dev_bypass"
+                        if getattr(request.state, "payment_mode", None) == "dev-bypass"
+                        else "charged"
+                    ),
                 )
                 handoff_error = None
                 break

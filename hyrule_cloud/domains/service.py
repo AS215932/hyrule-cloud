@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
+    AccountRow,
     CryptoIntentRow,
     DomainDNSRecordRow,
     DomainIdempotencyRow,
@@ -100,6 +101,10 @@ log = structlog.get_logger()
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _is_waived_billing(mode: str) -> bool:
+    return mode in {"admin_waived", "dev_bypass"}
 
 
 @overload
@@ -641,6 +646,7 @@ class DomainService:
         tx_hash: str | None,
         payment_network: str | None = None,
         payment_asset: str | None = None,
+        billing_mode: str = "charged",
     ) -> DomainOrderRow:
         return await self._mark_paid(
             order_id,
@@ -648,6 +654,7 @@ class DomainService:
             tx_hash=tx_hash,
             payment_network=payment_network,
             payment_asset=payment_asset,
+            billing_mode=billing_mode,
         )
 
     async def assert_x402_payable(self, order_id: str) -> None:
@@ -693,8 +700,24 @@ class DomainService:
         tx_hash: str | None,
         payment_network: str | None = None,
         payment_asset: str | None = None,
+        billing_mode: str = "charged",
     ) -> DomainOrderRow:
         async with self.db() as session:
+            # Account disable uses this row as its lifecycle fence. Acquire it
+            # before the order lock so a settlement either queues while the
+            # owner is enabled or becomes a refund after disable, never both.
+            snapshot = await session.get(DomainOrderRow, order_id)
+            if snapshot is None:
+                raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            owner = None
+            if snapshot.owner_account_id is not None:
+                owner = (
+                    await session.execute(
+                        select(AccountRow)
+                        .where(AccountRow.account_id == snapshot.owner_account_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
             order = (
                 await session.execute(
                     select(DomainOrderRow)
@@ -704,6 +727,12 @@ class DomainService:
             ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            if order.owner_account_id != snapshot.owner_account_id:
+                raise DomainProblem(
+                    409,
+                    "order_owner_changed",
+                    "The order owner changed while payment was settling.",
+                )
             if order.status not in {
                 DomainOrderStatus.AWAITING_PAYMENT.value,
                 DomainOrderStatus.PAID.value,
@@ -718,6 +747,27 @@ class DomainService:
                 order.payment_tx = tx_hash
                 order.payment_network = payment_network
                 order.payment_asset = payment_asset
+                order.billing_mode = billing_mode
+                if order.owner_account_id is not None and (
+                    owner is None or owner.disabled_at is not None
+                ):
+                    order.status = (
+                        DomainOrderStatus.FAILED.value
+                        if _is_waived_billing(order.billing_mode)
+                        else DomainOrderStatus.REFUND_DUE.value
+                    )
+                    order.error_code = "account_disabled"
+                    order.error_detail = (
+                        "The owning account was disabled before payment settled."
+                    )
+                    if not _is_waived_billing(order.billing_mode):
+                        session.add(
+                            await self._build_refund_event(
+                                session, order, "account_disabled"
+                            )
+                        )
+                    await session.commit()
+                    return order
                 quote = (
                     await session.execute(
                         select(DomainQuoteRow)
@@ -732,9 +782,18 @@ class DomainService:
                 ):
                     if quote is not None and _aware(quote.expires_at) <= _now():
                         quote.status = "expired"
-                    order.status = DomainOrderStatus.REFUND_DUE.value
+                    order.status = (
+                        DomainOrderStatus.FAILED.value
+                        if _is_waived_billing(order.billing_mode)
+                        else DomainOrderStatus.REFUND_DUE.value
+                    )
                     order.error_code = "quote_already_consumed"
-                    session.add(self._build_refund_event(order, "quote_already_consumed"))
+                    if not _is_waived_billing(order.billing_mode):
+                        session.add(
+                            await self._build_refund_event(
+                                session, order, "quote_already_consumed"
+                            )
+                        )
                     await session.commit()
                     return order
                 quote.status = "consumed"
@@ -742,11 +801,18 @@ class DomainService:
                 if order.vm_quote_id:
                     vm_quote = await session.get(VMQuoteRow, order.vm_quote_id)
                     if vm_quote is None or vm_quote.status != QuoteStatus.CONSUMED:
-                        order.status = DomainOrderStatus.REFUND_DUE.value
-                        order.error_code = "vm_quote_already_consumed"
-                        session.add(
-                            self._build_refund_event(order, "vm_quote_already_consumed")
+                        order.status = (
+                            DomainOrderStatus.FAILED.value
+                            if _is_waived_billing(order.billing_mode)
+                            else DomainOrderStatus.REFUND_DUE.value
                         )
+                        order.error_code = "vm_quote_already_consumed"
+                        if not _is_waived_billing(order.billing_mode):
+                            session.add(
+                                await self._build_refund_event(
+                                    session, order, "vm_quote_already_consumed"
+                                )
+                            )
                         await session.commit()
                         return order
                 order.status = DomainOrderStatus.QUEUED.value
@@ -1236,7 +1302,7 @@ class DomainService:
         cursor: tuple[datetime, str] | None = None
         while True:
             filters = [
-                PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
+                PaymentEventRow.event_type.in_(["settled", "dev_bypass", "admin_bypass"]),
                 PaymentEventRow.resource_path == "/v1/domains/orders",
             ]
             if cursor is not None:
@@ -1284,6 +1350,13 @@ class DomainService:
                     tx_hash=event.tx_hash,
                     payment_network=event.network,
                     payment_asset=event.asset,
+                    billing_mode=(
+                        "admin_waived"
+                        if event.event_type == "admin_bypass"
+                        else "dev_bypass"
+                        if event.event_type == "dev_bypass"
+                        else "charged"
+                    ),
                 )
                 recovered += 1
             if len(events) < limit:
@@ -2204,6 +2277,8 @@ class DomainService:
                 owner_wallet=order.payer or order.order_id,
                 payment_tx=order.payment_tx,
                 start_provisioning=False,
+                retail_amount=Decimal(order.vm_amount_usd),
+                admin_waived=order.billing_mode == "admin_waived",
             )
             if vm is None:
                 raise RuntimeError("the bundle VM reservation disappeared")
@@ -2212,7 +2287,6 @@ class DomainService:
             if not fallback_auto_domain:
                 await self.release_vm_attachment_claim(planned_vm_id)
             raise
-        await self.orchestrator.persist_charged_amount(vm.vm_id, Decimal(order.vm_amount_usd))
         await link_quote_vm(self.db, quote.quote_id, vm.vm_id)
         async with self.db() as session:
             current = await session.get(DomainOrderRow, order_id)
@@ -2247,7 +2321,11 @@ class DomainService:
             ).scalar_one_or_none()
             if current is None:
                 return
-            current.status = DomainOrderStatus.REFUND_DUE.value
+            current.status = (
+                DomainOrderStatus.FAILED.value
+                if _is_waived_billing(current.billing_mode)
+                else DomainOrderStatus.REFUND_DUE.value
+            )
             current.error_code = code
             current.error_detail = detail[:1000]
             operation = (
@@ -2267,11 +2345,24 @@ class DomainService:
             if domain is not None and domain.openprovider_id is None:
                 domain.status = DomainStatus.FAILED
                 domain.error = detail[:1000]
-            session.add(self._build_refund_event(current, code, amount=refund_amount))
+            if not _is_waived_billing(current.billing_mode):
+                session.add(
+                    await self._build_refund_event(
+                        session,
+                        current,
+                        code,
+                        amount=refund_amount,
+                    )
+                )
             await session.commit()
 
-    def _build_refund_event(
-        self, order: DomainOrderRow, reason: str, *, amount: Decimal | None = None
+    async def _build_refund_event(
+        self,
+        session: AsyncSession,
+        order: DomainOrderRow,
+        reason: str,
+        *,
+        amount: Decimal | None = None,
     ) -> PaymentEventRow:
         builder = getattr(self.orchestrator.refunds, "build_owed_event", None)
         if builder is None:
@@ -2280,6 +2371,23 @@ class DomainService:
             DomainPaymentMethod.BTC.value,
             DomainPaymentMethod.XMR.value,
         }
+        native_intent = (
+            await session.get(CryptoIntentRow, order.native_intent_id)
+            if native and order.native_intent_id
+            else None
+        )
+        extra: dict[str, str | None] = {
+            "order_id": order.order_id,
+            "domain": order.fqdn,
+            "refund_address": order.refund_address,
+        }
+        if native_intent is not None:
+            extra["intent_id"] = native_intent.intent_id
+            extra["amount_received_crypto"] = (
+                str(native_intent.amount_received_crypto)
+                if native_intent.amount_received_crypto is not None
+                else None
+            )
         event: PaymentEventRow | None = builder(
             resource_path="/v1/domains/orders",
             payer=order.order_id if native else order.payer,
@@ -2288,11 +2396,7 @@ class DomainService:
             reason=reason,
             network="native" if native else order.payment_network,
             asset=order.payment_method.upper() if native else order.payment_asset,
-            extra={
-                "order_id": order.order_id,
-                "domain": order.fqdn,
-                "refund_address": order.refund_address,
-            },
+            extra=extra,
         )
         if event is None:
             raise RuntimeError("paid domain order has no recordable refund target")
@@ -2803,15 +2907,31 @@ class DomainService:
         self, operation_id: str
     ) -> tuple[DomainOperationRow, DomainRow]:
         async with self.db() as session:
-            operation = await session.get(DomainOperationRow, operation_id)
+            operation = (
+                await session.execute(
+                    select(DomainOperationRow)
+                    .where(DomainOperationRow.operation_id == operation_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if operation is None:
                 raise RuntimeError("domain operation disappeared")
-            operation.status = DomainOperationStatus.RUNNING.value
             domain = (
-                await session.execute(select(DomainRow).where(DomainRow.fqdn == operation.fqdn))
+                await session.execute(
+                    select(DomainRow)
+                    .where(DomainRow.fqdn == operation.fqdn)
+                    .with_for_update()
+                )
             ).scalar_one_or_none()
             if domain is None:
                 raise RuntimeError("managed domain disappeared")
+            if operation.owner_account_id != domain.owner_account_id:
+                raise DomainProblem(
+                    409,
+                    "domain_owner_changed",
+                    "The domain changed owner after this operation was queued.",
+                )
+            operation.status = DomainOperationStatus.RUNNING.value
             await session.commit()
             return operation, domain
 
@@ -2953,13 +3073,17 @@ class DomainService:
                                     bundle_vm.error = str(exc)[:1000]
                                     bundle_vm.ipv6_prefix_index = None
                                     bundle_vm.ipv6_prefix = None
-                        if Decimal(order.vm_amount_usd) > 0:
+                        if (
+                            Decimal(order.vm_amount_usd) > 0
+                            and not _is_waived_billing(order.billing_mode)
+                        ):
                             # The terminal job/order state and the partial refund
                             # obligation are one atomic commit. If ledger event
                             # construction or persistence fails, neither side is
                             # left terminal and the stale job remains recoverable.
                             session.add(
-                                self._build_refund_event(
+                                await self._build_refund_event(
+                                    session,
                                     order,
                                     "bundle_vm_failed",
                                     amount=Decimal(order.vm_amount_usd),

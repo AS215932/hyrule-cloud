@@ -31,7 +31,12 @@ from hyrule_cloud.middleware.auth import (
     require_browser_session,
 )
 from hyrule_cloud.services.passwords import hash_password
-from hyrule_cloud.services.sessions import cookie_kwargs_for_set, create_session
+from hyrule_cloud.services.sessions import (
+    SessionCredentials,
+    cookie_kwargs_for_set,
+    create_session,
+    csrf_cookie_kwargs_for_set,
+)
 from hyrule_cloud.state import AppState, get_app_state
 
 
@@ -186,7 +191,7 @@ class WalletAuthService:
         *,
         account: AccountRow | None,
         request: Request,
-    ) -> tuple[AccountRow, AccountWalletRow, WalletAction, bool, str | None]:
+    ) -> tuple[AccountRow, AccountWalletRow, WalletAction, bool, SessionCredentials | None]:
         async with self.db() as session:
             challenge = (
                 await session.execute(
@@ -233,16 +238,18 @@ class WalletAuthService:
                     loaded_account = await session.get(AccountRow, wallet.account_id)
                     if loaded_account is None:
                         raise DomainProblem(401, "invalid_wallet_account", "The wallet account is unavailable.")
+                    if loaded_account.disabled_at is not None:
+                        raise DomainProblem(403, "account_disabled", "This account is disabled.")
                     account_row = loaded_account
                 challenge.used_at = _now()
                 await session.commit()
-                token = await create_session(
+                credentials = await create_session(
                     session,
                     account_row.account_id,
                     user_agent=request.headers.get("user-agent"),
                     ip_prefix_hash=derive_ip_prefix_hash(_client_ip(request)),
                 )
-                return account_row, wallet, action, created, token
+                return account_row, wallet, action, created, credentials
             if account is None or challenge.account_id != account.account_id:
                 raise DomainProblem(401, "authentication_required", "The session does not match this challenge.")
             if action is WalletAction.LINK:
@@ -436,18 +443,23 @@ async def wallet_verify(
             "browser_session_required",
             "Wallet login and account changes require a browser session.",
         )
-    account_row, wallet, action, created, token = await service.verify_login_or_account_action(
+    account_row, wallet, action, created, credentials = await service.verify_login_or_account_action(
         body, account=account, request=request
     )
     if action in {WalletAction.LINK, WalletAction.ROTATE}:
         await require_browser_session(request, account_row)
-    if token:
+    if credentials:
         secure = request.url.scheme == "https" or request.url.hostname not in {
             "localhost",
             "127.0.0.1",
             "::1",
         }
-        response.set_cookie(value=token, **cookie_kwargs_for_set(secure=secure))
+        response.set_cookie(
+            value=credentials.token, **cookie_kwargs_for_set(secure=secure)
+        )
+        response.set_cookie(
+            value=credentials.csrf_token, **csrf_cookie_kwargs_for_set(secure=secure)
+        )
     return WalletAuthResponse(
         account_id=account_row.account_id,
         address=wallet.address,

@@ -29,6 +29,7 @@ from hyrule_cloud.db import (
     PaymentEventRow,
     VMQuoteRow,
     VMRow,
+    WalletChallengeRow,
     create_db_engine,
     create_session_factory,
 )
@@ -252,6 +253,47 @@ async def domain_service(tmp_path):
     yield service, provider, sessions
     await service.close()
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_operation_execution_rejects_domain_owner_change(domain_service):
+    service, _provider, sessions = domain_service
+    async with sessions() as session:
+        session.add(
+            AccountRow(
+                account_id="H0987654321",
+                password_hash=hash_password("another sufficiently long test password"),
+            )
+        )
+        session.add(
+            DomainRow(
+                name="owner-changed",
+                extension="dev",
+                fqdn="owner-changed.dev",
+                owner_wallet="0xowner",
+                owner_account_id="H0987654321",
+                status="active",
+            )
+        )
+        session.add(
+            DomainOperationRow(
+                operation_id="dop_owner_changed",
+                fqdn="owner-changed.dev",
+                owner_account_id="H1234567890",
+                kind="nameservers",
+                status="queued",
+                request_payload={"mode": "managed"},
+            )
+        )
+        await session.commit()
+
+    with pytest.raises(DomainProblem) as exc:
+        await service._operation_and_domain("dop_owner_changed")
+    assert exc.value.code == "domain_owner_changed"
+
+    async with sessions() as session:
+        operation = await session.get(DomainOperationRow, "dop_owner_changed")
+        assert operation is not None and operation.status == "queued"
 
 
 def test_ascii_second_level_validation_and_pricing():
@@ -599,6 +641,69 @@ async def test_native_domain_intent_expires_with_its_quote(domain_service):
         intent = await session.get(CryptoIntentRow, order.native_intent_id)
     assert intent is not None
     assert intent.expires_at.replace(tzinfo=UTC) == quote.expires_at
+
+
+@pytest.mark.asyncio
+async def test_native_domain_settlement_refunds_disabled_owner(domain_service):
+    service, provider, sessions = domain_service
+
+    async def usd_per(asset: str) -> Decimal:
+        assert asset == "BTC"
+        return Decimal("60000")
+
+    service.rates.get_usd_per = usd_per
+    service.native_crypto.derive_btc_address = lambda _index: BTC_REFUND_ADDRESS
+    quote = await service.create_quote(
+        "disabled-owner-native.dev",
+        DomainAction.REGISTER,
+        "H1234567890",
+    )
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.BTC,
+            refund_address=BTC_REFUND_ADDRESS,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="disabled-owner-native",
+    )
+    async with sessions() as session:
+        account = await session.get(AccountRow, "H1234567890")
+        intent = await session.get(CryptoIntentRow, order.native_intent_id)
+        assert account is not None and intent is not None
+        account.disabled_at = datetime.now(UTC)
+        intent.tx_hash = "native-disabled-owner-tx"
+        intent.amount_received_crypto = Decimal("0.000271828182")
+        await session.commit()
+
+    settled = await service.native_order_settled(order.order_id, intent)
+
+    assert settled.status == "refund_due"
+    assert settled.error_code == "account_disabled"
+    async with sessions() as session:
+        stored_quote = await session.get(DomainQuoteRow, quote.quote_id)
+        operations = list(await session.scalars(select(DomainOperationRow)))
+        jobs = list(await session.scalars(select(DomainJobRow)))
+        refunds = list(
+            await session.scalars(
+                select(PaymentEventRow).where(
+                    PaymentEventRow.event_type == "refund_owed"
+                )
+            )
+        )
+    assert stored_quote is not None and stored_quote.status == "reserved"
+    assert operations == []
+    assert jobs == []
+    assert provider.registrations == []
+    assert len(refunds) == 1
+    assert refunds[0].amount_usd == order.amount_usd
+    assert refunds[0].tx_hash == "native-disabled-owner-tx"
+    assert refunds[0].extra["refund_address"] == BTC_REFUND_ADDRESS
+    assert refunds[0].extra["intent_id"] == order.native_intent_id
+    assert Decimal(refunds[0].extra["amount_received_crypto"]) == Decimal(
+        "0.000271828182"
+    )
 
 
 @pytest.mark.asyncio
@@ -1950,13 +2055,19 @@ async def test_bundle_claims_domain_before_reserving_vm(domain_service):
     async def release_vm_reservation(_vm_id):
         return None
 
-    async def persist_charged_amount(_vm_id: str, _amount: Decimal) -> None:
+    async def persist_payment_billing(
+        _vm_id: str,
+        _amount: Decimal,
+        *,
+        admin_waived: bool,
+        payment_tx: str | None = None,
+    ) -> None:
         return None
 
     service.orchestrator.reserve_vm_with_capacity = reserve_vm_with_capacity
     service.orchestrator.activate_vm_reservation = activate_vm_reservation
     service.orchestrator.release_vm_reservation = release_vm_reservation
-    service.orchestrator.persist_charged_amount = persist_charged_amount
+    service.orchestrator.persist_payment_billing = persist_payment_billing
     await service._provision_bundle(order.order_id)
 
     assert len(observed_claim) == 1
@@ -2221,6 +2332,93 @@ async def test_partial_bundle_refund_commits_atomically_with_terminal_job(
 
 
 @pytest.mark.asyncio
+async def test_admin_waived_bundle_failure_creates_no_refund_obligation(
+    domain_service,
+):
+    service, _provider, sessions = domain_service
+    fqdn = "waived-bundle-failure.dev"
+    quote = await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890")
+    vm_quote_id = "vmq_waived_bundle_failure"
+    async with sessions() as session:
+        session.add(
+            VMQuoteRow(
+                quote_id=vm_quote_id,
+                order_payload=_bundle_spec(fqdn).model_dump(mode="json", exclude={"quote_id"}),
+                amount_usd=Decimal("5"),
+                status=QuoteStatus.CREATED,
+                owner_account_id="H1234567890",
+                expires_at=datetime.now(UTC) + timedelta(minutes=15),
+            )
+        )
+        await session.commit()
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+            vm_quote_id=vm_quote_id,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="waived-bundle-failure",
+    )
+    await service.mark_x402_paid(
+        order.order_id,
+        payer="admin:H1234567890",
+        tx_hash="admin_bypass_waived_bundle",
+        payment_network="admin-bypass",
+        payment_asset=None,
+        billing_mode="admin_waived",
+    )
+    async with sessions() as session:
+        stored_order = await session.get(DomainOrderRow, order.order_id)
+        assert stored_order is not None
+        stored_order.vm_id = "vm_waived_bundle_failure"
+        session.add(
+            DomainRow(
+                name="waived-bundle-failure",
+                extension="dev",
+                fqdn=fqdn,
+                owner_wallet="admin:H1234567890",
+                owner_account_id="H1234567890",
+                status="active",
+                openprovider_id=7003,
+                nameserver_mode="managed",
+                nameservers=["ns1.hyrule.host", "ns2.hyrule.host"],
+                dnssec_mode="managed",
+                dnssec_status="active",
+                vm_id="vm_waived_bundle_failure",
+            )
+        )
+        job = (
+            await session.execute(
+                select(DomainJobRow).where(DomainJobRow.resource_id == order.order_id)
+            )
+        ).scalar_one()
+        job.status = "running"
+        job.attempts = 10
+        job_id = job.job_id
+        await session.commit()
+
+    await service._retry_or_fail_job(job_id, RuntimeError("bundle VM failed"))
+
+    async with sessions() as session:
+        failed_job = await session.get(DomainJobRow, job_id)
+        active_order = await session.get(DomainOrderRow, order.order_id)
+        active_domain = (
+            await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn))
+        ).scalar_one()
+        refund_events = list(
+            await session.scalars(
+                select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
+            )
+        )
+    assert failed_job is not None and failed_job.status == "failed"
+    assert active_order is not None and active_order.status == "active"
+    assert active_domain.vm_id is None
+    assert refund_events == []
+
+
+@pytest.mark.asyncio
 async def test_read_only_operation_poll_does_not_consume_transfer_secret(domain_service):
     service, _provider, sessions = domain_service
     key = Fernet.generate_key()
@@ -2346,4 +2544,64 @@ async def test_wallet_login_and_two_signature_rotation(tmp_path):
     )
     assert action is WalletAction.ROTATE
     assert rotated.address.lower() == replacement.address.lower()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_wallet_login_rejects_disabled_account_without_consuming_challenge(tmp_path):
+    engine = create_db_engine(f"sqlite+aiosqlite:///{tmp_path / 'wallet-disabled.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = create_session_factory(engine)
+    service = WalletAuthService(HyruleConfig(), sessions)
+    wallet_account = Account.create()
+    request = SimpleNamespace(headers={}, client=None)
+
+    initial = await service.create_challenge(
+        WalletChallengeRequest(
+            action=WalletAction.LOGIN,
+            address=wallet_account.address,
+            chain_id=8453,
+        ),
+        account=None,
+    )
+    initial_signature = Account.sign_message(
+        encode_defunct(text=initial.message),
+        wallet_account.key,
+    ).signature.hex()
+    account, *_ = await service.verify_login_or_account_action(
+        WalletVerifyRequest(nonce=initial.nonce, signature=initial_signature),
+        account=None,
+        request=request,
+    )
+    async with sessions() as session:
+        stored = await session.get(AccountRow, account.account_id)
+        assert stored is not None
+        stored.disabled_at = datetime.now(UTC)
+        await session.commit()
+
+    retry = await service.create_challenge(
+        WalletChallengeRequest(
+            action=WalletAction.LOGIN,
+            address=wallet_account.address,
+            chain_id=8453,
+        ),
+        account=None,
+    )
+    retry_signature = Account.sign_message(
+        encode_defunct(text=retry.message),
+        wallet_account.key,
+    ).signature.hex()
+    with pytest.raises(DomainProblem) as rejected:
+        await service.verify_login_or_account_action(
+            WalletVerifyRequest(nonce=retry.nonce, signature=retry_signature),
+            account=None,
+            request=request,
+        )
+
+    assert rejected.value.status == 403
+    assert rejected.value.code == "account_disabled"
+    async with sessions() as session:
+        stored_challenge = await session.get(WalletChallengeRow, retry.nonce)
+        assert stored_challenge is not None and stored_challenge.used_at is None
     await engine.dispose()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from ipaddress import IPv6Network
 
@@ -9,9 +10,9 @@ import yaml
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import Base, VMRow
+from hyrule_cloud.db import AccountRow, Base, VMRow
 from hyrule_cloud.models import VMSize, VMStatus
-from hyrule_cloud.orchestrator import Orchestrator
+from hyrule_cloud.orchestrator import AccountDisabledError, Orchestrator
 from hyrule_cloud.providers.network_config import (
     prefix_for_index,
     render_debian_network_config,
@@ -673,6 +674,60 @@ async def test_reservation_lifecycle(session_factory, monkeypatch):
     await orch.release_vm_reservation(reserved2.vm_id)
     async with session_factory() as session:
         assert await session.get(VMRow, reserved2.vm_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_reservation_activation_rechecks_owner_and_persists_waiver_atomically(
+    session_factory,
+):
+    from hyrule_cloud.models import VMCreateRequest
+
+    account_id = "H1234567890"
+    async with session_factory() as session:
+        session.add(AccountRow(account_id=account_id, password_hash="unused"))
+        await session.commit()
+
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    order = VMCreateRequest(
+        duration_days=1,
+        os="debian-13",
+        ssh_pubkey="ssh-ed25519 AAAA t",
+    )
+    reserved, _ = await orch.reserve_vm(order, owner_account_id=account_id)
+    activated = await orch.activate_vm_reservation(
+        reserved.vm_id,
+        owner_wallet=f"admin:{account_id}",
+        payment_tx="admin_bypass_test",
+        start_provisioning=False,
+        retail_amount=Decimal("1.25"),
+        admin_waived=True,
+    )
+    assert activated is not None
+    assert activated.billing_mode == "admin_waived"
+    assert activated.retail_cost_total == Decimal("1.25")
+    assert activated.cost_total == Decimal("0")
+
+    fenced, _ = await orch.reserve_vm(order, owner_account_id=account_id)
+    async with session_factory() as session:
+        owner = await session.get(AccountRow, account_id)
+        assert owner is not None
+        owner.disabled_at = datetime.now(UTC)
+        await session.commit()
+
+    with pytest.raises(AccountDisabledError):
+        await orch.activate_vm_reservation(
+            fenced.vm_id,
+            owner_wallet="0xPAYER",
+            payment_tx="0xSETTLED",
+            start_provisioning=False,
+            retail_amount=Decimal("1.25"),
+        )
+
+    async with session_factory() as session:
+        unchanged = await session.get(VMRow, fenced.vm_id)
+        assert unchanged is not None
+        assert unchanged.owner_wallet == ""
+        assert unchanged.payment_tx is None
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
+    AccountRow,
     CryptoIntentRow,
     DomainOrderRow,
     DomainRow,
@@ -77,6 +78,10 @@ _VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable cross-worker PostgreSQL lock k
 
 class VMCapacityError(RuntimeError):
     """The requested VM cannot fit within the configured live headroom."""
+
+
+class AccountDisabledError(RuntimeError):
+    """A VM reservation was fenced by its disabled owner account."""
 
 
 def _now() -> datetime:
@@ -253,6 +258,9 @@ class Orchestrator:
         vm_id: str | None = None,
         pricing_snapshot: dict | None = None,
         legacy_billing: bool = False,
+        payment_tx: str | None = None,
+        retail_amount: Decimal | None = None,
+        admin_waived: bool = False,
     ) -> tuple[VMRow, str]:
         """Persist a VM row and atomically claim a customer /64 (unique index).
 
@@ -327,10 +335,27 @@ class Orchestrator:
             hostname = f"{hostname_prefix}.{self.config.deploy_domain}"
 
             async with self.db() as session:
+                if owner_account_id is not None:
+                    owner = (
+                        await session.execute(
+                            select(AccountRow)
+                            .where(AccountRow.account_id == owner_account_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if owner is not None and owner.disabled_at is not None:
+                        raise AccountDisabledError("VM owner account is disabled")
                 if requested_vm_id:
                     existing = await session.get(VMRow, candidate_vm_id)
                     if existing is not None:
                         self._validate_replayed_vm(existing, request, owner_account_id)
+                        self._apply_payment_billing(
+                            existing,
+                            retail_amount=retail_amount,
+                            admin_waived=admin_waived,
+                            payment_tx=payment_tx,
+                        )
+                        await session.commit()
                         return existing, ""
                 prefix_index, prefix = await self._allocate_customer_prefix(
                     session, candidate_vm_id
@@ -360,6 +385,13 @@ class Orchestrator:
                     domain=request.domain,
                     expires_at=expires_at,
                     cost_total=total,
+                    retail_cost_total=total,
+                )
+                self._apply_payment_billing(
+                    row,
+                    retail_amount=retail_amount,
+                    admin_waived=admin_waived,
+                    payment_tx=payment_tx,
                 )
                 session.add(row)
                 try:
@@ -434,6 +466,9 @@ class Orchestrator:
         start_provisioning: bool = True,
         pricing_snapshot: dict | None = None,
         legacy_billing: bool = False,
+        payment_tx: str | None = None,
+        retail_amount: Decimal | None = None,
+        admin_waived: bool = False,
     ) -> tuple[VMRow, str]:
         """Create a VM record in DB and start background provisioning.
 
@@ -459,6 +494,9 @@ class Orchestrator:
             vm_id=vm_id,
             pricing_snapshot=pricing_snapshot,
             legacy_billing=legacy_billing,
+            payment_tx=payment_tx,
+            retail_amount=retail_amount,
+            admin_waived=admin_waived,
         )
         if start_provisioning:
             self._spawn_provisioning(row.vm_id)
@@ -563,6 +601,8 @@ class Orchestrator:
         payment_tx: str | None = None,
         *,
         start_provisioning: bool = True,
+        retail_amount: Decimal | None = None,
+        admin_waived: bool = False,
     ) -> VMRow | None:
         """Attach the settled payment to a reservation and start provisioning.
 
@@ -571,12 +611,40 @@ class Orchestrator:
         locked quote amount, so the link must be committed before it starts.
         """
         async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
+            # Account disable takes the account lock before touching owned VMs.
+            # Read the reservation only to discover its owner, then acquire the
+            # same locks in that order so settlement cannot deadlock with (or
+            # slip past) an administrative disable.
+            candidate = await session.get(VMRow, vm_id)
+            if candidate is None:
+                return None
+            expected_owner_account_id = candidate.owner_account_id
+            if expected_owner_account_id is not None:
+                owner = (
+                    await session.execute(
+                        select(AccountRow)
+                        .where(AccountRow.account_id == expected_owner_account_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if owner is None or owner.disabled_at is not None:
+                    raise AccountDisabledError("VM owner account is disabled")
+            row = (
+                await session.execute(
+                    select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                )
+            ).scalar_one_or_none()
             if row is None:
                 return None
+            if row.owner_account_id != expected_owner_account_id:
+                raise RuntimeError("VM reservation owner changed during payment")
             row.owner_wallet = owner_wallet
-            if payment_tx:
-                row.payment_tx = payment_tx
+            self._apply_payment_billing(
+                row,
+                retail_amount=retail_amount,
+                admin_waived=admin_waived,
+                payment_tx=payment_tx,
+            )
             await session.commit()
             await session.refresh(row)
         if start_provisioning:
@@ -736,11 +804,24 @@ class Orchestrator:
             custom_domain: str | None = None
             custom_account_id: str | None = None
             async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
-                if not row:
+                row = (
+                    await session.execute(
+                        select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if row is None:
                     return
+                admin_suspended = row.suspension_reason in {
+                    "account_disabled",
+                    "manual_admin",
+                }
+                if admin_suspended:
+                    # Serialize with account re-enablement while the row lock is
+                    # held: a disabled account must never observe a newly built
+                    # provider VM transition through READY.
+                    await self.xcpng.suspend_vm(xcpng_uuid)
                 row.ipv6 = ipv6
-                row.status = VMStatus.READY
+                row.status = VMStatus.SUSPENDED if admin_suspended else VMStatus.READY
                 # Block B (Wave 2): timestamp the READY transition so
                 # /v1/stats/runtime can roll a rolling avg over recent
                 # provisioning durations.
@@ -884,8 +965,9 @@ class Orchestrator:
         if await self._record_native_refund(vm_id, reason=reason):
             return
         is_dev_bypass = bool(payment_tx and payment_tx.startswith("dev_bypass"))
+        is_admin_bypass = bool(payment_tx and payment_tx.startswith("admin_bypass"))
         was_charged = bool(payment_tx) or (amount is not None and amount > 0)
-        if was_charged and not is_dev_bypass:
+        if was_charged and not is_dev_bypass and not is_admin_bypass:
             # A charge settled but couldn't be attributed to an EVM wallet or a
             # native intent — e.g. the SDK settled exposing neither a payer
             # ("unknown") NOR a tx string AND the best-effort settled ledger row
@@ -949,7 +1031,52 @@ class Orchestrator:
             row = await session.get(VMRow, vm_id)
             if row is not None:
                 row.cost_total = amount
+                row.retail_cost_total = amount
+                row.billing_mode = "charged"
                 await session.commit()
+
+    async def persist_payment_billing(
+        self,
+        vm_id: str,
+        retail_amount: Decimal,
+        *,
+        admin_waived: bool,
+        payment_tx: str | None = None,
+    ) -> None:
+        """Persist retail value separately from money actually charged."""
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                Orchestrator._apply_payment_billing(
+                    row,
+                    retail_amount=retail_amount,
+                    admin_waived=admin_waived,
+                    payment_tx=payment_tx,
+                )
+                await session.commit()
+
+    @staticmethod
+    def _apply_payment_billing(
+        row: VMRow,
+        *,
+        retail_amount: Decimal | None,
+        admin_waived: bool,
+        payment_tx: str | None,
+    ) -> None:
+        """Apply settlement metadata as part of the caller's DB transaction."""
+        if retail_amount is not None:
+            dev_bypass = bool(payment_tx and payment_tx.startswith("dev_bypass"))
+            row.retail_cost_total = retail_amount
+            row.cost_total = Decimal("0") if admin_waived or dev_bypass else retail_amount
+            row.billing_mode = (
+                "admin_waived"
+                if admin_waived
+                else "dev_bypass"
+                if dev_bypass
+                else "charged"
+            )
+        if payment_tx:
+            row.payment_tx = payment_tx
 
     async def record_create_failure_refund(
         self,
@@ -974,7 +1101,7 @@ class Orchestrator:
         # exposes no transaction string (middleware stores `settlement.transaction
         # or ""`) still charged the customer, so it must still be refunded using
         # payer + amount.
-        if payment_tx and payment_tx.startswith("dev_bypass"):
+        if payment_tx and payment_tx.startswith(("dev_bypass", "admin_bypass")):
             return
         settled = None
         if payment_tx:
@@ -1005,6 +1132,44 @@ class Orchestrator:
             resource_path="/v1/vm/create",
             payer=owner_wallet or "unknown",
             amount=charged_amount,
+            original_tx=payment_tx,
+            reason=reason,
+            vm_id=vm_id,
+        )
+
+    async def record_extension_failure_refund(
+        self,
+        *,
+        vm_id: str,
+        owner_wallet: str,
+        payment_tx: str | None,
+        charged_amount: Decimal,
+        reason: str,
+    ) -> None:
+        """Record a paid VM extension rejected after x402 settlement."""
+        if payment_tx and payment_tx.startswith(("dev_bypass", "admin_bypass")):
+            return
+        settled = None
+        if payment_tx:
+            async with self.db() as session:
+                settled = (
+                    await session.execute(
+                        select(PaymentEventRow)
+                        .where(
+                            PaymentEventRow.tx_hash == payment_tx,
+                            PaymentEventRow.event_type == "settled",
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+        await self.refunds.record_owed(
+            resource_path=f"/v1/vm/{vm_id}/extend",
+            payer=(settled.payer_wallet if settled is not None else None)
+            or owner_wallet
+            or "unknown",
+            amount=settled.amount_usd if settled is not None else charged_amount,
+            network=settled.network if settled is not None else None,
+            asset=settled.asset if settled is not None else None,
             original_tx=payment_tx,
             reason=reason,
             vm_id=vm_id,
@@ -1140,8 +1305,12 @@ class Orchestrator:
         await asyncio.sleep(0.1)
 
         async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row:
+            row = (
+                await session.execute(
+                    select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
                 return
             # Keep the simulated address consistent with the allocated
             # customer /64 — the status API exposes both, and an address
@@ -1151,7 +1320,11 @@ class Orchestrator:
             else:
                 fake_ipv6 = f"2001:db8::{random.randint(0x1000, 0x9999):04x}"
             row.ipv6 = fake_ipv6
-            row.status = VMStatus.READY
+            row.status = (
+                VMStatus.SUSPENDED
+                if row.suspension_reason in {"account_disabled", "manual_admin"}
+                else VMStatus.READY
+            )
             row.provisioned_at = _now()
             meta = row.metadata_ or {}
             lp = meta.get("launch_proof", {})
@@ -1246,32 +1419,111 @@ class Orchestrator:
             return result.scalar_one_or_none()
 
     async def extend_vm(self, vm_id: str, days: int) -> VMRow | None:
-        async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row or not row.expires_at:
-                return None
-
-            now = _now()
-            base = max(row.expires_at, now)
-            row.expires_at = base + timedelta(days=days)
-
-            suspend_status = row.status == VMStatus.SUSPENDED
-            xcpng_uuid = row.xcpng_uuid
-
-            await session.commit()
-            await session.refresh(row)
-
-        if suspend_status and xcpng_uuid:
-            power = await self.xcpng.get_vm_power_state(xcpng_uuid)
-            if power == "Halted":
-                await self.xcpng.start_vm(xcpng_uuid)
-
+        original_expiry: datetime | None = None
+        extended_expiry: datetime | None = None
+        original_status: VMStatus | None = None
+        original_suspension_reason: str | None = None
+        original_suspended_by_account_id: str | None = None
+        restart_uuid: str | None = None
+        restart_attempted = False
+        try:
             async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
-                if row:
+                snapshot = await session.get(VMRow, vm_id)
+                if snapshot is None:
+                    return None
+                owner_account_id = snapshot.owner_account_id
+                owner = None
+                if owner_account_id is not None:
+                    owner = (
+                        await session.execute(
+                            select(AccountRow)
+                            .where(AccountRow.account_id == owner_account_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                row = (
+                    await session.execute(
+                        select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if row is None or row.owner_account_id != owner_account_id:
+                    return None
+                if owner_account_id is not None and (
+                    owner is None or owner.disabled_at is not None
+                ):
+                    return None
+                if (
+                    row.expires_at is None
+                    or row.suspension_reason in {"account_disabled", "manual_admin"}
+                    or str(row.status)
+                    in {
+                        VMStatus.PROVISIONING.value,
+                        VMStatus.FAILED.value,
+                        VMStatus.DESTROYED.value,
+                    }
+                ):
+                    return None
+
+                original_expiry = row.expires_at
+                original_status = row.status
+                original_suspension_reason = row.suspension_reason
+                original_suspended_by_account_id = row.suspended_by_account_id
+                now = _now()
+                if row.expires_at.tzinfo is None:
+                    now = now.replace(tzinfo=None)
+                extended_expiry = max(row.expires_at, now) + timedelta(days=days)
+
+                if row.status == VMStatus.SUSPENDED:
+                    if not row.xcpng_uuid:
+                        return None
+                    restart_uuid = row.xcpng_uuid
+                    power = await self.xcpng.get_vm_power_state(restart_uuid)
+                    if power == "Halted":
+                        restart_attempted = True
+                        await self.xcpng.start_vm(restart_uuid)
                     row.status = VMStatus.RUNNING
-                    await session.commit()
-                    await session.refresh(row)
+                    row.suspension_reason = None
+                    row.suspended_by_account_id = None
+                row.expires_at = extended_expiry
+                await session.commit()
+        except Exception:
+            if restart_attempted and restart_uuid is not None:
+                try:
+                    await self.xcpng.suspend_vm(restart_uuid)
+                except Exception:
+                    log.exception(
+                        "vm_extension_restart_compensation_failed",
+                        vm_id=vm_id,
+                        vm_uuid=restart_uuid,
+                    )
+            # A commit can fail ambiguously after the server accepted it. Undo
+            # only the exact expiry written by this attempt so the caller never
+            # records a refund while the purchased days remain durable.
+            if (
+                original_expiry is not None
+                and extended_expiry is not None
+                and original_status is not None
+            ):
+                try:
+                    async with self.db() as session:
+                        current = (
+                            await session.execute(
+                                select(VMRow)
+                                .where(VMRow.vm_id == vm_id)
+                                .with_for_update()
+                            )
+                        ).scalar_one_or_none()
+                        if current is not None and current.expires_at == extended_expiry:
+                            current.expires_at = original_expiry
+                            current.status = original_status
+                            current.suspension_reason = original_suspension_reason
+                            current.suspended_by_account_id = (
+                                original_suspended_by_account_id
+                            )
+                            await session.commit()
+                except Exception:
+                    log.exception("vm_extension_database_compensation_failed", vm_id=vm_id)
+            raise
 
         log.info(
             "vm_extended",
@@ -1467,6 +1719,10 @@ class Orchestrator:
                     await session.execute(
                         update(VMRow)
                         .where(VMRow.vm_id == vm["vm_id"])
-                        .values(status=VMStatus.SUSPENDED)
+                        .values(
+                            status=VMStatus.SUSPENDED,
+                            suspension_reason="expired",
+                            suspended_by_account_id=None,
+                        )
                     )
                     await session.commit()

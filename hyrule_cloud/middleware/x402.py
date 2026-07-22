@@ -22,13 +22,16 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import structlog
-from fastapi import Request, Response
+from fastapi import HTTPException, Request, Response
+from sqlalchemy import delete, select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from x402.extensions.bazaar import bazaar_resource_server_extension
 from x402.http import (
     PAYMENT_REQUIRED_HEADER,
@@ -48,13 +51,24 @@ from x402.schemas import PaymentPayload, PaymentRequirements, ResourceConfig, Re
 from x402.server import x402ResourceServer
 
 from hyrule_cloud.config import PaymentConfig
+from hyrule_cloud.db import AccountRow, AdminBypassUsageRow
+from hyrule_cloud.services.sessions import (
+    CSRF_COOKIE_NAME,
+    SESSION_COOKIE_NAME,
+    constant_time_eq,
+    hash_csrf_token,
+    lookup_session,
+)
 
 if TYPE_CHECKING:
     from hyrule_cloud.services.payments_ledger import PaymentLedger
 
 log = structlog.get_logger()
 
+_ADMIN_BYPASS_RETENTION = timedelta(days=2)
+
 LEGACY_PAYMENT_REQUIRED_HEADER = "X-PAYMENT-REQUIRED"
+ADMIN_PAYMENT_MODE_HEADER = "X-Hyrule-Payment-Mode"
 _OPENFACILITATOR_HOST = "pay.openfacilitator.io"
 _PAYAI_FACILITATOR_HOST = "facilitator.payai.network"
 _CDP_FACILITATOR_HOST = "api.cdp.coinbase.com"
@@ -161,6 +175,13 @@ class VerifiedPayment:
     payment_payload: PaymentPayload | None = None
     matching_requirements: PaymentRequirements | None = None
     dev_bypass: bool = False
+    admin_bypass: bool = False
+
+
+@dataclass(frozen=True)
+class AdminBypassContext:
+    account_id: str
+    operation_class: str
 
 
 class PaymentGate:
@@ -177,10 +198,20 @@ class PaymentGate:
         config: PaymentConfig,
         public_base_url: str = "",
         ledger: PaymentLedger | None = None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+        admin_bypass_enabled: bool = False,
+        admin_step_up_seconds: int = 600,
+        admin_diagnostic_limit: int = 120,
+        admin_cost_limit: int = 10,
     ) -> None:
         self.config = config
         self.public_base_url = public_base_url.rstrip("/")
         self.ledger = ledger
+        self.session_factory = session_factory
+        self.admin_bypass_enabled = admin_bypass_enabled
+        self.admin_step_up_seconds = admin_step_up_seconds
+        self.admin_diagnostic_limit = admin_diagnostic_limit
+        self.admin_cost_limit = admin_cost_limit
         self._facilitator_host = urlparse(config.facilitator_url).hostname or ""
         self.facilitator = HTTPFacilitatorClient(_facilitator_config(config))
         self.server = x402ResourceServer(self.facilitator)
@@ -381,22 +412,306 @@ class PaymentGate:
     def _payment_header(request: Request) -> str | None:
         return request.headers.get(PAYMENT_SIGNATURE_HEADER) or request.headers.get(X_PAYMENT_HEADER)
 
-    def has_payment_credentials(self, request: Request) -> bool:
-        """True when this request will actually be charged if valid — a
-        payment header is present, or the dev bypass matches. Routes use this
-        to reserve scarce resources only for paying requests, not for the
-        unpaid discovery round-trip that just fetches the 402."""
+    @staticmethod
+    def _admin_operation_class(request: Request) -> str:
+        """Classify costly side effects separately from diagnostics."""
+        path = request.url.path.rstrip("/")
+        if path.startswith("/v1/vm/") and path.endswith("/extend"):
+            return "real_cost"
+        if path == "/v1/domains/orders":
+            return "real_cost"
+        from hyrule_cloud.services.discovery import match_paid_operation
+
+        operation = match_paid_operation(request.method, request.url.path)
+        if operation is None:
+            raise HTTPException(status_code=403, detail="admin_bypass_unclassified")
+        return operation.admin_operation_class
+
+    @staticmethod
+    def _aware(value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+    async def _admin_context(
+        self,
+        request: Request,
+        *,
+        force_refresh: bool = False,
+    ) -> AdminBypassContext | None:
+        """Resolve a browser Admin waiver and validate session-bound CSRF."""
+        cached = getattr(request.state, "admin_bypass_context", None)
+        if not force_refresh and isinstance(cached, AdminBypassContext):
+            return cached
+        if not self.admin_bypass_enabled or self.session_factory is None:
+            return None
+        # Never combine an API bearer with a privileged browser cookie.
+        if request.headers.get("authorization"):
+            return None
+        token = request.cookies.get(SESSION_COOKIE_NAME)
+        if not token:
+            return None
+        async with self.session_factory() as session:
+            session_row = await lookup_session(session, token)
+            if session_row is None:
+                return None
+            account = await session.get(AccountRow, session_row.account_id)
+            if account is None or not account.is_admin:
+                return None
+            if account.disabled_at is not None:
+                raise HTTPException(status_code=403, detail="Account disabled")
+
+            csrf_header = request.headers.get("X-CSRF-Token")
+            csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME)
+            expected_hash = session_row.csrf_token_hash
+            if (
+                not csrf_header
+                or not csrf_cookie
+                or not expected_hash
+                or not constant_time_eq(csrf_header, csrf_cookie)
+                or not constant_time_eq(hash_csrf_token(csrf_header), expected_hash)
+            ):
+                raise HTTPException(status_code=403, detail="CSRF validation failed")
+
+            operation_class = self._admin_operation_class(request)
+            if operation_class == "real_cost":
+                elevated_at = session_row.admin_elevated_at
+                if (
+                    elevated_at is None
+                    or (datetime.now(UTC) - self._aware(elevated_at)).total_seconds()
+                    > self.admin_step_up_seconds
+                ):
+                    raise HTTPException(status_code=403, detail="admin_step_up_required")
+
+            context = AdminBypassContext(account.account_id, operation_class)
+
+        request.state.admin_bypass_context = context
+        return context
+
+    async def _consume_admin_quota(self, context: AdminBypassContext) -> datetime:
+        """Atomically consume one fixed-window waiver slot in the database."""
+        assert self.session_factory is not None
+        now = datetime.now(UTC)
+        if context.operation_class == "real_cost":
+            window = now.replace(minute=0, second=0, microsecond=0)
+            limit = self.admin_cost_limit
+        else:
+            window = now.replace(second=0, microsecond=0)
+            limit = self.admin_diagnostic_limit
+
+        async with self.session_factory() as session:
+            dialect = session.get_bind().dialect.name
+            stored_window = window.replace(tzinfo=None) if dialect == "sqlite" else window
+            stored_now = now.replace(tzinfo=None) if dialect == "sqlite" else now
+            retention_cutoff = now - _ADMIN_BYPASS_RETENTION
+            stored_retention_cutoff = (
+                retention_cutoff.replace(tzinfo=None)
+                if dialect == "sqlite"
+                else retention_cutoff
+            )
+            # Fixed-window rows no longer participate in enforcement once they
+            # are outside the retention horizon. Prune them opportunistically
+            # under the same transaction so sustained diagnostic usage cannot
+            # grow this table without bound.
+            await session.execute(
+                delete(AdminBypassUsageRow).where(
+                    AdminBypassUsageRow.window_started_at < stored_retention_cutoff
+                )
+            )
+            values = {
+                "actor_account_id": context.account_id,
+                "operation_class": context.operation_class,
+                "window_started_at": stored_window,
+                "count": 1,
+                "updated_at": stored_now,
+            }
+            if dialect == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert
+
+                stmt = insert(AdminBypassUsageRow).values(**values)
+                stmt = stmt.on_conflict_do_update(
+                    constraint="uq_admin_bypass_usage_window",
+                    set_={
+                        "count": AdminBypassUsageRow.count + 1,
+                        "updated_at": stored_now,
+                    },
+                    where=AdminBypassUsageRow.count < limit,
+                ).returning(AdminBypassUsageRow.count)
+                consumed = (await session.execute(stmt)).scalar_one_or_none()
+            elif dialect == "sqlite":
+                from sqlalchemy.dialects.sqlite import insert
+
+                stmt = insert(AdminBypassUsageRow).values(**values)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[
+                        AdminBypassUsageRow.actor_account_id,
+                        AdminBypassUsageRow.operation_class,
+                        AdminBypassUsageRow.window_started_at,
+                    ],
+                    set_={
+                        "count": AdminBypassUsageRow.count + 1,
+                        "updated_at": stored_now,
+                    },
+                    where=AdminBypassUsageRow.count < limit,
+                ).returning(AdminBypassUsageRow.count)
+                consumed = (await session.execute(stmt)).scalar_one_or_none()
+            else:
+                row = (
+                    await session.execute(
+                        select(AdminBypassUsageRow)
+                        .where(
+                            AdminBypassUsageRow.actor_account_id == context.account_id,
+                            AdminBypassUsageRow.operation_class == context.operation_class,
+                            AdminBypassUsageRow.window_started_at == stored_window,
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if row is None:
+                    session.add(AdminBypassUsageRow(**values))
+                    consumed = 1
+                elif row.count < limit:
+                    row.count += 1
+                    consumed = row.count
+                else:
+                    consumed = None
+            await session.commit()
+        if consumed is None:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Admin {context.operation_class} waiver limit reached",
+            )
+        return window
+
+    async def _restore_admin_quota(
+        self,
+        context: AdminBypassContext,
+        window: datetime,
+    ) -> None:
+        """Compensate a consumed slot when its mandatory audit did not persist."""
+        assert self.session_factory is not None
+        async with self.session_factory() as session:
+            dialect = session.get_bind().dialect.name
+            stored_window = window.replace(tzinfo=None) if dialect == "sqlite" else window
+            now = datetime.now(UTC)
+            stored_now = now.replace(tzinfo=None) if dialect == "sqlite" else now
+            await session.execute(
+                update(AdminBypassUsageRow)
+                .where(
+                    AdminBypassUsageRow.actor_account_id == context.account_id,
+                    AdminBypassUsageRow.operation_class == context.operation_class,
+                    AdminBypassUsageRow.window_started_at == stored_window,
+                    AdminBypassUsageRow.count > 0,
+                )
+                .values(
+                    count=AdminBypassUsageRow.count - 1,
+                    updated_at=stored_now,
+                )
+            )
+            await session.commit()
+
+    async def _restore_admin_quota_after_failure(
+        self,
+        context: AdminBypassContext,
+        window: datetime,
+    ) -> None:
+        try:
+            await self._restore_admin_quota(context, window)
+        except Exception:
+            # Preserve the original required-audit failure while surfacing a
+            # compensation failure loudly for operator repair.
+            log.exception(
+                "admin_bypass_quota_restore_failed",
+                account_id=context.account_id,
+                operation_class=context.operation_class,
+            )
+
+    async def has_payment_credentials(self, request: Request) -> bool:
+        """True for an x402 signature, dev credential, or eligible Admin session."""
         if self._payment_header(request):
             return True
-        return bool(
+        if (
             self.config.dev_bypass_secret
             and request.headers.get("X-DEV-BYPASS") == self.config.dev_bypass_secret
-        )
+        ):
+            return True
+        return await self._admin_context(request) is not None
+
+    async def _apply_admin_bypass(
+        self,
+        request: Request,
+        amount: Decimal,
+        context: AdminBypassContext,
+        extra_body: dict[str, Any] | None,
+    ) -> str:
+        # The outer discovery middleware may have cached this context before
+        # FastAPI reads a slow request body. Re-read every security-bearing
+        # field immediately before consuming quota or granting the waiver so a
+        # revoked session, demotion, disable, CSRF rotation, or expired step-up
+        # cannot ride that stale authorization into provider work.
+        live_context = await self._admin_context(request, force_refresh=True)
+        if live_context is None or live_context != context:
+            raise HTTPException(status_code=403, detail="Admin waiver authorization expired")
+        context = live_context
+        quota_window = await self._consume_admin_quota(context)
+        tx_hash = f"admin_bypass_{secrets.token_hex(16)}"
+        payer = f"admin:{context.account_id}"
+        try:
+            await self._record_required(
+                "admin_bypass",
+                request,
+                amount,
+                network="admin-bypass",
+                payer=payer,
+                tx_hash=tx_hash,
+                actor_account_id=context.account_id,
+                extra={
+                    **(extra_body or {}),
+                    "operation_class": context.operation_class,
+                    "retail_amount_usd": str(amount),
+                },
+            )
+        except Exception:
+            await self._restore_admin_quota_after_failure(context, quota_window)
+            raise
+        request.state.payment_tx = tx_hash
+        request.state.payment_network = "admin-bypass"
+        request.state.payment_asset = None
+        request.state.payment_mode = "admin-bypass"
+        request.state.payment_response_headers = {ADMIN_PAYMENT_MODE_HEADER: "admin-bypass"}
+        return payer
 
     # Ledger writes are best-effort observability: a slow/exhausted payments
     # DB must never hold a settled response hostage. Writes that exceed this
     # bound are dropped with a warning.
     _LEDGER_WRITE_TIMEOUT_SECONDS = 2.0
+
+    async def _record_required(
+        self,
+        event_type: str,
+        request: Request,
+        amount: Decimal,
+        **kwargs: Any,
+    ) -> None:
+        """Persist a security-critical ledger event or fail closed."""
+        if self.ledger is None:
+            raise HTTPException(status_code=503, detail="Admin waiver audit unavailable")
+        try:
+            await asyncio.wait_for(
+                self.ledger.record(
+                    event_type=event_type,
+                    request=request,
+                    amount=amount,
+                    facilitator_host=self._facilitator_host,
+                    required=True,
+                    **kwargs,
+                ),
+                timeout=self._LEDGER_WRITE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            log.error("required_payment_ledger_write_failed", event_type=event_type, exc_info=True)
+            raise HTTPException(
+                status_code=503,
+                detail="Admin waiver audit unavailable",
+            ) from exc
 
     async def _record(self, event_type: str, request: Request, amount: Decimal, **kwargs: Any) -> None:
         """Bounded ledger write; no-op without a ledger, never raises."""
@@ -472,14 +787,17 @@ class PaymentGate:
                 return result
             wallet_address = result
         """
-        # Dev bypass for testing (never enable in production)
-        if self.config.dev_bypass_secret:
+        payment_header = self._payment_header(request)
+
+        # A real x402 signature always wins over every local waiver mode.
+        if not payment_header and self.config.dev_bypass_secret:
             bypass = request.headers.get("X-DEV-BYPASS")
             if bypass == self.config.dev_bypass_secret:
                 log.warning("dev_bypass_payment", amount=str(amount))
                 request.state.payment_tx = "dev_bypass_0x0"
                 request.state.payment_network = "dev-bypass"
                 request.state.payment_asset = "USDC"
+                request.state.payment_mode = "dev-bypass"
                 await self._record(
                     "dev_bypass",
                     request,
@@ -490,11 +808,15 @@ class PaymentGate:
                 )
                 return "0xDEV_TEST_WALLET"
 
+        if not payment_header:
+            admin_context = await self._admin_context(request)
+            if admin_context is not None:
+                return await self._apply_admin_bypass(request, amount, admin_context, extra_body)
+
         # Bazaar discovery declaration for this route (None when undeclared);
         # attached to every 402 so CDP indexes the endpoint at settlement.
         extensions = self._discovery_extensions(request)
 
-        payment_header = self._payment_header(request)
         if not payment_header:
             response = await self.build_402_response(
                 amount,
@@ -669,9 +991,11 @@ class PaymentGate:
         (402 challenge / 503 / 502) to return to the client otherwise. No money
         moves until ``settle_verified`` is called.
         """
+        payment_header = self._payment_header(request)
+
         # Dev bypass for testing (never enable in production). Settlement is
         # deferred to settle_verified so a failed delivery isn't recorded.
-        if self.config.dev_bypass_secret:
+        if not payment_header and self.config.dev_bypass_secret:
             bypass = request.headers.get("X-DEV-BYPASS")
             if bypass == self.config.dev_bypass_secret:
                 log.warning("dev_bypass_payment", amount=str(amount))
@@ -679,8 +1003,22 @@ class PaymentGate:
                     payer="0xDEV_TEST_WALLET", amount=amount, dev_bypass=True
                 )
 
+        if not payment_header:
+            admin_context = await self._admin_context(request)
+            if admin_context is not None:
+                payer = await self._apply_admin_bypass(
+                    request,
+                    amount,
+                    admin_context,
+                    extra_body,
+                )
+                return VerifiedPayment(
+                    payer=payer,
+                    amount=amount,
+                    admin_bypass=True,
+                )
+
         extensions = self._discovery_extensions(request)
-        payment_header = self._payment_header(request)
         if not payment_header:
             response = await self.build_402_response(
                 amount,
@@ -794,6 +1132,9 @@ class PaymentGate:
         """
         if verified.dev_bypass:
             request.state.payment_tx = "dev_bypass_0x0"
+            request.state.payment_network = "dev-bypass"
+            request.state.payment_asset = "USDC"
+            request.state.payment_mode = "dev-bypass"
             await self._record(
                 "dev_bypass",
                 request,
@@ -801,6 +1142,13 @@ class PaymentGate:
                 payer="0xDEV_TEST_WALLET",
                 tx_hash="dev_bypass_0x0",
             )
+            return True
+
+        if verified.admin_bypass:
+            # Unlike a real x402 authorization, an Admin waiver has no money to
+            # settle after delivery. verify_only already persisted its required
+            # audit event and attached the payment metadata before returning the
+            # handle, so the real-cost proxy request can never run unaudited.
             return True
 
         try:
