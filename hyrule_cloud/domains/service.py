@@ -104,6 +104,7 @@ from hyrule_cloud.services.intents import IntentExistsError, create_intent
 from hyrule_cloud.services.quotes import link_quote_vm
 
 log = structlog.get_logger()
+_PAYMENT_RECOVERY_RETRY_DELAY = timedelta(seconds=30)
 
 
 def _now() -> datetime:
@@ -892,6 +893,7 @@ class DomainService:
                 order.payment_authorization_fingerprint = None
                 order.payment_authorization_header = None
                 order.payment_settlement_pending_at = None
+                order.payment_recovery_next_attempt_at = None
                 await session.commit()
 
     async def fail_x402_settlement(self, order_id: str, *, reason: str) -> None:
@@ -917,6 +919,7 @@ class DomainService:
             order.payment_authorization_fingerprint = None
             order.payment_authorization_header = None
             order.payment_settlement_pending_at = None
+            order.payment_recovery_next_attempt_at = None
             await self._expire_unpaid_order(session, order, now=_now())
             order.error_code = f"payment_authorization_{reason}"[:64]
             quote = await session.get(DomainQuoteRow, order.quote_id)
@@ -957,9 +960,25 @@ class DomainService:
             order.payment_asset = payment_asset
             order.payment_authorization_header = None
             order.payment_settlement_pending_at = None
+            order.payment_recovery_next_attempt_at = None
             order.paid_at = order.paid_at or _now()
             await session.commit()
             return order
+
+    async def _defer_x402_recovery(self, order_id: str) -> None:
+        """Rotate an inconclusive authorization behind untouched domain orders."""
+
+        async with self.db() as session:
+            order = await session.get(DomainOrderRow, order_id)
+            if (
+                order is None
+                or order.status != DomainOrderStatus.AWAITING_PAYMENT.value
+                or order.paid_at is not None
+                or not order.payment_authorization_header
+            ):
+                return
+            order.payment_recovery_next_attempt_at = _now() + _PAYMENT_RECOVERY_RETRY_DELAY
+            await session.commit()
 
     async def mark_x402_paid(
         self,
@@ -1737,6 +1756,7 @@ class DomainService:
             return 0
         recovered = 0
         seen: set[str] = set()
+        now = _now()
         if gate is not None:
             async with self.db() as session:
                 pending = list(
@@ -1748,8 +1768,16 @@ class DomainService:
                             DomainOrderRow.payment_settlement_pending_at.is_not(None),
                             DomainOrderRow.paid_at.is_(None),
                             DomainOrderRow.payment_authorization_header.is_not(None),
+                            or_(
+                                DomainOrderRow.payment_recovery_next_attempt_at.is_(None),
+                                DomainOrderRow.payment_recovery_next_attempt_at <= now,
+                            ),
                         )
-                        .order_by(DomainOrderRow.payment_settlement_pending_at)
+                        .order_by(
+                            DomainOrderRow.payment_recovery_next_attempt_at.is_not(None),
+                            DomainOrderRow.payment_recovery_next_attempt_at,
+                            DomainOrderRow.payment_settlement_pending_at,
+                        )
                         .limit(limit)
                     )
                 )
@@ -1793,6 +1821,7 @@ class DomainService:
                         continue
                     settlement = reconciliation.payment
                     if settlement is None:
+                        await self._defer_x402_recovery(pending_order.order_id)
                         continue
                     await self.record_x402_settlement(
                         pending_order.order_id,
@@ -1802,6 +1831,7 @@ class DomainService:
                         payment_asset=settlement.asset,
                     )
                 except Exception:
+                    await self._defer_x402_recovery(pending_order.order_id)
                     log.warning(
                         "domain_payment_authorization_reconciliation_deferred",
                         order_id=pending_order.order_id,

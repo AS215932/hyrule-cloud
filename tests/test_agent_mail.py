@@ -269,6 +269,8 @@ def test_agent_mail_review_safety_schema_contracts():
     assert MailSendRow.__table__.c.payment_settled_at.index is True
     assert MailSendRow.__table__.c.payment_authorization_header.type.length is None
     assert MailSendRow.__table__.c.payment_settlement_pending_at.nullable is True
+    assert MailSendRow.__table__.c.payment_recovery_next_attempt_at.index is True
+    assert DomainOrderRow.__table__.c.payment_recovery_next_attempt_at.index is True
     assert isinstance(MailSendRow.__table__.c.in_reply_to.type, Text)
     assert MailAccountRow.__table__.c.domain_authority_hash.type.length == 64
     assert [column.name for column in MailMessageIndexRow.__table__.primary_key.columns] == [
@@ -283,6 +285,16 @@ def test_send_reservation_serializes_the_global_capacity_check():
 
     assert lock in source
     assert source.index(lock) < source.index("global_count =")
+
+
+def test_activation_expiry_locks_account_before_tombstoning():
+    source = inspect.getsource(MailService.expire_quotes)
+    account_select = source.index("select(MailAccountRow)")
+    account_lock = source.index(".with_for_update()", account_select)
+    refresh = source.index("await session.refresh(row)", account_lock)
+    settlement_check = source.index("account.payment_settlement_pending_at", refresh)
+
+    assert account_select < account_lock < refresh < settlement_check
 
 
 def test_payment_fingerprint_uses_canonical_signed_payload_fields():
@@ -1827,6 +1839,53 @@ async def test_settlement_replay_preserves_provisioning_backoff(mail_service):
 
 
 @pytest.mark.asyncio
+async def test_settlement_replay_preserves_activation_handoff_backoff(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="settlement-handoff-replay",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    account, _token, _created = await service.prepare_activation(
+        quote.quote_id,
+        idempotency_key="settlement-handoff-replay-idempotency-0001",
+    )
+    settlement = {
+        "payer": "0x" + "8" * 40,
+        "tx_hash": "0xsettlement-handoff-replay",
+        "payment_network": "eip155:8453",
+        "payment_asset": "USDC",
+    }
+    await service.record_activation_settlement(
+        account.mailbox_id,
+        quote.quote_id,
+        **settlement,
+    )
+    retry_at = datetime.now(UTC) + timedelta(seconds=30)
+    async with sessions() as session:
+        awaiting = await session.get(MailAccountRow, account.mailbox_id)
+        awaiting.provision_next_attempt_at = retry_at
+        await session.commit()
+
+    await service.record_activation_settlement(
+        account.mailbox_id,
+        quote.quote_id,
+        **settlement,
+    )
+
+    async with sessions() as session:
+        replayed = await session.get(MailAccountRow, account.mailbox_id)
+    assert replayed.status == MailboxStatus.AWAITING_PAYMENT.value
+    assert replayed.provision_next_attempt_at is not None
+    preserved_retry = replayed.provision_next_attempt_at.replace(
+        tzinfo=replayed.provision_next_attempt_at.tzinfo or UTC
+    )
+    assert preserved_retry == retry_at
+
+
+@pytest.mark.asyncio
 async def test_durable_activation_settlement_recovers_without_metrics_ledger(
     mail_service, monkeypatch
 ):
@@ -2930,6 +2989,77 @@ async def test_stored_authorization_recovers_send_payment_without_metrics_ledger
     assert recovered.payment_authorization_header is None
     assert recovered.payment_settlement_pending_at is None
     assert recovered.payment_settled_at is not None
+
+
+@pytest.mark.asyncio
+async def test_inconclusive_send_recovery_rotates_to_untouched_send(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    service.mail_config.mailbox_send_limit_per_day = 10
+    service.mail_config.global_send_limit_per_day = 10
+    mailbox_id, token = await _active_hosted(
+        service,
+        local_part="send-payment-rotation",
+        idempotency_key="send-payment-rotation-idempotency-0001",
+    )
+
+    async def accepted_send(recipient: str, authorization: str):
+        quote = await service.create_send_quote(
+            MailSendQuoteRequest(
+                mailbox_id=mailbox_id,
+                to=recipient,
+                subject=f"Recover {recipient}",
+                text="Rotate inconclusive authorizations fairly.",
+            ),
+            token,
+        )
+        sent = await service.deliver_send(quote.quote_id, token)
+        await service.begin_send_settlement(
+            sent.send_id,
+            quote.quote_id,
+            payer="0x" + "4" * 40,
+            payment_network="eip155:8453",
+            payment_asset="USDC",
+            payment_authorization=authorization,
+        )
+        return sent, quote
+
+    first, _first_quote = await accepted_send(
+        "first-recovery@example.net", "first-send-authorization"
+    )
+    second, second_quote = await accepted_send(
+        "second-recovery@example.net", "second-send-authorization"
+    )
+    attempted: list[str] = []
+
+    class _RecoveryGate:
+        async def reconcile_settlement(self, header, _amount, **_kwargs):
+            attempted.append(header)
+            if header == "first-send-authorization":
+                return PaymentReconciliation()
+            return PaymentReconciliation(
+                payment=RecoveredPayment(
+                    payer="0x" + "4" * 40,
+                    tx_hash="0xsecond-send-recovered",
+                    network="eip155:8453",
+                    asset="USDC",
+                )
+            )
+
+    gate = _RecoveryGate()
+    assert await service.recover_x402_handoffs(gate=gate, limit=1) == 0
+    async with sessions() as session:
+        deferred = await session.get(MailSendRow, first.send_id)
+        assert deferred.payment_recovery_next_attempt_at is not None
+        deferred.payment_recovery_next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    assert await service.recover_x402_handoffs(gate=gate, limit=1) == 1
+    async with sessions() as session:
+        untouched = await session.get(MailSendRow, second.send_id)
+    assert attempted == ["first-send-authorization", "second-send-authorization"]
+    assert untouched.quote_id == second_quote.quote_id
+    assert untouched.payment_tx == "0xsecond-send-recovered"
+    assert untouched.payment_recovery_next_attempt_at is None
 
 
 @pytest.mark.asyncio

@@ -820,7 +820,7 @@ class MailService:
                     "mail_activation_closed",
                     "This mailbox activation is no longer awaiting payment.",
                 )
-            awaiting_handoff = row.status == MailboxStatus.AWAITING_PAYMENT.value
+            first_settlement = row.payment_settled_at is None
             row.owner_wallet = payer[:64]
             row.payment_tx = tx_hash
             row.payment_network = payment_network
@@ -828,7 +828,7 @@ class MailService:
             row.payment_authorization_header = None
             row.payment_settlement_pending_at = None
             row.payment_settled_at = row.payment_settled_at or _now()
-            if awaiting_handoff:
+            if first_settlement:
                 row.provision_next_attempt_at = None
             await session.commit()
             return row
@@ -1118,6 +1118,7 @@ class MailService:
             send.payment_tx = settlement.tx_hash
             send.payment_authorization_header = None
             send.payment_settlement_pending_at = None
+            send.payment_recovery_next_attempt_at = None
             send.payment_settled_at = send.payment_settled_at or _now()
             await session.commit()
             return self._send_response(send)
@@ -1543,6 +1544,7 @@ class MailService:
                 row.payment_asset = None
                 row.payment_authorization_header = None
                 row.payment_settlement_pending_at = None
+                row.payment_recovery_next_attempt_at = None
                 await session.execute(
                     delete(MailPaymentAuthorizationRow).where(
                         MailPaymentAuthorizationRow.quote_id == quote_id
@@ -1571,6 +1573,7 @@ class MailService:
             row.payment_asset = None
             row.payment_authorization_header = None
             row.payment_settlement_pending_at = None
+            row.payment_recovery_next_attempt_at = None
             row.error = f"payment_authorization_{reason}_retryable"[:2000]
             await session.execute(
                 delete(MailPaymentAuthorizationRow).where(
@@ -1617,10 +1620,26 @@ class MailService:
             row.payment_tx = tx_hash
             row.payment_authorization_header = None
             row.payment_settlement_pending_at = None
+            row.payment_recovery_next_attempt_at = None
             row.payment_settled_at = row.payment_settled_at or _now()
             row.error = None
             await session.commit()
             return self._send_response(row)
+
+    async def _defer_send_settlement_recovery(self, send_id: str) -> None:
+        """Rotate an inconclusive authorization behind untouched accepted sends."""
+
+        async with self.db() as session:
+            row = await session.get(MailSendRow, send_id)
+            if (
+                row is None
+                or row.status != "accepted"
+                or row.payment_settled_at is not None
+                or not row.payment_authorization_header
+            ):
+                return
+            row.payment_recovery_next_attempt_at = _now() + _PAYMENT_HANDOFF_RETRY_DELAY
+            await session.commit()
 
     async def list_messages(
         self, mailbox_id: str, token: str, *, limit: int = 50
@@ -2328,8 +2347,23 @@ class MailService:
                     result += 1
                     continue
                 account = await session.scalar(
-                    select(MailAccountRow).where(MailAccountRow.quote_id == row.quote_id)
+                    select(MailAccountRow)
+                    .where(MailAccountRow.quote_id == row.quote_id)
+                    .with_for_update()
                 )
+                if account is not None:
+                    # The account lock serializes tombstoning with settlement
+                    # intent/record writes. Refresh the quote after waiting so
+                    # a concurrent successful handoff cannot be expired using
+                    # the stale outer-query snapshot.
+                    await session.refresh(row)
+                    refreshed_expires_at = _aware(row.expires_at)
+                    if (
+                        row.status not in [MailQuoteStatus.ACTIVE.value, "reserved"]
+                        or refreshed_expires_at is None
+                        or refreshed_expires_at > now
+                    ):
+                        continue
                 if account is None or account.status == MailboxStatus.AWAITING_PAYMENT.value:
                     expires_at = _aware(row.expires_at)
                     if account is not None and (
@@ -2400,8 +2434,16 @@ class MailService:
                             MailSendRow.payment_settlement_pending_at.is_not(None),
                             MailSendRow.payment_settled_at.is_(None),
                             MailSendRow.payment_authorization_header.is_not(None),
+                            or_(
+                                MailSendRow.payment_recovery_next_attempt_at.is_(None),
+                                MailSendRow.payment_recovery_next_attempt_at <= now,
+                            ),
                         )
-                        .order_by(MailSendRow.payment_settlement_pending_at)
+                        .order_by(
+                            MailSendRow.payment_recovery_next_attempt_at.is_not(None),
+                            MailSendRow.payment_recovery_next_attempt_at,
+                            MailSendRow.payment_settlement_pending_at,
+                        )
                         .limit(limit)
                     )
                 )
@@ -2427,6 +2469,7 @@ class MailService:
                         continue
                     send_payment = send_reconciliation.payment
                     if send_payment is None:
+                        await self._defer_send_settlement_recovery(pending_send.send_id)
                         continue
                     await self.record_send_settlement(
                         pending_send.send_id,
@@ -2438,6 +2481,7 @@ class MailService:
                     )
                     recovered += 1
                 except Exception:
+                    await self._defer_send_settlement_recovery(pending_send.send_id)
                     log.warning(
                         "mail_send_payment_authorization_reconciliation_deferred",
                         send_id=pending_send.send_id,

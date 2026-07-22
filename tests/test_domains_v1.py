@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1827,6 +1828,74 @@ async def test_stored_authorization_recovers_domain_payment_without_metrics_ledg
     assert recovered.payment_authorization_header is None
     assert recovered.payment_authorization_fingerprint == "a" * 64
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_inconclusive_domain_recovery_rotates_to_untouched_order(domain_service):
+    service, _provider, sessions = domain_service
+
+    async def pending_order(fqdn: str, idempotency_key: str, authorization: str):
+        quote = await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890")
+        order, _created = await service.create_order(
+            DomainOrderRequest(
+                quote_id=quote.quote_id,
+                payment_method=DomainPaymentMethod.USDC,
+                terms_version=service.domain_config.terms_version,
+            ),
+            owner_account_id="H1234567890",
+            idempotency_key=idempotency_key,
+        )
+        await service.begin_x402_settlement(
+            order.order_id,
+            payer="0x" + "4" * 40,
+            payment_network="eip155:8453",
+            payment_asset="USDC",
+            payment_authorization_fingerprint=hashlib.sha256(authorization.encode()).hexdigest(),
+            payment_authorization=authorization,
+        )
+        return order
+
+    first = await pending_order(
+        "first-domain-recovery.dev",
+        "first-domain-recovery",
+        "first-domain-authorization",
+    )
+    second = await pending_order(
+        "second-domain-recovery.dev",
+        "second-domain-recovery",
+        "second-domain-authorization",
+    )
+    attempted: list[str] = []
+
+    class _RecoveryGate:
+        async def reconcile_settlement(self, header, _amount, **_kwargs):
+            attempted.append(header)
+            if header == "first-domain-authorization":
+                return PaymentReconciliation()
+            return PaymentReconciliation(
+                payment=RecoveredPayment(
+                    payer="0x" + "4" * 40,
+                    tx_hash="0xsecond-domain-recovered",
+                    network="eip155:8453",
+                    asset="USDC",
+                )
+            )
+
+    gate = _RecoveryGate()
+    assert await service.recover_x402_handoffs(gate=gate, limit=1) == 0
+    async with sessions() as session:
+        deferred = await session.get(DomainOrderRow, first.order_id)
+        assert deferred.payment_recovery_next_attempt_at is not None
+        deferred.payment_recovery_next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    assert await service.recover_x402_handoffs(gate=gate, limit=1) == 1
+    async with sessions() as session:
+        recovered = await session.get(DomainOrderRow, second.order_id)
+    assert attempted == ["first-domain-authorization", "second-domain-authorization"]
+    assert recovered.status == DomainOrderStatus.QUEUED.value
+    assert recovered.payment_tx == "0xsecond-domain-recovered"
+    assert recovered.payment_recovery_next_attempt_at is None
 
 
 @pytest.mark.asyncio

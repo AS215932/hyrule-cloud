@@ -312,6 +312,9 @@ class DomainOrderRow(Base):
     payer: Mapped[str | None] = mapped_column(String(128))
     payment_tx: Mapped[str | None] = mapped_column(String(128), index=True)
     payment_settlement_pending_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_recovery_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
     payment_authorization_fingerprint: Mapped[str | None] = mapped_column(String(64))
     payment_authorization_header: Mapped[str | None] = mapped_column(Text)
     refund_address: Mapped[str | None] = mapped_column(String(128))
@@ -998,6 +1001,9 @@ class MailSendRow(Base):
     payment_tx: Mapped[str | None] = mapped_column(String(128))
     payment_authorization_header: Mapped[str | None] = mapped_column(Text)
     payment_settlement_pending_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_recovery_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
     payment_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     error: Mapped[str | None] = mapped_column(Text)
     submission_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
