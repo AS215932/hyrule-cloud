@@ -379,12 +379,19 @@ async def _verify_and_cleanup_tunnel(create_resp: httpx.Response) -> bool:
     ssh_command = str(data.get("ssh_command", "")).replace(token, "<redacted-token>")
     print(f"    ssh: {ssh_command}")
     async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
-        status = await http.get(f"/v1/tunnel/{tunnel_id}/status", headers={"X-Tunnel-Token": token})
-        status_ok = status.status_code == 200
-        print(f"    status: HTTP {status.status_code} (owner-token gated)")
-        rev = await http.delete(f"/v1/tunnel/{tunnel_id}", headers={"X-Tunnel-Token": token})
-        revoke_ok = rev.status_code in (200, 404)
-        print(f"    cleanup revoke: HTTP {rev.status_code}")
+        status_ok = False
+        try:
+            # Status is best-effort verification; a failure here must NOT skip the
+            # cleanup revoke below, or a paid tunnel leaks for the rest of its lease.
+            status = await http.get(f"/v1/tunnel/{tunnel_id}/status", headers={"X-Tunnel-Token": token})
+            status_ok = status.status_code == 200
+            print(f"    status: HTTP {status.status_code} (owner-token gated)")
+        except Exception as e:
+            print(f"    status check failed (continuing to cleanup): {e!r}")
+        finally:
+            rev = await http.delete(f"/v1/tunnel/{tunnel_id}", headers={"X-Tunnel-Token": token})
+            revoke_ok = rev.status_code in (200, 404)
+            print(f"    cleanup revoke: HTTP {rev.status_code}")
     if not revoke_ok:
         # A failed cleanup leaves a paid tunnel live with its printed token; fail
         # the canary so automation notices and remediates the leaked lease.

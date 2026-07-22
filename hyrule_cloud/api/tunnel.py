@@ -308,13 +308,13 @@ async def extend_tunnel(tunnel_id: str, body: TunnelExtendRequest, request: Requ
 async def _extend_failed_after_payment(
     request: Request, gate: Any, tunnel_id: str, amount: Any, payer: str | None, status: int
 ) -> HTTPException:
-    """Record a refund for a paid extension the daemon couldn't deliver, and
-    build an HTTPException whose message reflects whether the refund obligation
-    was durably recorded (so we never falsely claim a refund was recorded)."""
-    recorded = await _record_extend_refund(request, gate, tunnel_id, amount, payer)
-    if recorded:
-        return HTTPException(status, "extend failed after payment; a refund has been recorded")
-    log.critical("tunnel_extend_refund_not_recorded", tunnel_id=tunnel_id, amount=str(amount), payer=payer)
+    """Flag a refund for a paid extension the daemon couldn't deliver. The refund
+    ledger write is itself best-effort (it swallows DB errors), so we never claim
+    the refund was durably 'recorded' — we always CRITICAL-log the obligation so
+    an operator/reconciler can pick it up, and tell the customer a refund is owed
+    and has been logged, not that it succeeded."""
+    await _record_extend_refund(request, gate, tunnel_id, amount, payer)
+    log.critical("tunnel_extend_refund_owed", tunnel_id=tunnel_id, amount=str(amount), payer=payer)
     return HTTPException(status, "extend failed after payment; a refund is owed and has been logged for manual processing")
 
 

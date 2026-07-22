@@ -125,8 +125,13 @@ class TunnelService:
         except IntegrityError:
             # Another replica committed first with the same idempotency key
             # (unique). Free our just-allocated daemon lease and tell the caller
-            # to recover the winning row instead of provisioning a duplicate.
-            await self.provider.revoke_lease(tunnel_id)
+            # to recover the winning row instead of provisioning a duplicate. If
+            # the revoke doesn't confirm, persist a provisional marker (no
+            # idempotency_key, so it doesn't re-conflict) so the sweep retries.
+            if not await self.provider.revoke_lease(tunnel_id):
+                await self._persist_provisional_marker(
+                    tunnel_id, lease, owner_wallet, owner_account_id, allowlist_cidrs, hours
+                )
             raise TunnelIdempotencyConflictError from None
         except Exception:
             # The daemon already allocated a port; a persistence failure would
@@ -216,15 +221,25 @@ class TunnelService:
         Raises TunnelDaemonError if the daemon extend fails (before any DB write).
         """
         lease = await self.provider.extend_lease(tunnel_id, hours * 3600)
+        new_expiry = _parse_ts(lease.expires_at, default=_now() + timedelta(hours=hours))
         for attempt in range(5):
             try:
                 async with self.session_factory() as session:
-                    row = await session.get(ReverseTunnelRow, tunnel_id)
-                    if row is None:
+                    if await session.get(ReverseTunnelRow, tunnel_id) is None:
                         return None
-                    row.expires_at = _parse_ts(lease.expires_at, default=row.expires_at)
+                    # Monotonic: only advance the expiry. Two concurrent extends
+                    # whose commits land out of order can't regress it (the older
+                    # value's UPDATE no-ops because expires_at is already later).
+                    await session.execute(
+                        update(ReverseTunnelRow)
+                        .where(
+                            ReverseTunnelRow.tunnel_id == tunnel_id,
+                            ReverseTunnelRow.expires_at < new_expiry,
+                        )
+                        .values(expires_at=new_expiry)
+                    )
                     await session.commit()
-                    await session.refresh(row)
+                    row = await session.get(ReverseTunnelRow, tunnel_id)
                     return row
             except Exception:
                 log.warning("tunnel_extend_persist_retry", tunnel_id=tunnel_id, attempt=attempt)
@@ -241,9 +256,16 @@ class TunnelService:
         return await self.provider.get_lease(tunnel_id)
 
     async def sweep_expiries(self) -> int:
-        """Reap tunnels past expiry + grace AND provisioned-but-unsettled tunnels
-        that lingered past the provisional TTL (a crash/restart between provision
-        and settle would otherwise pin a scarce port for the full lease).
+        """Reap tunnels past expiry + grace, AND explicit 'provisioning' cleanup
+        markers past the provisional TTL (a tokenless/loser lease whose immediate
+        daemon revoke failed).
+
+        The fast provisional reap targets only status=='provisioning' markers, NOT
+        unsettled 'active' rows: a lease that settled but whose payment_tx stamp
+        failed to persist stays 'active', so it is never reaped early — only at
+        its legitimate expiry. (A normal create that crashed before settle is
+        'active' too; it is reaped at expiry, and is self-healing meanwhile via
+        the idempotent-create retry.)
 
         The row is deleted only after the daemon confirms teardown; if the daemon
         is unreachable the row is kept and retried on the next sweep, so a
@@ -258,7 +280,7 @@ class TunnelService:
                     select(ReverseTunnelRow.tunnel_id).where(
                         (ReverseTunnelRow.expires_at < expiry_cutoff)
                         | (
-                            (ReverseTunnelRow.payment_tx.is_(None))
+                            (ReverseTunnelRow.status == "provisioning")
                             & (ReverseTunnelRow.created_at < provisional_cutoff)
                         )
                     )

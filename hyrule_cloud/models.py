@@ -494,6 +494,10 @@ class TunnelCreateRequest(BaseModel):
         # dropped (which would leave the port open to everyone).
         if value is None:
             return None
+        if len(value) == 0:
+            # An explicit empty list is ambiguous (deny-all vs the "omit to allow
+            # all" contract) — reject it so it can't be silently treated as open.
+            raise ValueError("allowlist_cidrs must be non-empty; omit the field to allow all visitors")
         for entry in value:
             try:
                 ipaddress.ip_network(entry, strict=False)

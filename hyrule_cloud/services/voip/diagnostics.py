@@ -48,10 +48,10 @@ def _stun_host_valid() -> bool:
     from hyrule_cloud.services.voip.stun_probe import split_host_port
 
     try:
-        _, port = split_host_port(host)
+        hostname, port = split_host_port(host)
     except (ValueError, OverflowError):
         return False
-    return 1 <= port <= 65535
+    return bool(hostname) and 1 <= port <= 65535
 
 
 def voip_sources() -> dict[str, SourceHealth]:

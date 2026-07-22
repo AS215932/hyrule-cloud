@@ -183,6 +183,20 @@ async def test_sweep_reaps_expired_past_grace(session_factory):
 
 
 @pytest.mark.asyncio
+async def test_extend_is_monotonic(session_factory):
+    # A later extend then a "stale" shorter one must not regress the stored expiry.
+    provider = FakeTunnelProvider()
+    svc = TunnelService(_config(), session_factory, provider)
+    tid = new_tunnel_id()
+    await svc.provision(tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None, idempotency_key=None)
+    await svc.extend(tid, 5)
+    long_expiry = (await svc.get(tid)).expires_at
+    # The fake returns now+duration, so a 1h extend is EARLIER than the 5h one.
+    await svc.extend(tid, 1)
+    assert (await svc.get(tid)).expires_at == long_expiry  # not regressed
+
+
+@pytest.mark.asyncio
 async def test_sweep_keeps_live_lease(session_factory):
     provider = FakeTunnelProvider()
     svc = TunnelService(_config(), session_factory, provider)
@@ -478,6 +492,21 @@ async def test_create_is_idempotent_on_payment_auth(wired):
     assert len(provider.leases) == 1
     # The replay carries the original settlement proof so an x402 client accepts it.
     assert second.headers.get("X-PAYMENT-RESPONSE") == "proof"
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_empty_allowlist(wired):
+    client, _state, provider, gate = wired
+    # An explicit empty allowlist is rejected (422) before any payment, never
+    # silently treated as open.
+    r = await client.post(
+        "/v1/tunnel/create",
+        json={"hours": 1, "allowlist_cidrs": []},
+        headers={"X-Mock-Wallet": "0xabc"},
+    )
+    assert r.status_code == 422
+    assert gate.verified == 0
+    assert provider.leases == {}
 
 
 @pytest.mark.asyncio
