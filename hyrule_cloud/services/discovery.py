@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
-from cryptography.fernet import Fernet
 from fastapi.openapi.utils import get_openapi
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ValidationError
@@ -938,27 +937,7 @@ def _gate_enabled(gate: str) -> bool:
     if gate == "mail":
         return HyruleConfig().mail.public_ready
     if gate == "agent_domains":
-        config = HyruleConfig()
-        provider = config.openprovider
-        try:
-            Fernet(config.domain.agent_order_fernet_key.encode())
-        except (TypeError, ValueError):
-            return False
-        return bool(
-            config.domain.enabled
-            and config.domain.agent_purchases_enabled
-            and config.domain.legal_approved
-            and config.domain.tax_approved
-            and config.domain.dns_control_url
-            and config.domain.dns_control_secret
-            and config.domain.agent_order_fernet_key
-            and provider.username
-            and provider.password
-            and provider.owner_handle
-            and provider.admin_handle
-            and provider.tech_handle
-            and provider.billing_handle
-        )
+        return HyruleConfig().agent_domain_purchases_ready
     if gate in {"path_probe", "path_report"}:
         from hyrule_cloud.services.path.diagnostics import path_active_probe_enabled
 

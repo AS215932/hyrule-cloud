@@ -35,7 +35,7 @@ from hyrule_cloud.db import (
     PaymentEventRow,
 )
 from hyrule_cloud.domains.errors import DomainProblem
-from hyrule_cloud.domains.models import DomainAction, DomainOrderStatus
+from hyrule_cloud.domains.models import DomainAction, DomainOrderStatus, NameserverMode
 from hyrule_cloud.domains.service import DomainService
 from hyrule_cloud.mail.backend import (
     MailAttachmentTooLargeError,
@@ -215,7 +215,7 @@ class MailService:
                         f"{self.mail_config.active_days} days; "
                         "live domain quote plus activation; no auto-renew"
                     ),
-                    available=custom_ready and self.config.domain.agent_purchases_enabled,
+                    available=custom_ready and self.config.agent_domain_purchases_ready,
                     constraints=constraints,
                 ),
             ],
@@ -770,7 +770,16 @@ class MailService:
             quote = await session.get(MailQuoteRow, quote_id)
             if quote is not None:
                 quote.status = MailQuoteStatus.EXPIRED.value
-                quote.request_payload = {"redacted": True}
+                payload = dict(quote.request_payload or {})
+                quote.request_payload = {
+                    "redacted": True,
+                    "mode": payload.get("mode", row.plan),
+                    "activation_amount_usd": str(
+                        payload.get("activation_amount_usd")
+                        or row.activation_amount_usd
+                        or quote.amount_usd
+                    ),
+                }
             await session.commit()
 
     async def record_activation_settlement(
@@ -1033,8 +1042,6 @@ class MailService:
             if send is None or send.status != "accepted":
                 return None
             if send.payment_settled_at is not None or send.payment_tx:
-                return self._send_response(send)
-            if (send.error or "").startswith("payment_authorization_"):
                 return self._send_response(send)
             settlement = await session.scalar(
                 select(PaymentEventRow)
@@ -1516,7 +1523,12 @@ class MailService:
             row.payment_asset = None
             row.payment_authorization_header = None
             row.payment_settlement_pending_at = None
-            row.error = f"payment_authorization_{reason}"[:2000]
+            row.error = f"payment_authorization_{reason}_retryable"[:2000]
+            await session.execute(
+                delete(MailPaymentAuthorizationRow).where(
+                    MailPaymentAuthorizationRow.quote_id == quote_id
+                )
+            )
             await session.commit()
 
     async def record_send_settlement(
@@ -1961,15 +1973,31 @@ class MailService:
         if limit < 1:
             return 0
         now = _now()
+        actionable_domain_statuses = {
+            DomainOrderStatus.ACTIVE.value,
+            DomainOrderStatus.FAILED.value,
+            DomainOrderStatus.REFUND_DUE.value,
+            DomainOrderStatus.CANCELLED.value,
+            DomainOrderStatus.EXPIRED.value,
+        }
         async with self.db() as session:
             pending_domains = list(
                 await session.scalars(
                     select(MailAccountRow)
+                    .outerjoin(
+                        DomainOrderRow,
+                        DomainOrderRow.order_id == MailAccountRow.domain_order_id,
+                    )
                     .where(
                         MailAccountRow.status == MailboxStatus.PENDING_DOMAIN.value,
                         or_(
                             MailAccountRow.provision_next_attempt_at.is_(None),
                             MailAccountRow.provision_next_attempt_at <= now,
+                        ),
+                        or_(
+                            MailAccountRow.domain_order_id.is_(None),
+                            DomainOrderRow.order_id.is_(None),
+                            DomainOrderRow.status.in_(actionable_domain_statuses),
                         ),
                     )
                     .order_by(MailAccountRow.created_at)
@@ -2970,6 +2998,7 @@ class MailService:
         if (
             row is None
             or str(row.status) not in {DomainStatus.ACTIVE.value, DomainStatus.RENEWAL_DUE.value}
+            or row.nameserver_mode != NameserverMode.MANAGED.value
             or not row.anon_management_token_hash
             or not secrets.compare_digest(row.anon_management_token_hash, hash_token(token))
         ):
@@ -2984,6 +3013,7 @@ class MailService:
         return bool(
             row is not None
             and str(row.status) in {DomainStatus.ACTIVE.value, DomainStatus.RENEWAL_DUE.value}
+            and row.nameserver_mode == NameserverMode.MANAGED.value
             and expected_hash
             and row.anon_management_token_hash
             and secrets.compare_digest(row.anon_management_token_hash, expected_hash)
@@ -3124,8 +3154,9 @@ class MailService:
     def _quote_response(self, row: MailQuoteRow) -> MailQuoteResponse:
         payload = dict(row.request_payload)
         if row.kind == "activation":
-            mode = MailboxMode(payload["mode"])
-            activation_amount = Decimal(str(payload["activation_amount_usd"]))
+            raw_mode = payload.get("mode")
+            mode = MailboxMode(raw_mode) if raw_mode else None
+            activation_amount = Decimal(str(payload.get("activation_amount_usd", row.amount_usd)))
             domain_amount = Decimal(row.amount_usd) - activation_amount
             path = "/v1/mail/accounts"
             outbound_amount = Decimal("0")

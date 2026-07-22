@@ -45,7 +45,7 @@ from hyrule_cloud.db import (
     create_db_engine,
     create_session_factory,
 )
-from hyrule_cloud.domains.models import DomainOrderStatus
+from hyrule_cloud.domains.models import DomainOrderStatus, NameserverMode
 from hyrule_cloud.mail.backend import (
     MailAttachmentTooLargeError,
     MailBackendError,
@@ -436,8 +436,30 @@ def test_custom_mail_catalog_does_not_depend_on_domain_sales(mail_service):
     assert products["agent-mail-domain-bundle"].available is False
 
 
+def test_domain_bundle_catalog_requires_complete_agent_checkout(mail_service):
+    service, _sessions, _backend, _domains, _refunds = mail_service
+
+    incomplete = {product.id: product for product in service.products().products}
+    assert incomplete["agent-mail-domain-bundle"].available is False
+
+    service.config.domain.legal_approved = True
+    service.config.domain.tax_approved = True
+    service.config.domain.dns_control_url = "https://dns.internal"
+    service.config.domain.dns_control_secret = "dns-control-secret"
+    service.config.domain.agent_order_fernet_key = Fernet.generate_key().decode()
+    service.config.openprovider.username = "operator"
+    service.config.openprovider.password = "password"
+    service.config.openprovider.owner_handle = "owner"
+    service.config.openprovider.admin_handle = "admin"
+    service.config.openprovider.tech_handle = "tech"
+    service.config.openprovider.billing_handle = "billing"
+
+    ready = {product.id: product for product in service.products().products}
+    assert ready["agent-mail-domain-bundle"].available is True
+
+
 @pytest.mark.asyncio
-async def test_custom_domain_authority_is_revalidated_before_payment(mail_service):
+async def test_custom_domain_delegation_is_revalidated_before_payment(mail_service):
     service, sessions, _backend, _domains, _refunds = mail_service
     token = "hyr_identity_" + "a" * 43
     async with sessions() as session:
@@ -469,7 +491,7 @@ async def test_custom_domain_authority_is_revalidated_before_payment(mail_servic
     async with sessions() as session:
         domain = await session.scalar(select(DomainRow).where(DomainRow.fqdn == "authority.dev"))
         assert domain is not None
-        domain.anon_management_token_hash = None
+        domain.nameserver_mode = NameserverMode.EXTERNAL.value
         await session.commit()
 
     with pytest.raises(MailProblem) as changed:
@@ -1270,32 +1292,59 @@ async def test_unready_domain_orders_do_not_starve_ready_mailboxes(mail_service)
         "ready-hosted-mailbox",
         "ready-hosted-mailbox-idempotency-0001",
     )
+    active_domain = await awaiting_provision(
+        "ready-domain-order",
+        "ready-domain-order-idempotency-0001",
+    )
     now = datetime.now(UTC)
     async with sessions() as session:
         blocked_row = await session.get(MailAccountRow, blocked.mailbox_id)
         ready_row = await session.get(MailAccountRow, ready.mailbox_id)
+        active_domain_row = await session.get(MailAccountRow, active_domain.mailbox_id)
         blocked_row.status = MailboxStatus.PENDING_DOMAIN.value
         blocked_row.domain_order_id = "do_blocked_domain_order"
-        blocked_row.created_at = now - timedelta(hours=2)
-        ready_row.created_at = now - timedelta(hours=1)
-        session.add(
-            DomainOrderRow(
-                order_id="do_blocked_domain_order",
-                quote_id="dq_blocked_domain_order",
-                fqdn="blocked-domain-order.dev",
-                action="register",
-                owner_account_id=None,
-                idempotency_key="blocked-domain-order",
-                status=DomainOrderStatus.PROVIDER_PENDING.value,
-                amount_usd=Decimal("1"),
-                domain_amount_usd=Decimal("1"),
-                vm_amount_usd=Decimal("0"),
-                service_amount_usd=Decimal("0"),
-                payment_method="usdc",
-                on_domain_failure="keep_vm",
-                terms_version=service.config.domain.terms_version,
-                terms_accepted_at=now,
-            )
+        blocked_row.created_at = now - timedelta(hours=3)
+        ready_row.created_at = now - timedelta(hours=2)
+        active_domain_row.status = MailboxStatus.PENDING_DOMAIN.value
+        active_domain_row.domain_order_id = "do_ready_domain_order"
+        active_domain_row.created_at = now - timedelta(hours=1)
+        session.add_all(
+            [
+                DomainOrderRow(
+                    order_id="do_blocked_domain_order",
+                    quote_id="dq_blocked_domain_order",
+                    fqdn="blocked-domain-order.dev",
+                    action="register",
+                    owner_account_id=None,
+                    idempotency_key="blocked-domain-order",
+                    status=DomainOrderStatus.PROVIDER_PENDING.value,
+                    amount_usd=Decimal("1"),
+                    domain_amount_usd=Decimal("1"),
+                    vm_amount_usd=Decimal("0"),
+                    service_amount_usd=Decimal("0"),
+                    payment_method="usdc",
+                    on_domain_failure="keep_vm",
+                    terms_version=service.config.domain.terms_version,
+                    terms_accepted_at=now,
+                ),
+                DomainOrderRow(
+                    order_id="do_ready_domain_order",
+                    quote_id="dq_ready_domain_order",
+                    fqdn="ready-domain-order.dev",
+                    action="register",
+                    owner_account_id=None,
+                    idempotency_key="ready-domain-order",
+                    status=DomainOrderStatus.ACTIVE.value,
+                    amount_usd=Decimal("1"),
+                    domain_amount_usd=Decimal("1"),
+                    vm_amount_usd=Decimal("0"),
+                    service_amount_usd=Decimal("0"),
+                    payment_method="usdc",
+                    on_domain_failure="keep_vm",
+                    terms_version=service.config.domain.terms_version,
+                    terms_accepted_at=now,
+                ),
+            ]
         )
         await session.commit()
 
@@ -1303,8 +1352,18 @@ async def test_unready_domain_orders_do_not_starve_ready_mailboxes(mail_service)
     async with sessions() as session:
         still_blocked = await session.get(MailAccountRow, blocked.mailbox_id)
         provisioned = await session.get(MailAccountRow, ready.mailbox_id)
+        promoted = await session.get(MailAccountRow, active_domain.mailbox_id)
     assert still_blocked.status == MailboxStatus.PENDING_DOMAIN.value
     assert provisioned.status == MailboxStatus.ACTIVE.value
+    assert promoted.status == MailboxStatus.PROVISIONING.value
+
+    assert await service.provision_pending(limit=1) == 1
+    async with sessions() as session:
+        active_domain_provisioned = await session.get(
+            MailAccountRow,
+            active_domain.mailbox_id,
+        )
+    assert active_domain_provisioned.status == MailboxStatus.ACTIVE.value
 
 
 @pytest.mark.asyncio
@@ -1764,6 +1823,15 @@ async def test_terminal_authorization_releases_mail_capacity(mail_service):
     assert closed.provision_error == "payment_authorization_expired"
     assert closed_quote is not None
     assert closed_quote.status == "expired"
+    assert closed_quote.request_payload == {
+        "redacted": True,
+        "mode": MailboxMode.HOSTED.value,
+        "activation_amount_usd": quote.activation_amount_usd,
+    }
+    rendered = await service.get_quote(quote.quote_id)
+    assert rendered.mode is MailboxMode.HOSTED
+    assert rendered.activation_amount_usd == quote.activation_amount_usd
+    assert rendered.amount_usd == quote.amount_usd
 
 
 @pytest.mark.asyncio
@@ -2594,6 +2662,58 @@ async def test_stored_authorization_recovers_send_payment_without_metrics_ledger
     assert recovered.payment_authorization_header is None
     assert recovered.payment_settlement_pending_at is None
     assert recovered.payment_settled_at is not None
+
+
+@pytest.mark.asyncio
+async def test_terminal_send_authorization_can_be_replaced(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    mailbox_id, token = await _active_hosted(
+        service,
+        local_part="send-payment-terminal",
+        idempotency_key="send-payment-terminal-idempotency-0001",
+    )
+    quote = await service.create_send_quote(
+        MailSendQuoteRequest(
+            mailbox_id=mailbox_id,
+            to="proof@example.net",
+            subject="Replace authorization",
+            text="Retry payment without resending the accepted message.",
+        ),
+        token,
+    )
+    sent = await service.deliver_send(quote.quote_id, token)
+    first = hashlib.sha256(b"terminal-send-authorization").hexdigest()
+    replacement = hashlib.sha256(b"replacement-send-authorization").hexdigest()
+    await service.bind_payment_authorization(first, quote.quote_id)
+    await service.begin_send_settlement(
+        sent.send_id,
+        quote.quote_id,
+        payer="0x" + "4" * 40,
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+        payment_authorization="terminal-send-authorization",
+    )
+
+    class _TerminalGate:
+        async def reconcile_settlement(self, header, amount, *, pending_since, resource_key):
+            assert header == "terminal-send-authorization"
+            assert amount == Decimal(quote.amount_usd)
+            assert pending_since is not None
+            assert resource_key == f"mail_send:{quote.quote_id}"
+            return PaymentReconciliation(terminal_unsettled=True, reason="expired")
+
+    assert await service.recover_x402_handoffs(gate=_TerminalGate()) == 0
+    assert await service.settled_send_response(quote.quote_id, token) is None
+    await service.bind_payment_authorization(replacement, quote.quote_id)
+
+    async with sessions() as session:
+        unpaid = await session.get(MailSendRow, sent.send_id)
+        bindings = list(await session.scalars(select(MailPaymentAuthorizationRow)))
+    assert unpaid.status == "accepted"
+    assert unpaid.payment_settlement_pending_at is None
+    assert unpaid.payment_authorization_header is None
+    assert unpaid.error == "payment_authorization_expired_retryable"
+    assert [(row.fingerprint, row.quote_id) for row in bindings] == [(replacement, quote.quote_id)]
 
 
 @pytest.mark.asyncio

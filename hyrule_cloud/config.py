@@ -449,3 +449,27 @@ class HyruleConfig(BaseSettings):
     domain: DomainConfig = Field(default_factory=DomainConfig)
     mail: MailConfig = Field(default_factory=MailConfig)
     payment: PaymentConfig = Field(default_factory=PaymentConfig)
+
+    @property
+    def agent_domain_purchases_ready(self) -> bool:
+        """Whether wallet-native domain checkout can complete end to end."""
+
+        try:
+            Fernet(self.domain.agent_order_fernet_key.encode())
+        except (TypeError, ValueError):
+            return False
+        provider = self.openprovider
+        return bool(
+            self.domain.enabled
+            and self.domain.agent_purchases_enabled
+            and self.domain.legal_approved
+            and self.domain.tax_approved
+            and self.domain.dns_control_url
+            and self.domain.dns_control_secret
+            and provider.username
+            and provider.password
+            and provider.owner_handle
+            and provider.admin_handle
+            and provider.tech_handle
+            and provider.billing_handle
+        )
