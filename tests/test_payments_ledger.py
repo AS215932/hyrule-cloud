@@ -1,8 +1,8 @@
 """Payments ledger (Phase 2 of the x402 launch plan).
 
-Every payment-gate outcome must land in payment_events, ledger failures must
-never break the payment flow, and /metrics must aggregate the ledger behind
-its bearer token.
+Every payment-gate outcome should land in payment_events, best-effort metrics
+writes must never break the payment flow, and /metrics must aggregate the
+ledger behind its bearer token. Authorization ownership claims fail closed.
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from x402.http import PAYMENT_SIGNATURE_HEADER
 
 from hyrule_cloud.app import app
-from hyrule_cloud.db import Base, PaymentEventRow, VMRow
-from hyrule_cloud.middleware.x402 import PaymentGate
+from hyrule_cloud.db import Base, MailSendRow, PaymentAuthorizationRow, PaymentEventRow, VMRow
+from hyrule_cloud.middleware.x402 import PaymentGate, VerifiedPayment
 from hyrule_cloud.models import VMSize, VMStatus
 from hyrule_cloud.services.payments_ledger import PaymentLedger, service_group_for_path
 from tests.test_payment_gate_x402 import (
@@ -84,6 +84,69 @@ async def test_settled_payment_writes_ledger_row(session_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_payment_authorization_is_bound_across_paid_resources(session_factory) -> None:
+    server = _FakeServer()
+    gate = _gate(server)
+    gate.ledger = PaymentLedger(session_factory)
+    header = _payment_header(server.requirements[0])
+
+    mail = await gate.verify_only(
+        _request({PAYMENT_SIGNATURE_HEADER: header}, path="/v1/mail/messages/send"),
+        Decimal("0.05"),
+        "Send mail",
+        {"quote_id": "mailq_global_binding"},
+    )
+    replay = await gate.verify_only(
+        _request({PAYMENT_SIGNATURE_HEADER: header}, path="/v1/mail/messages/send"),
+        Decimal("0.05"),
+        "Send mail",
+        {"quote_id": "mailq_global_binding"},
+    )
+    other = await gate.verify_only(
+        _request({PAYMENT_SIGNATURE_HEADER: header}, path="/v1/bgp/lookup"),
+        Decimal("0.05"),
+        "BGP lookup",
+        {"resource": "203.0.113.0/24"},
+    )
+
+    assert isinstance(mail, VerifiedPayment)
+    assert isinstance(replay, VerifiedPayment)
+    assert isinstance(other, Response)
+    assert other.status_code == 409
+    async with session_factory() as session:
+        bindings = list(await session.scalars(select(PaymentAuthorizationRow)))
+    assert len(bindings) == 1
+    assert bindings[0].resource_key == "mail_send:mailq_global_binding"
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_authorization_claimed_by_another_resource(
+    session_factory,
+) -> None:
+    server = _FakeServer()
+    gate = _gate(server)
+    gate.ledger = PaymentLedger(session_factory)
+    header = _payment_header(server.requirements[0])
+    claimed = await gate.verify_only(
+        _request({PAYMENT_SIGNATURE_HEADER: header}, path="/v1/bgp/lookup"),
+        Decimal("0.05"),
+        "BGP lookup",
+        {"resource": "203.0.113.0/24"},
+    )
+    assert isinstance(claimed, VerifiedPayment)
+
+    reconciliation = await gate.reconcile_settlement(
+        header,
+        Decimal("0.05"),
+        resource_key="mail_send:mailq_cross_resource",
+    )
+
+    assert reconciliation.payment is None
+    assert reconciliation.terminal_unsettled is True
+    assert reconciliation.reason == "bound_elsewhere"
+
+
+@pytest.mark.asyncio
 async def test_no_payment_writes_required_402(session_factory) -> None:
     gate = _gate(_FakeServer())
     gate.ledger = PaymentLedger(session_factory)
@@ -142,7 +205,26 @@ async def test_dev_bypass_writes_dev_bypass(session_factory) -> None:
 
 
 @pytest.mark.asyncio
-async def test_broken_ledger_never_breaks_payment_flow() -> None:
+async def test_broken_metrics_write_never_breaks_payment_flow() -> None:
+    class _ExplodingMetricsLedger:
+        async def claim_authorization(self, **kwargs) -> bool:
+            return True
+
+        async def record(self, **kwargs) -> None:
+            raise RuntimeError("db down")
+
+    server = _FakeServer()
+    gate = _gate(server)
+    gate.ledger = _ExplodingMetricsLedger()  # type: ignore[assignment]
+    req = _request({PAYMENT_SIGNATURE_HEADER: _payment_header(server.requirements[0])})
+
+    result = await gate.check_payment(req, Decimal("0.05"), "VM creation")
+
+    assert result == PAYER
+
+
+@pytest.mark.asyncio
+async def test_broken_authorization_ledger_fails_closed() -> None:
     class _ExplodingFactory:
         def __call__(self):
             raise RuntimeError("db down")
@@ -154,7 +236,8 @@ async def test_broken_ledger_never_breaks_payment_flow() -> None:
 
     result = await gate.check_payment(req, Decimal("0.05"), "VM creation")
 
-    assert result == PAYER  # payment still settles even though the ledger is down
+    assert isinstance(result, Response)
+    assert result.status_code == 502
 
 
 # --- /metrics exporter ---
@@ -233,6 +316,15 @@ async def test_metrics_renders_ledger_and_fleet_counters(metrics_app_state) -> N
                 provisioned_at=None,
             )
         )
+        session.add(
+            MailSendRow(
+                send_id="send_metrics_test",
+                mailbox_id="mbx_metrics_test",
+                quote_id="mailq_metrics_test",
+                recipient="proof@example.net",
+                status="accepted",
+            )
+        )
         await session.commit()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -254,6 +346,11 @@ async def test_metrics_renders_ledger_and_fleet_counters(metrics_app_state) -> N
     assert 'hyrule_vms_active{status="ready"} 1' in body
     assert 'hyrule_vm_provision_total{result="ready"} 0' in body
     assert 'hyrule_vm_provision_total{result="failed"} 0' in body
+    assert "# TYPE hyrule_mail_activation_outcomes gauge" in body
+    assert "hyrule_mail_activation_outcomes_total" not in body
+    assert "# TYPE hyrule_mail_messages_current gauge" in body
+    assert 'hyrule_mail_messages_current{status="accepted"} 1' in body
+    assert "hyrule_mail_messages_total" not in body
 
 
 @pytest.mark.asyncio
@@ -279,6 +376,9 @@ async def test_hung_ledger_cannot_block_a_settled_response(monkeypatch) -> None:
     import asyncio
 
     class _HangingLedger:
+        async def claim_authorization(self, **kwargs) -> bool:
+            return True
+
         async def record(self, **kwargs) -> None:
             await asyncio.sleep(30)
 

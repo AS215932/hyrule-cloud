@@ -1,0 +1,7 @@
+interface:
+  display_name: "Hyrule Customer Journeys"
+  short_description: "Run outcome-led x402 infrastructure journeys"
+  default_prompt: "Use $hyrule-customer-journeys to run a Hyrule x402 proof journey with evidence, cost, and elapsed time."
+
+policy:
+  allow_implicit_invocation: true

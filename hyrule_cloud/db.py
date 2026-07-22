@@ -77,11 +77,21 @@ class VMRow(Base):
 
     # VM configuration
     status: Mapped[str] = mapped_column(
-        Enum(VMStatus, name="vm_status", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
+        Enum(
+            VMStatus,
+            name="vm_status",
+            create_constraint=True,
+            values_callable=lambda e: [m.value for m in e],
+        ),
         default=VMStatus.PROVISIONING,
     )
     size: Mapped[str] = mapped_column(
-        Enum(VMSize, name="vm_size", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
+        Enum(
+            VMSize,
+            name="vm_size",
+            create_constraint=True,
+            values_callable=lambda e: [m.value for m in e],
+        ),
         default=VMSize.XS,
     )
     # Exact provisioned resources. Nullable at the ORM level so databases can
@@ -114,7 +124,12 @@ class VMRow(Base):
 
     # Domain
     domain_mode: Mapped[str] = mapped_column(
-        Enum(DomainMode, name="domain_mode", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
+        Enum(
+            DomainMode,
+            name="domain_mode",
+            create_constraint=True,
+            values_callable=lambda e: [m.value for m in e],
+        ),
         default=DomainMode.AUTO,
     )
     domain: Mapped[str | None] = mapped_column(String(256))
@@ -174,7 +189,12 @@ class DomainRow(Base):
     )
     anon_management_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     status: Mapped[str] = mapped_column(
-        Enum(DomainStatus, name="domain_status", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
+        Enum(
+            DomainStatus,
+            name="domain_status",
+            create_constraint=True,
+            values_callable=lambda e: [m.value for m in e],
+        ),
         default=DomainStatus.REGISTERING,
     )
     client_order_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
@@ -213,9 +233,7 @@ class DomainRow(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    __table_args__ = (
-        Index("ix_domains_status", "status"),
-    )
+    __table_args__ = (Index("ix_domains_status", "status"),)
 
 
 class DomainTLDRow(Base):
@@ -272,19 +290,33 @@ class DomainOrderRow(Base):
     )
     fqdn: Mapped[str] = mapped_column(String(253), index=True)
     action: Mapped[str] = mapped_column(String(16), index=True)
-    owner_account_id: Mapped[str] = mapped_column(
+    owner_account_id: Mapped[str | None] = mapped_column(
         String(11), ForeignKey("accounts.account_id", ondelete="RESTRICT"), index=True
     )
     idempotency_key: Mapped[str] = mapped_column(String(128))
+    # Wallet-native orders have no Hyrule account. The high-entropy capability
+    # token is returned once and only its hash is used for later reads.
+    management_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    management_token_ciphertext: Mapped[str | None] = mapped_column(Text)
+    agent_idempotency_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
     status: Mapped[str] = mapped_column(String(32), default="awaiting_payment", index=True)
     amount_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
     domain_amount_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
     vm_amount_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+    service_amount_usd: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0"), server_default="0"
+    )
     payment_method: Mapped[str] = mapped_column(String(8))
     payment_network: Mapped[str | None] = mapped_column(String(64))
-    payment_asset: Mapped[str | None] = mapped_column(String(16))
+    payment_asset: Mapped[str | None] = mapped_column(String(66))
     payer: Mapped[str | None] = mapped_column(String(128))
     payment_tx: Mapped[str | None] = mapped_column(String(128), index=True)
+    payment_settlement_pending_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_recovery_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    payment_authorization_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    payment_authorization_header: Mapped[str | None] = mapped_column(Text)
     refund_address: Mapped[str | None] = mapped_column(String(128))
     native_intent_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("crypto_intents.intent_id", ondelete="SET NULL"), index=True
@@ -312,6 +344,10 @@ class DomainOrderRow(Base):
         UniqueConstraint(
             "owner_account_id", "idempotency_key", name="uq_domain_orders_account_idempotency"
         ),
+        UniqueConstraint(
+            "payment_authorization_fingerprint",
+            name="uq_domain_orders_payment_authorization",
+        ),
     )
 
 
@@ -320,7 +356,7 @@ class DomainOperationRow(Base):
 
     operation_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     fqdn: Mapped[str] = mapped_column(String(253), index=True)
-    owner_account_id: Mapped[str] = mapped_column(
+    owner_account_id: Mapped[str | None] = mapped_column(
         String(11), ForeignKey("accounts.account_id", ondelete="CASCADE"), index=True
     )
     order_id: Mapped[str | None] = mapped_column(
@@ -352,14 +388,17 @@ class DomainDNSRecordRow(Base):
     type: Mapped[str] = mapped_column(String(16))
     ttl: Mapped[int] = mapped_column(Integer)
     values: Mapped[list] = mapped_column(_JSONB, default=list)
+    # Lets product integrations merge and later remove only the RRsets they
+    # own without clobbering records created by the customer or another service.
+    managed_by: Mapped[str] = mapped_column(
+        String(32), default="customer", server_default="customer"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    __table_args__ = (
-        UniqueConstraint("fqdn", "name", "type", name="uq_domain_dns_rrset"),
-    )
+    __table_args__ = (UniqueConstraint("fqdn", "name", "type", name="uq_domain_dns_rrset"),)
 
 
 class DomainIdempotencyRow(Base):
@@ -443,7 +482,9 @@ class OpenproviderWebhookRow(Base):
     event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     event_type: Mapped[str | None] = mapped_column(String(64), index=True)
     payload: Mapped[dict] = mapped_column(_JSONB)
-    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -482,7 +523,12 @@ class CryptoIntentRow(Base):
     amount_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
     address: Mapped[str] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(
-        Enum(CryptoIntentStatus, name="crypto_intent_status", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
+        Enum(
+            CryptoIntentStatus,
+            name="crypto_intent_status",
+            create_constraint=True,
+            values_callable=lambda e: [m.value for m in e],
+        ),
         default=CryptoIntentStatus.CREATED,
     )
     bip32_index: Mapped[int | None] = mapped_column(Integer)
@@ -570,8 +616,19 @@ class PaymentEventRow(Base):
     error_reason: Mapped[str | None] = mapped_column(String(256))
     extra: Mapped[dict | None] = mapped_column(_JSONB)
 
-    __table_args__ = (
-        Index("ix_payment_events_type_created", "event_type", "created_at"),
+    __table_args__ = (Index("ix_payment_events_type_created", "event_type", "created_at"),)
+
+
+class PaymentAuthorizationRow(Base):
+    """Service-wide ownership of one canonical x402 authorization."""
+
+    __tablename__ = "payment_authorizations"
+
+    fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    resource_key: Mapped[str] = mapped_column(String(256), index=True)
+    resource_path: Mapped[str] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
     )
 
 
@@ -612,9 +669,7 @@ class VMQuoteRow(Base):
     )
     # Set when the quote is consumed (links to the provisioned VM).
     vm_id: Mapped[str | None] = mapped_column(String(32), index=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (Index("ix_vm_quotes_status_expires", "status", "expires_at"),)
@@ -661,7 +716,9 @@ class BGPSnapshotRow(Base):
     sha256: Mapped[str | None] = mapped_column(String(64))
     compressed_size_bytes: Mapped[int | None] = mapped_column(Integer)
     payload: Mapped[dict | None] = mapped_column(_JSONB)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
@@ -712,7 +769,9 @@ class DiagnosticJobRow(Base):
     status: Mapped[str] = mapped_column(String(32), index=True)
     target: Mapped[str | None] = mapped_column(String(512), index=True)
     owner_wallet: Mapped[str | None] = mapped_column(String(64), index=True)
-    owner_account_id: Mapped[str | None] = mapped_column(String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True)
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
     payment_tx: Mapped[str | None] = mapped_column(String(128))
     access_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     request: Mapped[dict] = mapped_column(_JSONB)
@@ -759,17 +818,54 @@ class MailAccountRow(Base):
     mailbox_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     address: Mapped[str] = mapped_column(String(320), unique=True, index=True)
     owner_wallet: Mapped[str | None] = mapped_column(String(64), index=True)
-    owner_account_id: Mapped[str | None] = mapped_column(String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True)
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
     management_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    management_token_ciphertext: Mapped[str | None] = mapped_column(Text)
     plan: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32), index=True)
     display_name: Mapped[str | None] = mapped_column(String(128))
     features: Mapped[dict | None] = mapped_column(_JSONB)
     backend: Mapped[str | None] = mapped_column(String(64))
     backend_id: Mapped[str | None] = mapped_column(String(128))
+    backend_credential_ciphertext: Mapped[str | None] = mapped_column(Text)
+    domain: Mapped[str | None] = mapped_column(String(253), index=True)
+    local_part: Mapped[str | None] = mapped_column(String(64))
+    domain_order_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    domain_authority_hash: Mapped[str | None] = mapped_column(String(64))
+    quote_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    idempotency_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    terms_version: Mapped[str | None] = mapped_column(String(64))
+    activation_amount_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    total_amount_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    capacity_reserved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    provision_claim_token: Mapped[str | None] = mapped_column(String(64))
+    provision_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    provision_retry_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    provision_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    dns_cleanup_pending: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", index=True
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    grace_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provision_error: Mapped[str | None] = mapped_column(Text)
+    suspended_reason: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     payment_tx: Mapped[str | None] = mapped_column(String(128))
+    payment_network: Mapped[str | None] = mapped_column(String(64))
+    payment_asset: Mapped[str | None] = mapped_column(String(66))
+    payment_settlement_pending_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    payment_authorization_header: Mapped[str | None] = mapped_column(Text)
 
 
 class MailDomainRow(Base):
@@ -777,7 +873,9 @@ class MailDomainRow(Base):
 
     domain_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     domain: Mapped[str] = mapped_column(String(253), unique=True, index=True)
-    owner_account_id: Mapped[str | None] = mapped_column(String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True)
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
     status: Mapped[str] = mapped_column(String(32), index=True)
     required_dns: Mapped[list | None] = mapped_column(_JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -826,6 +924,10 @@ class MailWebhookRow(Base):
     url: Mapped[str] = mapped_column(Text)
     events: Mapped[list] = mapped_column(_JSONB, default=list)
     secret_hash: Mapped[str | None] = mapped_column(String(64))
+    secret_ciphertext: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
+    failure_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -837,7 +939,108 @@ class MailEventRow(Base):
     type: Mapped[str] = mapped_column(String(64), index=True)
     message_id: Mapped[str | None] = mapped_column(String(128), index=True)
     payload: Mapped[dict | None] = mapped_column(_JSONB)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class MailQuoteRow(Base):
+    """Immutable, short-lived price and request snapshot.
+
+    Send payloads are locked into their quote so the paid retry cannot switch
+    recipients or content after the x402 amount was challenged.
+    """
+
+    __tablename__ = "mail_quotes"
+
+    quote_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(24), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    mailbox_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    address: Mapped[str | None] = mapped_column(String(320), index=True)
+    request_hash: Mapped[str] = mapped_column(String(64))
+    request_payload: Mapped[dict] = mapped_column(_JSONB)
+    amount_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    domain_quote_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    terms_version: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MailRecipientRow(Base):
+    __tablename__ = "mail_recipients"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
+    recipient: Mapped[str] = mapped_column(String(320))
+    first_sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("mailbox_id", "recipient", name="uq_mail_recipient_mailbox_address"),
+    )
+
+
+class MailSendRow(Base):
+    __tablename__ = "mail_sends"
+
+    send_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
+    quote_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    recipient: Mapped[str] = mapped_column(String(320), index=True)
+    message_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    in_reply_to: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    amount_usd: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0"), server_default="0"
+    )
+    payment_payer: Mapped[str | None] = mapped_column(String(64))
+    payment_network: Mapped[str | None] = mapped_column(String(64))
+    payment_asset: Mapped[str | None] = mapped_column(String(66))
+    payment_tx: Mapped[str | None] = mapped_column(String(128))
+    payment_authorization_header: Mapped[str | None] = mapped_column(Text)
+    payment_settlement_pending_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_recovery_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    payment_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    submission_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MailPaymentAuthorizationRow(Base):
+    """Durable binding from one x402 authorization to one mail quote."""
+
+    __tablename__ = "mail_payment_authorizations"
+
+    fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    quote_id: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+    __table_args__ = (UniqueConstraint("quote_id", name="uq_mail_payment_authorization_quote"),)
+
+
+class MailWebhookDeliveryRow(Base):
+    __tablename__ = "mail_webhook_deliveries"
+
+    delivery_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    webhook_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_id: Mapped[str] = mapped_column(String(36), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (UniqueConstraint("webhook_id", "event_id", name="uq_mail_webhook_event"),)
 
 
 class MailDeliveryLogRow(Base):
@@ -850,21 +1053,25 @@ class MailDeliveryLogRow(Base):
     status: Mapped[str] = mapped_column(String(32), index=True)
     remote: Mapped[str | None] = mapped_column(String(320))
     detail: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
 
 
 class MailMessageIndexRow(Base):
     __tablename__ = "mail_message_index"
 
+    mailbox_id: Mapped[str] = mapped_column(String(36), primary_key=True, index=True)
     message_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    mailbox_id: Mapped[str] = mapped_column(String(36), index=True)
     folder: Mapped[str] = mapped_column(String(64), index=True)
     sender: Mapped[str | None] = mapped_column(String(320))
     recipients: Mapped[list | None] = mapped_column(_JSONB)
     subject: Mapped[str | None] = mapped_column(Text)
     flags: Mapped[list | None] = mapped_column(_JSONB)
     has_attachments: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
 
 
 class MailQuarantineRow(Base):
@@ -875,7 +1082,9 @@ class MailQuarantineRow(Base):
     message_id: Mapped[str] = mapped_column(String(128), index=True)
     reason: Mapped[str | None] = mapped_column(Text)
     payload: Mapped[dict | None] = mapped_column(_JSONB)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -940,9 +1149,7 @@ class AccountRow(Base):
     recovery_code_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     password_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
@@ -956,9 +1163,7 @@ class SessionRow(Base):
     account_id: Mapped[str] = mapped_column(
         String(11), ForeignKey("accounts.account_id", ondelete="CASCADE"), index=True
     )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -993,9 +1198,7 @@ class ApiKeyRow(Base):
     key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(64))
     scopes: Mapped[list] = mapped_column(_JSONB, default=list)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -1031,8 +1234,6 @@ class RecoveryChallengeRow(Base):
     nonce: Mapped[str] = mapped_column(String(64), primary_key=True)
     account_id: Mapped[str] = mapped_column(String(11), index=True)
     challenge_text: Mapped[str] = mapped_column(Text)
-    issued_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

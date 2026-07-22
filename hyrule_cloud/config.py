@@ -9,7 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from cryptography.fernet import Fernet
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -151,9 +153,7 @@ class OpenproviderConfig(BaseSettings):
     admin_handle: str = ""
     tech_handle: str = ""
     billing_handle: str = ""
-    nameservers: list[str] = Field(
-        default_factory=lambda: ["ns1.hyrule.host", "ns2.hyrule.host"]
-    )
+    nameservers: list[str] = Field(default_factory=lambda: ["ns1.hyrule.host", "ns2.hyrule.host"])
 
 
 class DomainConfig(BaseSettings):
@@ -169,6 +169,7 @@ class DomainConfig(BaseSettings):
 
     enabled: bool = True
     purchases_enabled: bool = False
+    agent_purchases_enabled: bool = False
     legal_approved: bool = False
     tax_approved: bool = False
     terms_version: str = "2026-07-15"
@@ -202,12 +203,83 @@ class DomainConfig(BaseSettings):
     # storage. An empty key disables transfer-out rather than storing a secret
     # in plaintext.
     authcode_fernet_key: str = ""
+    # Encrypts the one-time capability token on wallet-native orders so an
+    # idempotent paid retry can return the same token without storing it clear.
+    agent_order_fernet_key: str = ""
     openprovider_webhook_secret: str = ""
 
     max_dns_rrsets: int = Field(default=500, ge=1, le=5000)
     max_dns_changes: int = Field(default=100, ge=1, le=500)
     transfer_challenge_ttl_seconds: int = Field(default=300, ge=60, le=900)
     transfer_authcode_ttl_seconds: int = Field(default=900, ge=60, le=3600)
+
+
+class MailConfig(BaseSettings):
+    """Fail-closed Agent Mail product configuration.
+
+    Merely setting ``MAIL_ENABLED=true`` must never expose a payable route.
+    Legal/abuse approval, the dedicated Stalwart control plane, encrypted
+    credential storage, and authenticated event ingestion are all required.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="MAIL_", env_file=".env", extra="ignore")
+
+    enabled: bool = False
+    legal_approved: bool = False
+    abuse_approved: bool = False
+    terms_version: str = "2026-08-04"
+
+    backend_url: str = ""
+    backend_token: str = ""
+    credential_fernet_key: str = ""
+    internal_webhook_secret: str = ""
+    backend_timeout_seconds: float = Field(default=15.0, ge=1.0, le=60.0)
+
+    hosted_domain: str = "agentmail.hyrule.host"
+    mail_hostname: str = "mx1.agentmail.hyrule.host"
+    # Stalwart object id, not an ACME provider label. Leave empty unless the
+    # dedicated mail host has reconciled and exposed the exact provider id.
+    acme_provider_id: str = ""
+    storage_quota_bytes: int = Field(default=1_073_741_824, ge=104_857_600)
+    active_days: int = Field(default=30, ge=1, le=365)
+    grace_days: int = Field(default=7, ge=0, le=30)
+    retention_days: int = Field(default=30, ge=1, le=365)
+    quote_ttl_seconds: int = Field(default=900, ge=60, le=3600)
+    worker_poll_seconds: int = Field(default=5, ge=1, le=60)
+    provision_lease_seconds: int = Field(default=300, ge=30, le=1800)
+    provision_dns_retry_seconds: int = Field(default=60, ge=1, le=3600)
+    provision_dns_max_attempts: int = Field(default=15, ge=1, le=100)
+
+    mailbox_send_limit_per_day: int = Field(default=20, ge=1, le=100)
+    mailbox_new_recipient_limit_per_day: int = Field(default=5, ge=1, le=25)
+    global_send_limit_per_day: int = Field(default=100, ge=1)
+    max_active_mailboxes: int = Field(default=25, ge=1)
+    max_webhooks_per_mailbox: int = Field(default=5, ge=1, le=20)
+    max_subject_chars: int = Field(default=998, ge=1, le=998)
+    max_text_chars: int = Field(default=100_000, ge=1, le=1_000_000)
+    max_html_chars: int = Field(default=100_000, ge=1, le=1_000_000)
+    max_attachment_bytes: int = Field(
+        default=26_214_400,
+        ge=1_048_576,
+        le=104_857_600,
+    )
+
+    @property
+    def public_ready(self) -> bool:
+        parsed = urlsplit(self.backend_url)
+        try:
+            Fernet(self.credential_fernet_key.encode())
+        except (ValueError, TypeError):
+            return False
+        return bool(
+            self.enabled
+            and self.legal_approved
+            and self.abuse_approved
+            and parsed.scheme == "https"
+            and parsed.hostname
+            and len(self.backend_token) >= 16
+            and len(self.internal_webhook_secret) >= 32
+        )
 
 
 class PaymentConfig(BaseSettings):
@@ -255,7 +327,9 @@ class PaymentConfig(BaseSettings):
     price_vm_addon_ram_gb: Decimal = Decimal("0.15")
     price_vm_addon_disk_10gb: Decimal = Decimal("0.05")
     price_domain_markup: Decimal = Decimal("1.00")
-    
+    price_mail_activation: Decimal = Decimal("1.00")
+    price_mail_send: Decimal = Decimal("0.01")
+
     price_proxy_direct: Decimal = Decimal("0.01")
     price_proxy_tor: Decimal = Decimal("0.05")
     price_proxy_i2p: Decimal = Decimal("0.05")
@@ -334,9 +408,7 @@ class HyruleConfig(BaseSettings):
     max_paid_active_vms: int = 0
     max_duration_days: int = 365
     max_ports: int = 10
-    blocked_ports: list[int] = Field(
-        default_factory=lambda: [25, 465, 587]
-    )
+    blocked_ports: list[int] = Field(default_factory=lambda: [25, 465, 587])
 
     # Cloud-init template directory
     templates_dir: Path = Path("templates")
@@ -375,4 +447,29 @@ class HyruleConfig(BaseSettings):
     xcpng: XCPNGConfig = Field(default_factory=XCPNGConfig)
     openprovider: OpenproviderConfig = Field(default_factory=OpenproviderConfig)
     domain: DomainConfig = Field(default_factory=DomainConfig)
+    mail: MailConfig = Field(default_factory=MailConfig)
     payment: PaymentConfig = Field(default_factory=PaymentConfig)
+
+    @property
+    def agent_domain_purchases_ready(self) -> bool:
+        """Whether wallet-native domain checkout can complete end to end."""
+
+        try:
+            Fernet(self.domain.agent_order_fernet_key.encode())
+        except (TypeError, ValueError):
+            return False
+        provider = self.openprovider
+        return bool(
+            self.domain.enabled
+            and self.domain.agent_purchases_enabled
+            and self.domain.legal_approved
+            and self.domain.tax_approved
+            and self.domain.dns_control_url
+            and self.domain.dns_control_secret
+            and provider.username
+            and provider.password
+            and provider.owner_handle
+            and provider.admin_handle
+            and provider.tech_handle
+            and provider.billing_handle
+        )

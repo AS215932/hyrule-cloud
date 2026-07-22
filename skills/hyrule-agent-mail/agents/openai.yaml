@@ -1,0 +1,7 @@
+interface:
+  display_name: "Hyrule Agent Mail"
+  short_description: "Buy and operate API-only agent email"
+  default_prompt: "Use $hyrule-agent-mail to buy or activate an agent mailbox and verify it."
+
+policy:
+  allow_implicit_invocation: true

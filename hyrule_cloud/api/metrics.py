@@ -21,7 +21,7 @@ from typing import Any
 from fastapi import APIRouter, Request, Response
 from sqlalchemy import func, select
 
-from hyrule_cloud.db import DomainRow, PaymentEventRow, VMRow
+from hyrule_cloud.db import DomainRow, MailAccountRow, MailSendRow, PaymentEventRow, VMRow
 from hyrule_cloud.models import VMStatus
 
 router = APIRouter(tags=["Observability"])
@@ -127,6 +127,24 @@ async def _render(session_factory: Any) -> str:
 
         _metric(
             lines,
+            "hyrule_acquired_customer_wallets",
+            "Distinct wallets that settled a product activation or substantive service; "
+            "one-cent Agent Mail sends are deliberately excluded.",
+            "gauge",
+        )
+        acquired = (
+            await session.execute(
+                select(func.count(func.distinct(PaymentEventRow.payer_wallet))).where(
+                    PaymentEventRow.event_type == "settled",
+                    PaymentEventRow.payer_wallet.is_not(None),
+                    PaymentEventRow.resource_path != "/v1/mail/messages/send",
+                )
+            )
+        ).scalar_one()
+        lines.append(f"hyrule_acquired_customer_wallets {acquired}")
+
+        _metric(
+            lines,
             "hyrule_vms_active",
             "Live VMs by lifecycle status (destroyed/failed rows are retained "
             "in the DB but excluded here so the gauge tracks the actual fleet).",
@@ -172,6 +190,57 @@ async def _render(session_factory: Any) -> str:
         for status, count in rows:
             value = getattr(status, "value", status)
             lines.append(f'hyrule_domains_total{{status="{_esc(value)}"}} {count}')
+
+        _metric(
+            lines,
+            "hyrule_mailboxes",
+            "Agent Mail mailboxes by lifecycle status and offer mode.",
+            "gauge",
+        )
+        rows = (
+            await session.execute(
+                select(MailAccountRow.status, MailAccountRow.plan, func.count()).group_by(
+                    MailAccountRow.status, MailAccountRow.plan
+                )
+            )
+        ).all()
+        for status, mode, count in rows:
+            lines.append(
+                f'hyrule_mailboxes{{status="{_esc(status)}",mode="{_esc(mode)}"}} {count}'
+            )
+
+        _metric(
+            lines,
+            "hyrule_mail_activation_outcomes",
+            "Current Agent Mail activation outcomes inferred from retained mailbox rows.",
+            "gauge",
+        )
+        activated = await session.scalar(
+            select(func.count())
+            .select_from(MailAccountRow)
+            .where(MailAccountRow.activated_at.is_not(None))
+        )
+        failed = await session.scalar(
+            select(func.count())
+            .select_from(MailAccountRow)
+            .where(MailAccountRow.status.in_(["failed", "refund_due"]))
+        )
+        lines.append(f'hyrule_mail_activation_outcomes{{result="activated"}} {activated or 0}')
+        lines.append(f'hyrule_mail_activation_outcomes{{result="failed"}} {failed or 0}')
+
+        _metric(
+            lines,
+            "hyrule_mail_messages_current",
+            "Current retained Agent Mail outbound message rows by status.",
+            "gauge",
+        )
+        rows = (
+            await session.execute(
+                select(MailSendRow.status, func.count()).group_by(MailSendRow.status)
+            )
+        ).all()
+        for status, count in rows:
+            lines.append(f'hyrule_mail_messages_current{{status="{_esc(status)}"}} {count}')
 
     return "\n".join(lines) + "\n"
 

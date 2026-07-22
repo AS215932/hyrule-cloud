@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import socket
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -16,7 +17,7 @@ import dns.rdatatype
 import structlog
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -30,6 +31,7 @@ from hyrule_cloud.db import (
     DomainOrderRow,
     DomainQuoteRow,
     DomainRow,
+    MailAccountRow,
     OpenproviderWebhookRow,
     PaymentEventRow,
     VMQuoteRow,
@@ -39,6 +41,7 @@ from hyrule_cloud.domains.catalog import DomainCatalog, _operation_price
 from hyrule_cloud.domains.dns_control import DNSControlClient, DNSControlError
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.domains.models import (
+    AgentDomainOrderResponse,
     DNSChangeAction,
     DNSChangesetRequest,
     DNSRRSet,
@@ -76,6 +79,11 @@ from hyrule_cloud.domains.validation import (
     validate_rrset,
 )
 from hyrule_cloud.middleware.anon_token import hash_anon_token
+from hyrule_cloud.middleware.x402 import (
+    PaymentReconciliation,
+    domain_payment_resource_key,
+    mail_payment_resource_key,
+)
 from hyrule_cloud.models import (
     CryptoIntentStatus,
     DomainMode,
@@ -96,6 +104,7 @@ from hyrule_cloud.services.intents import IntentExistsError, create_intent
 from hyrule_cloud.services.quotes import link_quote_vm
 
 log = structlog.get_logger()
+_PAYMENT_RECOVERY_RETRY_DELAY = timedelta(seconds=30)
 
 
 def _now() -> datetime:
@@ -182,6 +191,48 @@ class DomainService:
             raise DomainProblem(
                 403, "account_not_allowlisted", "This account is not in the launch cohort."
             )
+
+    def require_agent_purchase_launch(self) -> None:
+        """Require the separately approved account-free checkout surface."""
+
+        cfg = self.domain_config
+        if not cfg.enabled or not cfg.agent_purchases_enabled:
+            raise DomainProblem(
+                503,
+                "agent_purchases_disabled",
+                "Wallet-native domain purchases are not enabled yet.",
+                headers={"Retry-After": "3600"},
+            )
+        if not cfg.legal_approved or not cfg.tax_approved:
+            raise DomainProblem(
+                503,
+                "launch_approval_pending",
+                "Agent domain checkout is awaiting legal and tax launch approval.",
+            )
+        if not self.dns.configured:
+            raise DomainProblem(503, "managed_dns_not_ready", "Managed DNS is not configured.")
+        provider_cfg = self.config.openprovider
+        if not all(
+            (
+                provider_cfg.username,
+                provider_cfg.password,
+                provider_cfg.owner_handle,
+                provider_cfg.admin_handle,
+                provider_cfg.tech_handle,
+                provider_cfg.billing_handle,
+            )
+        ):
+            raise DomainProblem(
+                503, "registrar_not_ready", "Registrar contacts are not configured."
+            )
+        try:
+            Fernet(cfg.agent_order_fernet_key.encode())
+        except (ValueError, TypeError) as exc:
+            raise DomainProblem(
+                503,
+                "agent_token_storage_not_ready",
+                "Agent capability-token storage is not configured.",
+            ) from exc
 
     async def list_tlds(self) -> DomainTLDListResponse:
         rows = await self.catalog.list_eligible()
@@ -551,6 +602,149 @@ class DomainService:
             )
         return order, True
 
+    async def create_agent_order(
+        self,
+        *,
+        quote_id: str,
+        terms_version: str,
+        idempotency_key: str,
+        additional_amount_usd: Decimal = Decimal("0"),
+        management_token: str | None = None,
+    ) -> tuple[DomainOrderRow, str, bool]:
+        """Reserve an anonymous registration quote for an x402 payer.
+
+        The idempotency key is treated as a secret and only its hash is stored.
+        The capability token is encrypted solely so a retry can receive the
+        same response; authorization always compares its SHA-256 hash.
+        """
+
+        self.require_agent_purchase_launch()
+        if len(idempotency_key) < 16 or len(idempotency_key) > 128:
+            raise DomainProblem(
+                400,
+                "idempotency_key_required",
+                "Agent checkout requires a high-entropy 16-128 character Idempotency-Key.",
+            )
+        if additional_amount_usd < 0:
+            raise DomainProblem(422, "invalid_additional_amount", "Additional amount is invalid.")
+        idempotency_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()
+        fernet = Fernet(self.domain_config.agent_order_fernet_key.encode())
+        async with self.db() as session:
+            existing = (
+                await session.execute(
+                    select(DomainOrderRow).where(
+                        DomainOrderRow.agent_idempotency_hash == idempotency_hash
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                if (
+                    existing.quote_id != quote_id
+                    or existing.terms_version != terms_version
+                    or Decimal(existing.service_amount_usd) != additional_amount_usd
+                ):
+                    raise DomainProblem(
+                        409,
+                        "idempotency_conflict",
+                        "This Idempotency-Key is bound to another agent order.",
+                    )
+                try:
+                    token = fernet.decrypt(
+                        str(existing.management_token_ciphertext).encode()
+                    ).decode()
+                except (InvalidToken, AttributeError) as exc:
+                    raise DomainProblem(
+                        503, "agent_token_unavailable", "The order token cannot be recovered."
+                    ) from exc
+                return existing, token, False
+
+            quote = await session.get(DomainQuoteRow, quote_id)
+            if quote is None:
+                raise DomainProblem(404, "quote_not_found", "Domain quote not found.")
+            if quote.owner_account_id is not None or quote.action != DomainAction.REGISTER.value:
+                raise DomainProblem(404, "quote_not_found", "Domain quote not found.")
+            now = _now()
+            if _aware(quote.expires_at) <= now or quote.status != "active":
+                raise DomainProblem(409, "quote_expired", "This domain quote is not payable.")
+            if (
+                quote.terms_version != terms_version
+                or terms_version != self.domain_config.terms_version
+            ):
+                raise DomainProblem(409, "terms_changed", "The domain terms changed; re-quote.")
+            reserved = await session.execute(
+                update(DomainQuoteRow)
+                .where(
+                    DomainQuoteRow.quote_id == quote.quote_id,
+                    DomainQuoteRow.status == "active",
+                    DomainQuoteRow.expires_at > now,
+                )
+                .values(status="reserved")
+                .execution_options(synchronize_session=False)
+            )
+            if int(getattr(reserved, "rowcount", 0) or 0) != 1:
+                await session.rollback()
+                raise DomainProblem(409, "quote_unavailable", "This quote is already reserved.")
+            token = management_token or "hyr_dom_" + secrets.token_urlsafe(32)
+            if len(token) < 32:
+                raise DomainProblem(
+                    422, "invalid_management_token", "Management token is too short."
+                )
+            order = DomainOrderRow(
+                order_id=generate_domain_order_id(),
+                quote_id=quote.quote_id,
+                fqdn=quote.fqdn,
+                action=quote.action,
+                owner_account_id=None,
+                idempotency_key=f"agent:{idempotency_hash[:32]}",
+                management_token_hash=hash_anon_token(token),
+                management_token_ciphertext=fernet.encrypt(token.encode()).decode(),
+                agent_idempotency_hash=idempotency_hash,
+                status=DomainOrderStatus.AWAITING_PAYMENT.value,
+                amount_usd=Decimal(quote.total_usd) + additional_amount_usd,
+                domain_amount_usd=quote.total_usd,
+                vm_amount_usd=Decimal("0"),
+                service_amount_usd=additional_amount_usd,
+                payment_method=DomainPaymentMethod.USDC.value,
+                on_domain_failure=DomainFailurePolicy.KEEP_VM.value,
+                terms_version=terms_version,
+                terms_accepted_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(order)
+            await session.commit()
+            return order, token, True
+
+    async def get_agent_order(
+        self, order_id: str, management_token: str
+    ) -> AgentDomainOrderResponse:
+        async with self.db() as session:
+            row = await session.get(DomainOrderRow, order_id)
+            if (
+                row is None
+                or row.owner_account_id is not None
+                or not row.management_token_hash
+                or not secrets.compare_digest(
+                    row.management_token_hash, hash_anon_token(management_token)
+                )
+            ):
+                raise DomainProblem(404, "order_not_found", "Domain order not found.")
+        base = await self.order_response(row)
+        return AgentDomainOrderResponse(
+            **base.model_dump(),
+            status_url=f"/v1/domains/agent/orders/{order_id}",
+        )
+
+    async def agent_order_response(
+        self, row: DomainOrderRow, *, management_token: str | None = None
+    ) -> AgentDomainOrderResponse:
+        base = await self.order_response(row)
+        return AgentDomainOrderResponse(
+            **base.model_dump(),
+            management_token=management_token,
+            status_url=f"/v1/domains/agent/orders/{row.order_id}",
+        )
+
     @staticmethod
     def _validate_order_replay(order: DomainOrderRow, body: DomainOrderRequest) -> None:
         if (
@@ -579,9 +773,7 @@ class DomainService:
             return order
         async with self.db() as session:
             quote_expires_at = await session.scalar(
-                select(DomainQuoteRow.expires_at).where(
-                    DomainQuoteRow.quote_id == order.quote_id
-                )
+                select(DomainQuoteRow.expires_at).where(DomainQuoteRow.quote_id == order.quote_id)
             )
         if quote_expires_at is None:
             raise DomainProblem(404, "quote_not_found", "Domain quote not found.")
@@ -633,6 +825,161 @@ class DomainService:
             await session.commit()
             return current
 
+    async def begin_x402_settlement(
+        self,
+        order_id: str,
+        *,
+        payer: str,
+        payment_network: str | None,
+        payment_asset: str | None,
+        payment_authorization_fingerprint: str | None = None,
+        payment_authorization: str | None = None,
+    ) -> DomainOrderRow:
+        """Persist a domain-payment intent before the facilitator can move money."""
+
+        async with self.db() as session:
+            order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if order is None:
+                raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            if order.status != DomainOrderStatus.AWAITING_PAYMENT.value:
+                raise DomainProblem(
+                    409,
+                    "order_payment_closed",
+                    "This domain order is no longer awaiting payment.",
+                )
+            if (
+                order.payment_authorization_fingerprint is not None
+                and order.payment_authorization_fingerprint != payment_authorization_fingerprint
+            ):
+                raise DomainProblem(
+                    409,
+                    "domain_order_payment_bound",
+                    "This order is already bound to another payment authorization; retry the original payment.",
+                )
+            if order.paid_at is None:
+                order.payer = payer[:128]
+                order.payment_network = payment_network
+                order.payment_asset = payment_asset
+                if payment_authorization_fingerprint is not None:
+                    order.payment_authorization_fingerprint = payment_authorization_fingerprint
+                    order.payment_authorization_header = payment_authorization
+                order.payment_settlement_pending_at = order.payment_settlement_pending_at or _now()
+                try:
+                    await session.commit()
+                except IntegrityError as exc:
+                    await session.rollback()
+                    raise DomainProblem(
+                        409,
+                        "payment_authorization_reused",
+                        "This payment authorization is already bound to another domain order.",
+                    ) from exc
+            return order
+
+    async def clear_x402_settlement(self, order_id: str) -> None:
+        """Clear an intent after the facilitator definitively rejects settlement."""
+
+        async with self.db() as session:
+            order = await session.get(DomainOrderRow, order_id)
+            if order is not None and order.paid_at is None:
+                order.payer = None
+                order.payment_network = None
+                order.payment_asset = None
+                order.payment_authorization_fingerprint = None
+                order.payment_authorization_header = None
+                order.payment_settlement_pending_at = None
+                order.payment_recovery_next_attempt_at = None
+                await session.commit()
+
+    async def fail_x402_settlement(self, order_id: str, *, reason: str) -> None:
+        """Close an authorization that provably can no longer pay this order."""
+
+        async with self.db() as session:
+            order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                order is None
+                or order.status != DomainOrderStatus.AWAITING_PAYMENT.value
+                or order.paid_at is not None
+            ):
+                return
+            order.payer = None
+            order.payment_network = None
+            order.payment_asset = None
+            order.payment_authorization_fingerprint = None
+            order.payment_authorization_header = None
+            order.payment_settlement_pending_at = None
+            order.payment_recovery_next_attempt_at = None
+            await self._expire_unpaid_order(session, order, now=_now())
+            order.error_code = f"payment_authorization_{reason}"[:64]
+            quote = await session.get(DomainQuoteRow, order.quote_id)
+            if quote is not None and quote.status in {"active", "reserved"}:
+                quote.status = "expired"
+            await session.commit()
+
+    async def record_x402_settlement(
+        self,
+        order_id: str,
+        *,
+        payer: str,
+        tx_hash: str | None,
+        payment_network: str | None,
+        payment_asset: str | None,
+    ) -> DomainOrderRow:
+        """Durably stamp a settled domain payment before fulfillment handoff."""
+
+        async with self.db() as session:
+            order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if order is None:
+                raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            if order.status != DomainOrderStatus.AWAITING_PAYMENT.value and order.paid_at is None:
+                raise DomainProblem(
+                    409,
+                    "order_payment_closed",
+                    "This domain order is no longer awaiting payment.",
+                )
+            order.payer = payer[:128]
+            order.payment_tx = tx_hash
+            order.payment_network = payment_network
+            order.payment_asset = payment_asset
+            order.payment_authorization_header = None
+            order.payment_settlement_pending_at = None
+            order.payment_recovery_next_attempt_at = None
+            order.paid_at = order.paid_at or _now()
+            await session.commit()
+            return order
+
+    async def _defer_x402_recovery(self, order_id: str) -> None:
+        """Rotate an inconclusive authorization behind untouched domain orders."""
+
+        async with self.db() as session:
+            order = await session.get(DomainOrderRow, order_id)
+            if (
+                order is None
+                or order.status != DomainOrderStatus.AWAITING_PAYMENT.value
+                or order.paid_at is not None
+                or not order.payment_authorization_header
+            ):
+                return
+            order.payment_recovery_next_attempt_at = _now() + _PAYMENT_RECOVERY_RETRY_DELAY
+            await session.commit()
+
     async def mark_x402_paid(
         self,
         order_id: str,
@@ -641,6 +988,7 @@ class DomainService:
         tx_hash: str | None,
         payment_network: str | None = None,
         payment_asset: str | None = None,
+        payment_handoff_grace: timedelta | None = None,
     ) -> DomainOrderRow:
         return await self._mark_paid(
             order_id,
@@ -648,6 +996,7 @@ class DomainService:
             tx_hash=tx_hash,
             payment_network=payment_network,
             payment_asset=payment_asset,
+            payment_handoff_grace=payment_handoff_grace,
         )
 
     async def assert_x402_payable(self, order_id: str) -> None:
@@ -661,6 +1010,8 @@ class DomainService:
             ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            if order.payment_settlement_pending_at is not None or order.paid_at is not None:
+                return
             quote = await session.get(DomainQuoteRow, order.quote_id)
             if (
                 quote is None
@@ -693,6 +1044,7 @@ class DomainService:
         tx_hash: str | None,
         payment_network: str | None = None,
         payment_asset: str | None = None,
+        payment_handoff_grace: timedelta | None = None,
     ) -> DomainOrderRow:
         async with self.db() as session:
             order = (
@@ -704,6 +1056,45 @@ class DomainService:
             ).scalar_one_or_none()
             if order is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            durable_settlement = order.paid_at is not None
+            late_handoff = False
+            if (
+                order.status == DomainOrderStatus.EXPIRED.value
+                and payment_handoff_grace is not None
+            ):
+                quote = (
+                    await session.execute(
+                        select(DomainQuoteRow)
+                        .where(DomainQuoteRow.quote_id == order.quote_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                expires_at = _aware(quote.expires_at) if quote is not None else None
+                late_handoff = bool(
+                    quote is not None
+                    and quote.status in {"active", "reserved", "expired"}
+                    and expires_at is not None
+                    and expires_at > _now() - payment_handoff_grace
+                )
+                if late_handoff:
+                    assert quote is not None
+                    order.status = DomainOrderStatus.AWAITING_PAYMENT.value
+                    order.error_code = None
+                    order.error_detail = None
+                    quote.status = "reserved"
+                else:
+                    order.paid_at = order.paid_at or _now()
+                    order.payer = payer[:128]
+                    order.payment_tx = tx_hash
+                    order.payment_network = payment_network
+                    order.payment_asset = payment_asset
+                    order.payment_authorization_header = None
+                    order.payment_settlement_pending_at = None
+                    order.status = DomainOrderStatus.REFUND_DUE.value
+                    order.error_code = "late_payment_after_expiry"
+                    session.add(self._build_refund_event(order, "late_payment_after_expiry"))
+                    await session.commit()
+                    return order
             if order.status not in {
                 DomainOrderStatus.AWAITING_PAYMENT.value,
                 DomainOrderStatus.PAID.value,
@@ -713,11 +1104,13 @@ class DomainService:
             if order.status == DomainOrderStatus.AWAITING_PAYMENT.value:
                 # Persist settlement attribution before any quote validation so
                 # an invalidated quote still produces a usable refund record.
-                order.paid_at = _now()
+                order.paid_at = order.paid_at or _now()
                 order.payer = payer[:128]
                 order.payment_tx = tx_hash
                 order.payment_network = payment_network
                 order.payment_asset = payment_asset
+                order.payment_authorization_header = None
+                order.payment_settlement_pending_at = None
                 quote = (
                     await session.execute(
                         select(DomainQuoteRow)
@@ -728,7 +1121,11 @@ class DomainService:
                 if (
                     quote is None
                     or quote.status not in {"active", "reserved"}
-                    or _aware(quote.expires_at) <= _now()
+                    or (
+                        _aware(quote.expires_at) <= _now()
+                        and not late_handoff
+                        and not durable_settlement
+                    )
                 ):
                     if quote is not None and _aware(quote.expires_at) <= _now():
                         quote.status = "expired"
@@ -744,9 +1141,7 @@ class DomainService:
                     if vm_quote is None or vm_quote.status != QuoteStatus.CONSUMED:
                         order.status = DomainOrderStatus.REFUND_DUE.value
                         order.error_code = "vm_quote_already_consumed"
-                        session.add(
-                            self._build_refund_event(order, "vm_quote_already_consumed")
-                        )
+                        session.add(self._build_refund_event(order, "vm_quote_already_consumed"))
                         await session.commit()
                         return order
                 order.status = DomainOrderStatus.QUEUED.value
@@ -854,6 +1249,102 @@ class DomainService:
             dnssec_status=domain.dnssec_status,
         )
 
+    async def replace_service_records(
+        self,
+        fqdn: str,
+        records: list[dict[str, Any]],
+        *,
+        managed_by: str,
+    ) -> None:
+        """Atomically replace only one service's centrally managed RRsets."""
+
+        if not managed_by or managed_by == "customer" or len(managed_by) > 32:
+            raise DomainProblem(422, "invalid_record_owner", "DNS record owner is invalid.")
+        grouped: dict[tuple[str, str, int], list[str]] = {}
+        for item in records:
+            record_type = str(item.get("type") or "").upper()
+            value = str(item.get("value") or "")
+            key = (str(item.get("name") or "@"), record_type, int(item.get("ttl") or 3600))
+            grouped.setdefault(key, []).append(value)
+        normalized: list[DNSRRSet] = []
+        for (name, record_type, ttl), values in grouped.items():
+            try:
+                rrset = DNSRRSet(
+                    name=name,
+                    type=ManagedRecordType(record_type),
+                    ttl=ttl,
+                    values=values,
+                )
+            except (ValueError, TypeError) as exc:
+                raise DomainProblem(
+                    422, "invalid_mail_dns", "Mail DNS contains an invalid RRset."
+                ) from exc
+            normalized.append(validate_rrset(rrset, fqdn))
+
+        async with self.db() as session:
+            domain = (
+                await session.execute(
+                    select(DomainRow).where(DomainRow.fqdn == fqdn).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if domain is None:
+                raise DomainProblem(404, "domain_not_found", "The managed domain was not found.")
+            active = str(domain.status) in {
+                DomainStatus.ACTIVE.value,
+                DomainStatus.RENEWAL_DUE.value,
+            }
+            if normalized and not active:
+                raise DomainProblem(409, "domain_not_active", "The managed domain is not active.")
+            owned_keys = {(row.name, row.type.value) for row in normalized}
+            conflicts = list(
+                await session.scalars(
+                    select(DomainDNSRecordRow).where(
+                        DomainDNSRecordRow.fqdn == fqdn,
+                        DomainDNSRecordRow.managed_by != managed_by,
+                    )
+                )
+            )
+            if any((row.name, row.type) in owned_keys for row in conflicts):
+                raise DomainProblem(
+                    409,
+                    "dns_record_conflict",
+                    "Mail DNS conflicts with an existing customer or service RRset.",
+                )
+            await session.execute(
+                delete(DomainDNSRecordRow).where(
+                    DomainDNSRecordRow.fqdn == fqdn,
+                    DomainDNSRecordRow.managed_by == managed_by,
+                )
+            )
+            for row in normalized:
+                session.add(
+                    DomainDNSRecordRow(
+                        fqdn=fqdn,
+                        name=row.name,
+                        type=row.type.value,
+                        ttl=row.ttl,
+                        values=row.values,
+                        managed_by=managed_by,
+                    )
+                )
+            domain.zone_revision += 1
+            await session.flush()
+            all_records = list(
+                await session.scalars(
+                    select(DomainDNSRecordRow).where(DomainDNSRecordRow.fqdn == fqdn)
+                )
+            )
+            if domain.nameserver_mode == NameserverMode.MANAGED.value:
+                await self.dns.apply_zone(
+                    fqdn,
+                    revision=domain.zone_revision,
+                    records=[self._record_payload(row) for row in all_records],
+                )
+            await session.commit()
+
+    async def remove_service_records(self, fqdn: str, *, managed_by: str) -> None:
+        await self.replace_service_records(fqdn, [], managed_by=managed_by)
+
     async def apply_changeset(
         self,
         owner_account_id: str,
@@ -954,6 +1445,12 @@ class DomainService:
                     )
                 key = (rrset.name, rrset.type.value)
                 existing = desired.get(key)
+                if existing is not None and existing.managed_by != "customer":
+                    raise DomainProblem(
+                        409,
+                        "service_dns_record_managed",
+                        "This DNS record is managed by an attached service; remove the service before changing it.",
+                    )
                 if change.action is DNSChangeAction.DELETE:
                     if existing is not None:
                         await session.delete(existing)
@@ -1054,7 +1551,7 @@ class DomainService:
             "nameservers",
             {"mode": body.mode.value, "nameservers": nameservers},
             idempotency_key,
-            reject_vm_attachment=body.mode is NameserverMode.EXTERNAL,
+            reject_external_delegation=body.mode is NameserverMode.EXTERNAL,
         )
 
     async def enqueue_dnssec_update(
@@ -1094,6 +1591,7 @@ class DomainService:
             "transfer_out",
             {},
             idempotency_key,
+            reject_external_delegation=True,
         )
 
     async def find_existing_operation(
@@ -1179,6 +1677,26 @@ class DomainService:
                 raise DomainProblem(404, "domain_not_found", "Domain not found.")
             if row.anon_management_token_hash != hash_anon_token(token):
                 raise DomainProblem(404, "domain_not_found", "Domain not found.")
+            pending_activation = await session.scalar(
+                select(MailAccountRow.mailbox_id)
+                .where(
+                    MailAccountRow.domain == fqdn,
+                    or_(
+                        MailAccountRow.status.in_(["pending_domain", "provisioning"]),
+                        and_(
+                            MailAccountRow.status == "awaiting_payment",
+                            MailAccountRow.capacity_reserved_at.is_not(None),
+                        ),
+                    ),
+                )
+                .limit(1)
+            )
+            if pending_activation is not None:
+                raise DomainProblem(
+                    409,
+                    "domain_activation_pending",
+                    "This domain has a payment-authorized mailbox activation in progress.",
+                )
             row.owner_account_id = owner_account_id
             row.anon_management_token_hash = None
             await session.commit()
@@ -1227,69 +1745,179 @@ class DomainService:
             self.orchestrator.start_provisioning(vm_id)
         return len(vm_ids)
 
-    async def recover_x402_handoffs(self, *, limit: int = 200) -> int:
+    async def recover_x402_handoffs(
+        self,
+        *,
+        gate: Any | None = None,
+        limit: int = 200,
+    ) -> int:
         """Replay settled domain payments whose order transition was lost."""
         if limit < 1:
             return 0
         recovered = 0
         seen: set[str] = set()
-        cursor: tuple[datetime, str] | None = None
-        while True:
-            filters = [
-                PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
-                PaymentEventRow.resource_path == "/v1/domains/orders",
-            ]
-            if cursor is not None:
-                created_at, event_id = cursor
-                filters.append(
-                    or_(
-                        PaymentEventRow.created_at < created_at,
-                        and_(
-                            PaymentEventRow.created_at == created_at,
-                            PaymentEventRow.event_id < event_id,
-                        ),
-                    )
-                )
+        now = _now()
+        if gate is not None:
             async with self.db() as session:
-                events = list(
+                pending = list(
                     await session.scalars(
-                        select(PaymentEventRow)
-                        .where(*filters)
+                        select(DomainOrderRow)
+                        .where(
+                            DomainOrderRow.status == DomainOrderStatus.AWAITING_PAYMENT.value,
+                            DomainOrderRow.payment_method == DomainPaymentMethod.USDC.value,
+                            DomainOrderRow.payment_settlement_pending_at.is_not(None),
+                            DomainOrderRow.paid_at.is_(None),
+                            DomainOrderRow.payment_authorization_header.is_not(None),
+                            or_(
+                                DomainOrderRow.payment_recovery_next_attempt_at.is_(None),
+                                DomainOrderRow.payment_recovery_next_attempt_at <= now,
+                            ),
+                        )
                         .order_by(
-                            PaymentEventRow.created_at.desc(),
-                            PaymentEventRow.event_id.desc(),
+                            DomainOrderRow.payment_recovery_next_attempt_at.is_not(None),
+                            DomainOrderRow.payment_recovery_next_attempt_at,
+                            DomainOrderRow.payment_settlement_pending_at,
                         )
                         .limit(limit)
                     )
                 )
-            if not events:
-                break
-            for event in events:
-                extra = event.extra if isinstance(event.extra, dict) else {}
-                order_id = str(extra.get("order_id") or "")
-                if not order_id or order_id in seen:
+                pending_ids = [row.order_id for row in pending]
+                bundle_quotes = {
+                    order_id: quote_id
+                    for order_id, quote_id in (
+                        await session.execute(
+                            select(
+                                MailAccountRow.domain_order_id,
+                                MailAccountRow.quote_id,
+                            ).where(MailAccountRow.domain_order_id.in_(pending_ids))
+                        )
+                    ).all()
+                    if order_id is not None and quote_id is not None
+                }
+            for pending_order in pending:
+                if not pending_order.payment_authorization_header:
                     continue
-                seen.add(order_id)
-                async with self.db() as session:
-                    order = await session.get(DomainOrderRow, order_id)
-                    awaiting = bool(
-                        order is not None
-                        and order.status == DomainOrderStatus.AWAITING_PAYMENT.value
+                try:
+                    bundle_quote_id = bundle_quotes.get(pending_order.order_id)
+                    resource_key = (
+                        mail_payment_resource_key(
+                            bundle_quote_id,
+                            domain_order_id=pending_order.order_id,
+                        )
+                        if bundle_quote_id
+                        else domain_payment_resource_key(pending_order.order_id)
                     )
-                if not awaiting:
-                    continue
-                await self._mark_paid(
-                    order_id,
-                    payer=event.payer_wallet or "unknown",
-                    tx_hash=event.tx_hash,
-                    payment_network=event.network,
-                    payment_asset=event.asset,
+                    reconciliation: PaymentReconciliation = await gate.reconcile_settlement(
+                        pending_order.payment_authorization_header,
+                        Decimal(pending_order.amount_usd),
+                        pending_since=_aware(pending_order.payment_settlement_pending_at),
+                        resource_key=resource_key,
+                    )
+                    if reconciliation.terminal_unsettled:
+                        await self.fail_x402_settlement(
+                            pending_order.order_id,
+                            reason=reconciliation.reason or "unsettled",
+                        )
+                        continue
+                    settlement = reconciliation.payment
+                    if settlement is None:
+                        await self._defer_x402_recovery(pending_order.order_id)
+                        continue
+                    await self.record_x402_settlement(
+                        pending_order.order_id,
+                        payer=settlement.payer,
+                        tx_hash=settlement.tx_hash,
+                        payment_network=settlement.network,
+                        payment_asset=settlement.asset,
+                    )
+                except Exception:
+                    await self._defer_x402_recovery(pending_order.order_id)
+                    log.warning(
+                        "domain_payment_authorization_reconciliation_deferred",
+                        order_id=pending_order.order_id,
+                        exc_info=True,
+                    )
+        async with self.db() as session:
+            durable = list(
+                await session.scalars(
+                    select(DomainOrderRow)
+                    .where(
+                        DomainOrderRow.status == DomainOrderStatus.AWAITING_PAYMENT.value,
+                        DomainOrderRow.payment_method == DomainPaymentMethod.USDC.value,
+                        DomainOrderRow.paid_at.is_not(None),
+                    )
+                    .order_by(DomainOrderRow.paid_at)
+                    .limit(limit)
                 )
-                recovered += 1
-            if len(events) < limit:
-                break
-            last = events[-1]
-            cursor = (_aware(last.created_at), last.event_id)
+            )
+        for durable_order in durable:
+            seen.add(durable_order.order_id)
+            await self._mark_paid(
+                durable_order.order_id,
+                payer=durable_order.payer or "unknown",
+                tx_hash=durable_order.payment_tx,
+                payment_network=durable_order.payment_network,
+                payment_asset=durable_order.payment_asset,
+            )
+            recovered += 1
+        settled_event_exists = (
+            select(PaymentEventRow.event_id)
+            .where(
+                PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
+                PaymentEventRow.resource_path.in_(
+                    ["/v1/domains/orders", "/v1/domains/agent/orders"]
+                ),
+                PaymentEventRow.amount_usd == DomainOrderRow.amount_usd,
+                PaymentEventRow.extra["order_id"].as_string() == DomainOrderRow.order_id,
+            )
+            .correlate(DomainOrderRow)
+            .exists()
+        )
+        async with self.db() as session:
+            ledger_candidates = list(
+                await session.scalars(
+                    select(DomainOrderRow)
+                    .where(
+                        DomainOrderRow.status == DomainOrderStatus.AWAITING_PAYMENT.value,
+                        DomainOrderRow.payment_method == DomainPaymentMethod.USDC.value,
+                        DomainOrderRow.paid_at.is_(None),
+                        settled_event_exists,
+                    )
+                    .order_by(DomainOrderRow.created_at, DomainOrderRow.order_id)
+                    .limit(limit)
+                )
+            )
+        for order in ledger_candidates:
+            if order.order_id in seen:
+                continue
+            async with self.db() as session:
+                event = await session.scalar(
+                    select(PaymentEventRow)
+                    .where(
+                        PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
+                        PaymentEventRow.resource_path.in_(
+                            ["/v1/domains/orders", "/v1/domains/agent/orders"]
+                        ),
+                        PaymentEventRow.amount_usd == order.amount_usd,
+                        PaymentEventRow.extra["order_id"].as_string() == order.order_id,
+                    )
+                    .order_by(
+                        PaymentEventRow.created_at.desc(),
+                        PaymentEventRow.event_id.desc(),
+                    )
+                    .limit(1)
+                )
+            if event is None:
+                continue
+            seen.add(order.order_id)
+            await self._mark_paid(
+                order.order_id,
+                payer=event.payer_wallet or "unknown",
+                tx_hash=event.tx_hash,
+                payment_network=event.network,
+                payment_asset=event.asset,
+            )
+            recovered += 1
         return recovered
 
     async def expire_quotes(self) -> int:
@@ -1301,6 +1929,8 @@ class DomainService:
                     .join(DomainQuoteRow, DomainQuoteRow.quote_id == DomainOrderRow.quote_id)
                     .where(
                         DomainOrderRow.status == DomainOrderStatus.AWAITING_PAYMENT.value,
+                        DomainOrderRow.payment_settlement_pending_at.is_(None),
+                        DomainOrderRow.paid_at.is_(None),
                         DomainQuoteRow.status.in_(["active", "reserved"]),
                         DomainQuoteRow.expires_at < now,
                     )
@@ -1309,11 +1939,24 @@ class DomainService:
             )
             for order in unpaid_orders:
                 await self._expire_unpaid_order(session, order, now=now)
+            protected_handoff = (
+                select(DomainOrderRow.order_id)
+                .where(
+                    DomainOrderRow.quote_id == DomainQuoteRow.quote_id,
+                    DomainOrderRow.status == DomainOrderStatus.AWAITING_PAYMENT.value,
+                    or_(
+                        DomainOrderRow.payment_settlement_pending_at.is_not(None),
+                        DomainOrderRow.paid_at.is_not(None),
+                    ),
+                )
+                .exists()
+            )
             result = await session.execute(
                 update(DomainQuoteRow)
                 .where(
                     DomainQuoteRow.status.in_(["active", "reserved"]),
                     DomainQuoteRow.expires_at < now,
+                    ~protected_handoff,
                 )
                 .values(status="expired")
             )
@@ -1327,7 +1970,11 @@ class DomainService:
         *,
         now: datetime,
     ) -> None:
-        if order.status != DomainOrderStatus.AWAITING_PAYMENT.value:
+        if (
+            order.status != DomainOrderStatus.AWAITING_PAYMENT.value
+            or order.payment_settlement_pending_at is not None
+            or order.paid_at is not None
+        ):
             return
         order.status = DomainOrderStatus.EXPIRED.value
         order.error_code = "quote_expired"
@@ -1335,9 +1982,7 @@ class DomainService:
             return
         vm_quote = (
             await session.execute(
-                select(VMQuoteRow)
-                .where(VMQuoteRow.quote_id == order.vm_quote_id)
-                .with_for_update()
+                select(VMQuoteRow).where(VMQuoteRow.quote_id == order.vm_quote_id).with_for_update()
             )
         ).scalar_one_or_none()
         if (
@@ -1346,9 +1991,7 @@ class DomainService:
             and vm_quote.vm_id is None
         ):
             vm_quote.status = (
-                QuoteStatus.EXPIRED
-                if _aware(vm_quote.expires_at) <= now
-                else QuoteStatus.CREATED
+                QuoteStatus.EXPIRED if _aware(vm_quote.expires_at) <= now else QuoteStatus.CREATED
             )
 
     async def reconcile_pending(self) -> int:
@@ -1453,9 +2096,7 @@ class DomainService:
                 )
             await session.commit()
 
-    async def claim_vm_attachment(
-        self, owner_account_id: str, value: str, vm_id: str
-    ) -> None:
+    async def claim_vm_attachment(self, owner_account_id: str, value: str, vm_id: str) -> None:
         """Atomically reserve a managed domain before payment settles."""
         _, _, fqdn = normalize_registrable_domain(value)
         async with self.db() as session:
@@ -1557,9 +2198,7 @@ class DomainService:
             },
         )
 
-    async def _enqueue_vm_job(
-        self, *, kind: str, vm_id: str, payload: dict[str, Any]
-    ) -> None:
+    async def _enqueue_vm_job(self, *, kind: str, vm_id: str, payload: dict[str, Any]) -> None:
         dedupe_key = f"{kind}:{vm_id}"
         async with self.db() as session:
             existing = (
@@ -1890,9 +2529,7 @@ class DomainService:
                     dedupe_key=f"provider-pending:{order_id}",
                     payload={"order_id": order_id},
                     available_at=_now()
-                    + timedelta(
-                        seconds=self.domain_config.provider_reconcile_delay_seconds
-                    ),
+                    + timedelta(seconds=self.domain_config.provider_reconcile_delay_seconds),
                 )
             operation = await session.get(DomainOperationRow, order.operation_id)
             if operation is not None:
@@ -1944,6 +2581,7 @@ class DomainService:
                 domain.extension = extension
                 domain.owner_wallet = order.payer or order.order_id
                 domain.owner_account_id = order.owner_account_id
+                domain.anon_management_token_hash = order.management_token_hash
                 domain.status = DomainStatus.REGISTERING
                 domain.client_order_id = order.order_id
                 domain.registrar_price = quote.provider_cost
@@ -1975,6 +2613,7 @@ class DomainService:
                     fqdn=order.fqdn,
                     owner_wallet=order.payer or order.order_id,
                     owner_account_id=order.owner_account_id,
+                    anon_management_token_hash=order.management_token_hash,
                     status=DomainStatus.REGISTERING,
                     client_order_id=order.order_id,
                     registrar_price=quote.provider_cost,
@@ -2139,9 +2778,7 @@ class DomainService:
                     dedupe_key=f"provider-pending:{order_id}",
                     payload={"order_id": order_id},
                     available_at=_now()
-                    + timedelta(
-                        seconds=self.domain_config.provider_reconcile_delay_seconds
-                    ),
+                    + timedelta(seconds=self.domain_config.provider_reconcile_delay_seconds),
                 )
             if operation is not None:
                 operation.status = (
@@ -2177,6 +2814,7 @@ class DomainService:
                 # VM insert and quote/order linking can then replay safely.
                 order.vm_id = generate_vm_id()
             planned_vm_id = order.vm_id
+            owner_account_id = order.owner_account_id
             await session.commit()
         spec = VMCreateRequest.model_validate(quote.order_payload)
         if fallback_auto_domain:
@@ -2186,15 +2824,13 @@ class DomainService:
             # not exist yet. Claim it for the durably planned VM id before any
             # provisioning call so a concurrent standalone VM purchase cannot
             # take the bundle's domain during that gap.
-            await self.claim_vm_attachment(
-                order.owner_account_id,
-                order.fqdn,
-                planned_vm_id,
-            )
+            if owner_account_id is None:
+                raise RuntimeError("the bundle order is missing its owner account")
+            await self.claim_vm_attachment(owner_account_id, order.fqdn, planned_vm_id)
         try:
             reserved, _ = await self.orchestrator.reserve_vm_with_capacity(
                 spec,
-                owner_account_id=order.owner_account_id,
+                owner_account_id=owner_account_id,
                 vm_id=planned_vm_id,
                 pricing_snapshot=quote.pricing_snapshot,
                 legacy_billing=quote.pricing_snapshot is None,
@@ -2304,7 +2940,7 @@ class DomainService:
         mode = NameserverMode(payload["mode"])
         nameservers = list(payload.get("nameservers") or [])
         if mode is NameserverMode.EXTERNAL:
-            self._assert_external_delegation_allowed(domain)
+            await self._assert_external_delegation_allowed(domain)
         if domain.openprovider_id is None:
             raise RuntimeError("domain has no registrar id")
         incompatible_dnssec = (
@@ -2388,6 +3024,7 @@ class DomainService:
 
     async def _transfer_out(self, operation_id: str) -> None:
         _operation, domain = await self._operation_and_domain(operation_id)
+        await self._assert_external_delegation_allowed(domain)
         if domain.openprovider_id is None:
             raise RuntimeError("domain has no registrar id")
         await self.provider.unlock_domain(domain.openprovider_id)
@@ -2518,12 +3155,8 @@ class DomainService:
                 order.provider_domain_id = provider_id
                 order.provider_status = status
                 response_payload = jsonable_encoder(result)
-                if order.action == DomainAction.RENEW.value and isinstance(
-                    response_payload, dict
-                ):
-                    baseline = (order.provider_response or {}).get(
-                        "_hyrule_renewal_baseline"
-                    )
+                if order.action == DomainAction.RENEW.value and isinstance(response_payload, dict):
+                    baseline = (order.provider_response or {}).get("_hyrule_renewal_baseline")
                     if baseline is not None:
                         response_payload["_hyrule_renewal_baseline"] = baseline
                 order.provider_response = response_payload
@@ -2695,7 +3328,7 @@ class DomainService:
         payload: dict[str, Any],
         idempotency_key: str,
         *,
-        reject_vm_attachment: bool = False,
+        reject_external_delegation: bool = False,
     ) -> DomainOperationResponse:
         if not idempotency_key or len(idempotency_key) > 128:
             raise DomainProblem(
@@ -2713,7 +3346,7 @@ class DomainService:
                 if operation is not None:
                     self._validate_operation_replay(operation, fqdn, kind, payload)
                     return self._operation_response(operation)
-            if reject_vm_attachment:
+            if reject_external_delegation:
                 domain = (
                     await session.execute(
                         select(DomainRow)
@@ -2726,7 +3359,7 @@ class DomainService:
                 ).scalar_one_or_none()
                 if domain is None:
                     raise DomainProblem(404, "domain_not_found", "Domain not found.")
-                self._assert_external_delegation_allowed(domain)
+                await self._assert_external_delegation_allowed(domain, session=session)
             operation = DomainOperationRow(
                 operation_id=generate_domain_operation_id(),
                 fqdn=fqdn,
@@ -2772,13 +3405,50 @@ class DomainService:
             + hashlib.sha256(f"{owner_account_id}:{kind}:{idempotency_key}".encode()).hexdigest()
         )
 
-    @staticmethod
-    def _assert_external_delegation_allowed(domain: DomainRow) -> None:
+    async def _assert_external_delegation_allowed(
+        self,
+        domain: DomainRow,
+        *,
+        session: AsyncSession | None = None,
+    ) -> None:
         if domain.vm_id is not None or domain.vm_ipv6 is not None:
             raise DomainProblem(
                 409,
                 "domain_attached_to_vm",
                 "Detach the VM before switching this domain to external nameservers.",
+            )
+        occupancy = or_(
+            MailAccountRow.status.in_(
+                ["pending_domain", "provisioning", "active", "suspended", "grace"]
+            ),
+            and_(
+                MailAccountRow.status == "awaiting_payment",
+                MailAccountRow.capacity_reserved_at.is_not(None),
+            ),
+            MailAccountRow.dns_cleanup_pending.is_(True),
+        )
+
+        async def occupied(db: AsyncSession) -> bool:
+            mailbox_id = await db.scalar(
+                select(MailAccountRow.mailbox_id)
+                .where(
+                    MailAccountRow.domain == domain.fqdn,
+                    occupancy,
+                )
+                .limit(1)
+            )
+            return mailbox_id is not None
+
+        if session is not None:
+            has_mailbox = await occupied(session)
+        else:
+            async with self.db() as current_session:
+                has_mailbox = await occupied(current_session)
+        if has_mailbox:
+            raise DomainProblem(
+                409,
+                "domain_attached_to_mailbox",
+                "Delete the Agent Mail mailbox before changing domain delegation.",
             )
 
     @staticmethod
@@ -2933,11 +3603,7 @@ class DomainService:
                         order.status = DomainOrderStatus.ACTIVE.value
                         order.error_code = "bundle_vm_failed"
                         order.error_detail = str(exc)[:1000]
-                        if (
-                            order.vm_id
-                            and domain.vm_id == order.vm_id
-                            and domain.vm_ipv6 is None
-                        ):
+                        if order.vm_id and domain.vm_id == order.vm_id and domain.vm_ipv6 is None:
                             bundle_vm = await session.get(VMRow, order.vm_id)
                             if bundle_vm is None or str(bundle_vm.status) in {
                                 VMStatus.PROVISIONING.value,

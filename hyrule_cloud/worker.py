@@ -15,10 +15,13 @@ from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
 from hyrule_cloud.domains.service import DomainService
 from hyrule_cloud.logging_config import SAFE_DICT_TRACEBACKS
+from hyrule_cloud.mail.service import MailService
+from hyrule_cloud.middleware.x402 import PaymentGate
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
 from hyrule_cloud.services.intents import scan_pending_intents
+from hyrule_cloud.services.payments_ledger import PaymentLedger
 
 structlog.configure(
     processors=[
@@ -40,6 +43,11 @@ async def run_worker() -> None:
     engine = create_db_engine(config.database_url)
     await init_db(engine)
     sessions = create_session_factory(engine)
+    payment_gate = PaymentGate(
+        config.payment,
+        public_base_url=config.public_base_url,
+        ledger=PaymentLedger(sessions),
+    )
     orchestrator = Orchestrator(config, sessions)
     rates = RateProvider()
     native = NativeCryptoProvider(config.payment)
@@ -55,6 +63,7 @@ async def run_worker() -> None:
         orchestrator,
     )
     orchestrator.domains = domains
+    mail = MailService(config, sessions, domains, orchestrator.refunds)
     recovered_bundles = await domains.recover_bundle_provisioning()
 
     stop = asyncio.Event()
@@ -74,6 +83,9 @@ async def run_worker() -> None:
     next_catalog = now
     next_reconcile = now
     next_renewal_state = now
+    next_mail = now
+    next_mail_retention = now
+    next_mail_webhooks = now
     worker_id = f"{socket.gethostname()}:{id(stop)}"
     log.info(
         "worker_started",
@@ -96,9 +108,17 @@ async def run_worker() -> None:
                 next_intents = now + timedelta(seconds=15)
             if now >= next_payment_handoffs:
                 try:
-                    await domains.recover_x402_handoffs()
+                    await domains.recover_x402_handoffs(gate=payment_gate)
                 except Exception:
                     log.exception("domain_payment_handoff_recovery_failed")
+                try:
+                    await mail.recover_x402_handoffs(gate=payment_gate)
+                except Exception:
+                    log.exception("mail_payment_handoff_recovery_failed")
+                try:
+                    await mail.reconcile_send_intents()
+                except Exception:
+                    log.exception("mail_send_intent_reconciliation_failed")
                 next_payment_handoffs = now + timedelta(seconds=15)
             if now >= next_jobs:
                 try:
@@ -137,11 +157,33 @@ async def run_worker() -> None:
                 except Exception:
                     log.exception("domain_renewal_state_refresh_failed")
                 next_renewal_state = now + timedelta(hours=1)
+            if now >= next_mail:
+                try:
+                    await mail.provision_pending(limit=10)
+                    await mail.retry_failed_backend_cleanup(limit=20)
+                    await mail.process_lifecycle()
+                    await mail.expire_quotes()
+                except Exception:
+                    log.exception("agent_mail_lifecycle_failed")
+                next_mail = now + timedelta(seconds=config.mail.worker_poll_seconds)
+            if now >= next_mail_retention:
+                try:
+                    await mail.sweep_retention()
+                except Exception:
+                    log.exception("agent_mail_retention_sweep_failed")
+                next_mail_retention = now + timedelta(days=1)
+            if now >= next_mail_webhooks:
+                try:
+                    await mail.deliver_webhooks(limit=20)
+                except Exception:
+                    log.exception("agent_mail_webhook_delivery_failed")
+                next_mail_webhooks = now + timedelta(seconds=5)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=1.0)
             except TimeoutError:
                 pass
     finally:
+        await mail.close()
         await domains.close()
         await native.close()
         await rates.close()

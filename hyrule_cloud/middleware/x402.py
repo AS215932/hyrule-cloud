@@ -16,17 +16,20 @@ back either a 402 Response or the verified payment details.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
 import secrets
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+import httpx
 import structlog
 from fastapi import Request, Response
 from x402.extensions.bazaar import bazaar_resource_server_extension
@@ -44,6 +47,7 @@ from x402.http import (
     encode_payment_response_header,
 )
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
+from x402.mechanisms.evm.types import ExactEIP3009Payload
 from x402.schemas import PaymentPayload, PaymentRequirements, ResourceConfig, ResourceInfo
 from x402.server import x402ResourceServer
 
@@ -63,6 +67,13 @@ _ALLOWED_FACILITATOR_HOSTS = {
     _PAYAI_FACILITATOR_HOST,
     _CDP_FACILITATOR_HOST,
 }
+_AUTHORIZATION_STATE_SELECTOR = "e94a0102"
+_AUTHORIZATION_USED_TOPIC = "0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5"
+_AUTHORIZATION_CANCELED_TOPIC = "0x1cdd46ff242716cdaa72d159d339a485b3438398348d68f09d7c8c0a59353d81"
+_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+_RECOVERY_CONFIRMATIONS = 12
+_RECOVERY_LOG_BLOCKS = 50_000
+_RECOVERY_CLOCK_SKEW = timedelta(minutes=5)
 
 
 class CdpFacilitatorAuthProvider:
@@ -163,6 +174,100 @@ class VerifiedPayment:
     dev_bypass: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalPaymentAuthorization:
+    fingerprint: str
+    network: str
+    asset: str
+    payer: str
+    pay_to: str
+    value: str
+    valid_after: str
+    valid_before: str
+    nonce: str
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveredPayment:
+    payer: str
+    tx_hash: str | None
+    network: str
+    asset: str
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentReconciliation:
+    payment: RecoveredPayment | None = None
+    terminal_unsettled: bool = False
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorizationChainOutcome:
+    state: str
+    tx_hash: str | None = None
+
+
+def mail_payment_resource_key(
+    quote_id: str,
+    *,
+    domain_order_id: str | None = None,
+    send: bool = False,
+) -> str:
+    """Return the global binding key for one mail quote or intentional bundle."""
+
+    if domain_order_id:
+        return f"domain_mail_bundle:{quote_id}:{domain_order_id}"
+    return f"mail_send:{quote_id}" if send else f"mail_activation:{quote_id}"
+
+
+def domain_payment_resource_key(order_id: str) -> str:
+    return f"domain_order:{order_id}"
+
+
+def canonical_payment_authorization(header: str) -> CanonicalPaymentAuthorization:
+    """Decode one EIP-3009 authorization independently of header transport."""
+
+    payment = decode_payment_signature_header(header)
+    if not isinstance(payment, PaymentPayload):
+        raise ValueError("Unsupported payment payload version")
+    evm = ExactEIP3009Payload.from_dict(payment.payload)
+    authorization = evm.authorization
+    accepted = payment.accepted
+    network = str(payment.get_network()).lower()
+    asset = str(accepted.asset).lower()
+    signed = {
+        "from": authorization.from_address.lower(),
+        "to": authorization.to.lower(),
+        "value": str(int(authorization.value)),
+        "validAfter": str(int(authorization.valid_after)),
+        "validBefore": str(int(authorization.valid_before)),
+        "nonce": authorization.nonce.lower(),
+    }
+    fields = {
+        "network": network,
+        "asset": asset,
+        "authorization": signed,
+    }
+    canonical = json.dumps(
+        fields,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return CanonicalPaymentAuthorization(
+        fingerprint=hashlib.sha256(canonical).hexdigest(),
+        network=network,
+        asset=asset,
+        payer=signed["from"],
+        pay_to=signed["to"],
+        value=signed["value"],
+        valid_after=signed["validAfter"],
+        valid_before=signed["validBefore"],
+        nonce=signed["nonce"],
+    )
+
+
 class PaymentGate:
     """
     Handles x402 payment verification for dynamically-priced endpoints.
@@ -181,6 +286,14 @@ class PaymentGate:
         self.config = config
         self.public_base_url = public_base_url.rstrip("/")
         self.ledger = ledger
+        missing_recovery_rpc = [
+            network.key for network in config.enabled_networks() if not network.rpc_url.strip()
+        ]
+        if missing_recovery_rpc:
+            raise ValueError(
+                "Enabled payment networks require recovery RPC URLs: "
+                + ", ".join(missing_recovery_rpc)
+            )
         self._facilitator_host = urlparse(config.facilitator_url).hostname or ""
         self.facilitator = HTTPFacilitatorClient(_facilitator_config(config))
         self.server = x402ResourceServer(self.facilitator)
@@ -193,6 +306,74 @@ class PaymentGate:
             self.server.register(net_cfg["network"], ExactEvmServerScheme())
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._local_authorization_bindings: dict[str, str] = {}
+        self._authorization_lock = asyncio.Lock()
+
+    @staticmethod
+    def _request_resource_key(
+        request: Request,
+        amount: Decimal,
+        extra_body: dict[str, Any] | None,
+    ) -> str:
+        extra = extra_body or {}
+        quote_id = str(extra.get("quote_id") or "")
+        domain_order_id = str(extra.get("domain_order_id") or "") or None
+        if request.url.path == "/v1/mail/accounts" and quote_id:
+            return mail_payment_resource_key(
+                quote_id,
+                domain_order_id=domain_order_id,
+            )
+        if request.url.path == "/v1/mail/messages/send" and quote_id:
+            return mail_payment_resource_key(quote_id, send=True)
+        order_id = str(extra.get("order_id") or "")
+        if order_id and request.url.path.startswith("/v1/domains"):
+            return domain_payment_resource_key(order_id)
+        canonical = json.dumps(
+            {
+                "method": request.method.upper(),
+                "path": request.url.path,
+                "amount": format(amount, "f"),
+                "extra": extra,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+        return "http:" + hashlib.sha256(canonical).hexdigest()
+
+    async def _claim_authorization_fingerprint(
+        self,
+        fingerprint: str,
+        resource_key: str,
+        resource_path: str,
+    ) -> bool:
+        if self.ledger is not None:
+            return await self.ledger.claim_authorization(
+                fingerprint=fingerprint,
+                resource_key=resource_key,
+                resource_path=resource_path,
+            )
+        async with self._authorization_lock:
+            existing = self._local_authorization_bindings.get(fingerprint)
+            if existing is None:
+                self._local_authorization_bindings[fingerprint] = resource_key
+                return True
+            return existing == resource_key
+
+    async def _claim_request_authorization(
+        self,
+        request: Request,
+        payment_header: str,
+        amount: Decimal,
+        extra_body: dict[str, Any] | None,
+    ) -> bool:
+        authorization = canonical_payment_authorization(payment_header)
+        return await self._claim_authorization_fingerprint(
+            authorization.fingerprint,
+            self._request_resource_key(request, amount, extra_body),
+            request.url.path,
+        )
 
     async def _ensure_initialized(self) -> bool:
         """Lazily fetch facilitator support once for SDK requirement building."""
@@ -210,7 +391,9 @@ class PaymentGate:
             return True
 
     @staticmethod
-    def _json_response(status_code: int, body: dict[str, Any], headers: dict[str, str] | None = None) -> Response:
+    def _json_response(
+        status_code: int, body: dict[str, Any], headers: dict[str, str] | None = None
+    ) -> Response:
         response_headers = {"Content-Type": "application/json"}
         if headers:
             response_headers.update(headers)
@@ -285,9 +468,7 @@ class PaymentGate:
             mime_type="application/json",
             service_name="Hyrule Cloud",
             tags=list(operation.tags),
-            icon_url=(
-                f"{self.public_base_url}/icon-192.png" if self.public_base_url else None
-            ),
+            icon_url=(f"{self.public_base_url}/icon-192.png" if self.public_base_url else None),
         )
 
     async def _payment_required_response(
@@ -379,7 +560,9 @@ class PaymentGate:
 
     @staticmethod
     def _payment_header(request: Request) -> str | None:
-        return request.headers.get(PAYMENT_SIGNATURE_HEADER) or request.headers.get(X_PAYMENT_HEADER)
+        return request.headers.get(PAYMENT_SIGNATURE_HEADER) or request.headers.get(
+            X_PAYMENT_HEADER
+        )
 
     def has_payment_credentials(self, request: Request) -> bool:
         """True when this request will actually be charged if valid — a
@@ -398,7 +581,9 @@ class PaymentGate:
     # bound are dropped with a warning.
     _LEDGER_WRITE_TIMEOUT_SECONDS = 2.0
 
-    async def _record(self, event_type: str, request: Request, amount: Decimal, **kwargs: Any) -> None:
+    async def _record(
+        self, event_type: str, request: Request, amount: Decimal, **kwargs: Any
+    ) -> None:
         """Bounded ledger write; no-op without a ledger, never raises."""
         if self.ledger is None:
             return
@@ -593,6 +778,25 @@ class PaymentGate:
                     extensions=extensions,
                 )
 
+            if not await self._claim_request_authorization(
+                request,
+                payment_header,
+                amount,
+                extra_body,
+            ):
+                await self._record(
+                    "verify_failed",
+                    request,
+                    amount,
+                    network=matching_requirements.network,
+                    payer=verification.payer,
+                    error="Payment authorization already bound to another resource",
+                )
+                return self._json_response(
+                    409,
+                    {"error": "Payment authorization is already bound to another resource"},
+                )
+
             settlement = await self.server.settle_payment(
                 payment_payload,
                 matching_requirements,
@@ -675,9 +879,7 @@ class PaymentGate:
             bypass = request.headers.get("X-DEV-BYPASS")
             if bypass == self.config.dev_bypass_secret:
                 log.warning("dev_bypass_payment", amount=str(amount))
-                return VerifiedPayment(
-                    payer="0xDEV_TEST_WALLET", amount=amount, dev_bypass=True
-                )
+                return VerifiedPayment(payer="0xDEV_TEST_WALLET", amount=amount, dev_bypass=True)
 
         extensions = self._discovery_extensions(request)
         payment_header = self._payment_header(request)
@@ -773,6 +975,25 @@ class PaymentGate:
                     extensions=extensions,
                 )
 
+            if not await self._claim_request_authorization(
+                request,
+                payment_header,
+                amount,
+                extra_body,
+            ):
+                await self._record(
+                    "verify_failed",
+                    request,
+                    amount,
+                    network=matching_requirements.network,
+                    payer=verification.payer,
+                    error="Payment authorization already bound to another resource",
+                )
+                return self._json_response(
+                    409,
+                    {"error": "Payment authorization is already bound to another resource"},
+                )
+
             return VerifiedPayment(
                 payer=verification.payer or "",
                 amount=amount,
@@ -783,7 +1004,13 @@ class PaymentGate:
             log.error("payment_processing_error", exc_info=True)
             return self._json_response(502, {"error": "Payment processing error"})
 
-    async def settle_verified(self, request: Request, verified: VerifiedPayment) -> bool:
+    async def settle_verified(
+        self,
+        request: Request,
+        verified: VerifiedPayment,
+        *,
+        extra_body: dict[str, Any] | None = None,
+    ) -> bool:
         """Settle a payment already verified by ``verify_only``.
 
         Call ONLY after the paid resource has been delivered. Attaches the
@@ -792,14 +1019,19 @@ class PaymentGate:
         succeeded; on failure the resource was already delivered, so the caller
         keeps the response — a rare uncharged delivery, never a double-charge.
         """
+        request.state.payment_settlement_indeterminate = False
         if verified.dev_bypass:
             request.state.payment_tx = "dev_bypass_0x0"
+            request.state.payment_network = "dev-bypass"
+            request.state.payment_asset = "USDC"
+            request.state.payment_payer = verified.payer
             await self._record(
                 "dev_bypass",
                 request,
                 verified.amount,
                 payer="0xDEV_TEST_WALLET",
                 tx_hash="dev_bypass_0x0",
+                extra=extra_body,
             )
             return True
 
@@ -811,6 +1043,7 @@ class PaymentGate:
         except Exception:
             # A facilitator error must not become an unhandled 500 in the route;
             # report failed settlement so the caller withholds the paid result.
+            request.state.payment_settlement_indeterminate = True
             log.error("payment_settlement_error", exc_info=True)
             await self._record(
                 "settle_failed",
@@ -856,9 +1089,325 @@ class PaymentGate:
             asset=verified.matching_requirements.asset,
             payer=wallet,
             tx_hash=tx_hash,
+            extra=extra_body,
         )
         request.state.payment_tx = tx_hash
+        request.state.payment_network = verified.matching_requirements.network
+        request.state.payment_asset = verified.matching_requirements.asset
+        request.state.payment_payer = wallet
         return True
+
+    async def reconcile_settlement(
+        self,
+        payment_header: str,
+        amount: Decimal,
+        *,
+        pending_since: datetime | None = None,
+        resource_key: str | None = None,
+    ) -> PaymentReconciliation:
+        """Replay a stored authorization, then prove its outcome on-chain.
+
+        EIP-3009 authorizations are single-use. Re-submitting the same signed
+        authorization cannot charge twice. If the facilitator cannot return
+        the original success, a confirmed AuthorizationUsed event and matching
+        USDC Transfer receipt distinguish payment from nonce cancellation.
+        """
+
+        try:
+            authorization = canonical_payment_authorization(payment_header)
+            payment_payload = decode_payment_signature_header(payment_header)
+            if not isinstance(payment_payload, PaymentPayload):
+                return PaymentReconciliation()
+        except (TypeError, ValueError):
+            log.warning("payment_reconciliation_payload_invalid", exc_info=True)
+            return PaymentReconciliation()
+
+        if resource_key is not None and not await self._claim_authorization_fingerprint(
+            authorization.fingerprint,
+            resource_key,
+            "x402-recovery",
+        ):
+            return PaymentReconciliation(
+                terminal_unsettled=True,
+                reason="bound_elsewhere",
+            )
+
+        # x402 2.10 requires initialization before requirement construction.
+        # The worker owns a fresh gate after every restart, so doing this first
+        # is essential for durable handoff recovery.
+        if not await self._ensure_initialized():
+            return PaymentReconciliation()
+        try:
+            requirements = self._build_requirements(amount)
+            matching = self.server.find_matching_requirements(
+                requirements,
+                payment_payload,
+            )
+            if matching is None:
+                return PaymentReconciliation()
+            if authorization.pay_to != str(matching.pay_to).lower() or int(
+                authorization.value
+            ) != int(matching.amount):
+                return PaymentReconciliation(
+                    terminal_unsettled=True,
+                    reason="authorization_mismatch",
+                )
+        except (RuntimeError, TypeError, ValueError):
+            log.warning("payment_reconciliation_requirements_failed", exc_info=True)
+            return PaymentReconciliation()
+
+        try:
+            settlement = await self.server.settle_payment(
+                payment_payload,
+                matching,
+            )
+        except Exception:
+            log.warning("payment_reconciliation_facilitator_failed", exc_info=True)
+        else:
+            if settlement.success:
+                return PaymentReconciliation(
+                    payment=RecoveredPayment(
+                        payer=settlement.payer or authorization.payer,
+                        tx_hash=settlement.transaction or None,
+                        network=matching.network,
+                        asset=matching.asset,
+                    )
+                )
+
+        outcome = await self._authorization_outcome_onchain(
+            authorization,
+            pending_since=pending_since,
+        )
+        if outcome.state == "transferred":
+            return PaymentReconciliation(
+                payment=RecoveredPayment(
+                    payer=authorization.payer,
+                    tx_hash=outcome.tx_hash,
+                    network=authorization.network,
+                    asset=authorization.asset,
+                )
+            )
+        if outcome.state in {"canceled", "expired", "consumed_without_payment"}:
+            return PaymentReconciliation(
+                terminal_unsettled=True,
+                reason=outcome.state,
+            )
+        return PaymentReconciliation()
+
+    async def _authorization_outcome_onchain(
+        self,
+        authorization: CanonicalPaymentAuthorization,
+        *,
+        pending_since: datetime | None,
+    ) -> _AuthorizationChainOutcome:
+        network = next(
+            (
+                item
+                for item in self.config.payment_networks
+                if item.caip2.lower() == authorization.network
+                and item.token_address.lower() == authorization.asset
+            ),
+            None,
+        )
+        if (
+            network is None
+            or not network.rpc_url
+            or authorization.pay_to != self.config.receiver_address.lower()
+        ):
+            return _AuthorizationChainOutcome("unknown")
+        payer = authorization.payer.removeprefix("0x")
+        pay_to = authorization.pay_to.removeprefix("0x")
+        nonce = authorization.nonce.removeprefix("0x")
+        if len(payer) != 40 or len(pay_to) != 40 or len(nonce) != 64:
+            return _AuthorizationChainOutcome("unknown")
+        call_data = "0x" + _AUTHORIZATION_STATE_SELECTOR + payer.zfill(64) + nonce
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                latest_raw = await self._rpc_call(
+                    client,
+                    network.rpc_url,
+                    "eth_blockNumber",
+                    [],
+                )
+                latest_block = int(str(latest_raw), 16)
+                confirmed_block = max(0, latest_block - _RECOVERY_CONFIRMATIONS)
+                confirmed_tag = hex(confirmed_block)
+                block = await self._rpc_call(
+                    client,
+                    network.rpc_url,
+                    "eth_getBlockByNumber",
+                    [confirmed_tag, False],
+                )
+                if not isinstance(block, dict):
+                    return _AuthorizationChainOutcome("unknown")
+                chain_timestamp = int(str(block.get("timestamp")), 16)
+                state_raw = await self._rpc_call(
+                    client,
+                    network.rpc_url,
+                    "eth_call",
+                    [
+                        {"to": authorization.asset, "data": call_data},
+                        confirmed_tag,
+                    ],
+                )
+                consumed = int(str(state_raw), 16) != 0
+                if not consumed:
+                    if chain_timestamp > int(authorization.valid_before):
+                        return _AuthorizationChainOutcome("expired")
+                    return _AuthorizationChainOutcome("unused")
+
+                first_block = await self._first_recovery_block(
+                    client,
+                    network.rpc_url,
+                    confirmed_block,
+                    pending_since,
+                )
+                events: list[dict[str, Any]] = []
+                for start in range(
+                    first_block,
+                    confirmed_block + 1,
+                    _RECOVERY_LOG_BLOCKS,
+                ):
+                    end = min(confirmed_block, start + _RECOVERY_LOG_BLOCKS - 1)
+                    result = await self._rpc_call(
+                        client,
+                        network.rpc_url,
+                        "eth_getLogs",
+                        [
+                            {
+                                "address": authorization.asset,
+                                "fromBlock": hex(start),
+                                "toBlock": hex(end),
+                                "topics": [
+                                    [
+                                        _AUTHORIZATION_USED_TOPIC,
+                                        _AUTHORIZATION_CANCELED_TOPIC,
+                                    ],
+                                    "0x" + payer.zfill(64),
+                                    "0x" + nonce,
+                                ],
+                            }
+                        ],
+                    )
+                    if not isinstance(result, list):
+                        return _AuthorizationChainOutcome("unknown")
+                    events.extend(item for item in result if isinstance(item, dict))
+
+                events.sort(
+                    key=lambda item: (
+                        int(str(item.get("blockNumber", "0x0")), 16),
+                        int(str(item.get("logIndex", "0x0")), 16),
+                    )
+                )
+                for event in events:
+                    topics = event.get("topics")
+                    if not isinstance(topics, list) or not topics:
+                        continue
+                    event_topic = str(topics[0]).lower()
+                    if event_topic == _AUTHORIZATION_CANCELED_TOPIC:
+                        return _AuthorizationChainOutcome("canceled")
+                    if event_topic != _AUTHORIZATION_USED_TOPIC:
+                        continue
+                    tx_hash = event.get("transactionHash")
+                    if not isinstance(tx_hash, str) or not tx_hash:
+                        return _AuthorizationChainOutcome("unknown")
+                    receipt = await self._rpc_call(
+                        client,
+                        network.rpc_url,
+                        "eth_getTransactionReceipt",
+                        [tx_hash],
+                    )
+                    if not isinstance(receipt, dict):
+                        return _AuthorizationChainOutcome("unknown")
+                    if self._receipt_has_matching_transfer(receipt, authorization):
+                        return _AuthorizationChainOutcome("transferred", tx_hash)
+                    return _AuthorizationChainOutcome("consumed_without_payment")
+            return _AuthorizationChainOutcome("unknown")
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            log.warning(
+                "payment_authorization_outcome_lookup_failed",
+                network=authorization.network,
+                exc_info=True,
+            )
+            return _AuthorizationChainOutcome("unknown")
+
+    @staticmethod
+    async def _rpc_call(
+        client: httpx.AsyncClient,
+        url: str,
+        method: str,
+        params: list[Any],
+    ) -> Any:
+        response = await client.post(
+            url,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("error") is not None:
+            raise ValueError(f"JSON-RPC {method} failed")
+        return payload.get("result")
+
+    async def _first_recovery_block(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        confirmed_block: int,
+        pending_since: datetime | None,
+    ) -> int:
+        if pending_since is None:
+            return 0
+        if pending_since.tzinfo is None:
+            pending_since = pending_since.replace(tzinfo=UTC)
+        target = int((pending_since - _RECOVERY_CLOCK_SKEW).timestamp())
+        low = 0
+        high = confirmed_block
+        while low < high:
+            middle = (low + high) // 2
+            block = await self._rpc_call(
+                client,
+                url,
+                "eth_getBlockByNumber",
+                [hex(middle), False],
+            )
+            if not isinstance(block, dict):
+                raise ValueError("block lookup returned no block")
+            timestamp = int(str(block.get("timestamp")), 16)
+            if timestamp < target:
+                low = middle + 1
+            else:
+                high = middle
+        return max(0, low - _RECOVERY_CONFIRMATIONS)
+
+    @staticmethod
+    def _receipt_has_matching_transfer(
+        receipt: dict[str, Any],
+        authorization: CanonicalPaymentAuthorization,
+    ) -> bool:
+        if int(str(receipt.get("status", "0x0")), 16) != 1:
+            return False
+        payer = authorization.payer.removeprefix("0x").lower()
+        pay_to = authorization.pay_to.removeprefix("0x").lower()
+        for item in receipt.get("logs", []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("address", "")).lower() != authorization.asset:
+                continue
+            topics = item.get("topics")
+            if not isinstance(topics, list) or len(topics) < 3:
+                continue
+            if str(topics[0]).lower() != _TRANSFER_TOPIC:
+                continue
+            if not str(topics[1]).lower().endswith(payer):
+                continue
+            if not str(topics[2]).lower().endswith(pay_to):
+                continue
+            try:
+                if int(str(item.get("data", "0x0")), 16) == int(authorization.value):
+                    return True
+            except ValueError:
+                continue
+        return False
 
     @staticmethod
     def _extract_wallet(payment_header: str) -> str | None:

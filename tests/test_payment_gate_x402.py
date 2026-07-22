@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,10 +28,13 @@ from x402.schemas import (
 
 from hyrule_cloud.config import PaymentConfig
 from hyrule_cloud.middleware.x402 import (
+    _AUTHORIZATION_CANCELED_TOPIC,
+    _TRANSFER_TOPIC,
     LEGACY_PAYMENT_REQUIRED_HEADER,
     CdpFacilitatorAuthProvider,
     PaymentGate,
     _facilitator_config,
+    canonical_payment_authorization,
 )
 
 RECEIVER = "0xFf4555af30A1066A889324a3Fe88c76796159f15"
@@ -42,9 +47,7 @@ def _request(
     *,
     path: str = "/v1/vm/create",
 ) -> Request:
-    raw_headers = [
-        (k.lower().encode(), v.encode()) for k, v in (headers or {}).items()
-    ]
+    raw_headers = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     return Request(
         {
             "type": "http",
@@ -167,6 +170,23 @@ class _FailingInitServer(_FakeServer):
         raise RuntimeError("facilitator down")
 
 
+class _RequiresInitializationServer(_FakeServer):
+    def build_payment_requirements(self, config: Any) -> list[PaymentRequirements]:
+        if not self.initialized:
+            raise RuntimeError("server must be initialized")
+        return super().build_payment_requirements(config)
+
+
+class _IndeterminateSettlementServer(_FakeServer):
+    async def settle_payment(
+        self,
+        payload: PaymentPayload,
+        requirements: PaymentRequirements,
+    ) -> SettleResponse:
+        self.settle_payment_calls += 1
+        raise TimeoutError("facilitator response was lost")
+
+
 def _gate(server: _FakeServer, public_base_url: str = "") -> PaymentGate:
     gate = PaymentGate(
         PaymentConfig(
@@ -199,6 +219,16 @@ def _payment_header(req: PaymentRequirements | None = None) -> str:
     return encode_payment_signature_header(payload)
 
 
+def test_enabled_payment_networks_require_recovery_rpc_urls() -> None:
+    config = PaymentConfig()
+    config.payment_networks = [
+        replace(config.payment_networks[0], rpc_url="", enabled=True),
+    ]
+
+    with pytest.raises(ValueError, match="recovery RPC URLs: base"):
+        PaymentGate(config)
+
+
 def test_sdk_accepts_dollar_prefixed_money_price() -> None:
     parsed = ExactEvmServerScheme().parse_price("$0.05", "eip155:8453")
 
@@ -223,7 +253,9 @@ def test_unknown_facilitator_host_is_rejected() -> None:
         "https://pay.openfacilitator.io",
     ],
 )
-def test_non_cdp_facilitator_does_not_attach_cdp_auth(monkeypatch: pytest.MonkeyPatch, facilitator_url: str) -> None:
+def test_non_cdp_facilitator_does_not_attach_cdp_auth(
+    monkeypatch: pytest.MonkeyPatch, facilitator_url: str
+) -> None:
     monkeypatch.setenv("CDP_API_KEY_ID", "organizations/test/apiKeys/key-id")
     monkeypatch.setenv("CDP_API_KEY_SECRET", "not-used-for-public-facilitator")
 
@@ -418,6 +450,155 @@ async def test_settlement_failure_returns_402_with_payment_response_headers() ->
 
 
 @pytest.mark.asyncio
+async def test_reconcile_settlement_replays_stored_single_use_authorization() -> None:
+    server = _FakeServer()
+    gate = _gate(server)
+
+    reconciliation = await gate.reconcile_settlement(
+        _payment_header(server.requirements[0]),
+        Decimal("0.05"),
+    )
+
+    recovered = reconciliation.payment
+    assert recovered is not None
+    assert recovered.payer == PAYER
+    assert recovered.tx_hash == "0xSETTLED"
+    assert recovered.network == "eip155:8453"
+    assert recovered.asset == ASSET
+    assert server.settle_payment_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_initializes_server_before_building_requirements() -> None:
+    server = _RequiresInitializationServer()
+    gate = _gate(server)
+
+    reconciliation = await gate.reconcile_settlement(
+        _payment_header(server.requirements[0]),
+        Decimal("0.05"),
+    )
+
+    assert server.initialized is True
+    assert reconciliation.payment is not None
+
+
+@pytest.mark.asyncio
+async def test_canceled_authorization_is_terminal_not_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _FakeServer(settle_success=False)
+    gate = _gate(server)
+
+    async def canceled(*_args, **_kwargs):
+        return SimpleNamespace(state="canceled", tx_hash=None)
+
+    monkeypatch.setattr(gate, "_authorization_outcome_onchain", canceled)
+    reconciliation = await gate.reconcile_settlement(
+        _payment_header(server.requirements[0]),
+        Decimal("0.05"),
+    )
+
+    assert reconciliation.payment is None
+    assert reconciliation.terminal_unsettled is True
+    assert reconciliation.reason == "canceled"
+
+
+def test_onchain_recovery_requires_matching_transfer_receipt() -> None:
+    authorization = canonical_payment_authorization(_payment_header())
+    payer_topic = "0x" + authorization.payer.removeprefix("0x").zfill(64)
+    receiver_topic = "0x" + authorization.pay_to.removeprefix("0x").zfill(64)
+    matching = {
+        "status": "0x1",
+        "logs": [
+            {
+                "address": authorization.asset,
+                "topics": [_TRANSFER_TOPIC, payer_topic, receiver_topic],
+                "data": hex(int(authorization.value)),
+            }
+        ],
+    }
+    canceled = {"status": "0x1", "logs": []}
+
+    assert PaymentGate._receipt_has_matching_transfer(matching, authorization) is True
+    assert PaymentGate._receipt_has_matching_transfer(canceled, authorization) is False
+
+
+@pytest.mark.asyncio
+async def test_onchain_outcome_distinguishes_canceled_nonce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _gate(_FakeServer(settle_success=False))
+    authorization = canonical_payment_authorization(_payment_header())
+
+    async def rpc_call(_client, _url, method, _params):
+        if method == "eth_blockNumber":
+            return "0x64"
+        if method == "eth_getBlockByNumber":
+            return {"timestamp": "0x77359400"}
+        if method == "eth_call":
+            return "0x1"
+        if method == "eth_getLogs":
+            return [
+                {
+                    "blockNumber": "0x50",
+                    "logIndex": "0x0",
+                    "transactionHash": "0xcanceled",
+                    "topics": [_AUTHORIZATION_CANCELED_TOPIC],
+                }
+            ]
+        raise AssertionError(f"unexpected RPC method: {method}")
+
+    monkeypatch.setattr(gate, "_rpc_call", rpc_call)
+    outcome = await gate._authorization_outcome_onchain(
+        authorization,
+        pending_since=None,
+    )
+
+    assert outcome.state == "canceled"
+    assert outcome.tx_hash is None
+
+
+@pytest.mark.asyncio
+async def test_onchain_outcome_marks_confirmed_unused_expiry_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _gate(_FakeServer(settle_success=False))
+    authorization = replace(
+        canonical_payment_authorization(_payment_header()),
+        valid_before="1",
+    )
+
+    async def rpc_call(_client, _url, method, _params):
+        if method == "eth_blockNumber":
+            return "0x64"
+        if method == "eth_getBlockByNumber":
+            return {"timestamp": "0x2"}
+        if method == "eth_call":
+            return "0x0"
+        raise AssertionError(f"unexpected RPC method: {method}")
+
+    monkeypatch.setattr(gate, "_rpc_call", rpc_call)
+    outcome = await gate._authorization_outcome_onchain(
+        authorization,
+        pending_since=None,
+    )
+
+    assert outcome.state == "expired"
+
+
+@pytest.mark.asyncio
+async def test_settlement_timeout_marks_outcome_indeterminate() -> None:
+    server = _IndeterminateSettlementServer()
+    request = _request({PAYMENT_SIGNATURE_HEADER: _payment_header(server.requirements[0])})
+    gate = _gate(server)
+    verified = await gate.verify_only(request, Decimal("0.05"), "VM creation")
+
+    assert not isinstance(verified, Response)
+    assert await gate.settle_verified(request, verified) is False
+    assert request.state.payment_settlement_indeterminate is True
+
+
+@pytest.mark.asyncio
 async def test_facilitator_initialization_failure_returns_503() -> None:
     gate = _gate(_FailingInitServer())
 
@@ -498,8 +679,11 @@ def test_discovery_registry_only_declares_real_endpoints() -> None:
     from hyrule_cloud.services.discovery import DISCOVERY
 
     declared_paths = {path for _, path in DISCOVERY}
-    for dead in ("/v1/mail/accounts", "/v1/mail/messages/send", "/v1/speedtest", "/v1/web/reports", "/v1/voip/report", "/v1/path/jobs"):
+    for dead in ("/v1/speedtest", "/v1/web/reports", "/v1/voip/report", "/v1/path/jobs"):
         assert dead not in declared_paths
+    assert "/v1/mail/accounts" in declared_paths
+    assert "/v1/mail/messages/send" in declared_paths
+    assert "/v1/domains/agent/orders" in declared_paths
 
 
 def test_discovery_schemas_contain_no_unresolved_refs() -> None:

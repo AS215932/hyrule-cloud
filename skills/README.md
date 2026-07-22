@@ -34,6 +34,10 @@ cross-references resolve:
 9. `hyrule-voip-sip` — SIP/`/v1/voip/check` only (the number-lookup section is
    already stripped from the source SKILL.md until a number-intel provider ships)
 10. `hyrule-mail-deliverability`
+11. `hyrule-agent-mail` — only after the dedicated Stalwart canary and legal/
+    abuse launch gates pass
+12. `hyrule-customer-journeys` — only after all three redacted production
+    canaries have been captured
 
 ## Withheld — do NOT publish
 
@@ -47,6 +51,10 @@ cross-references resolve:
 
 These carry a NOT YET LAUNCHED banner. Publish only once the backends ship and
 the endpoints are re-advertised in `/.well-known/x402.json`.
+
+Agent Mail and the customer-journey umbrella are likewise withheld until their
+explicit readiness conditions above pass; checked-in Skills are launch assets,
+not evidence that a gated service is already live.
 
 ## Keeping skills honest
 

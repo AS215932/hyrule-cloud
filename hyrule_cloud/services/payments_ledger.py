@@ -14,9 +14,11 @@ from typing import Any
 
 import structlog
 from fastapi import Request
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from hyrule_cloud.db import PaymentEventRow
+from hyrule_cloud.db import PaymentAuthorizationRow, PaymentEventRow
 
 log = structlog.get_logger()
 
@@ -58,6 +60,42 @@ class PaymentLedger:
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+
+    async def claim_authorization(
+        self,
+        *,
+        fingerprint: str,
+        resource_key: str,
+        resource_path: str,
+    ) -> bool:
+        """Atomically bind an authorization to one logical paid resource.
+
+        Unlike metrics-ledger writes, this security decision is strict: a
+        database failure propagates so the payment gate fails closed.
+        """
+
+        async with self._session_factory() as session:
+            existing = await session.get(PaymentAuthorizationRow, fingerprint)
+            if existing is not None:
+                return existing.resource_key == resource_key
+            session.add(
+                PaymentAuthorizationRow(
+                    fingerprint=fingerprint,
+                    resource_key=resource_key,
+                    resource_path=resource_path[:256],
+                )
+            )
+            try:
+                await session.commit()
+                return True
+            except IntegrityError:
+                await session.rollback()
+            winner = await session.scalar(
+                select(PaymentAuthorizationRow).where(
+                    PaymentAuthorizationRow.fingerprint == fingerprint
+                )
+            )
+            return winner is not None and winner.resource_key == resource_key
 
     async def record(
         self,
