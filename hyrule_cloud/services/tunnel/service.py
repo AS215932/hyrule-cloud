@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import ReverseTunnelRow
+from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.providers.tunnel_client import LeaseResult, TunnelProvider
 
 log = structlog.get_logger()
@@ -62,7 +63,7 @@ class TunnelService:
             tunnel_id=tunnel_id,
             owner_wallet=owner_wallet or "",
             owner_account_id=owner_account_id,
-            token=lease.token or "",
+            token_hash=hash_anon_token(lease.token or ""),
             allocated_port=lease.port,
             endpoint_host=lease.endpoint_host,
             ssh_port=lease.ssh_port,
@@ -71,9 +72,17 @@ class TunnelService:
             expires_at=_parse_ts(lease.expires_at, default=_now() + timedelta(hours=hours)),
             payment_tx=None,
         )
-        async with self.session_factory() as session:
-            session.add(row)
-            await session.commit()
+        try:
+            async with self.session_factory() as session:
+                session.add(row)
+                await session.commit()
+        except Exception:
+            # The daemon already allocated a port; a persistence failure would
+            # otherwise leak it (unpaid retries could exhaust the range). Best-
+            # effort revoke on the daemon before surfacing the error.
+            log.error("tunnel_persist_failed", tunnel_id=tunnel_id, exc_info=True)
+            await self.provider.revoke_lease(tunnel_id)
+            raise
         return row, lease
 
     async def mark_settled(self, tunnel_id: str, payment_tx: str) -> None:
@@ -85,15 +94,21 @@ class TunnelService:
             )
             await session.commit()
 
-    async def revoke(self, tunnel_id: str, *, on_daemon: bool = True) -> None:
-        """Tear down a tunnel: revoke on the daemon and delete the row."""
-        if on_daemon:
-            await self.provider.revoke_lease(tunnel_id)
+    async def revoke(self, tunnel_id: str) -> bool:
+        """Strictly tear down a tunnel: delete the row ONLY after the daemon has
+        confirmed revocation. Returns False (row retained) if the daemon revoke
+        fails, so the owner can retry the emergency teardown and we never report
+        a still-live tunnel as revoked. Used by the user endpoint and the
+        settle-failure cleanup.
+        """
+        if not await self.provider.revoke_lease(tunnel_id):
+            return False
         async with self.session_factory() as session:
             await session.execute(
                 sql_delete(ReverseTunnelRow).where(ReverseTunnelRow.tunnel_id == tunnel_id)
             )
             await session.commit()
+        return True
 
     async def extend(self, tunnel_id: str, hours: int) -> ReverseTunnelRow | None:
         lease = await self.provider.extend_lease(tunnel_id, hours * 3600)

@@ -366,11 +366,16 @@ async def _verify_and_cleanup_tunnel(create_resp: httpx.Response) -> bool:
     print(f"    ssh: {data.get('ssh_command')}")
     async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
         status = await http.get(f"/v1/tunnel/{tunnel_id}/status", headers={"X-Tunnel-Token": token})
-        ok = status.status_code == 200
+        status_ok = status.status_code == 200
         print(f"    status: HTTP {status.status_code} (owner-token gated)")
         rev = await http.delete(f"/v1/tunnel/{tunnel_id}", headers={"X-Tunnel-Token": token})
+        revoke_ok = rev.status_code in (200, 404)
         print(f"    cleanup revoke: HTTP {rev.status_code}")
-    return ok
+    if not revoke_ok:
+        # A failed cleanup leaves a paid tunnel live with its printed token; fail
+        # the canary so automation notices and remediates the leaked lease.
+        print("    !! tunnel cleanup revoke failed — leaked lease; FAILING.")
+    return status_ok and revoke_ok
 
 
 async def _create_quote(order_payload: dict) -> str | None:

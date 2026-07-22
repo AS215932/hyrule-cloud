@@ -482,8 +482,10 @@ class ReverseTunnelRow(Base):
     owner_account_id: Mapped[str | None] = mapped_column(
         String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
     )
-    # Lease token (the SSH username), also the management credential.
-    token: Mapped[str] = mapped_column(String(64))
+    # sha256 hex of the lease token (the SSH username + management credential).
+    # Only the hash is stored so a DB disclosure never yields a live credential;
+    # the cleartext token is returned to the caller only once, at creation.
+    token_hash: Mapped[str] = mapped_column(String(64), index=True)
     allocated_port: Mapped[int] = mapped_column(Integer)
     endpoint_host: Mapped[str] = mapped_column(String(128))
     ssh_port: Mapped[int] = mapped_column(Integer, default=2222)

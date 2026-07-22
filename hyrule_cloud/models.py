@@ -5,12 +5,13 @@ Domain models for Hyrule Cloud resources.
 from __future__ import annotations
 
 import enum
+import ipaddress
 import secrets
 import string
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Block A0: widen vm_id from 48-bit hex (vm_<12 hex>) to ~131-bit base62
 # (vm_<22 base62>). The legacy 48-bit space was borderline guessable; with
@@ -476,16 +477,33 @@ class TunnelCreateRequest(BaseModel):
     becomes reachable on the allocated public TCP port.
     """
 
-    hours: int = Field(ge=1, le=720, description="Lease duration in hours")
+    # Absolute sanity ceiling only; the configured tunnel_min_hours/
+    # tunnel_max_hours window is enforced in the route so deployments can
+    # tighten (or widen up to this cap) the policy without a schema change.
+    hours: int = Field(ge=1, le=8760, description="Lease duration in hours")
     allowlist_cidrs: list[str] | None = Field(
         default=None,
         max_length=64,
         description="Optional source-CIDR allowlist for visitors; omit to allow all",
     )
 
+    @field_validator("allowlist_cidrs")
+    @classmethod
+    def _validate_cidrs(cls, value: list[str] | None) -> list[str] | None:
+        # Fail closed: a typo'd restriction must be rejected, never silently
+        # dropped (which would leave the port open to everyone).
+        if value is None:
+            return None
+        for entry in value:
+            try:
+                ipaddress.ip_network(entry, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"invalid CIDR in allowlist_cidrs: {entry!r}") from exc
+        return value
+
 
 class TunnelExtendRequest(BaseModel):
-    hours: int = Field(ge=1, le=720, description="Additional hours to add")
+    hours: int = Field(ge=1, le=8760, description="Additional hours to add")
 
 
 class TunnelResponse(BaseModel):

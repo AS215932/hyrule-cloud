@@ -1,12 +1,9 @@
 """Reverse-SSH tunnel leases.
 
-Revision ID: 016
-Revises: 015
+Revision ID: 017
+Revises: 016
 Create Date: 2026-07-22
 
-NOTE: built off the last released migration (015). If the parallel in-flight
-admin-console / vm-pricing work (its own 016/017) lands first, renumber this to
-the next free revision and update down_revision accordingly.
 """
 
 from collections.abc import Sequence
@@ -18,8 +15,8 @@ from alembic import op
 
 _JSONB = postgresql.JSONB(astext_type=sa.Text()).with_variant(sa.JSON(), "sqlite")
 
-revision: str = "016"
-down_revision: str | None = "015"
+revision: str = "017"
+down_revision: str | None = "016"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -34,7 +31,7 @@ def upgrade() -> None:
             sa.String(11),
             sa.ForeignKey("accounts.account_id", ondelete="SET NULL"),
         ),
-        sa.Column("token", sa.String(64), nullable=False),
+        sa.Column("token_hash", sa.String(64), nullable=False),
         sa.Column("allocated_port", sa.Integer(), nullable=False),
         sa.Column("endpoint_host", sa.String(128), nullable=False),
         sa.Column("ssh_port", sa.Integer(), nullable=False, server_default="2222"),
@@ -51,6 +48,7 @@ def upgrade() -> None:
     )
     op.create_index("ix_reverse_tunnels_owner_wallet", "reverse_tunnels", ["owner_wallet"])
     op.create_index("ix_reverse_tunnels_owner_account_id", "reverse_tunnels", ["owner_account_id"])
+    op.create_index("ix_reverse_tunnels_token_hash", "reverse_tunnels", ["token_hash"])
     op.create_index("ix_reverse_tunnels_status", "reverse_tunnels", ["status"])
     op.create_index("ix_reverse_tunnels_expires_at", "reverse_tunnels", ["expires_at"])
     op.create_index(
@@ -59,6 +57,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.drop_index("ix_reverse_tunnels_token_hash", table_name="reverse_tunnels")
     op.drop_index("ix_reverse_tunnels_owner_status", table_name="reverse_tunnels")
     op.drop_index("ix_reverse_tunnels_expires_at", table_name="reverse_tunnels")
     op.drop_index("ix_reverse_tunnels_status", table_name="reverse_tunnels")

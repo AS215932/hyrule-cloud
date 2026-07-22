@@ -23,6 +23,7 @@ from hyrule_cloud.models import (
 from hyrule_cloud.services.diagnostics.sources import (
     source_not_configured,
     source_ok,
+    source_unavailable,
     source_usable,
 )
 from hyrule_cloud.services.dns.lookup import lookup
@@ -84,39 +85,53 @@ def voip_check_has_live_backend(checks: list[VoIPCheck]) -> bool:
     return any(check in live for check in checks)
 
 
-async def _stun_check() -> list[DiagnosticFinding]:
-    """Confirm a public STUN responder is reachable, or emit the contract stub."""
+async def _stun_check() -> tuple[list[DiagnosticFinding], SourceHealth]:
+    """Confirm a public STUN responder is reachable.
+
+    Returns the findings and the resolved ``stun_turn`` source health, so the
+    response never reports the source as healthy while a finding says the
+    responder is unreachable.
+    """
     host = _stun_host()
     if not host:
-        return [
-            _finding(
-                DiagnosticStatus.INFO,
-                "stun_turn_not_configured",
-                "STUN tester requires a configured public STUN responder.",
-            )
-        ]
+        return (
+            [
+                _finding(
+                    DiagnosticStatus.INFO,
+                    "stun_turn_not_configured",
+                    "STUN tester requires a configured public STUN responder.",
+                )
+            ],
+            source_not_configured("STUN active tester is not configured (set HYRULE_STUN_TEST_HOST)."),
+        )
     from hyrule_cloud.services.voip.stun_probe import stun_binding
 
     hostname, _, port_str = host.partition(":")
     port = int(port_str) if port_str else 3478
     mapped = await stun_binding(hostname, port)
     if mapped is None:
-        return [
-            _finding(
-                DiagnosticStatus.WARNING,
-                "stun_responder_unreachable",
-                f"Public STUN responder {host} did not answer a binding request.",
-            )
-        ]
-    return [
-        _finding(
-            DiagnosticStatus.OK,
-            "stun_responder_available",
-            f"Public STUN responder {host} answered; mapped address {mapped[0]}:{mapped[1]}.",
-            mapped_ip=mapped[0],
-            mapped_port=mapped[1],
+        return (
+            [
+                _finding(
+                    DiagnosticStatus.WARNING,
+                    "stun_responder_unreachable",
+                    f"Public STUN responder {host} did not answer a binding request.",
+                )
+            ],
+            source_unavailable(f"configured STUN responder {host} did not answer a binding request"),
         )
-    ]
+    return (
+        [
+            _finding(
+                DiagnosticStatus.OK,
+                "stun_responder_available",
+                f"Public STUN responder {host} answered; mapped address {mapped[0]}:{mapped[1]}.",
+                mapped_ip=mapped[0],
+                mapped_port=mapped[1],
+            )
+        ],
+        source_ok(),
+    )
 
 
 async def voip_check(body: VoIPCheckRequest) -> DiagnosticResponse:
@@ -134,15 +149,19 @@ async def voip_check(body: VoIPCheckRequest) -> DiagnosticResponse:
         findings.extend(await _sip_tls(target, body.sip_port))
     if VoIPCheck.SIP_OPTIONS in body.checks:
         findings.append(_finding(DiagnosticStatus.INFO, "sip_options_contract", "SIP OPTIONS active probe is supported by contract and runs from configured VoIP-safe vantages when enabled."))
+    sources = voip_sources()
     if VoIPCheck.STUN_TURN in body.checks:
-        findings.extend(await _stun_check())
+        stun_findings, stun_source = await _stun_check()
+        findings.extend(stun_findings)
+        # Reflect the live probe outcome, not just "a host is configured".
+        sources["stun_turn"] = stun_source
     status = DiagnosticStatus.OK if findings and all(f.severity in {DiagnosticStatus.OK, DiagnosticStatus.INFO} for f in findings) else DiagnosticStatus.WARNING
     return DiagnosticResponse(
         status=status,
         summary=f"VoIP/SIP check for {target}: {len(findings)} finding(s).",
         target=DiagnosticTarget(input=body.target, normalized=target, type=DiagnosticTargetType.DOMAIN),
         findings=findings,
-        sources=voip_sources(),
+        sources=sources,
         raw=raw if body.include_raw else None,
         generated_at=datetime.now(UTC),
     )

@@ -91,6 +91,7 @@ _TAG_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/nat", ("network-intel", "reachability")),
     ("/v1/threat", ("network-intel", "reputation")),
     ("/v1/voip", ("network-intel", "voip")),
+    ("/v1/tunnel", ("tunnel", "ssh", "nat-traversal")),
 )
 
 

@@ -18,10 +18,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from hyrule_cloud.api._contract import config_from_request, not_implemented, payment_price, quote
+from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import ReverseTunnelRow
+from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CapabilityEndpoint,
     PaidEndpointQuote,
@@ -34,6 +37,8 @@ from hyrule_cloud.models import (
 from hyrule_cloud.providers.tunnel_client import TunnelDaemonError
 from hyrule_cloud.services.tunnel.readiness import tunnel_service_ready
 from hyrule_cloud.services.tunnel.service import TunnelService, new_tunnel_id
+
+log = structlog.get_logger()
 
 router = APIRouter(prefix="/v1/tunnel", tags=["Reverse SSH Tunnel"])
 
@@ -150,6 +155,8 @@ async def create_tunnel(body: TunnelCreateRequest, request: Request) -> TunnelRe
     if gate is None or svc is None:
         return not_implemented("tunnel", "Tunnel service is not wired.")
 
+    cfg = config_from_request(request)
+    _require_hours_in_bounds(body.hours, cfg)
     amount = payment_price(request, "price_tunnel_hourly", "0.05") * body.hours
     description = f"Reverse SSH tunnel for {body.hours}h"
     extra_body = {"hours": body.hours}
@@ -177,10 +184,20 @@ async def create_tunnel(body: TunnelCreateRequest, request: Request) -> TunnelRe
         # Delivered a live tunnel: settle. On settle failure the lease is durable
         # and revocable, so revoke it rather than hand out a paid-for-free tunnel.
         if not await gate.settle_verified(request, verified):
-            await svc.revoke(tunnel_id)
+            if not await svc.revoke(tunnel_id):
+                # The daemon revoke also failed; the lease self-expires at its
+                # lease time and the worker sweep retries. Log for visibility.
+                log.error("tunnel_settle_failed_revoke_failed", tunnel_id=tunnel_id)
             raise HTTPException(402, "payment settlement failed")
 
-        await svc.mark_settled(tunnel_id, getattr(request.state, "payment_tx", "") or "")
+        # Payment is final and the tunnel is live. The payment_tx stamp is
+        # bookkeeping — a failure there must NOT hide the one-time token, or the
+        # paid tunnel becomes unmanageable, so record best-effort and always
+        # return the credential.
+        try:
+            await svc.mark_settled(tunnel_id, getattr(request.state, "payment_tx", "") or "")
+        except Exception:
+            log.error("tunnel_mark_settled_failed", tunnel_id=tunnel_id, exc_info=True)
         return _to_response(row, token=lease.token)
 
 
@@ -192,23 +209,35 @@ async def extend_tunnel(tunnel_id: str, body: TunnelExtendRequest, request: Requ
     if gate is None or svc is None:
         return not_implemented("tunnel", "Tunnel service is not wired.")
 
+    cfg = config_from_request(request)
+    _require_hours_in_bounds(body.hours, cfg)
     amount = payment_price(request, "price_tunnel_hourly", "0.05") * body.hours
-    result = await gate.check_payment(
-        request,
-        amount=amount,
-        description=f"Extend tunnel {tunnel_id} by {body.hours}h",
-        extra_body={"tunnel_id": tunnel_id, "hours": body.hours},
-    )
-    if isinstance(result, Response):
-        return result
 
-    try:
-        updated = await svc.extend(tunnel_id, body.hours)
-    except TunnelDaemonError as exc:
-        raise HTTPException(502, "tunnel extend failed") from exc
-    if updated is None:
-        raise HTTPException(404, "tunnel not found")
-    return _to_response(updated)
+    # Deliver-before-charge: verify the payment, apply the extension on the
+    # daemon, then settle. If the daemon is unreachable or the lease is gone,
+    # the payment is never settled so the customer is not charged for time they
+    # did not receive.
+    async with _tunnel_authorization_guard(request):
+        verified = await gate.verify_only(
+            request,
+            amount=amount,
+            description=f"Extend tunnel {tunnel_id} by {body.hours}h",
+            extra_body={"tunnel_id": tunnel_id, "hours": body.hours},
+        )
+        if isinstance(verified, Response):
+            return verified
+
+        try:
+            updated = await svc.extend(tunnel_id, body.hours)
+        except TunnelDaemonError as exc:
+            raise HTTPException(502, "tunnel extend failed") from exc
+        if updated is None:
+            raise HTTPException(404, "tunnel not found")
+
+        # Extension delivered: settle now.
+        if not await gate.settle_verified(request, verified):
+            raise HTTPException(402, "payment settlement failed")
+        return _to_response(updated)
 
 
 @router.delete("/{tunnel_id}")
@@ -217,7 +246,10 @@ async def revoke_tunnel(tunnel_id: str, request: Request) -> dict[str, str]:
     await _tunnel_for_management(tunnel_id, request)  # 404s if svc is None
     svc = _service(request)
     assert svc is not None
-    await svc.revoke(tunnel_id)
+    # Strict: only report success once the daemon confirms teardown. The row is
+    # retained on daemon failure so the owner can retry the emergency teardown.
+    if not await svc.revoke(tunnel_id):
+        raise HTTPException(502, "tunnel daemon revoke failed; retry")
     return {"status": "revoked", "tunnel_id": tunnel_id}
 
 
@@ -245,6 +277,24 @@ async def _tunnel_for_management(tunnel_id: str, request: Request) -> ReverseTun
         raise HTTPException(404, "tunnel not found")
     row = await svc.get(tunnel_id)
     presented = request.headers.get("x-tunnel-token", "")
-    if row is None or not presented or not secrets.compare_digest(presented, row.token):
+    # Only the token hash is stored; compare hashes in constant time.
+    if (
+        row is None
+        or not presented
+        or not secrets.compare_digest(hash_anon_token(presented), row.token_hash)
+    ):
         raise HTTPException(404, "tunnel not found")
     return row
+
+
+def _require_hours_in_bounds(hours: int, cfg: HyruleConfig) -> None:
+    """Enforce the *configured* lease bounds, not just the schema's outer cap.
+
+    Pricing advertises tunnel_min_hours/tunnel_max_hours from config, so a
+    deployment that tightens them must reject out-of-policy requests here.
+    """
+    if hours < cfg.tunnel_min_hours or hours > cfg.tunnel_max_hours:
+        raise HTTPException(
+            422,
+            f"hours must be between {cfg.tunnel_min_hours} and {cfg.tunnel_max_hours}",
+        )
