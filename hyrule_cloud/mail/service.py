@@ -87,6 +87,7 @@ _MAIL_CAPACITY_STATUSES = (
 _SEND_RESERVED_STATUSES = ("pending", "submitting", "accepted")
 _SEND_SUBMISSION_LEASE = timedelta(minutes=5)
 _PAYMENT_HANDOFF_GRACE = timedelta(hours=1)
+_PAYMENT_HANDOFF_RETRY_DELAY = timedelta(seconds=30)
 
 
 def _now() -> datetime:
@@ -826,8 +827,27 @@ class MailService:
             row.payment_authorization_header = None
             row.payment_settlement_pending_at = None
             row.payment_settled_at = row.payment_settled_at or _now()
+            row.provision_next_attempt_at = None
             await session.commit()
             return row
+
+    async def _defer_activation_recovery(self, mailbox_id: str) -> None:
+        """Yield a failed payment handoff so later settled accounts can run."""
+
+        async with self.db() as session:
+            row = await session.get(MailAccountRow, mailbox_id)
+            recoverable_expiry = bool(
+                row is not None
+                and row.status == MailboxStatus.FAILED.value
+                and row.provision_error == "payment_window_expired"
+                and row.management_token_ciphertext
+            )
+            if row is None or (
+                row.status != MailboxStatus.AWAITING_PAYMENT.value and not recoverable_expiry
+            ):
+                return
+            row.provision_next_attempt_at = _now() + _PAYMENT_HANDOFF_RETRY_DELAY
+            await session.commit()
 
     async def bind_payment_authorization(self, fingerprint: str, quote_id: str) -> None:
         """Bind one verified authorization to exactly one mail quote forever."""
@@ -2363,6 +2383,11 @@ class MailService:
             return 0
         recovered = 0
         seen: set[tuple[str, str]] = set()
+        now = _now()
+        recovery_due = or_(
+            MailAccountRow.provision_next_attempt_at.is_(None),
+            MailAccountRow.provision_next_attempt_at <= now,
+        )
         if gate is not None:
             async with self.db() as session:
                 pending_sends = list(
@@ -2425,6 +2450,7 @@ class MailService:
                             MailAccountRow.payment_settlement_pending_at.is_not(None),
                             MailAccountRow.payment_settled_at.is_(None),
                             MailAccountRow.payment_authorization_header.is_not(None),
+                            recovery_due,
                         )
                         .order_by(MailAccountRow.payment_settlement_pending_at)
                         .limit(limit)
@@ -2456,6 +2482,7 @@ class MailService:
                         continue
                     settlement = reconciliation.payment
                     if settlement is None:
+                        await self._defer_activation_recovery(pending_account.mailbox_id)
                         continue
                     await self.record_activation_settlement(
                         pending_account.mailbox_id,
@@ -2466,6 +2493,7 @@ class MailService:
                         payment_asset=settlement.asset,
                     )
                 except Exception:
+                    await self._defer_activation_recovery(pending_account.mailbox_id)
                     log.warning(
                         "mail_payment_authorization_reconciliation_deferred",
                         mailbox_id=pending_account.mailbox_id,
@@ -2485,6 +2513,7 @@ class MailService:
                                 MailAccountRow.management_token_ciphertext.is_not(None),
                             ),
                         ),
+                        recovery_due,
                     )
                     .order_by(MailAccountRow.payment_settled_at)
                     .limit(limit)
@@ -2505,6 +2534,7 @@ class MailService:
                     payment_asset=durable_account.payment_asset,
                 )
             except DomainProblem:
+                await self._defer_activation_recovery(durable_account.mailbox_id)
                 log.warning(
                     "mail_durable_payment_handoff_recovery_deferred",
                     mailbox_id=durable_account.mailbox_id,
@@ -2540,6 +2570,7 @@ class MailService:
                                 MailAccountRow.management_token_ciphertext.is_not(None),
                             ),
                         ),
+                        recovery_due,
                         settled_event_exists,
                     )
                     .order_by(MailAccountRow.created_at, MailAccountRow.mailbox_id)
@@ -2581,6 +2612,7 @@ class MailService:
                     payment_asset=event.asset,
                 )
             except DomainProblem:
+                await self._defer_activation_recovery(account.mailbox_id)
                 # One temporarily unrecoverable activation (for example,
                 # capacity contention) must not starve later settled handoffs.
                 log.warning(
