@@ -8,7 +8,18 @@ from hyrule_cloud.services.voip.stun_probe import (
     _MAGIC_COOKIE,
     _build_binding_request,
     _parse_xor_mapped_address,
+    split_host_port,
 )
+
+
+def test_split_host_port():
+    assert split_host_port("tun.hyrule.host") == ("tun.hyrule.host", 3478)
+    assert split_host_port("tun.hyrule.host:5000") == ("tun.hyrule.host", 5000)
+    assert split_host_port("1.2.3.4:9") == ("1.2.3.4", 9)
+    # IPv6 must not split on the first colon.
+    assert split_host_port("2a0c:b641:b50:2::e0") == ("2a0c:b641:b50:2::e0", 3478)
+    assert split_host_port("[2a0c:b641:b50:2::e0]:3478") == ("2a0c:b641:b50:2::e0", 3478)
+    assert split_host_port("[2001:db8::1]") == ("2001:db8::1", 3478)
 
 
 def _success_with_xor_mapped(txid: bytes, ip: str, port: int, family: int = 0x01) -> bytes:

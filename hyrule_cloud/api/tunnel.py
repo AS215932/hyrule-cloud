@@ -13,6 +13,7 @@ Payment model:
 """
 from __future__ import annotations
 
+import hashlib
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -142,6 +143,9 @@ async def get_tunnel_pricing(request: Request) -> TunnelPricingResponse:
 
 @router.post("/quote", response_model=PaidEndpointQuote)
 async def quote_tunnel(request: Request, body: TunnelCreateRequest) -> PaidEndpointQuote:
+    # Apply the same configured bounds as create, so a quote is never issued for
+    # a duration create would reject.
+    _require_hours_in_bounds(body.hours, config_from_request(request))
     hourly = payment_price(request, "price_tunnel_hourly", "0.05")
     return quote(hourly, "tunnel_hour", "/v1/tunnel/create", quantity=body.hours)
 
@@ -161,7 +165,31 @@ async def create_tunnel(body: TunnelCreateRequest, request: Request) -> TunnelRe
     description = f"Reverse SSH tunnel for {body.hours}h"
     extra_body = {"hours": body.hours}
 
+    idem = _idempotency_key(request)
+
     async with _tunnel_authorization_guard(request):
+        # Idempotent replay: a prior attempt with this exact payment authorization
+        # already provisioned a tunnel. Recover its one-time token from the daemon
+        # (create is idempotent on tunnel_id) so a client that lost the original
+        # response can retry without paying again or leaking a port.
+        if idem is not None:
+            existing = await svc.find_by_idempotency_key(idem)
+            if existing is not None:
+                recovered = await svc.recover_lease(existing.tunnel_id)
+                if recovered is None or not recovered.token:
+                    raise HTTPException(410, "tunnel no longer available")
+                if existing.payment_tx:
+                    # Already settled — return the credential, do NOT settle again.
+                    return _to_response(existing, token=recovered.token)
+                # Provisioned but interrupted before settlement: complete it now.
+                verified = await gate.verify_only(request, amount=amount, description=description, extra_body=extra_body)
+                if isinstance(verified, Response):
+                    return verified
+                if not await gate.settle_verified(request, verified):
+                    raise HTTPException(402, "payment settlement failed")
+                await _mark_settled_best_effort(svc, existing.tunnel_id, request)
+                return _to_response(existing, token=recovered.token)
+
         verified = await gate.verify_only(request, amount=amount, description=description, extra_body=extra_body)
         if isinstance(verified, Response):
             return verified
@@ -174,6 +202,7 @@ async def create_tunnel(body: TunnelCreateRequest, request: Request) -> TunnelRe
                 allowlist_cidrs=body.allowlist_cidrs,
                 owner_wallet=verified.payer,
                 owner_account_id=None,
+                idempotency_key=idem,
             )
         except TunnelDaemonError as exc:
             # Not provisioned -> never settle -> no charge.
@@ -190,14 +219,7 @@ async def create_tunnel(body: TunnelCreateRequest, request: Request) -> TunnelRe
                 log.error("tunnel_settle_failed_revoke_failed", tunnel_id=tunnel_id)
             raise HTTPException(402, "payment settlement failed")
 
-        # Payment is final and the tunnel is live. The payment_tx stamp is
-        # bookkeeping — a failure there must NOT hide the one-time token, or the
-        # paid tunnel becomes unmanageable, so record best-effort and always
-        # return the credential.
-        try:
-            await svc.mark_settled(tunnel_id, getattr(request.state, "payment_tx", "") or "")
-        except Exception:
-            log.error("tunnel_mark_settled_failed", tunnel_id=tunnel_id, exc_info=True)
+        await _mark_settled_best_effort(svc, tunnel_id, request)
         return _to_response(row, token=lease.token)
 
 
@@ -213,30 +235,39 @@ async def extend_tunnel(tunnel_id: str, body: TunnelExtendRequest, request: Requ
     _require_hours_in_bounds(body.hours, cfg)
     amount = payment_price(request, "price_tunnel_hourly", "0.05") * body.hours
 
-    # Deliver-before-charge: verify the payment, apply the extension on the
-    # daemon, then settle. If the daemon is unreachable or the lease is gone,
-    # the payment is never settled so the customer is not charged for time they
-    # did not receive.
     async with _tunnel_authorization_guard(request):
-        verified = await gate.verify_only(
+        # Pre-flight: confirm the daemon still has this lease and is reachable
+        # BEFORE charging, so a daemon-down / lease-gone extend never charges for
+        # time that can't be delivered.
+        try:
+            stats = await svc.live_stats(tunnel_id)
+        except TunnelDaemonError as exc:
+            raise HTTPException(502, "tunnel control plane unavailable; not charged") from exc
+        if stats is None:
+            raise HTTPException(404, "tunnel not found on daemon; not charged")
+
+        # Settle first so extra time is never delivered before it is paid for.
+        result = await gate.check_payment(
             request,
             amount=amount,
             description=f"Extend tunnel {tunnel_id} by {body.hours}h",
             extra_body={"tunnel_id": tunnel_id, "hours": body.hours},
         )
-        if isinstance(verified, Response):
-            return verified
+        if isinstance(result, Response):
+            return result
+        payer = result  # check_payment returns the payer wallet on success
 
+        # Apply the extension. The pre-flight makes a post-settlement failure
+        # rare; if it still happens, record a refund rather than silently keep
+        # the money for undelivered time.
         try:
             updated = await svc.extend(tunnel_id, body.hours)
         except TunnelDaemonError as exc:
-            raise HTTPException(502, "tunnel extend failed") from exc
+            await _record_extend_refund(request, gate, tunnel_id, amount, payer)
+            raise HTTPException(502, "extend failed after payment; a refund has been recorded") from exc
         if updated is None:
-            raise HTTPException(404, "tunnel not found")
-
-        # Extension delivered: settle now.
-        if not await gate.settle_verified(request, verified):
-            raise HTTPException(402, "payment settlement failed")
+            await _record_extend_refund(request, gate, tunnel_id, amount, payer)
+            raise HTTPException(500, "tunnel lost after payment; a refund has been recorded")
         return _to_response(updated)
 
 
@@ -259,7 +290,13 @@ async def tunnel_status(tunnel_id: str, request: Request) -> TunnelResponse:
     svc = _service(request)
     connected, visitors = False, 0
     if svc is not None:
-        stats = await svc.live_stats(tunnel_id)
+        # Distinguish "daemon says the lease is gone" (404 -> not connected) from
+        # "control plane unavailable" (503), rather than reporting a healthy-
+        # looking 200 when the daemon is actually unreachable.
+        try:
+            stats = await svc.live_stats(tunnel_id)
+        except TunnelDaemonError as exc:
+            raise HTTPException(503, "tunnel control plane unavailable") from exc
         if stats is not None:
             connected, visitors = stats.connected, stats.visitor_conns
     return _to_response(row, connected=connected, visitor_conns=visitors)
@@ -298,3 +335,46 @@ def _require_hours_in_bounds(hours: int, cfg: HyruleConfig) -> None:
             422,
             f"hours must be between {cfg.tunnel_min_hours} and {cfg.tunnel_max_hours}",
         )
+
+
+def _idempotency_key(request: Request) -> str | None:
+    """Derive a stable idempotency key from the x402 payment authorization, so a
+    client retry of a settled create recovers the same tunnel rather than paying
+    again. Unpaid/dev-bypass probes (no auth header) get no key.
+    """
+    auth = request.headers.get("payment-signature") or request.headers.get("x-payment")
+    if not auth:
+        return None
+    return hashlib.sha256(auth.encode("utf-8")).hexdigest()
+
+
+async def _mark_settled_best_effort(svc: TunnelService, tunnel_id: str, request: Request) -> None:
+    """Stamp payment_tx after a successful settle. Best-effort: a bookkeeping
+    failure must never hide the one-time token or mask a completed payment.
+    """
+    try:
+        await svc.mark_settled(tunnel_id, getattr(request.state, "payment_tx", "") or "")
+    except Exception:
+        log.error("tunnel_mark_settled_failed", tunnel_id=tunnel_id, exc_info=True)
+
+
+async def _record_extend_refund(
+    request: Request, gate: Any, tunnel_id: str, amount: Any, payer: str | None
+) -> None:
+    """Record a refund obligation when an extension is charged but the daemon
+    then fails to apply it (rare, post-settlement). Best-effort."""
+    from hyrule_cloud.services.refunds import RefundService
+
+    try:
+        await RefundService(getattr(gate, "ledger", None)).record_owed(
+            resource_path=f"/v1/tunnel/{tunnel_id}/extend",
+            payer=payer,
+            amount=amount,
+            original_tx=getattr(request.state, "payment_tx", None),
+            reason="tunnel_extend_failed_after_settlement",
+            network=getattr(request.state, "payment_network", None),
+            asset=getattr(request.state, "payment_asset", None),
+            extra={"tunnel_id": tunnel_id},
+        )
+    except Exception:
+        log.error("tunnel_extend_refund_record_failed", tunnel_id=tunnel_id, exc_info=True)

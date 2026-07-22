@@ -331,8 +331,9 @@ class HyruleConfig(BaseSettings):
     tunnel_min_hours: int = 1
     tunnel_max_hours: int = 720
     tunnel_grace_period_minutes: int = 15
-    # Public endpoint advertised for tunnels (matches the daemon's config).
-    tunnel_endpoint_host: str = "tun.hyrule.host"
+    # How long a provisioned-but-unsettled tunnel may linger before the sweep
+    # reaps it (crash/restart between provision commit and settle).
+    tunnel_provisional_ttl_minutes: int = 15
     # STUN test target for the /v1/voip/check STUN arm; empty keeps it stubbed.
     stun_test_host: str = ""
 

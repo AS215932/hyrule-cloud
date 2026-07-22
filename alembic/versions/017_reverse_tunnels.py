@@ -37,6 +37,7 @@ def upgrade() -> None:
         sa.Column("ssh_port", sa.Integer(), nullable=False, server_default="2222"),
         sa.Column("allowlist_cidrs", _JSONB),
         sa.Column("status", sa.String(16), nullable=False, server_default="active"),
+        sa.Column("idempotency_key", sa.String(64)),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -49,6 +50,7 @@ def upgrade() -> None:
     op.create_index("ix_reverse_tunnels_owner_wallet", "reverse_tunnels", ["owner_wallet"])
     op.create_index("ix_reverse_tunnels_owner_account_id", "reverse_tunnels", ["owner_account_id"])
     op.create_index("ix_reverse_tunnels_token_hash", "reverse_tunnels", ["token_hash"])
+    op.create_index("ix_reverse_tunnels_idempotency_key", "reverse_tunnels", ["idempotency_key"])
     op.create_index("ix_reverse_tunnels_status", "reverse_tunnels", ["status"])
     op.create_index("ix_reverse_tunnels_expires_at", "reverse_tunnels", ["expires_at"])
     op.create_index(
@@ -57,6 +59,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.drop_index("ix_reverse_tunnels_idempotency_key", table_name="reverse_tunnels")
     op.drop_index("ix_reverse_tunnels_token_hash", table_name="reverse_tunnels")
     op.drop_index("ix_reverse_tunnels_owner_status", table_name="reverse_tunnels")
     op.drop_index("ix_reverse_tunnels_expires_at", table_name="reverse_tunnels")

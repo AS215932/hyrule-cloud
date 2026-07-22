@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import ReverseTunnelRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token
-from hyrule_cloud.providers.tunnel_client import LeaseResult, TunnelProvider
+from hyrule_cloud.providers.tunnel_client import LeaseResult, TunnelDaemonError, TunnelProvider
 
 log = structlog.get_logger()
 
@@ -43,6 +43,30 @@ class TunnelService:
         self.session_factory = session_factory
         self.provider = provider
 
+    async def find_by_idempotency_key(self, key: str) -> ReverseTunnelRow | None:
+        async with self.session_factory() as session:
+            return (
+                await session.execute(
+                    select(ReverseTunnelRow).where(ReverseTunnelRow.idempotency_key == key)
+                )
+            ).scalar_one_or_none()
+
+    async def recover_lease(self, tunnel_id: str) -> LeaseResult | None:
+        """Re-fetch the daemon lease (idempotent create) to recover its token for
+        an idempotent create replay. Returns None if the daemon no longer has it.
+        """
+        row = await self.get(tunnel_id)
+        if row is None:
+            return None
+        expires = row.expires_at
+        if expires.tzinfo is None:  # SQLite (tests) returns naive; Postgres keeps tz
+            expires = expires.replace(tzinfo=UTC)
+        duration = max(1, int((expires - _now()).total_seconds()))
+        try:
+            return await self.provider.create_lease(tunnel_id, duration, row.allowlist_cidrs)
+        except TunnelDaemonError:
+            return None
+
     async def provision(
         self,
         *,
@@ -51,24 +75,32 @@ class TunnelService:
         allowlist_cidrs: list[str] | None,
         owner_wallet: str,
         owner_account_id: str | None,
+        idempotency_key: str | None,
     ) -> tuple[ReverseTunnelRow, LeaseResult]:
         """Create the daemon lease and persist the row (payment not yet settled).
 
-        Raises TunnelDaemonError if the daemon rejects the create; the caller
-        must then NOT settle (no charge for an unprovisioned tunnel).
+        Raises TunnelDaemonError if the daemon rejects the create, or if it
+        returns no token (an unusable/unmanageable tunnel); the caller must then
+        NOT settle (no charge for an unprovisioned tunnel).
         """
         duration = hours * 3600
         lease = await self.provider.create_lease(tunnel_id, duration, allowlist_cidrs)
+        if not lease.token:
+            # No token means the customer could neither connect nor manage the
+            # tunnel; treat as a provisioning failure and free the daemon lease.
+            await self.provider.revoke_lease(tunnel_id)
+            raise TunnelDaemonError("daemon returned a lease without a token")
         row = ReverseTunnelRow(
             tunnel_id=tunnel_id,
             owner_wallet=owner_wallet or "",
             owner_account_id=owner_account_id,
-            token_hash=hash_anon_token(lease.token or ""),
+            token_hash=hash_anon_token(lease.token),
             allocated_port=lease.port,
             endpoint_host=lease.endpoint_host,
             ssh_port=lease.ssh_port,
             allowlist_cidrs=allowlist_cidrs,
             status="active",
+            idempotency_key=idempotency_key,
             expires_at=_parse_ts(lease.expires_at, default=_now() + timedelta(hours=hours)),
             payment_tx=None,
         )
@@ -130,21 +162,36 @@ class TunnelService:
         return await self.provider.get_lease(tunnel_id)
 
     async def sweep_expiries(self) -> int:
-        """Revoke tunnels past expiry + grace on the daemon and delete the rows.
+        """Reap tunnels past expiry + grace AND provisioned-but-unsettled tunnels
+        that lingered past the provisional TTL (a crash/restart between provision
+        and settle would otherwise pin a scarce port for the full lease).
 
-        Belt-and-braces with the daemon's own time-based expiry.
+        The row is deleted only after the daemon confirms teardown; if the daemon
+        is unreachable the row is kept and retried on the next sweep, so a
+        still-reachable lease is never orphaned by dropping its record.
         """
-        cutoff = _now() - timedelta(minutes=self.config.tunnel_grace_period_minutes)
+        now = _now()
+        expiry_cutoff = now - timedelta(minutes=self.config.tunnel_grace_period_minutes)
+        provisional_cutoff = now - timedelta(minutes=self.config.tunnel_provisional_ttl_minutes)
         async with self.session_factory() as session:
-            expired = list(
+            candidates = list(
                 await session.scalars(
                     select(ReverseTunnelRow.tunnel_id).where(
-                        ReverseTunnelRow.expires_at < cutoff
+                        (ReverseTunnelRow.expires_at < expiry_cutoff)
+                        | (
+                            (ReverseTunnelRow.payment_tx.is_(None))
+                            & (ReverseTunnelRow.created_at < provisional_cutoff)
+                        )
                     )
                 )
             )
-        for tunnel_id in expired:
-            await self.provider.revoke_lease(tunnel_id)
+        reaped = 0
+        for tunnel_id in candidates:
+            if not await self.provider.revoke_lease(tunnel_id):
+                # Daemon unreachable/errored — keep the row and retry next sweep
+                # rather than orphan a possibly-live lease.
+                log.warning("tunnel_sweep_revoke_failed", tunnel_id=tunnel_id)
+                continue
             async with self.session_factory() as session:
                 await session.execute(
                     sql_delete(ReverseTunnelRow).where(
@@ -152,9 +199,10 @@ class TunnelService:
                     )
                 )
                 await session.commit()
-        if expired:
-            log.info("tunnel_expiry_sweep", reaped=len(expired))
-        return len(expired)
+            reaped += 1
+        if reaped:
+            log.info("tunnel_expiry_sweep", reaped=reaped)
+        return reaped
 
 
 def _parse_ts(value: str | None, *, default: datetime) -> datetime:

@@ -3,9 +3,9 @@
 Covers the daemon-backed lease lifecycle (provision/extend/revoke/sweep) with a
 fake TunnelProvider over an in-memory SQLite store, and the route's x402 payment
 ordering: gate-hidden until ready, verify->provision->settle on create,
-revoke-on-settle-failure, verify->extend->settle (deliver-before-charge) on
-extend, config-bound duration checks, strict daemon-confirmed revoke, and the
-hashed owner-token management gate.
+revoke-on-settle-failure, settle-after-daemon-preflight on extend, config-bound
+duration checks, strict daemon-confirmed revoke, and the hashed owner-token
+management gate.
 """
 from __future__ import annotations
 
@@ -49,6 +49,15 @@ class FakeTunnelProvider:
     async def create_lease(self, tunnel_id, duration_seconds, allowlist_cidrs):
         if self.create_error is not None:
             raise self.create_error
+        if tunnel_id in self.leases:
+            return LeaseResult.from_json(self.leases[tunnel_id])  # idempotent
+        if getattr(self, "omit_token", False):
+            rec = {"lease_id": tunnel_id, "token": None, "port": self.next_port,
+                   "endpoint_host": "tun.hyrule.host", "ssh_port": 2222, "status": "active",
+                   "expires_at": (datetime.now(UTC) + timedelta(seconds=duration_seconds)).isoformat()}
+            self.next_port += 1
+            self.leases[tunnel_id] = rec
+            return LeaseResult.from_json(rec)
         port = self.next_port
         self.next_port += 1
         expires = datetime.now(UTC) + timedelta(seconds=duration_seconds)
@@ -117,7 +126,7 @@ async def test_provision_writes_row_and_allocates(session_factory):
     svc = TunnelService(_config(), session_factory, provider)
     tid = new_tunnel_id()
     row, lease = await svc.provision(
-        tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None
+        tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None, idempotency_key=None
     )
     assert row.allocated_port == lease.port == 10000
     assert row.owner_wallet == "0xabc"
@@ -132,7 +141,7 @@ async def test_mark_settled_and_revoke(session_factory):
     provider = FakeTunnelProvider()
     svc = TunnelService(_config(), session_factory, provider)
     tid = new_tunnel_id()
-    await svc.provision(tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None)
+    await svc.provision(tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None, idempotency_key=None)
     await svc.mark_settled(tid, "0xTX")
     row = await svc.get(tid)
     assert row.payment_tx == "0xTX"
@@ -147,7 +156,7 @@ async def test_extend_pushes_expiry(session_factory):
     provider = FakeTunnelProvider()
     svc = TunnelService(_config(), session_factory, provider)
     tid = new_tunnel_id()
-    await svc.provision(tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None)
+    await svc.provision(tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None, idempotency_key=None)
     # Read both endpoints from the DB so tz-awareness is consistent (SQLite
     # returns naive datetimes; Postgres keeps tz — the comparison must not care).
     before = (await svc.get(tid)).expires_at
@@ -161,7 +170,7 @@ async def test_sweep_reaps_expired_past_grace(session_factory):
     provider = FakeTunnelProvider()
     svc = TunnelService(_config(tunnel_grace_period_minutes=0), session_factory, provider)
     tid = new_tunnel_id()
-    await svc.provision(tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None)
+    await svc.provision(tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None, idempotency_key=None)
     # Force it into the past.
     async with session_factory() as s:
         r = await s.get(ReverseTunnelRow, tid)
@@ -178,7 +187,7 @@ async def test_sweep_keeps_live_lease(session_factory):
     provider = FakeTunnelProvider()
     svc = TunnelService(_config(), session_factory, provider)
     tid = new_tunnel_id()
-    await svc.provision(tunnel_id=tid, hours=5, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None)
+    await svc.provision(tunnel_id=tid, hours=5, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None, idempotency_key=None)
     assert await svc.sweep_expiries() == 0
     assert await svc.get(tid) is not None
 
@@ -332,40 +341,39 @@ async def test_create_hidden_when_not_ready(session_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_extend_verifies_then_settles(wired):
+async def test_extend_settles_after_preflight(wired):
     client, _state, _provider, gate = wired
     created = await client.post("/v1/tunnel/create", json={"hours": 1}, headers={"X-Mock-Wallet": "0xabc"})
     tid = created.json()["tunnel_id"]
     token = created.json()["token"]
-    gate.verified = 0
-    gate.settled = 0
+    gate.checked = 0
     r = await client.post(
         f"/v1/tunnel/{tid}/extend",
         json={"hours": 3},
         headers={"X-Mock-Wallet": "0xabc", "X-Tunnel-Token": token},
     )
     assert r.status_code == 200, r.text
-    # Deliver-before-charge: verify happened, extension applied, then settle.
-    assert gate.verified == 1 and gate.settled == 1 and gate.checked == 0
+    # Settle-first after a daemon pre-flight: check_payment used once.
+    assert gate.checked == 1
 
 
 @pytest.mark.asyncio
-async def test_extend_daemon_failure_does_not_settle(wired):
+async def test_extend_daemon_gone_does_not_charge(wired):
     client, _state, provider, gate = wired
     created = await client.post("/v1/tunnel/create", json={"hours": 1}, headers={"X-Mock-Wallet": "0xabc"})
     tid = created.json()["tunnel_id"]
     token = created.json()["token"]
-    # Daemon has dropped the lease (e.g. expired-in-grace); extend must fail
-    # WITHOUT charging.
+    # Daemon has dropped the lease (e.g. expired-in-grace); the pre-flight must
+    # fail the extend BEFORE any charge.
     provider.leases.pop(tid, None)
-    gate.settled = 0
+    gate.checked = 0
     r = await client.post(
         f"/v1/tunnel/{tid}/extend",
         json={"hours": 3},
         headers={"X-Mock-Wallet": "0xabc", "X-Tunnel-Token": token},
     )
-    assert r.status_code == 502
-    assert gate.settled == 0  # never charged for undelivered time
+    assert r.status_code == 404
+    assert gate.checked == 0  # never charged for undelivered time
 
 
 @pytest.mark.asyncio
@@ -413,7 +421,7 @@ async def test_token_is_hashed_at_rest(session_factory):
     svc = TunnelService(_config(), session_factory, provider)
     tid = new_tunnel_id()
     _row, lease = await svc.provision(
-        tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None
+        tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None, idempotency_key=None
     )
     from hyrule_cloud.middleware.anon_token import hash_anon_token
 
@@ -448,6 +456,50 @@ async def test_revoke_requires_owner_token_then_tears_down(wired):
     assert tid in provider.revoked
     # Gone now.
     assert (await client.get(f"/v1/tunnel/{tid}/status", headers={"X-Tunnel-Token": token})).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_is_idempotent_on_payment_auth(wired):
+    client, _state, provider, gate = wired
+    headers = {"X-Mock-Wallet": "0xabc", "x-payment": "auth-ABC-123"}
+    first = await client.post("/v1/tunnel/create", json={"hours": 1}, headers=headers)
+    assert first.status_code == 200
+    tid1, tok1 = first.json()["tunnel_id"], first.json()["token"]
+    settled_after_first = gate.settled
+
+    # Retry with the SAME payment authorization: recovers the same tunnel+token,
+    # does NOT settle again, does NOT allocate a second lease.
+    second = await client.post("/v1/tunnel/create", json={"hours": 1}, headers=headers)
+    assert second.status_code == 200
+    assert second.json()["tunnel_id"] == tid1
+    assert second.json()["token"] == tok1
+    assert gate.settled == settled_after_first  # no double charge
+    assert len(provider.leases) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_missing_daemon_token(wired):
+    client, _state, provider, gate = wired
+    provider.omit_token = True
+    r = await client.post("/v1/tunnel/create", json={"hours": 1}, headers={"X-Mock-Wallet": "0xabc"})
+    assert r.status_code == 502
+    assert gate.settled == 0  # never charged
+    assert provider.leases == {}  # daemon lease revoked
+
+
+@pytest.mark.asyncio
+async def test_status_daemon_unavailable_is_503(wired):
+    client, _state, provider, _gate = wired
+    created = await client.post("/v1/tunnel/create", json={"hours": 1}, headers={"X-Mock-Wallet": "0xabc"})
+    tid = created.json()["tunnel_id"]
+    token = created.json()["token"]
+
+    async def boom(_tid):
+        raise TunnelDaemonError("daemon down")
+
+    provider.get_lease = boom
+    r = await client.get(f"/v1/tunnel/{tid}/status", headers={"X-Tunnel-Token": token})
+    assert r.status_code == 503
 
 
 @pytest.mark.asyncio

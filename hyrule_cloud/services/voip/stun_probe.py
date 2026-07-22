@@ -66,6 +66,28 @@ class _STUNProtocol(asyncio.DatagramProtocol):
             self._future.set_exception(exc)
 
 
+def split_host_port(endpoint: str, default_port: int = 3478) -> tuple[str, int]:
+    """Split a STUN endpoint into (host, port), handling IPv6 literals.
+
+    Accepts ``[2001:db8::1]:3478`` (bracketed with port), ``[2001:db8::1]`` or a
+    bare ``2001:db8::1`` (IPv6, default port), and ``host:port`` / ``host`` for
+    names/IPv4. Splitting on the first colon would corrupt an IPv6 literal.
+    """
+    endpoint = endpoint.strip()
+    if endpoint.startswith("["):
+        host, sep, rest = endpoint[1:].partition("]")
+        if sep and rest.startswith(":") and rest[1:]:
+            return host, int(rest[1:])
+        return host, default_port
+    # Bare IPv6 literal (2+ colons and no brackets) => host, default port.
+    if endpoint.count(":") >= 2:
+        return endpoint, default_port
+    host, sep, port_str = endpoint.partition(":")
+    if sep and port_str:
+        return host, int(port_str)
+    return host, default_port
+
+
 async def stun_binding(host: str, port: int = 3478, timeout: float = 3.0) -> tuple[str, int] | None:
     """Return the (ip, port) STUN maps us to, or None if unreachable/unparsable."""
     loop = asyncio.get_running_loop()

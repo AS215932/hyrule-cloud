@@ -491,6 +491,10 @@ class ReverseTunnelRow(Base):
     ssh_port: Mapped[int] = mapped_column(Integer, default=2222)
     allowlist_cidrs: Mapped[list | None] = mapped_column(_JSONB)
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    # sha256 of the x402 payment authorization; makes create idempotent so a
+    # client retry (after a lost response) recovers the same tunnel + token
+    # instead of paying again or leaking a port.
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

@@ -104,10 +104,9 @@ async def _stun_check() -> tuple[list[DiagnosticFinding], SourceHealth]:
             ],
             source_not_configured("STUN active tester is not configured (set HYRULE_STUN_TEST_HOST)."),
         )
-    from hyrule_cloud.services.voip.stun_probe import stun_binding
+    from hyrule_cloud.services.voip.stun_probe import split_host_port, stun_binding
 
-    hostname, _, port_str = host.partition(":")
-    port = int(port_str) if port_str else 3478
+    hostname, port = split_host_port(host)
     mapped = await stun_binding(hostname, port)
     if mapped is None:
         return (

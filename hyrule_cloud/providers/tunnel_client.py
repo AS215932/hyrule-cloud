@@ -143,12 +143,19 @@ class TunnelProvider:
         return resp.status_code in (204, 404)
 
     async def get_lease(self, tunnel_id: str) -> LeaseResult | None:
+        """Return the daemon's live view of a lease, None if the daemon reports
+        404 (gone), or raise TunnelDaemonError on an operational failure
+        (network error / 5xx), so callers can distinguish "not connected" from
+        "control plane unavailable".
+        """
         try:
             resp = await self._client.get(f"/v1/leases/{tunnel_id}")
-        except Exception:
+        except Exception as exc:
+            raise TunnelDaemonError(f"tunnel daemon unreachable: {exc}") from exc
+        if resp.status_code == 404:
             return None
         if resp.status_code != 200:
-            return None
+            raise TunnelDaemonError(f"daemon get failed: HTTP {resp.status_code}")
         return LeaseResult.from_json(resp.json())
 
     async def list_leases(self) -> list[LeaseResult]:
