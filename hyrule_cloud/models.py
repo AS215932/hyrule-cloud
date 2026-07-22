@@ -469,6 +469,48 @@ class NetworkResponse(BaseModel):
     error: str | None = None
 
 
+class TunnelCreateRequest(BaseModel):
+    """Provision a reverse-SSH tunnel for a host behind NAT.
+
+    The host runs `ssh -N -R 0:localhost:<port> <token>@<endpoint> -p 2222` and
+    becomes reachable on the allocated public TCP port.
+    """
+
+    hours: int = Field(ge=1, le=720, description="Lease duration in hours")
+    allowlist_cidrs: list[str] | None = Field(
+        default=None,
+        max_length=64,
+        description="Optional source-CIDR allowlist for visitors; omit to allow all",
+    )
+
+
+class TunnelExtendRequest(BaseModel):
+    hours: int = Field(ge=1, le=720, description="Additional hours to add")
+
+
+class TunnelResponse(BaseModel):
+    tunnel_id: str
+    token: str | None = Field(
+        default=None,
+        description="SSH username for the tunnel; returned once on create only",
+    )
+    endpoint_host: str
+    ssh_port: int
+    public_port: int = Field(description="Public TCP port the tunnel is reachable on")
+    ssh_command: str = Field(description="Ready-to-run ssh -R command for the NAT'd host")
+    status: str
+    expires_at: datetime
+    connected: bool = False
+    visitor_conns: int = 0
+
+
+class TunnelPricingResponse(BaseModel):
+    hourly_usd: str
+    min_hours: int
+    max_hours: int
+    currency: str = "USDC"
+
+
 class CryptoIntentRequest(BaseModel):
     """Block E: payment-intent creation. `order_payload` carries the full VM
     spec so the orchestrator can provision on settlement without re-asking

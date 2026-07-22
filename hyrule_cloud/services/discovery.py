@@ -327,6 +327,13 @@ _PROXY_PRICE = PriceSpec(
         ("price_proxy_yggdrasil", "0.03"),
     ),
 )
+_TUNNEL_PRICE = PriceSpec(
+    "dynamic",
+    (("price_tunnel_hourly", "0.05"),),
+    # Total is hours * hourly (1-720h), so a truthful upper bound is impossible
+    # at discovery time; advertise the per-hour minimum, like the VM price.
+    bounded=False,
+)
 _BGP_LOOKUP_PRICE = PriceSpec(
     "dynamic",
     (
@@ -487,6 +494,27 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
             "elapsed_seconds": 0.12,
             "proxy_mode": "direct",
         },
+    ),
+    _body_operation(
+        "/v1/tunnel/create",
+        "Expose a host behind NAT on a public TCP port via reverse SSH (ssh -R), leased by the hour",
+        _TUNNEL_PRICE,
+        models.TunnelCreateRequest,
+        {"hours": 1},
+        models.TunnelResponse,
+        {
+            "tunnel_id": "rtun_a1b2c3d4e5f6a7b8",
+            "token": "abcdefghijklmnopqrstuvwxyz234567",
+            "endpoint_host": "tun.hyrule.host",
+            "ssh_port": 2222,
+            "public_port": 10234,
+            "ssh_command": "ssh -N -R 0:localhost:22 abcdefghijklmnopqrstuvwxyz234567@tun.hyrule.host -p 2222",
+            "status": "active",
+            "expires_at": "2026-07-22T18:00:00Z",
+            "connected": False,
+            "visitor_conns": 0,
+        },
+        gate="tunnel",
     ),
     _body_operation(
         "/v1/bgp/lookup",
@@ -875,6 +903,10 @@ def _gate_enabled(gate: str) -> bool:
         from hyrule_cloud.services.bgp.snapshots import router_snapshot_download_enabled
 
         return router_snapshot_download_enabled()
+    if gate == "tunnel":
+        from hyrule_cloud.services.tunnel.readiness import tunnel_service_ready
+
+        return tunnel_service_ready()
     raise ValueError(f"Unknown paid-operation gate: {gate}")
 
 

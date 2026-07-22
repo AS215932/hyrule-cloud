@@ -249,6 +249,73 @@ async def reboot_vm(vm_id: str) -> str:
 
 
 @mcp.tool()
+async def create_tunnel(hours: int, allowlist_cidrs: str | None = None) -> str:
+    """
+    Expose a host behind NAT on a public TCP port via reverse SSH. Paid via x402
+    (per hour). Returns 402 with payment instructions if no payment is attached.
+
+    On the NAT'd host, run the returned ssh command (works from a stock rescue
+    image, no install). Use `-R 0:` so ssh prints the allocated port. Wrap it in
+    autossh so it reconnects. allowlist_cidrs is an optional comma-separated list
+    of source CIDRs allowed to reach the public port (default: open to all).
+    Save the returned token — it is the SSH username AND the management credential.
+    """
+    cidrs = [c.strip() for c in allowlist_cidrs.split(",")] if allowlist_cidrs else None
+    try:
+        async with _client() as hc:
+            r = await hc.create_tunnel(hours, cidrs)
+            return (
+                f"Tunnel created!\n"
+                f"  ID: {r['tunnel_id']}\n"
+                f"  Token (SSH username + management): {r.get('token')}\n"
+                f"  Public endpoint: {r['endpoint_host']}:{r['public_port']}\n"
+                f"  Expires: {r['expires_at']}\n"
+                f"  Run on the NAT'd host:\n    {r['ssh_command']}"
+            )
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def extend_tunnel(tunnel_id: str, token: str, hours: int) -> str:
+    """Extend a reverse-SSH tunnel lease by N hours. Paid via x402; needs the token."""
+    try:
+        async with _client() as hc:
+            r = await hc.extend_tunnel(tunnel_id, token, hours)
+            return f"Tunnel {tunnel_id} extended.\n  New expiry: {r.get('expires_at', 'unknown')}"
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def tunnel_status(tunnel_id: str, token: str) -> str:
+    """Get live status of a reverse-SSH tunnel (connected? visitors?). Needs the token."""
+    try:
+        async with _client() as hc:
+            r = await hc.tunnel_status(tunnel_id, token)
+            return (
+                f"Tunnel {tunnel_id}\n"
+                f"  Endpoint: {r['endpoint_host']}:{r['public_port']}\n"
+                f"  Status: {r['status']}  Connected: {r.get('connected')}\n"
+                f"  Visitors: {r.get('visitor_conns', 0)}\n"
+                f"  Expires: {r['expires_at']}"
+            )
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def revoke_tunnel(tunnel_id: str, token: str) -> str:
+    """Tear down a reverse-SSH tunnel before its lease expires. Needs the token."""
+    try:
+        async with _client() as hc:
+            await hc.revoke_tunnel(tunnel_id, token)
+            return f"Tunnel {tunnel_id} revoked."
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
 async def destroy_vm(vm_id: str) -> str:
     """Destroy a VM permanently. This cannot be undone."""
     try:

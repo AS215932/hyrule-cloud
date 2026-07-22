@@ -31,11 +31,22 @@ from hyrule_cloud.services.safety import assert_safe_active_probe_target, normal
 _NUMBER_PROVIDERS = ["twilio", "telnyx", "numverify", "cnam_provider", "e911_provider", "number_spam_reputation"]
 
 
+def _stun_host() -> str:
+    from hyrule_cloud.config import HyruleConfig
+
+    return HyruleConfig().stun_test_host
+
+
 def voip_sources() -> dict[str, SourceHealth]:
+    stun_source = (
+        source_ok()
+        if _stun_host()
+        else source_not_configured("STUN active tester is not configured (set HYRULE_STUN_TEST_HOST).")
+    )
     sources = {
         "dns": source_ok(),
         "sip_tls": source_ok(),
-        "stun_turn": source_not_configured("STUN/TURN active tester is not configured in server-only MVP."),
+        "stun_turn": stun_source,
     }
     sources.update({provider: source_not_configured("number intelligence provider API key is not configured") for provider in _NUMBER_PROVIDERS})
     return sources
@@ -64,9 +75,48 @@ def voip_check_has_live_backend(checks: list[VoIPCheck]) -> bool:
 
     A voip_check request that only asks for SIP_OPTIONS/STUN_TURN gets nothing
     but contract findings, so the route must 501 before charging rather than
-    bill for a non-answer — mirroring the number-lookup and path gates.
+    bill for a non-answer — mirroring the number-lookup and path gates. STUN
+    becomes live once a public STUN responder is configured.
     """
-    return any(check in _LIVE_VOIP_CHECKS for check in checks)
+    live = set(_LIVE_VOIP_CHECKS)
+    if _stun_host():
+        live.add(VoIPCheck.STUN_TURN)
+    return any(check in live for check in checks)
+
+
+async def _stun_check() -> list[DiagnosticFinding]:
+    """Confirm a public STUN responder is reachable, or emit the contract stub."""
+    host = _stun_host()
+    if not host:
+        return [
+            _finding(
+                DiagnosticStatus.INFO,
+                "stun_turn_not_configured",
+                "STUN tester requires a configured public STUN responder.",
+            )
+        ]
+    from hyrule_cloud.services.voip.stun_probe import stun_binding
+
+    hostname, _, port_str = host.partition(":")
+    port = int(port_str) if port_str else 3478
+    mapped = await stun_binding(hostname, port)
+    if mapped is None:
+        return [
+            _finding(
+                DiagnosticStatus.WARNING,
+                "stun_responder_unreachable",
+                f"Public STUN responder {host} did not answer a binding request.",
+            )
+        ]
+    return [
+        _finding(
+            DiagnosticStatus.OK,
+            "stun_responder_available",
+            f"Public STUN responder {host} answered; mapped address {mapped[0]}:{mapped[1]}.",
+            mapped_ip=mapped[0],
+            mapped_port=mapped[1],
+        )
+    ]
 
 
 async def voip_check(body: VoIPCheckRequest) -> DiagnosticResponse:
@@ -85,7 +135,7 @@ async def voip_check(body: VoIPCheckRequest) -> DiagnosticResponse:
     if VoIPCheck.SIP_OPTIONS in body.checks:
         findings.append(_finding(DiagnosticStatus.INFO, "sip_options_contract", "SIP OPTIONS active probe is supported by contract and runs from configured VoIP-safe vantages when enabled."))
     if VoIPCheck.STUN_TURN in body.checks:
-        findings.append(_finding(DiagnosticStatus.INFO, "stun_turn_not_configured", "STUN/TURN tester requires configured relay/test credentials."))
+        findings.extend(await _stun_check())
     status = DiagnosticStatus.OK if findings and all(f.severity in {DiagnosticStatus.OK, DiagnosticStatus.INFO} for f in findings) else DiagnosticStatus.WARNING
     return DiagnosticResponse(
         status=status,

@@ -1,0 +1,67 @@
+"""Reverse-SSH tunnel leases.
+
+Revision ID: 016
+Revises: 015
+Create Date: 2026-07-22
+
+NOTE: built off the last released migration (015). If the parallel in-flight
+admin-console / vm-pricing work (its own 016/017) lands first, renumber this to
+the next free revision and update down_revision accordingly.
+"""
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+
+from alembic import op
+
+_JSONB = postgresql.JSONB(astext_type=sa.Text()).with_variant(sa.JSON(), "sqlite")
+
+revision: str = "016"
+down_revision: str | None = "015"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "reverse_tunnels",
+        sa.Column("tunnel_id", sa.String(32), primary_key=True),
+        sa.Column("owner_wallet", sa.String(64), nullable=False, server_default=""),
+        sa.Column(
+            "owner_account_id",
+            sa.String(11),
+            sa.ForeignKey("accounts.account_id", ondelete="SET NULL"),
+        ),
+        sa.Column("token", sa.String(64), nullable=False),
+        sa.Column("allocated_port", sa.Integer(), nullable=False),
+        sa.Column("endpoint_host", sa.String(128), nullable=False),
+        sa.Column("ssh_port", sa.Integer(), nullable=False, server_default="2222"),
+        sa.Column("allowlist_cidrs", _JSONB),
+        sa.Column("status", sa.String(16), nullable=False, server_default="active"),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("payment_tx", sa.String(128)),
+    )
+    op.create_index("ix_reverse_tunnels_owner_wallet", "reverse_tunnels", ["owner_wallet"])
+    op.create_index("ix_reverse_tunnels_owner_account_id", "reverse_tunnels", ["owner_account_id"])
+    op.create_index("ix_reverse_tunnels_status", "reverse_tunnels", ["status"])
+    op.create_index("ix_reverse_tunnels_expires_at", "reverse_tunnels", ["expires_at"])
+    op.create_index(
+        "ix_reverse_tunnels_owner_status", "reverse_tunnels", ["owner_wallet", "status"]
+    )
+
+
+def downgrade() -> None:
+    op.drop_index("ix_reverse_tunnels_owner_status", table_name="reverse_tunnels")
+    op.drop_index("ix_reverse_tunnels_expires_at", table_name="reverse_tunnels")
+    op.drop_index("ix_reverse_tunnels_status", table_name="reverse_tunnels")
+    op.drop_index("ix_reverse_tunnels_owner_account_id", table_name="reverse_tunnels")
+    op.drop_index("ix_reverse_tunnels_owner_wallet", table_name="reverse_tunnels")
+    op.drop_table("reverse_tunnels")

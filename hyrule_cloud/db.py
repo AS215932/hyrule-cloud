@@ -466,6 +466,39 @@ class VPNTunnelRow(Base):
     payment_tx: Mapped[str | None] = mapped_column(String(128))
 
 
+class ReverseTunnelRow(Base):
+    """Reverse-SSH tunnel lease.
+
+    Hyrule Cloud is the billing authority; the hyrule-tunnel-proxy daemon owns
+    the SSH intake and allocates the token + public port. This row is the
+    cloud-side record used for ownership, expiry sweeps, and reconcile.
+    """
+
+    __tablename__ = "reverse_tunnels"
+
+    # tunnel_id is our generated id (rtun_<hex>) and the daemon's lease_id.
+    tunnel_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_wallet: Mapped[str] = mapped_column(String(64), index=True, default="")
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+    # Lease token (the SSH username), also the management credential.
+    token: Mapped[str] = mapped_column(String(64))
+    allocated_port: Mapped[int] = mapped_column(Integer)
+    endpoint_host: Mapped[str] = mapped_column(String(128))
+    ssh_port: Mapped[int] = mapped_column(Integer, default=2222)
+    allowlist_cidrs: Mapped[list | None] = mapped_column(_JSONB)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    payment_tx: Mapped[str | None] = mapped_column(String(128))
+
+    __table_args__ = (Index("ix_reverse_tunnels_owner_status", "owner_wallet", "status"),)
+
+
 class CryptoIntentRow(Base):
     """Tracking for native crypto payment intents (BTC/XMR).
 

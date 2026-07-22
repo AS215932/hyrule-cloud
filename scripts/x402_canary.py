@@ -21,6 +21,7 @@ Usage
   python x402_canary.py intel                # every network-intel probe (~$0.06)
   python x402_canary.py proxy                # direct + tor network requests
   python x402_canary.py domain --name mytest12345   # REAL account-owned registration
+  python x402_canary.py tunnel               # provision a real 1h reverse tunnel, then revoke it
   python x402_canary.py vm                   # provision a real VM + print SSH target
   python x402_canary.py vm --quote --destroy # via the locked-quote flow, then tear down
   python x402_canary.py path-report          # gated probe: run by name once a prober is live
@@ -171,6 +172,14 @@ TESTS: dict[str, dict] = {
         "body": {"url": "https://example.com", "method": "GET", "proxy_mode": "tor"},
         "usd": "0.05",
         "group": "proxy",
+    },
+    # --- 3e reverse-SSH tunnel (provisions a real 1h lease, then revokes) ---
+    "tunnel": {
+        "path": "/v1/tunnel/create",
+        "body": {"hours": 1},
+        "usd": "0.05",
+        "group": "provision",
+        "spendy": True,
     },
     # --- 3c domain (REAL registration, side effects) ---
     # The dedicated runner performs check -> quote -> authenticated x402 order
@@ -338,7 +347,30 @@ async def _run_one(
         # gate isn't passed until the VM reaches ready AND its launch-proof
         # (SSH smoke + DNS AAAA) verifies. Propagate that.
         return await _poll_and_report_vm(r, destroy=destroy, yes=yes)
+    if name == "tunnel":
+        return await _verify_and_cleanup_tunnel(r)
     return True
+
+
+async def _verify_and_cleanup_tunnel(create_resp: httpx.Response) -> bool:
+    """Assert the tunnel create returned a usable lease, then revoke it so the
+    canary never leaks a live tunnel (min lease is 1h; revoke frees it now)."""
+    data = create_resp.json()
+    token = data.get("token")
+    tunnel_id = data.get("tunnel_id")
+    port = data.get("public_port")
+    if not (token and tunnel_id and port):
+        print(f"    !! tunnel create omitted token/id/port: {create_resp.text[:200]}")
+        return False
+    print(f"    tunnel {tunnel_id} -> {data.get('endpoint_host')}:{port}")
+    print(f"    ssh: {data.get('ssh_command')}")
+    async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
+        status = await http.get(f"/v1/tunnel/{tunnel_id}/status", headers={"X-Tunnel-Token": token})
+        ok = status.status_code == 200
+        print(f"    status: HTTP {status.status_code} (owner-token gated)")
+        rev = await http.delete(f"/v1/tunnel/{tunnel_id}", headers={"X-Tunnel-Token": token})
+        print(f"    cleanup revoke: HTTP {rev.status_code}")
+    return ok
 
 
 async def _create_quote(order_payload: dict) -> str | None:
