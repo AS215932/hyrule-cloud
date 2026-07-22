@@ -1830,65 +1830,64 @@ class DomainService:
                 payment_asset=durable_order.payment_asset,
             )
             recovered += 1
-        cursor: tuple[datetime, str] | None = None
-        while True:
-            filters: list[Any] = [
+        settled_event_exists = (
+            select(PaymentEventRow.event_id)
+            .where(
                 PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
                 PaymentEventRow.resource_path.in_(
                     ["/v1/domains/orders", "/v1/domains/agent/orders"]
                 ),
-            ]
-            if cursor is not None:
-                created_at, event_id = cursor
-                filters.append(
-                    or_(
-                        PaymentEventRow.created_at < created_at,
-                        and_(
-                            PaymentEventRow.created_at == created_at,
-                            PaymentEventRow.event_id < event_id,
-                        ),
+                PaymentEventRow.amount_usd == DomainOrderRow.amount_usd,
+                PaymentEventRow.extra["order_id"].as_string() == DomainOrderRow.order_id,
+            )
+            .correlate(DomainOrderRow)
+            .exists()
+        )
+        async with self.db() as session:
+            ledger_candidates = list(
+                await session.scalars(
+                    select(DomainOrderRow)
+                    .where(
+                        DomainOrderRow.status == DomainOrderStatus.AWAITING_PAYMENT.value,
+                        DomainOrderRow.payment_method == DomainPaymentMethod.USDC.value,
+                        DomainOrderRow.paid_at.is_(None),
+                        settled_event_exists,
                     )
+                    .order_by(DomainOrderRow.created_at, DomainOrderRow.order_id)
+                    .limit(limit)
                 )
+            )
+        for order in ledger_candidates:
+            if order.order_id in seen:
+                continue
             async with self.db() as session:
-                events = list(
-                    await session.scalars(
-                        select(PaymentEventRow)
-                        .where(*filters)
-                        .order_by(
-                            PaymentEventRow.created_at.desc(),
-                            PaymentEventRow.event_id.desc(),
-                        )
-                        .limit(limit)
+                event = await session.scalar(
+                    select(PaymentEventRow)
+                    .where(
+                        PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
+                        PaymentEventRow.resource_path.in_(
+                            ["/v1/domains/orders", "/v1/domains/agent/orders"]
+                        ),
+                        PaymentEventRow.amount_usd == order.amount_usd,
+                        PaymentEventRow.extra["order_id"].as_string() == order.order_id,
                     )
-                )
-            if not events:
-                break
-            for event in events:
-                extra = event.extra if isinstance(event.extra, dict) else {}
-                order_id = str(extra.get("order_id") or "")
-                if not order_id or order_id in seen:
-                    continue
-                seen.add(order_id)
-                async with self.db() as session:
-                    ledger_order = await session.get(DomainOrderRow, order_id)
-                    awaiting = bool(
-                        ledger_order is not None
-                        and ledger_order.status == DomainOrderStatus.AWAITING_PAYMENT.value
+                    .order_by(
+                        PaymentEventRow.created_at.desc(),
+                        PaymentEventRow.event_id.desc(),
                     )
-                if not awaiting:
-                    continue
-                await self._mark_paid(
-                    order_id,
-                    payer=event.payer_wallet or "unknown",
-                    tx_hash=event.tx_hash,
-                    payment_network=event.network,
-                    payment_asset=event.asset,
+                    .limit(1)
                 )
-                recovered += 1
-            if len(events) < limit:
-                break
-            last = events[-1]
-            cursor = (_aware(last.created_at), last.event_id)
+            if event is None:
+                continue
+            seen.add(order.order_id)
+            await self._mark_paid(
+                order.order_id,
+                payer=event.payer_wallet or "unknown",
+                tx_hash=event.tx_hash,
+                payment_network=event.network,
+                payment_asset=event.asset,
+            )
+            recovered += 1
         return recovered
 
     async def expire_quotes(self) -> int:

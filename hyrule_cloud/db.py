@@ -987,7 +987,7 @@ class MailSendRow(Base):
     quote_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
     recipient: Mapped[str] = mapped_column(String(320), index=True)
     message_id: Mapped[str | None] = mapped_column(String(128), index=True)
-    in_reply_to: Mapped[str | None] = mapped_column(String(128), index=True)
+    in_reply_to: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), index=True)
     amount_usd: Mapped[Decimal] = mapped_column(
         Numeric(12, 6), default=Decimal("0"), server_default="0"

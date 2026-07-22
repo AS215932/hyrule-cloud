@@ -307,15 +307,21 @@ async def send_message(
     fingerprint = _mail_payment_authorization_fingerprint(request)
     if fingerprint is not None:
         await service.bind_payment_authorization(fingerprint, body.quote_id)
-    result = await service.deliver_send(body.quote_id, token)
-    await service.begin_send_settlement(
-        result.send_id,
+    intent = await service.prepare_send_settlement(
         body.quote_id,
+        token,
         payer=verified.payer or "unknown",
         payment_network=getattr(verified.matching_requirements, "network", None),
         payment_asset=getattr(verified.matching_requirements, "asset", None),
         payment_authorization=_mail_payment_authorization(request),
     )
+    result = await service.deliver_send(body.quote_id, token)
+    if result.send_id != intent.send_id:
+        raise MailProblem(
+            409,
+            "mail_send_superseded",
+            "The payable message changed before submission.",
+        )
     settlement_metadata = {**payment_metadata, "send_id": result.send_id}
     if not await gate.settle_verified(request, verified, extra_body=settlement_metadata):
         if getattr(request.state, "payment_settlement_indeterminate", False):

@@ -14,7 +14,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from cryptography.fernet import Fernet
-from sqlalchemy import func, select
+from sqlalchemy import Text, func, select
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -148,6 +148,7 @@ class _Domains:
     def __init__(self) -> None:
         self.agent_orders: list[dict] = []
         self.paid_orders: list[dict] = []
+        self.removed_service_records: list[dict] = []
         self.dns = SimpleNamespace(configured=True)
 
     async def create_quote(self, domain, action, owner):
@@ -170,6 +171,7 @@ class _Domains:
         return None
 
     async def remove_service_records(self, *args, **kwargs):
+        self.removed_service_records.append({"args": args, **kwargs})
         return None
 
 
@@ -267,6 +269,7 @@ def test_agent_mail_review_safety_schema_contracts():
     assert MailSendRow.__table__.c.payment_settled_at.index is True
     assert MailSendRow.__table__.c.payment_authorization_header.type.length is None
     assert MailSendRow.__table__.c.payment_settlement_pending_at.nullable is True
+    assert isinstance(MailSendRow.__table__.c.in_reply_to.type, Text)
     assert MailAccountRow.__table__.c.domain_authority_hash.type.length == 64
     assert [column.name for column in MailMessageIndexRow.__table__.primary_key.columns] == [
         "mailbox_id",
@@ -1261,7 +1264,7 @@ async def test_incomplete_mail_dns_keeps_provisioning_retryable(mail_service):
 
 @pytest.mark.asyncio
 async def test_unready_domain_orders_do_not_starve_ready_mailboxes(mail_service):
-    service, sessions, _backend, _domains, _refunds = mail_service
+    service, sessions, _backend, domains, _refunds = mail_service
 
     async def awaiting_provision(local_part: str, key: str):
         quote = await service.create_account_quote(
@@ -1302,6 +1305,8 @@ async def test_unready_domain_orders_do_not_starve_ready_mailboxes(mail_service)
         ready_row = await session.get(MailAccountRow, ready.mailbox_id)
         active_domain_row = await session.get(MailAccountRow, active_domain.mailbox_id)
         blocked_row.status = MailboxStatus.PENDING_DOMAIN.value
+        blocked_row.plan = MailboxMode.DOMAIN_AND_MAILBOX.value
+        blocked_row.domain = "blocked-domain-order.dev"
         blocked_row.domain_order_id = "do_blocked_domain_order"
         blocked_row.created_at = now - timedelta(hours=3)
         ready_row.created_at = now - timedelta(hours=2)
@@ -1374,6 +1379,8 @@ async def test_unready_domain_orders_do_not_starve_ready_mailboxes(mail_service)
         terminal = await session.get(MailAccountRow, blocked.mailbox_id)
     assert terminal.status == MailboxStatus.FAILED.value
     assert terminal.provision_error == "domain_registration_failed"
+    assert terminal.dns_cleanup_pending is False
+    assert domains.removed_service_records == []
 
 
 @pytest.mark.asyncio
@@ -1619,7 +1626,8 @@ async def test_settlement_ledger_recovers_lost_mail_activation_handoff(mail_serv
         quote.quote_id,
         idempotency_key="recover-mail-payment-idempotency-0001",
     )
-    event = PaymentLedger(sessions).build_event(
+    ledger = PaymentLedger(sessions)
+    event = ledger.build_event(
         event_type="settled",
         resource_path="/v1/mail/accounts",
         method="POST",
@@ -1634,10 +1642,27 @@ async def test_settlement_ledger_recovers_lost_mail_activation_handoff(mail_serv
             "address": account.address,
         },
     )
+    irrelevant_events = [
+        ledger.build_event(
+            event_type="settled",
+            resource_path="/v1/mail/accounts",
+            method="POST",
+            amount=service.config.payment.price_mail_activation,
+            network="eip155:8453",
+            asset="USDC",
+            payer="0x" + "5" * 40,
+            tx_hash=f"0xirrelevant-mail-{index}",
+            extra={
+                "mailbox_id": f"mbx_irrelevant_{index}",
+                "quote_id": f"mailq_irrelevant_{index}",
+            },
+        )
+        for index in range(3)
+    ]
     async with sessions() as session:
         stored_quote = await session.get(MailQuoteRow, quote.quote_id)
         stored_quote.expires_at = datetime.now(UTC) - timedelta(hours=2)
-        session.add(event)
+        session.add_all([event, *irrelevant_events])
         await session.commit()
 
     assert await service.expire_quotes() == 0
@@ -1645,8 +1670,8 @@ async def test_settlement_ledger_recovers_lost_mail_activation_handoff(mail_serv
         preserved = await session.get(MailAccountRow, account.mailbox_id)
         assert preserved.status == MailboxStatus.AWAITING_PAYMENT.value
         assert preserved.management_token_ciphertext
-    assert await service.recover_x402_handoffs() == 1
-    assert await service.recover_x402_handoffs() == 0
+    assert await service.recover_x402_handoffs(limit=1) == 1
+    assert await service.recover_x402_handoffs(limit=1) == 0
     async with sessions() as session:
         recovered = await session.get(MailAccountRow, account.mailbox_id)
         assert recovered.status == MailboxStatus.PROVISIONING.value
@@ -2549,6 +2574,91 @@ async def test_send_route_verifies_and_reports_the_immutable_quote_amount(mail_s
 
 
 @pytest.mark.asyncio
+async def test_send_route_persists_settlement_intent_before_backend_submission(
+    mail_service, monkeypatch
+):
+    service, sessions, backend, _domains, _refunds = mail_service
+    mailbox_id, token = await _active_hosted(service)
+    quote = await service.create_send_quote(
+        MailSendQuoteRequest(
+            mailbox_id=mailbox_id,
+            to="proof@example.net",
+            subject="Durable settlement intent",
+            text="Persist authorization before the external write.",
+        ),
+        token,
+    )
+    observed: dict[str, object] = {}
+
+    async def fail_after_observing_intent(**_kwargs):
+        async with sessions() as session:
+            stored = await session.scalar(
+                select(MailSendRow).where(MailSendRow.quote_id == quote.quote_id)
+            )
+        observed["status"] = stored.status
+        observed["authorization"] = stored.payment_authorization_header
+        observed["pending_at"] = stored.payment_settlement_pending_at
+        raise MailBackendError("submission outcome unavailable")
+
+    monkeypatch.setattr(backend, "send_message", fail_after_observing_intent)
+    monkeypatch.setattr(
+        "hyrule_cloud.api.mail._mail_payment_authorization_fingerprint",
+        lambda _request: "a" * 64,
+    )
+
+    class Gate:
+        settle_calls = 0
+
+        async def verify_only(self, _request, **_kwargs):
+            return SimpleNamespace(
+                payer="0x" + "7" * 40,
+                matching_requirements=SimpleNamespace(
+                    network="eip155:8453",
+                    asset="USDC",
+                ),
+            )
+
+        async def settle_verified(self, *_args, **_kwargs):
+            self.settle_calls += 1
+            raise AssertionError("payment cannot settle before message acceptance")
+
+    gate = Gate()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "https",
+            "server": ("cloud.hyrule.host", 443),
+            "path": "/v1/mail/messages/send",
+            "query_string": b"",
+            "headers": [
+                (b"authorization", f"Bearer {token}".encode()),
+                (b"payment-signature", b"stored-authorization"),
+            ],
+        }
+    )
+
+    with pytest.raises(MailProblem) as failed:
+        await send_message_route(
+            MailSendRequest(quote_id=quote.quote_id),
+            request,
+            service=service,
+            gate=gate,
+        )
+    assert failed.value.code == "mail_submission_failed"
+    assert observed["status"] == "submitting"
+    assert observed["authorization"] == "stored-authorization"
+    assert observed["pending_at"] is not None
+    assert gate.settle_calls == 0
+    async with sessions() as session:
+        stored = await session.scalar(
+            select(MailSendRow).where(MailSendRow.quote_id == quote.quote_id)
+        )
+    assert stored.payment_authorization_header == "stored-authorization"
+    assert stored.payment_settlement_pending_at is not None
+
+
+@pytest.mark.asyncio
 async def test_send_route_replays_ledger_settlement_without_a_second_payment(mail_service):
     service, sessions, _backend, _domains, _refunds = mail_service
     mailbox_id, token = await _active_hosted(service)
@@ -2804,10 +2914,11 @@ async def test_reply_quote_translates_jmap_id_to_rfc_message_id(mail_service):
             )
         )
         await session.commit()
+    long_message_id = f"<{'r' * 300}@example.net>"
     backend.authoritative_messages = [
         {
             "id": "jmap-inbound-1",
-            "messageId": ["<original-rfc-id@example.net>"],
+            "messageId": [long_message_id],
             "folder": "inbox",
             "from": [{"email": "correspondent@example.net"}],
             "to": [{"email": account.address}],
@@ -2831,9 +2942,12 @@ async def test_reply_quote_translates_jmap_id_to_rfc_message_id(mail_service):
     )
     async with sessions() as session:
         stored = await session.get(MailQuoteRow, quote.quote_id)
-        assert stored.request_payload["in_reply_to"] == "<original-rfc-id@example.net>"
-    await service.deliver_send(quote.quote_id, token)
-    assert backend.sent[-1]["in_reply_to"] == "<original-rfc-id@example.net>"
+        assert stored.request_payload["in_reply_to"] == long_message_id
+    sent = await service.deliver_send(quote.quote_id, token)
+    assert backend.sent[-1]["in_reply_to"] == long_message_id
+    async with sessions() as session:
+        stored_send = await session.get(MailSendRow, sent.send_id)
+    assert stored_send.in_reply_to == long_message_id
 
 
 @pytest.mark.asyncio

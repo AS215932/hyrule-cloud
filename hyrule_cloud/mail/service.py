@@ -1013,6 +1013,35 @@ class MailService:
 
     async def deliver_send(self, quote_id: str, token: str) -> MailSendResponse:
         self.require_launch()
+        send = await self._send_intent_for_quote(quote_id, token)
+        if send.status == "accepted":
+            return self._send_response(send)
+        return await self._submit_send_intent(send.send_id)
+
+    async def prepare_send_settlement(
+        self,
+        quote_id: str,
+        token: str,
+        *,
+        payer: str,
+        payment_network: str | None,
+        payment_asset: str | None,
+        payment_authorization: str | None,
+    ) -> MailSendRow:
+        """Persist a payable send and its authorization before Stalwart submission."""
+
+        self.require_launch()
+        send = await self._send_intent_for_quote(quote_id, token)
+        return await self.begin_send_settlement(
+            send.send_id,
+            quote_id,
+            payer=payer,
+            payment_network=payment_network,
+            payment_asset=payment_asset,
+            payment_authorization=payment_authorization,
+        )
+
+    async def _send_intent_for_quote(self, quote_id: str, token: str) -> MailSendRow:
         async with self.db() as session:
             quote = await session.get(MailQuoteRow, quote_id)
             if quote is None or quote.kind != "send" or not quote.mailbox_id:
@@ -1023,10 +1052,7 @@ class MailService:
             existing: MailSendRow | None = await session.scalar(
                 select(MailSendRow).where(MailSendRow.quote_id == quote_id)
             )
-        send = existing or await self._reserve_send_intent(quote_id)
-        if send.status == "accepted":
-            return self._send_response(send)
-        return await self._submit_send_intent(send.send_id)
+        return existing or await self._reserve_send_intent(quote_id)
 
     async def settled_send_response(self, quote_id: str, token: str) -> MailSendResponse | None:
         """Return an already-paid send without asking the payer to settle again."""
@@ -1468,11 +1494,11 @@ class MailService:
                     "mail_send_superseded",
                     "This payment belongs to an earlier mail send.",
                 )
-            if row.status != "accepted":
+            if row.status not in _SEND_RESERVED_STATUSES:
                 raise MailProblem(
                     409,
                     "mail_send_not_accepted",
-                    "This message has not been accepted for delivery.",
+                    "This message is not available for settlement.",
                 )
             if row.payment_settled_at is None:
                 row.payment_payer = payer[:64]
@@ -2486,92 +2512,84 @@ class MailService:
                 )
                 continue
             recovered += 1
-        cursor: tuple[datetime, str] | None = None
-        while True:
-            filters = [
+        settled_event_exists = (
+            select(PaymentEventRow.event_id)
+            .where(
                 PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
                 PaymentEventRow.resource_path == "/v1/mail/accounts",
-            ]
-            if cursor is not None:
-                created_at, event_id = cursor
-                filters.append(
-                    or_(
-                        PaymentEventRow.created_at < created_at,
-                        and_(
-                            PaymentEventRow.created_at == created_at,
-                            PaymentEventRow.event_id < event_id,
+                PaymentEventRow.amount_usd == MailAccountRow.total_amount_usd,
+                PaymentEventRow.extra["mailbox_id"].as_string() == MailAccountRow.mailbox_id,
+                PaymentEventRow.extra["quote_id"].as_string() == MailAccountRow.quote_id,
+            )
+            .correlate(MailAccountRow)
+            .exists()
+        )
+        async with self.db() as session:
+            ledger_candidates = list(
+                await session.scalars(
+                    select(MailAccountRow)
+                    .where(
+                        MailAccountRow.payment_settled_at.is_(None),
+                        MailAccountRow.quote_id.is_not(None),
+                        MailAccountRow.total_amount_usd.is_not(None),
+                        or_(
+                            MailAccountRow.status == MailboxStatus.AWAITING_PAYMENT.value,
+                            and_(
+                                MailAccountRow.status == MailboxStatus.FAILED.value,
+                                MailAccountRow.provision_error == "payment_window_expired",
+                                MailAccountRow.management_token_ciphertext.is_not(None),
+                            ),
                         ),
+                        settled_event_exists,
                     )
+                    .order_by(MailAccountRow.created_at, MailAccountRow.mailbox_id)
+                    .limit(limit)
                 )
+            )
+        for account in ledger_candidates:
+            if not account.quote_id or account.total_amount_usd is None:
+                continue
+            activation = (account.mailbox_id, account.quote_id)
+            if activation in seen:
+                continue
             async with self.db() as session:
-                events = list(
-                    await session.scalars(
-                        select(PaymentEventRow)
-                        .where(*filters)
-                        .order_by(
-                            PaymentEventRow.created_at.desc(),
-                            PaymentEventRow.event_id.desc(),
-                        )
-                        .limit(limit)
+                event = await session.scalar(
+                    select(PaymentEventRow)
+                    .where(
+                        PaymentEventRow.event_type.in_(["settled", "dev_bypass"]),
+                        PaymentEventRow.resource_path == "/v1/mail/accounts",
+                        PaymentEventRow.amount_usd == account.total_amount_usd,
+                        PaymentEventRow.extra["mailbox_id"].as_string() == account.mailbox_id,
+                        PaymentEventRow.extra["quote_id"].as_string() == account.quote_id,
                     )
+                    .order_by(
+                        PaymentEventRow.created_at.desc(),
+                        PaymentEventRow.event_id.desc(),
+                    )
+                    .limit(1)
                 )
-            if not events:
-                break
-            for event in events:
-                extra = event.extra if isinstance(event.extra, dict) else {}
-                mailbox_id = str(extra.get("mailbox_id") or "")
-                quote_id = str(extra.get("quote_id") or "")
-                activation = (mailbox_id, quote_id)
-                if not mailbox_id or not quote_id or activation in seen:
-                    continue
-                async with self.db() as session:
-                    account = await session.get(MailAccountRow, mailbox_id)
-                    awaiting = bool(
-                        account is not None
-                        and account.quote_id == quote_id
-                        and account.total_amount_usd is not None
-                        and event.amount_usd is not None
-                        and Decimal(account.total_amount_usd) == Decimal(event.amount_usd)
-                        and (
-                            account.status == MailboxStatus.AWAITING_PAYMENT.value
-                            or (
-                                account.status == MailboxStatus.FAILED.value
-                                and account.provision_error == "payment_window_expired"
-                                and account.management_token_ciphertext
-                            )
-                        )
-                    )
-                if not awaiting:
-                    continue
-                seen.add(activation)
-                try:
-                    await self.mark_activation_paid(
-                        mailbox_id,
-                        quote_id,
-                        payer=event.payer_wallet or "unknown",
-                        tx_hash=event.tx_hash,
-                        payment_network=event.network,
-                        payment_asset=event.asset,
-                    )
-                except DomainProblem:
-                    # One temporarily unrecoverable activation (for example,
-                    # capacity contention) must not starve later settled
-                    # handoffs. The durable payment event remains available
-                    # for the next worker pass.
-                    log.warning(
-                        "mail_payment_handoff_recovery_deferred",
-                        mailbox_id=mailbox_id,
-                        exc_info=True,
-                    )
-                    continue
-                recovered += 1
-            if len(events) < limit:
-                break
-            last = events[-1]
-            last_created_at = _aware(last.created_at)
-            if last_created_at is None:
-                break
-            cursor = (last_created_at, last.event_id)
+            if event is None:
+                continue
+            seen.add(activation)
+            try:
+                await self.mark_activation_paid(
+                    account.mailbox_id,
+                    account.quote_id,
+                    payer=event.payer_wallet or "unknown",
+                    tx_hash=event.tx_hash,
+                    payment_network=event.network,
+                    payment_asset=event.asset,
+                )
+            except DomainProblem:
+                # One temporarily unrecoverable activation (for example,
+                # capacity contention) must not starve later settled handoffs.
+                log.warning(
+                    "mail_payment_handoff_recovery_deferred",
+                    mailbox_id=account.mailbox_id,
+                    exc_info=True,
+                )
+                continue
+            recovered += 1
         return recovered
 
     async def deliver_webhooks(self, *, limit: int = 20) -> int:
@@ -2882,7 +2900,12 @@ class MailService:
                     return False
                 if refund_event is not None:
                     session.add(refund_event)
-            needs_dns_cleanup = row.plan != MailboxMode.HOSTED.value and bool(row.domain)
+            # backend_id is committed immediately before the external DNS
+            # write. Without it, a combined order failed before mail DNS could
+            # have been installed, so scheduling cleanup would retry forever.
+            needs_dns_cleanup = (
+                row.plan != MailboxMode.HOSTED.value and bool(row.domain) and bool(row.backend_id)
+            )
             row.status = MailboxStatus.REFUND_DUE.value if refund else MailboxStatus.FAILED.value
             row.provision_error = reason[:2000]
             row.dns_cleanup_pending = needs_dns_cleanup

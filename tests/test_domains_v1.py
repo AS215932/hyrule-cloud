@@ -1709,8 +1709,8 @@ async def test_settlement_ledger_recovers_lost_x402_order_handoff(domain_service
         session.add_all([event, *newer_events])
         await session.commit()
 
-    # The recoverable event sits beyond the first page of already-processed
-    # ledger entries, so a single fixed LIMIT would strand it forever.
+    # Historical events for unrelated resources cannot consume the bounded
+    # candidate limit or strand this currently actionable order.
     assert await service.recover_x402_handoffs(limit=2) == 1
     assert await service.recover_x402_handoffs(limit=2) == 0
     async with sessions() as session:
