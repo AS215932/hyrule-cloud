@@ -761,7 +761,11 @@ class DomainService:
                         "The owning account was disabled before payment settled."
                     )
                     if not _is_waived_billing(order.billing_mode):
-                        session.add(self._build_refund_event(order, "account_disabled"))
+                        session.add(
+                            await self._build_refund_event(
+                                session, order, "account_disabled"
+                            )
+                        )
                     await session.commit()
                     return order
                 quote = (
@@ -785,7 +789,11 @@ class DomainService:
                     )
                     order.error_code = "quote_already_consumed"
                     if not _is_waived_billing(order.billing_mode):
-                        session.add(self._build_refund_event(order, "quote_already_consumed"))
+                        session.add(
+                            await self._build_refund_event(
+                                session, order, "quote_already_consumed"
+                            )
+                        )
                     await session.commit()
                     return order
                 quote.status = "consumed"
@@ -801,7 +809,9 @@ class DomainService:
                         order.error_code = "vm_quote_already_consumed"
                         if not _is_waived_billing(order.billing_mode):
                             session.add(
-                                self._build_refund_event(order, "vm_quote_already_consumed")
+                                await self._build_refund_event(
+                                    session, order, "vm_quote_already_consumed"
+                                )
                             )
                         await session.commit()
                         return order
@@ -2336,11 +2346,23 @@ class DomainService:
                 domain.status = DomainStatus.FAILED
                 domain.error = detail[:1000]
             if not _is_waived_billing(current.billing_mode):
-                session.add(self._build_refund_event(current, code, amount=refund_amount))
+                session.add(
+                    await self._build_refund_event(
+                        session,
+                        current,
+                        code,
+                        amount=refund_amount,
+                    )
+                )
             await session.commit()
 
-    def _build_refund_event(
-        self, order: DomainOrderRow, reason: str, *, amount: Decimal | None = None
+    async def _build_refund_event(
+        self,
+        session: AsyncSession,
+        order: DomainOrderRow,
+        reason: str,
+        *,
+        amount: Decimal | None = None,
     ) -> PaymentEventRow:
         builder = getattr(self.orchestrator.refunds, "build_owed_event", None)
         if builder is None:
@@ -2349,6 +2371,23 @@ class DomainService:
             DomainPaymentMethod.BTC.value,
             DomainPaymentMethod.XMR.value,
         }
+        native_intent = (
+            await session.get(CryptoIntentRow, order.native_intent_id)
+            if native and order.native_intent_id
+            else None
+        )
+        extra: dict[str, str | None] = {
+            "order_id": order.order_id,
+            "domain": order.fqdn,
+            "refund_address": order.refund_address,
+        }
+        if native_intent is not None:
+            extra["intent_id"] = native_intent.intent_id
+            extra["amount_received_crypto"] = (
+                str(native_intent.amount_received_crypto)
+                if native_intent.amount_received_crypto is not None
+                else None
+            )
         event: PaymentEventRow | None = builder(
             resource_path="/v1/domains/orders",
             payer=order.order_id if native else order.payer,
@@ -2357,11 +2396,7 @@ class DomainService:
             reason=reason,
             network="native" if native else order.payment_network,
             asset=order.payment_method.upper() if native else order.payment_asset,
-            extra={
-                "order_id": order.order_id,
-                "domain": order.fqdn,
-                "refund_address": order.refund_address,
-            },
+            extra=extra,
         )
         if event is None:
             raise RuntimeError("paid domain order has no recordable refund target")
@@ -3047,7 +3082,8 @@ class DomainService:
                             # construction or persistence fails, neither side is
                             # left terminal and the stale job remains recoverable.
                             session.add(
-                                self._build_refund_event(
+                                await self._build_refund_event(
+                                    session,
                                     order,
                                     "bundle_vm_failed",
                                     amount=Decimal(order.vm_amount_usd),

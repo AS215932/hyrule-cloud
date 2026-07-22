@@ -1102,7 +1102,10 @@ async def vm_action(
             else:
                 await orch.xcpng.suspend_vm(current.xcpng_uuid)
                 current.status = VMStatus.SUSPENDED
-            if action != "start" and current.suspension_reason != "account_disabled":
+            if (
+                action in {"shutdown", "suspend"}
+                and current.suspension_reason != "account_disabled"
+            ):
                 current.suspension_reason = "manual_admin"
                 current.suspended_by_account_id = actor.account_id
             await session.commit()
@@ -1154,12 +1157,33 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
     """Clear an old owner's account suspension after a successful transfer."""
     restart_provisioning = False
     async with _factory(state)() as session:
+        snapshot = (
+            await session.execute(
+                select(VMRow.owner_account_id).where(VMRow.vm_id == vm_id)
+            )
+        ).one_or_none()
+        if snapshot is None or snapshot[0] is None:
+            return
+        owner_account_id = snapshot[0]
+        recipient = (
+            await session.execute(
+                select(AccountRow)
+                .where(AccountRow.account_id == owner_account_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         current = (
             await session.execute(
                 select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
             )
         ).scalar_one_or_none()
-        if current is None or current.suspension_reason != "account_disabled":
+        if (
+            current is None
+            or current.owner_account_id != owner_account_id
+            or recipient is None
+            or recipient.disabled_at is not None
+            or current.suspension_reason != "account_disabled"
+        ):
             return
         if current.expires_at is not None and _aware(current.expires_at) <= _now():
             current.suspension_reason = "expired"
@@ -1241,6 +1265,39 @@ async def _pending_domain_work(
     return job_id is not None
 
 
+async def _lock_domain_transfer_bundle(
+    session: AsyncSession,
+    fqdn: str,
+) -> tuple[DomainRow, VMRow | None]:
+    """Lock an attached VM before its domain, matching VM transfers."""
+    snapshot = (
+        await session.execute(
+            select(DomainRow.vm_id).where(DomainRow.fqdn == fqdn)
+        )
+    ).one_or_none()
+    if snapshot is None:
+        raise HTTPException(404, "Domain not found")
+    snapshot_vm_id = snapshot[0]
+
+    vm = None
+    if snapshot_vm_id is not None:
+        vm = (
+            await session.execute(
+                select(VMRow).where(VMRow.vm_id == snapshot_vm_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+    domain = (
+        await session.execute(
+            select(DomainRow).where(DomainRow.fqdn == fqdn).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if domain is None:
+        raise HTTPException(404, "Domain not found")
+    if domain.vm_id != snapshot_vm_id:
+        raise HTTPException(409, "Domain attachment changed; retry the transfer")
+    return domain, vm
+
+
 @router.post("/vms/{vm_id}/transfer")
 async def transfer_vm(
     vm_id: str,
@@ -1310,21 +1367,11 @@ async def transfer_domain(
     async with _factory(state)() as session:
         await _assert_transfer_target(session, body.target_account_id)
         new_owner_wallet = await _transfer_wallet_identity(session, body.target_account_id)
-        domain = (
-            await session.execute(select(DomainRow).where(DomainRow.fqdn == fqdn).with_for_update())
-        ).scalar_one_or_none()
-        if domain is None:
-            raise HTTPException(404, "Domain not found")
+        domain, vm = await _lock_domain_transfer_bundle(session, fqdn)
         if await _pending_domain_work(session, fqdn=fqdn, vm_id=domain.vm_id):
             raise HTTPException(409, "Domain has a pending operation")
-        vm = None
         if domain.vm_id:
             attached_vm_id = domain.vm_id
-            vm = (
-                await session.execute(
-                    select(VMRow).where(VMRow.vm_id == domain.vm_id).with_for_update()
-                )
-            ).scalar_one_or_none()
             if vm is not None and str(vm.status) == VMStatus.PROVISIONING.value:
                 raise HTTPException(409, "Provisioning VMs cannot be transferred")
         previous_account_id = domain.owner_account_id

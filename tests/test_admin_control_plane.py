@@ -19,6 +19,8 @@ from hyrule_cloud.api.admin import (
     RefundResolutionRequest,
     StepUpRequest,
     _assert_transfer_target,
+    _lock_domain_transfer_bundle,
+    _resume_transferred_vm,
     resolve_refund,
     retry_job,
     step_up,
@@ -917,6 +919,52 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
 
 
 @pytest.mark.asyncio
+async def test_transferred_vm_revalidates_disabled_recipient_before_resume(
+    admin_factory,
+) -> None:
+    async with admin_factory() as session:
+        session.add(
+            AccountRow(
+                account_id="HBBBBBBBBBB",
+                password_hash="unused",
+                disabled_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            VMRow(
+                vm_id="vm_transfer_disabled_recipient",
+                owner_wallet="0xowner",
+                owner_account_id="HBBBBBBBBBB",
+                xcpng_uuid="uuid-transfer-disabled-recipient",
+                status="suspended",
+                suspension_reason="account_disabled",
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+        await session.commit()
+
+    xcpng = _AdminXCPNG()
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(
+            xcpng=xcpng,
+            start_provisioning=lambda _vm_id: None,
+        ),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+
+    await _resume_transferred_vm(state, "vm_transfer_disabled_recipient")
+
+    assert xcpng.started == []
+    async with admin_factory() as session:
+        row = await session.get(VMRow, "vm_transfer_disabled_recipient")
+    assert row is not None and str(row.status) == "suspended"
+    assert row.suspension_reason == "account_disabled"
+
+
+@pytest.mark.asyncio
 async def test_transfers_block_active_domain_attachment_jobs(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
     async with admin_factory() as session:
@@ -1154,6 +1202,62 @@ async def test_transfer_target_eligibility_check_locks_account() -> None:
 
 
 @pytest.mark.asyncio
+async def test_domain_transfer_bundle_locks_vm_before_domain() -> None:
+    vm = VMRow(
+        vm_id="vm_lock_order",
+        owner_wallet="0xowner",
+        status="running",
+    )
+    domain = DomainRow(
+        name="lock-order",
+        extension="example",
+        fqdn="lock-order.example",
+        vm_id=vm.vm_id,
+        owner_wallet="0xowner",
+        status="active",
+    )
+
+    class Result:
+        def __init__(self, value, *, scalar: bool = False) -> None:
+            self.value = value
+            self.scalar = scalar
+
+        def one_or_none(self):
+            assert not self.scalar
+            return self.value
+
+        def scalar_one_or_none(self):
+            assert self.scalar
+            return self.value
+
+    class Session:
+        def __init__(self) -> None:
+            self.statements = []
+
+        async def execute(self, statement):
+            self.statements.append(statement)
+            if len(self.statements) == 1:
+                return Result((vm.vm_id,))
+            if len(self.statements) == 2:
+                return Result(vm, scalar=True)
+            return Result(domain, scalar=True)
+
+    session = Session()
+    locked_domain, locked_vm = await _lock_domain_transfer_bundle(
+        session, domain.fqdn
+    )
+
+    locked_entities = [
+        statement.column_descriptions[0]["entity"]
+        for statement in session.statements
+        if statement._for_update_arg is not None
+    ]
+    assert locked_entities == [VMRow, DomainRow]
+    assert locked_domain is domain
+    assert locked_vm is vm
+
+
+@pytest.mark.asyncio
 async def test_admin_retry_rejects_terminal_fulfillment_job(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
     async with admin_factory() as session:
@@ -1377,6 +1481,55 @@ async def test_admin_start_updates_vm_while_owner_fence_is_held(admin_factory) -
     assert row.suspension_reason is None
     assert row.suspended_by_account_id is None
     assert audit.succeeded is True
+
+
+@pytest.mark.asyncio
+async def test_admin_reboot_preserves_running_vm_suspension_provenance(
+    admin_factory,
+) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add(
+            VMRow(
+                vm_id="vm_admin_reboot",
+                owner_wallet="0xowner",
+                owner_account_id="HAAAAAAAAAA",
+                xcpng_uuid="uuid-admin-reboot",
+                status="running",
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+        await session.commit()
+
+    xcpng = _AdminXCPNG()
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(xcpng=xcpng),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    result = await vm_action(
+        "vm_admin_reboot",
+        "reboot",
+        ReasonRequest(reason="apply security updates"),
+        _browser_request(
+            credentials,
+            path="/v1/admin/vms/vm_admin_reboot/actions/reboot",
+        ),
+        actor,
+        state,
+    )
+
+    assert result["status"] == "accepted"
+    assert xcpng.rebooted == ["uuid-admin-reboot"]
+    async with admin_factory() as session:
+        row = await session.get(VMRow, "vm_admin_reboot")
+    assert row is not None and str(row.status) == "running"
+    assert row.suspension_reason is None
+    assert row.suspended_by_account_id is None
 
 
 @pytest.mark.asyncio

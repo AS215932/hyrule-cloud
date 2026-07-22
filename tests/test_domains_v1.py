@@ -674,6 +674,7 @@ async def test_native_domain_settlement_refunds_disabled_owner(domain_service):
         assert account is not None and intent is not None
         account.disabled_at = datetime.now(UTC)
         intent.tx_hash = "native-disabled-owner-tx"
+        intent.amount_received_crypto = Decimal("0.000271828182")
         await session.commit()
 
     settled = await service.native_order_settled(order.order_id, intent)
@@ -699,6 +700,10 @@ async def test_native_domain_settlement_refunds_disabled_owner(domain_service):
     assert refunds[0].amount_usd == order.amount_usd
     assert refunds[0].tx_hash == "native-disabled-owner-tx"
     assert refunds[0].extra["refund_address"] == BTC_REFUND_ADDRESS
+    assert refunds[0].extra["intent_id"] == order.native_intent_id
+    assert Decimal(refunds[0].extra["amount_received_crypto"]) == Decimal(
+        "0.000271828182"
+    )
 
 
 @pytest.mark.asyncio
