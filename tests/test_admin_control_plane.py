@@ -1306,12 +1306,16 @@ class _AdminXCPNG:
     def __init__(self) -> None:
         self.suspended: list[str] = []
         self.started: list[str] = []
+        self.shut_down: list[str] = []
 
     async def suspend_vm(self, vm_uuid: str) -> None:
         self.suspended.append(vm_uuid)
 
     async def start_vm(self, vm_uuid: str) -> None:
         self.started.append(vm_uuid)
+
+    async def shutdown_vm(self, vm_uuid: str) -> None:
+        self.shut_down.append(vm_uuid)
 
 
 @pytest.mark.asyncio
@@ -1368,6 +1372,61 @@ async def test_admin_start_updates_vm_while_owner_fence_is_held(admin_factory) -
     assert row is not None and str(row.status) == "running"
     assert row.suspension_reason is None
     assert row.suspended_by_account_id is None
+    assert audit.succeeded is True
+
+
+@pytest.mark.asyncio
+async def test_admin_shutdown_persists_under_the_vm_action_fence(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add(
+            VMRow(
+                vm_id="vm_admin_shutdown",
+                owner_wallet="0xowner",
+                owner_account_id="HAAAAAAAAAA",
+                xcpng_uuid="uuid-admin-shutdown",
+                status="running",
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+        await session.commit()
+
+    xcpng = _AdminXCPNG()
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(xcpng=xcpng),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    result = await vm_action(
+        "vm_admin_shutdown",
+        "shutdown",
+        ReasonRequest(reason="customer requested shutdown"),
+        _browser_request(
+            credentials,
+            path="/v1/admin/vms/vm_admin_shutdown/actions/shutdown",
+        ),
+        actor,
+        state,
+    )
+
+    assert result["status"] == "accepted"
+    assert xcpng.shut_down == ["uuid-admin-shutdown"]
+    async with admin_factory() as session:
+        row = await session.get(VMRow, "vm_admin_shutdown")
+        audit = (
+            await session.execute(
+                select(AdminAuditRow).where(
+                    AdminAuditRow.action == "vm.shutdown.requested"
+                )
+            )
+        ).scalar_one()
+    assert row is not None and str(row.status) == "suspended"
+    assert row.suspension_reason == "manual_admin"
+    assert row.suspended_by_account_id == "HAAAAAAAAAA"
     assert audit.succeeded is True
 
 
@@ -1885,6 +1944,46 @@ async def test_admin_suspension_blocks_orchestrator_extension(admin_factory) -> 
         assert row is not None and row.expires_at is not None
         stored_expiry = row.expires_at.replace(tzinfo=UTC) if row.expires_at.tzinfo is None else row.expires_at
         assert stored_expiry == expires_at
+
+
+@pytest.mark.asyncio
+async def test_disabled_owner_blocks_extension_without_vm_marker(admin_factory) -> None:
+    expires_at = datetime.now(UTC) + timedelta(days=1)
+    async with admin_factory() as session:
+        session.add(
+            AccountRow(
+                account_id="HBBBBBBBBBB",
+                password_hash="unused",
+                disabled_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            VMRow(
+                vm_id="vm_disabled_owner_extension",
+                owner_wallet="0xowner",
+                owner_account_id="HBBBBBBBBBB",
+                status="running",
+                expires_at=expires_at,
+            )
+        )
+        await session.commit()
+
+    result = await Orchestrator.extend_vm(
+        SimpleNamespace(db=admin_factory),
+        "vm_disabled_owner_extension",
+        7,
+    )
+
+    assert result is None
+    async with admin_factory() as session:
+        row = await session.get(VMRow, "vm_disabled_owner_extension")
+        assert row is not None and row.expires_at is not None
+        stored_expiry = (
+            row.expires_at.replace(tzinfo=UTC)
+            if row.expires_at.tzinfo is None
+            else row.expires_at
+        )
+    assert stored_expiry == expires_at
 
 
 @pytest.mark.asyncio

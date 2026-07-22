@@ -1027,11 +1027,12 @@ async def vm_action(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     orch = state.orchestrator
-    if action == "start":
+    if action in {"start", "shutdown", "suspend"}:
         # Account disable and its resource worker retain this same account row
-        # lock as their state fence. Holding it through provider dispatch keeps
-        # a start from clearing an account-disabled suspension written by a
-        # concurrent worker.
+        # lock as their state fence. Every direct power transition also takes
+        # the VM lock and retains both through provider dispatch and persistence,
+        # so start/shutdown/suspend cannot cross and leave provider/database
+        # state describing different outcomes.
         async with _factory(state)() as session:
             snapshot = await session.get(VMRow, vm_id)
             if snapshot is None:
@@ -1046,7 +1047,7 @@ async def vm_action(
                         .with_for_update()
                     )
                 ).scalar_one_or_none()
-                if owner is None or owner.disabled_at is not None:
+                if action == "start" and (owner is None or owner.disabled_at is not None):
                     raise HTTPException(
                         409,
                         "Account-disabled VMs must be resumed through account enable",
@@ -1060,33 +1061,44 @@ async def vm_action(
                 raise HTTPException(404, "VM not found")
             if current.owner_account_id != owner_account_id:
                 raise HTTPException(409, "VM ownership changed; retry the action")
-            status = str(current.status)
-            if status in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
-                raise HTTPException(409, "Terminal VMs cannot be started")
-            if status == VMStatus.PROVISIONING.value:
-                raise HTTPException(409, "Provisioning VMs cannot be started manually")
-            if current.expires_at is not None and _aware(current.expires_at) <= _now():
-                raise HTTPException(409, "Expired VMs cannot be started")
-            if current.suspension_reason == "account_disabled":
-                raise HTTPException(
-                    409,
-                    "Account-disabled VMs must be resumed through account enable",
-                )
+            if action == "start":
+                status = str(current.status)
+                if status in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
+                    raise HTTPException(409, "Terminal VMs cannot be started")
+                if status == VMStatus.PROVISIONING.value:
+                    raise HTTPException(409, "Provisioning VMs cannot be started manually")
+                if current.expires_at is not None and _aware(current.expires_at) <= _now():
+                    raise HTTPException(409, "Expired VMs cannot be started")
+                if current.suspension_reason == "account_disabled":
+                    raise HTTPException(
+                        409,
+                        "Account-disabled VMs must be resumed through account enable",
+                    )
             if not current.xcpng_uuid:
                 raise HTTPException(409, "VM has no provider instance")
             await _audit_before_dispatch(
                 state,
                 request,
                 actor,
-                "vm.start",
+                f"vm.{action}",
                 target_type="vm",
                 target_id=vm_id,
                 reason=body.reason,
             )
-            await orch.xcpng.start_vm(current.xcpng_uuid)
-            current.status = VMStatus.RUNNING
-            current.suspension_reason = None
-            current.suspended_by_account_id = None
+            if action == "start":
+                await orch.xcpng.start_vm(current.xcpng_uuid)
+                current.status = VMStatus.RUNNING
+                current.suspension_reason = None
+                current.suspended_by_account_id = None
+            elif action == "shutdown":
+                await orch.xcpng.shutdown_vm(current.xcpng_uuid)
+                current.status = VMStatus.SUSPENDED
+            else:
+                await orch.xcpng.suspend_vm(current.xcpng_uuid)
+                current.status = VMStatus.SUSPENDED
+            if action != "start" and current.suspension_reason != "account_disabled":
+                current.suspension_reason = "manual_admin"
+                current.suspended_by_account_id = actor.account_id
             await session.commit()
         return {"vm_id": vm_id, "action": action, "status": "accepted"}
 
@@ -1094,9 +1106,6 @@ async def vm_action(
         row = await session.get(VMRow, vm_id)
         if row is None:
             raise HTTPException(404, "VM not found")
-        xcpng_uuid = row.xcpng_uuid
-        if action not in {"reboot", "destroy"} and not xcpng_uuid:
-            raise HTTPException(409, "VM has no provider instance")
     await _audit_before_dispatch(
         state,
         request,
@@ -1112,19 +1121,6 @@ async def vm_action(
     elif action == "destroy":
         if not await orch.destroy_vm(vm_id):
             raise HTTPException(409, "VM cannot be destroyed")
-    else:
-        assert xcpng_uuid is not None
-        if action == "shutdown":
-            await orch.xcpng.shutdown_vm(xcpng_uuid)
-        else:
-            await orch.xcpng.suspend_vm(xcpng_uuid)
-        async with _factory(state)() as session:
-            current = await session.get(VMRow, vm_id)
-            if current is not None:
-                current.status = VMStatus.SUSPENDED
-                current.suspension_reason = "manual_admin"
-                current.suspended_by_account_id = actor.account_id
-                await session.commit()
     return {"vm_id": vm_id, "action": action, "status": "accepted"}
 
 

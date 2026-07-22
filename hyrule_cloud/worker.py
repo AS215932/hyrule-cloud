@@ -10,6 +10,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
@@ -34,6 +35,23 @@ structlog.configure(
 )
 
 log = structlog.get_logger().bind(service="hyrule-cloud-worker")
+
+
+async def _run_admin_operations_loop(
+    stop: asyncio.Event,
+    sessions: async_sessionmaker[AsyncSession],
+    orchestrator: Orchestrator,
+) -> None:
+    """Process slow bulk account work without blocking the main scheduler."""
+    while not stop.is_set():
+        try:
+            await process_admin_operations(sessions, orchestrator, limit=10)
+        except Exception:
+            log.exception("admin_operations_failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=5.0)
+        except TimeoutError:
+            pass
 
 
 async def run_worker() -> None:
@@ -75,12 +93,15 @@ async def run_worker() -> None:
     next_catalog = now
     next_reconcile = now
     next_renewal_state = now
-    next_admin_operations = now
     worker_id = f"{socket.gethostname()}:{id(stop)}"
     log.info(
         "worker_started",
         worker_id=worker_id,
         recovered_bundle_vms=recovered_bundles,
+    )
+    admin_operations_task = asyncio.create_task(
+        _run_admin_operations_loop(stop, sessions, orchestrator),
+        name="admin-operations",
     )
     try:
         while not stop.is_set():
@@ -108,12 +129,6 @@ async def run_worker() -> None:
                 except Exception:
                     log.exception("domain_jobs_failed")
                 next_jobs = now + timedelta(seconds=config.domain.worker_poll_seconds)
-            if now >= next_admin_operations:
-                try:
-                    await process_admin_operations(sessions, orchestrator, limit=10)
-                except Exception:
-                    log.exception("admin_operations_failed")
-                next_admin_operations = now + timedelta(seconds=5)
             if now >= next_expiry:
                 try:
                     await orchestrator.check_expiries()
@@ -150,6 +165,8 @@ async def run_worker() -> None:
             except TimeoutError:
                 pass
     finally:
+        stop.set()
+        await admin_operations_task
         await domains.close()
         await native.close()
         await rates.close()

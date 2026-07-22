@@ -211,6 +211,140 @@ async def test_rejected_waived_extension_does_not_claim_a_refund(
     assert await _events(session_factory) == []
 
 
+@pytest.mark.asyncio
+async def test_extension_restart_failure_rolls_back_days_before_refund(
+    session_factory,
+) -> None:
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+
+    class FailingRestart:
+        def __init__(self) -> None:
+            self.started: list[str] = []
+            self.suspended: list[str] = []
+
+        async def get_vm_power_state(self, _vm_uuid: str) -> str:
+            return "Halted"
+
+        async def start_vm(self, vm_uuid: str) -> None:
+            self.started.append(vm_uuid)
+            raise RuntimeError("provider start failed")
+
+        async def suspend_vm(self, vm_uuid: str) -> None:
+            self.suspended.append(vm_uuid)
+
+    xcpng = FailingRestart()
+    orch.xcpng = xcpng  # type: ignore[assignment]
+    original_expiry = datetime.now(UTC) - timedelta(hours=1)
+    async with session_factory() as session:
+        session.add(
+            VMRow(
+                vm_id="vm_extension_restart_failure",
+                owner_wallet=EVM_WALLET,
+                xcpng_uuid="uuid-extension-restart-failure",
+                status=VMStatus.SUSPENDED,
+                suspension_reason="expired",
+                size=VMSize.XS,
+                expires_at=original_expiry,
+            )
+        )
+        await session.commit()
+    async with session_factory() as session:
+        managed_row = await session.get(VMRow, "vm_extension_restart_failure")
+    assert managed_row is not None
+
+    class SettlingGate:
+        async def check_payment(self, request, **_kwargs):
+            request.state.payment_tx = "0xEXTENSION_RESTART_FAILED"
+            return EVM_WALLET
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/vm/vm_extension_restart_failure/extend",
+            "headers": [],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        await extend_vm_route(
+            "vm_extension_restart_failure",
+            VMExtendRequest(days=3),
+            request,
+            managed_row,
+            orch,
+            cfg,
+            SettlingGate(),
+        )
+
+    assert exc.value.status_code == 500
+    assert xcpng.started == ["uuid-extension-restart-failure"]
+    assert xcpng.suspended == ["uuid-extension-restart-failure"]
+    async with session_factory() as session:
+        stored = await session.get(VMRow, "vm_extension_restart_failure")
+    assert stored is not None and stored.expires_at is not None
+    stored_expiry = (
+        stored.expires_at.replace(tzinfo=UTC)
+        if stored.expires_at.tzinfo is None
+        else stored.expires_at
+    )
+    assert stored_expiry == original_expiry
+    assert str(stored.status) == "suspended"
+    assert stored.suspension_reason == "expired"
+    events = await _events(session_factory)
+    assert len(events) == 1 and events[0].event_type == "refund_owed"
+
+
+@pytest.mark.asyncio
+async def test_expired_suspended_extension_commits_after_provider_restart(
+    session_factory,
+) -> None:
+    cfg = HyruleConfig()
+    orch = Orchestrator(cfg, session_factory)
+
+    class RestartingProvider:
+        def __init__(self) -> None:
+            self.started: list[str] = []
+
+        async def get_vm_power_state(self, _vm_uuid: str) -> str:
+            return "Halted"
+
+        async def start_vm(self, vm_uuid: str) -> None:
+            self.started.append(vm_uuid)
+
+    xcpng = RestartingProvider()
+    orch.xcpng = xcpng  # type: ignore[assignment]
+    async with session_factory() as session:
+        session.add(
+            VMRow(
+                vm_id="vm_extension_restart_success",
+                owner_wallet=EVM_WALLET,
+                xcpng_uuid="uuid-extension-restart-success",
+                status=VMStatus.SUSPENDED,
+                suspension_reason="expired",
+                size=VMSize.XS,
+                expires_at=datetime.now(UTC) - timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
+    updated = await orch.extend_vm("vm_extension_restart_success", 3)
+
+    assert updated is not None
+    assert xcpng.started == ["uuid-extension-restart-success"]
+    async with session_factory() as session:
+        stored = await session.get(VMRow, "vm_extension_restart_success")
+    assert stored is not None and stored.expires_at is not None
+    assert str(stored.status) == "running"
+    assert stored.suspension_reason is None
+    stored_expiry = (
+        stored.expires_at.replace(tzinfo=UTC)
+        if stored.expires_at.tzinfo is None
+        else stored.expires_at
+    )
+    assert stored_expiry > datetime.now(UTC) + timedelta(days=2, hours=23)
+
+
 def _paid_provisioning_vm(vm_id: str, *, wallet: str, tx: str | None, cost: str) -> VMRow:
     return VMRow(
         vm_id=vm_id,

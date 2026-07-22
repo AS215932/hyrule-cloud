@@ -1419,36 +1419,111 @@ class Orchestrator:
             return result.scalar_one_or_none()
 
     async def extend_vm(self, vm_id: str, days: int) -> VMRow | None:
-        async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if (
-                not row
-                or not row.expires_at
-                or row.suspension_reason in {"account_disabled", "manual_admin"}
-            ):
-                return None
-
-            now = _now()
-            base = max(row.expires_at, now)
-            row.expires_at = base + timedelta(days=days)
-
-            suspend_status = row.status == VMStatus.SUSPENDED
-            xcpng_uuid = row.xcpng_uuid
-
-            await session.commit()
-            await session.refresh(row)
-
-        if suspend_status and xcpng_uuid:
-            power = await self.xcpng.get_vm_power_state(xcpng_uuid)
-            if power == "Halted":
-                await self.xcpng.start_vm(xcpng_uuid)
-
+        original_expiry: datetime | None = None
+        extended_expiry: datetime | None = None
+        original_status: VMStatus | None = None
+        original_suspension_reason: str | None = None
+        original_suspended_by_account_id: str | None = None
+        restart_uuid: str | None = None
+        restart_attempted = False
+        try:
             async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
-                if row:
+                snapshot = await session.get(VMRow, vm_id)
+                if snapshot is None:
+                    return None
+                owner_account_id = snapshot.owner_account_id
+                owner = None
+                if owner_account_id is not None:
+                    owner = (
+                        await session.execute(
+                            select(AccountRow)
+                            .where(AccountRow.account_id == owner_account_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                row = (
+                    await session.execute(
+                        select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if row is None or row.owner_account_id != owner_account_id:
+                    return None
+                if owner_account_id is not None and (
+                    owner is None or owner.disabled_at is not None
+                ):
+                    return None
+                if (
+                    row.expires_at is None
+                    or row.suspension_reason in {"account_disabled", "manual_admin"}
+                    or str(row.status)
+                    in {
+                        VMStatus.PROVISIONING.value,
+                        VMStatus.FAILED.value,
+                        VMStatus.DESTROYED.value,
+                    }
+                ):
+                    return None
+
+                original_expiry = row.expires_at
+                original_status = row.status
+                original_suspension_reason = row.suspension_reason
+                original_suspended_by_account_id = row.suspended_by_account_id
+                now = _now()
+                if row.expires_at.tzinfo is None:
+                    now = now.replace(tzinfo=None)
+                extended_expiry = max(row.expires_at, now) + timedelta(days=days)
+
+                if row.status == VMStatus.SUSPENDED:
+                    if not row.xcpng_uuid:
+                        return None
+                    restart_uuid = row.xcpng_uuid
+                    power = await self.xcpng.get_vm_power_state(restart_uuid)
+                    if power == "Halted":
+                        restart_attempted = True
+                        await self.xcpng.start_vm(restart_uuid)
                     row.status = VMStatus.RUNNING
-                    await session.commit()
-                    await session.refresh(row)
+                    row.suspension_reason = None
+                    row.suspended_by_account_id = None
+                row.expires_at = extended_expiry
+                await session.commit()
+        except Exception:
+            if restart_attempted and restart_uuid is not None:
+                try:
+                    await self.xcpng.suspend_vm(restart_uuid)
+                except Exception:
+                    log.exception(
+                        "vm_extension_restart_compensation_failed",
+                        vm_id=vm_id,
+                        vm_uuid=restart_uuid,
+                    )
+            # A commit can fail ambiguously after the server accepted it. Undo
+            # only the exact expiry written by this attempt so the caller never
+            # records a refund while the purchased days remain durable.
+            if (
+                original_expiry is not None
+                and extended_expiry is not None
+                and original_status is not None
+            ):
+                try:
+                    async with self.db() as session:
+                        current = (
+                            await session.execute(
+                                select(VMRow)
+                                .where(VMRow.vm_id == vm_id)
+                                .with_for_update()
+                            )
+                        ).scalar_one_or_none()
+                        if current is not None and current.expires_at == extended_expiry:
+                            current.expires_at = original_expiry
+                            current.status = original_status
+                            current.suspension_reason = original_suspension_reason
+                            current.suspended_by_account_id = (
+                                original_suspended_by_account_id
+                            )
+                            await session.commit()
+                except Exception:
+                    log.exception("vm_extension_database_compensation_failed", vm_id=vm_id)
+            raise
 
         log.info(
             "vm_extended",
