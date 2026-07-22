@@ -820,6 +820,7 @@ class MailService:
                     "mail_activation_closed",
                     "This mailbox activation is no longer awaiting payment.",
                 )
+            awaiting_handoff = row.status == MailboxStatus.AWAITING_PAYMENT.value
             row.owner_wallet = payer[:64]
             row.payment_tx = tx_hash
             row.payment_network = payment_network
@@ -827,7 +828,8 @@ class MailService:
             row.payment_authorization_header = None
             row.payment_settlement_pending_at = None
             row.payment_settled_at = row.payment_settled_at or _now()
-            row.provision_next_attempt_at = None
+            if awaiting_handoff:
+                row.provision_next_attempt_at = None
             await session.commit()
             return row
 
@@ -2452,7 +2454,11 @@ class MailService:
                             MailAccountRow.payment_authorization_header.is_not(None),
                             recovery_due,
                         )
-                        .order_by(MailAccountRow.payment_settlement_pending_at)
+                        .order_by(
+                            MailAccountRow.provision_next_attempt_at.is_not(None),
+                            MailAccountRow.provision_next_attempt_at,
+                            MailAccountRow.payment_settlement_pending_at,
+                        )
                         .limit(limit)
                     )
                 )
@@ -2515,7 +2521,11 @@ class MailService:
                         ),
                         recovery_due,
                     )
-                    .order_by(MailAccountRow.payment_settled_at)
+                    .order_by(
+                        MailAccountRow.provision_next_attempt_at.is_not(None),
+                        MailAccountRow.provision_next_attempt_at,
+                        MailAccountRow.payment_settled_at,
+                    )
                     .limit(limit)
                 )
             )
@@ -2573,7 +2583,12 @@ class MailService:
                         recovery_due,
                         settled_event_exists,
                     )
-                    .order_by(MailAccountRow.created_at, MailAccountRow.mailbox_id)
+                    .order_by(
+                        MailAccountRow.provision_next_attempt_at.is_not(None),
+                        MailAccountRow.provision_next_attempt_at,
+                        MailAccountRow.created_at,
+                        MailAccountRow.mailbox_id,
+                    )
                     .limit(limit)
                 )
             )

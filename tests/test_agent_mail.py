@@ -1679,7 +1679,7 @@ async def test_settlement_ledger_recovers_lost_mail_activation_handoff(mail_serv
 
 
 @pytest.mark.asyncio
-async def test_failed_payment_handoff_yields_to_later_settled_account(mail_service, monkeypatch):
+async def test_never_attempted_payment_handoff_precedes_due_retries(mail_service, monkeypatch):
     service, sessions, _backend, _domains, _refunds = mail_service
 
     async def awaiting_activation(local_part: str, idempotency_key: str):
@@ -1701,6 +1701,10 @@ async def test_failed_payment_handoff_yields_to_later_settled_account(mail_servi
         "blocked-payment-handoff-idempotency-0001",
     )
     second, second_quote = await awaiting_activation(
+        "second-blocked-handoff",
+        "second-blocked-handoff-idempotency-0001",
+    )
+    third, third_quote = await awaiting_activation(
         "later-payment-handoff",
         "later-payment-handoff-idempotency-0001",
     )
@@ -1723,12 +1727,15 @@ async def test_failed_payment_handoff_yields_to_later_settled_account(mail_servi
     async with sessions() as session:
         first_row = await session.get(MailAccountRow, first.mailbox_id)
         second_row = await session.get(MailAccountRow, second.mailbox_id)
-        first_row.created_at = now - timedelta(minutes=2)
-        second_row.created_at = now - timedelta(minutes=1)
+        third_row = await session.get(MailAccountRow, third.mailbox_id)
+        first_row.created_at = now - timedelta(minutes=3)
+        second_row.created_at = now - timedelta(minutes=2)
+        third_row.created_at = now - timedelta(minutes=1)
         session.add_all(
             [
                 settlement(first, first_quote, "0xblocked-handoff"),
-                settlement(second, second_quote, "0xlater-handoff"),
+                settlement(second, second_quote, "0xsecond-blocked-handoff"),
+                settlement(third, third_quote, "0xlater-handoff"),
             ]
         )
         await session.commit()
@@ -1738,7 +1745,7 @@ async def test_failed_payment_handoff_yields_to_later_settled_account(mail_servi
 
     async def fail_oldest(mailbox_id: str, quote_id: str, **kwargs):
         attempted.append(mailbox_id)
-        if mailbox_id == first.mailbox_id:
+        if mailbox_id in {first.mailbox_id, second.mailbox_id}:
             raise MailProblem(503, "domain_handoff_unavailable", "Retry later.")
         return await original_mark_paid(mailbox_id, quote_id, **kwargs)
 
@@ -1753,12 +1760,70 @@ async def test_failed_payment_handoff_yields_to_later_settled_account(mail_servi
     )
     assert deferred_at > now
 
+    assert await service.recover_x402_handoffs(limit=1) == 0
+    async with sessions() as session:
+        due_retry = await session.get(MailAccountRow, first.mailbox_id)
+        second_deferred = await session.get(MailAccountRow, second.mailbox_id)
+        due_retry.provision_next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    assert second_deferred.provision_next_attempt_at is not None
+
+    # Even though the oldest failure is due again, the untouched third
+    # settlement must run before any retry.
     assert await service.recover_x402_handoffs(limit=1) == 1
     async with sessions() as session:
-        recovered = await session.get(MailAccountRow, second.mailbox_id)
-    assert attempted == [first.mailbox_id, second.mailbox_id]
+        recovered = await session.get(MailAccountRow, third.mailbox_id)
+    assert attempted == [first.mailbox_id, second.mailbox_id, third.mailbox_id]
     assert recovered.status == MailboxStatus.PROVISIONING.value
     assert recovered.payment_tx == "0xlater-handoff"
+
+
+@pytest.mark.asyncio
+async def test_settlement_replay_preserves_provisioning_backoff(mail_service):
+    service, sessions, _backend, _domains, _refunds = mail_service
+    quote = await service.create_account_quote(
+        MailAccountQuoteRequest(
+            local_part="settlement-replay-backoff",
+            mode=MailboxMode.HOSTED,
+            terms_version=service.mail_config.terms_version,
+        )
+    )
+    account, _token, _created = await service.prepare_activation(
+        quote.quote_id,
+        idempotency_key="settlement-replay-backoff-idempotency-0001",
+    )
+    payer = "0x" + "7" * 40
+    await service.mark_activation_paid(
+        account.mailbox_id,
+        quote.quote_id,
+        payer=payer,
+        tx_hash="0xsettlement-replay",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+    retry_at = datetime.now(UTC) + timedelta(minutes=5)
+    async with sessions() as session:
+        provisioning = await session.get(MailAccountRow, account.mailbox_id)
+        provisioning.provision_next_attempt_at = retry_at
+        await session.commit()
+
+    await service.record_activation_settlement(
+        account.mailbox_id,
+        quote.quote_id,
+        payer=payer,
+        tx_hash="0xsettlement-replay",
+        payment_network="eip155:8453",
+        payment_asset="USDC",
+    )
+
+    async with sessions() as session:
+        replayed = await session.get(MailAccountRow, account.mailbox_id)
+    assert replayed.status == MailboxStatus.PROVISIONING.value
+    assert replayed.provision_next_attempt_at is not None
+    preserved_retry = replayed.provision_next_attempt_at.replace(
+        tzinfo=replayed.provision_next_attempt_at.tzinfo or UTC
+    )
+    assert preserved_retry == retry_at
 
 
 @pytest.mark.asyncio
