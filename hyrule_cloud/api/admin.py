@@ -1027,11 +1027,11 @@ async def vm_action(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     orch = state.orchestrator
-    if action in {"start", "shutdown", "suspend"}:
+    if action in {"start", "reboot", "shutdown", "suspend"}:
         # Account disable and its resource worker retain this same account row
         # lock as their state fence. Every direct power transition also takes
         # the VM lock and retains both through provider dispatch and persistence,
-        # so start/shutdown/suspend cannot cross and leave provider/database
+        # so start/reboot/shutdown/suspend cannot cross and leave provider/database
         # state describing different outcomes.
         async with _factory(state)() as session:
             snapshot = await session.get(VMRow, vm_id)
@@ -1047,7 +1047,9 @@ async def vm_action(
                         .with_for_update()
                     )
                 ).scalar_one_or_none()
-                if action == "start" and (owner is None or owner.disabled_at is not None):
+                if action in {"start", "reboot"} and (
+                    owner is None or owner.disabled_at is not None
+                ):
                     raise HTTPException(
                         409,
                         "Account-disabled VMs must be resumed through account enable",
@@ -1061,14 +1063,16 @@ async def vm_action(
                 raise HTTPException(404, "VM not found")
             if current.owner_account_id != owner_account_id:
                 raise HTTPException(409, "VM ownership changed; retry the action")
-            if action == "start":
+            if action in {"start", "reboot"}:
                 status = str(current.status)
                 if status in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
-                    raise HTTPException(409, "Terminal VMs cannot be started")
+                    raise HTTPException(409, "Terminal VMs cannot be powered on")
                 if status == VMStatus.PROVISIONING.value:
-                    raise HTTPException(409, "Provisioning VMs cannot be started manually")
+                    raise HTTPException(409, "Provisioning VMs cannot be powered manually")
+            if action == "start":
                 if current.expires_at is not None and _aware(current.expires_at) <= _now():
                     raise HTTPException(409, "Expired VMs cannot be started")
+            if action in {"start", "reboot"}:
                 if current.suspension_reason == "account_disabled":
                     raise HTTPException(
                         409,
@@ -1090,6 +1094,8 @@ async def vm_action(
                 current.status = VMStatus.RUNNING
                 current.suspension_reason = None
                 current.suspended_by_account_id = None
+            elif action == "reboot":
+                await orch.xcpng.reboot_vm(current.xcpng_uuid)
             elif action == "shutdown":
                 await orch.xcpng.shutdown_vm(current.xcpng_uuid)
                 current.status = VMStatus.SUSPENDED
@@ -1115,10 +1121,7 @@ async def vm_action(
         target_id=vm_id,
         reason=body.reason,
     )
-    if action == "reboot":
-        if not await orch.reboot_vm(vm_id):
-            raise HTTPException(409, "VM cannot be rebooted")
-    elif action == "destroy":
+    if action == "destroy":
         if not await orch.destroy_vm(vm_id):
             raise HTTPException(409, "VM cannot be destroyed")
     return {"vm_id": vm_id, "action": action, "status": "accepted"}

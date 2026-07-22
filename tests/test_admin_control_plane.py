@@ -1102,14 +1102,14 @@ async def test_vm_action_audit_is_durable_before_provider_dispatch(admin_factory
         )
         await session.commit()
 
-    class FailingOrchestrator:
-        async def reboot_vm(self, vm_id: str) -> bool:
+    class FailingXCPNG:
+        async def reboot_vm(self, _vm_uuid: str) -> None:
             async with admin_factory() as session:
                 persisted = list(
                     await session.scalars(
                         select(AdminAuditRow).where(
                             AdminAuditRow.action == "vm.reboot.requested",
-                            AdminAuditRow.target_id == vm_id,
+                            AdminAuditRow.target_id == "vm_audit_dispatch",
                         )
                     )
                 )
@@ -1118,7 +1118,7 @@ async def test_vm_action_audit_is_durable_before_provider_dispatch(admin_factory
 
     state = AppState(
         config=SimpleNamespace(),
-        orchestrator=FailingOrchestrator(),
+        orchestrator=SimpleNamespace(xcpng=FailingXCPNG()),
         payment_gate=None,
         network_provider=None,
         session_factory=admin_factory,
@@ -1307,6 +1307,7 @@ class _AdminXCPNG:
         self.suspended: list[str] = []
         self.started: list[str] = []
         self.shut_down: list[str] = []
+        self.rebooted: list[str] = []
 
     async def suspend_vm(self, vm_uuid: str) -> None:
         self.suspended.append(vm_uuid)
@@ -1316,6 +1317,9 @@ class _AdminXCPNG:
 
     async def shutdown_vm(self, vm_uuid: str) -> None:
         self.shut_down.append(vm_uuid)
+
+    async def reboot_vm(self, vm_uuid: str) -> None:
+        self.rebooted.append(vm_uuid)
 
 
 @pytest.mark.asyncio
@@ -1428,6 +1432,64 @@ async def test_admin_shutdown_persists_under_the_vm_action_fence(admin_factory) 
     assert row.suspension_reason == "manual_admin"
     assert row.suspended_by_account_id == "HAAAAAAAAAA"
     assert audit.succeeded is True
+
+
+@pytest.mark.asyncio
+async def test_admin_reboot_rejects_disabled_owner_before_worker_marker(
+    admin_factory,
+) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add(
+            AccountRow(
+                account_id="HBBBBBBBBBB",
+                password_hash="unused",
+                disabled_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            VMRow(
+                vm_id="vm_admin_reboot_disabled",
+                owner_wallet="0xowner",
+                owner_account_id="HBBBBBBBBBB",
+                xcpng_uuid="uuid-admin-reboot-disabled",
+                status="running",
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+        await session.commit()
+
+    xcpng = _AdminXCPNG()
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(xcpng=xcpng),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await vm_action(
+            "vm_admin_reboot_disabled",
+            "reboot",
+            ReasonRequest(reason="manual recovery"),
+            _browser_request(
+                credentials,
+                path="/v1/admin/vms/vm_admin_reboot_disabled/actions/reboot",
+            ),
+            actor,
+            state,
+        )
+
+    assert exc.value.status_code == 409
+    assert xcpng.rebooted == []
+    async with admin_factory() as session:
+        row = await session.get(VMRow, "vm_admin_reboot_disabled")
+        audits = list(await session.scalars(select(AdminAuditRow)))
+    assert row is not None and str(row.status) == "running"
+    assert row.suspension_reason is None
+    assert audits == []
 
 
 @pytest.mark.asyncio
