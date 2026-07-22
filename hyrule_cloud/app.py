@@ -131,6 +131,14 @@ async def lifespan(app: FastAPI):
     wallet_auth = WalletAuthService(config, session_factory)
     orchestrator.domains = domains
 
+    # DNS domain-intelligence products. The API only reads completed
+    # blocklist generations; the dedicated worker owns refresh/compilation.
+    from hyrule_cloud.services.dns.blocklists import BlocklistService
+    from hyrule_cloud.services.dns.filtering import DNSFilteringService
+
+    dns_blocklists = BlocklistService(config.dns_blocklists)
+    dns_filtering = DNSFilteringService(config.dns_filtering)
+
     # Wire up app state
     app.state._typed_state = AppState(
         config=config,
@@ -143,6 +151,8 @@ async def lifespan(app: FastAPI):
         session_factory=session_factory,
         domains=domains,
         wallet_auth=wallet_auth,
+        dns_blocklists=dns_blocklists,
+        dns_filtering=dns_filtering,
     )
 
     log.info(
@@ -154,6 +164,7 @@ async def lifespan(app: FastAPI):
     yield
 
     await domains.close()
+    await dns_filtering.close()
     await orchestrator.shutdown()
     await network_provider.close()
     await native_crypto.close()

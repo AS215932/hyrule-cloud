@@ -416,6 +416,72 @@ _DNS_LOOKUP_OUTPUT = {
     "trace": [],
     "generated_at": _GENERATED_AT,
 }
+_DNS_BLOCKLIST_OUTPUT = {
+    "request_id": "diag_a1b2c3d4",
+    "input_domain": "example.com",
+    "normalized_domain": "example.com",
+    "verdict": "not_listed",
+    "categories": [],
+    "checked_source_count": 16,
+    "matched_source_count": 0,
+    "required_source_count": 16,
+    "results": [
+        {
+            "source_id": "easylist",
+            "source_name": "EasyList",
+            "categories": ["ads"],
+            "outcome": "not_listed",
+            "source_status": "ok",
+            "source_age_seconds": 300,
+        }
+    ],
+    "catalog_version": "blcat_a1b2c3d4",
+    "snapshot_id": "blsnap_20260719T000000-a1b2c3d4",
+    "partial": False,
+    "generated_at": _GENERATED_AT,
+}
+_DNS_FILTERING_OUTPUT = {
+    "request_id": "diag_a1b2c3d4",
+    "input_domain": "example.com",
+    "normalized_domain": "example.com",
+    "vantage": "hyrule",
+    "overall": "allowed",
+    "blocked_profile_count": 0,
+    "allowed_profile_count": 8,
+    "conclusive_profile_count": 8,
+    "total_profile_count": 8,
+    "profiles": [
+        {
+            "profile_id": "cloudflare_security",
+            "name": "Cloudflare Malware Blocking",
+            "provider": "Cloudflare",
+            "categories": ["phishing", "malware"],
+            "status": "allowed",
+            "reason": "filtered resolver returned usable addresses",
+            "filtered": [
+                {
+                    "record_type": "A",
+                    "rcode": "NOERROR",
+                    "answers": ["93.184.216.34"],
+                    "latency_ms": 18.2,
+                }
+            ],
+            "control": [
+                {
+                    "record_type": "A",
+                    "rcode": "NOERROR",
+                    "answers": ["93.184.216.34"],
+                    "latency_ms": 16.4,
+                }
+            ],
+            "observed_at": _GENERATED_AT,
+        }
+    ],
+    "partial": False,
+    "observed_at": _GENERATED_AT,
+    "cache_age_seconds": 0,
+    "generated_at": _GENERATED_AT,
+}
 _MX_CHECK_OUTPUT = {
     "request_id": "mx_a1b2c3d4",
     "tool": "mx",
@@ -565,6 +631,26 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         },
         models.DNSLookupResponse,
         _DNS_LOOKUP_OUTPUT,
+    ),
+    _body_operation(
+        "/v1/dns/blocklists/check",
+        "Paid domain membership check across Hyrule's maintained catalog of common DNS-capable ad, privacy, and security blocklists",
+        _fixed("price_dns_blocklist_check", "0.003"),
+        models.DNSDomainCheckRequest,
+        {"domain": "example.com"},
+        models.DNSBlocklistCheckResponse,
+        _DNS_BLOCKLIST_OUTPUT,
+        gate="dns_blocklists",
+    ),
+    _body_operation(
+        "/v1/dns/filtering/check",
+        "Paid live DNS filtering comparison across curated public security and ads/tracking resolver profiles from Hyrule's vantage",
+        _fixed("price_dns_filtering_check", "0.01"),
+        models.DNSDomainCheckRequest,
+        {"domain": "example.com"},
+        models.DNSFilteringCheckResponse,
+        _DNS_FILTERING_OUTPUT,
+        gate="dns_filtering",
     ),
     _body_operation(
         "/v1/dns/propagation",
@@ -875,6 +961,14 @@ def _gate_enabled(gate: str) -> bool:
         from hyrule_cloud.services.bgp.snapshots import router_snapshot_download_enabled
 
         return router_snapshot_download_enabled()
+    if gate == "dns_blocklists":
+        from hyrule_cloud.services.dns.blocklists import blocklist_catalog_ready
+
+        return blocklist_catalog_ready()
+    if gate == "dns_filtering":
+        from hyrule_cloud.services.dns.filtering import dns_filtering_enabled
+
+        return dns_filtering_enabled()
     raise ValueError(f"Unknown paid-operation gate: {gate}")
 
 
@@ -897,10 +991,11 @@ def match_enabled_operation(method: str, concrete_path: str) -> PaidOperation | 
     wanted_method = method.upper()
     normalized_path = concrete_path.rstrip("/") or "/"
     for operation, path_regex in _PATH_MATCHERS:
-        if operation.method != wanted_method or not _gate_enabled(operation.gate):
+        if operation.method != wanted_method:
             continue
-        if path_regex.fullmatch(normalized_path):
-            return operation
+        if not path_regex.fullmatch(normalized_path):
+            continue
+        return operation if _gate_enabled(operation.gate) else None
     return None
 
 
@@ -924,7 +1019,7 @@ _CATALOG_PHRASES: tuple[tuple[str, str], ...] = (
     ("/v1/network", "outbound requests over Direct, Tor, I2P, or Yggdrasil"),
     ("/v1/bgp", "BGP/routing intelligence"),
     ("/v1/ip", "IP/ASN intelligence"),
-    ("/v1/dns", "DNS diagnostics"),
+    ("/v1/dns", "DNS diagnostics, blocklist membership, and filtering evidence"),
     ("/v1/rdap", "RDAP/WHOIS registry lookups"),
     ("/v1/whois", "RDAP/WHOIS registry lookups"),
     ("/v1/web", "web and deep TLS checks"),

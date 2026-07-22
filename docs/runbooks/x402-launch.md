@@ -141,7 +141,8 @@ revenue.)
 ### 3a Network-intel (no code changes)
 
 One paid call each; response must contain substantive real data:
-`/v1/dns/lookup`, `/v1/ip/lookup`, `/v1/bgp/lookup`, `/v1/rdap/lookup`,
+`/v1/dns/lookup`, `/v1/dns/blocklists/check`, `/v1/dns/filtering/check`,
+`/v1/ip/lookup`, `/v1/bgp/lookup`, `/v1/rdap/lookup`,
 `/v1/whois/lookup`, `/v1/web/check`, `/v1/web/tls/deep`, `/v1/mx/check`,
 `/v1/path/ping`, `/v1/path/report`, `/v1/ports/check`, `/v1/nat/port-forward/check`,
 `/v1/voip/check`, **`/v1/threat/lookup`** (inspect quality — its service
@@ -153,6 +154,33 @@ once an active-probe vantage (Globalping/RIPE Atlas) is configured; until then
 the canary reports them **SKIPPED (501)**, not failed. Configure a prober and
 re-run `python scripts/x402_canary.py path-report` to validate the paid path
 evidence before treating 3a as complete.
+
+#### DNS blocklist and filtering readiness
+
+1. Provision `/var/lib/hyrule-cloud/blocklists` as durable worker-writable
+   storage and mount the same path read-only in every API process. In Compose,
+   the `blocklist_data` volume already provides this split.
+2. Start the worker and wait for its first `dns_blocklist_snapshot_published`
+   event. Then require:
+   ```bash
+   curl -fsS https://cloud.hyrule.host/v1/dns/blocklists/sources \
+     | jq -e '.ready and .required_source_count == 16 and .usable_source_count >= 12'
+   ```
+   First activation requires all 16 feeds to have succeeded once. The paid
+   operation is absent from OpenAPI/x402 discovery until the snapshot is ready.
+3. Verify `GET /v1/dns/filtering/resolvers` returns eight configured profiles,
+   with both security and ads/tracking policies and their unfiltered controls.
+4. Run `python scripts/x402_canary.py dns-blocklists --yes` and
+   `python scripts/x402_canary.py dns-filtering --yes`. The former must return a
+   snapshot ID with at least 12 checked sources; the latter must return at least
+   six conclusive profiles. Both must carry successful settlement headers.
+5. Failure drill: make the catalog path temporarily unreadable or mock six DoH
+   profiles unavailable. The request must return 503 without a new `settled`
+   ledger event. A syntactically valid but non-resolving domain must return 422
+   without settlement.
+
+The resolver product sends each submitted domain to the public providers named
+by `/v1/dns/filtering/resolvers`; keep that disclosure in customer-facing copy.
 
 ### 3b Network proxy
 
