@@ -1365,6 +1365,16 @@ async def test_unready_domain_orders_do_not_starve_ready_mailboxes(mail_service)
         )
     assert active_domain_provisioned.status == MailboxStatus.ACTIVE.value
 
+    async with sessions() as session:
+        blocked_order = await session.get(DomainOrderRow, "do_blocked_domain_order")
+        blocked_order.status = DomainOrderStatus.REFUNDED.value
+        await session.commit()
+    assert await service.provision_pending(limit=1) == 1
+    async with sessions() as session:
+        terminal = await session.get(MailAccountRow, blocked.mailbox_id)
+    assert terminal.status == MailboxStatus.FAILED.value
+    assert terminal.provision_error == "domain_registration_failed"
+
 
 @pytest.mark.asyncio
 async def test_incomplete_mail_dns_eventually_fails_and_refunds(mail_service):

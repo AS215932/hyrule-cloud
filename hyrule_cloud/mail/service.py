@@ -1977,6 +1977,7 @@ class MailService:
             DomainOrderStatus.ACTIVE.value,
             DomainOrderStatus.FAILED.value,
             DomainOrderStatus.REFUND_DUE.value,
+            DomainOrderStatus.REFUNDED.value,
             DomainOrderStatus.CANCELLED.value,
             DomainOrderStatus.EXPIRED.value,
         }
@@ -2033,6 +2034,7 @@ class MailService:
             elif domain_order.status in {
                 DomainOrderStatus.FAILED.value,
                 DomainOrderStatus.REFUND_DUE.value,
+                DomainOrderStatus.REFUNDED.value,
                 DomainOrderStatus.CANCELLED.value,
                 DomainOrderStatus.EXPIRED.value,
             }:
