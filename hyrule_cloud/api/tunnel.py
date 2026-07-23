@@ -172,6 +172,7 @@ async def create_tunnel(body: TunnelCreateRequest, request: Request) -> TunnelRe
     extra_body = {"hours": body.hours}
 
     idem = _idempotency_key(request)
+    req_hash = _request_hash(body)
 
     async with _tunnel_authorization_guard(request):
         # Idempotent replay: a prior attempt with this exact payment authorization
@@ -181,7 +182,7 @@ async def create_tunnel(body: TunnelCreateRequest, request: Request) -> TunnelRe
         if idem is not None:
             existing = await svc.find_by_idempotency_key(idem)
             if existing is not None:
-                return await _replay_create(request, gate, svc, existing, amount, description, extra_body)
+                return await _replay_create(request, gate, svc, existing, amount, description, extra_body, req_hash)
 
         verified = await gate.verify_only(request, amount=amount, description=description, extra_body=extra_body)
         if isinstance(verified, Response):
@@ -196,13 +197,14 @@ async def create_tunnel(body: TunnelCreateRequest, request: Request) -> TunnelRe
                 owner_wallet=verified.payer,
                 owner_account_id=None,
                 idempotency_key=idem,
+                request_hash=req_hash,
             )
         except TunnelIdempotencyConflictError:
             # A concurrent replica won the idempotency race; recover the winner.
             existing = await svc.find_by_idempotency_key(idem) if idem else None
             if existing is None:
                 raise HTTPException(409, "concurrent create; retry") from None
-            return await _replay_create(request, gate, svc, existing, amount, description, extra_body)
+            return await _replay_create(request, gate, svc, existing, amount, description, extra_body, req_hash)
         except TunnelDaemonError as exc:
             # Not provisioned -> never settle -> no charge.
             if exc.ports_exhausted:
@@ -233,8 +235,14 @@ async def _replay_create(
     amount: Any,
     description: str,
     extra_body: dict[str, Any],
+    req_hash: str,
 ) -> TunnelResponse | Response:
     """Return an idempotent-replay response for an existing create attempt."""
+    # Same payment authorization, different request body (hours/allowlist) is a
+    # conflict, not a replay — never silently return a tunnel with different
+    # terms than requested (e.g. an open tunnel for a now-restricted request).
+    if existing.request_hash is not None and existing.request_hash != req_hash:
+        raise HTTPException(409, "payment authorization already used for a different tunnel request")
     try:
         recovered = await svc.recover_lease(existing.tunnel_id)
     except TunnelDaemonError as exc:
@@ -382,6 +390,16 @@ def _require_hours_in_bounds(hours: int, cfg: HyruleConfig) -> None:
             422,
             f"hours must be between {cfg.tunnel_min_hours} and {cfg.tunnel_max_hours}",
         )
+
+
+def _request_hash(body: TunnelCreateRequest) -> str:
+    """Canonical hash of the create request body (hours + sorted allowlist), so a
+    replay of the same payment authorization with different terms is detected."""
+    canonical = json.dumps(
+        {"hours": body.hours, "allowlist_cidrs": sorted(body.allowlist_cidrs or [])},
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _idempotency_key(request: Request) -> str | None:

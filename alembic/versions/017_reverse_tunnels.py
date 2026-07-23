@@ -38,6 +38,7 @@ def upgrade() -> None:
         sa.Column("allowlist_cidrs", _JSONB),
         sa.Column("status", sa.String(16), nullable=False, server_default="active"),
         sa.Column("idempotency_key", sa.String(64)),
+        sa.Column("request_hash", sa.String(64)),
         sa.Column("settlement_header", sa.Text()),
         sa.Column(
             "created_at",

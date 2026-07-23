@@ -496,6 +496,10 @@ class ReverseTunnelRow(Base):
     # instead of paying again or leaking a port. UNIQUE so two concurrent
     # replicas with the same authorization cannot both provision.
     idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    # sha256 of the canonical create request (hours + allowlist); an idempotent
+    # replay with the SAME payment auth but a DIFFERENT body is a 409 conflict,
+    # not a silent return of the original tunnel.
+    request_hash: Mapped[str | None] = mapped_column(String(64))
     # x402 settlement response header from the original create, replayed on an
     # idempotent retry so a standard x402 client sees settlement proof.
     settlement_header: Mapped[str | None] = mapped_column(Text)

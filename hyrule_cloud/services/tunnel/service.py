@@ -65,6 +65,11 @@ class TunnelService:
         an idempotent create replay. Returns None only if the row is gone;
         propagates TunnelDaemonError on an operational failure so the caller can
         return a retryable 503 rather than a permanent-looking gone response.
+
+        If the daemon had LOST the lease and recreated it with a different token/
+        port/endpoint, the row is re-synced so its token_hash matches the token
+        we return (else the management gate would reject it) and the advertised
+        port is current.
         """
         row = await self.get(tunnel_id)
         if row is None:
@@ -73,7 +78,26 @@ class TunnelService:
         if expires.tzinfo is None:  # SQLite (tests) returns naive; Postgres keeps tz
             expires = expires.replace(tzinfo=UTC)
         duration = max(1, int((expires - _now()).total_seconds()))
-        return await self.provider.create_lease(tunnel_id, duration, row.allowlist_cidrs)
+        lease = await self.provider.create_lease(tunnel_id, duration, row.allowlist_cidrs)
+        new_hash = hash_anon_token(lease.token or "")
+        if lease.token and (
+            row.token_hash != new_hash
+            or row.allocated_port != lease.port
+            or row.endpoint_host != lease.endpoint_host
+        ):
+            async with self.session_factory() as session:
+                await session.execute(
+                    update(ReverseTunnelRow)
+                    .where(ReverseTunnelRow.tunnel_id == tunnel_id)
+                    .values(
+                        token_hash=new_hash,
+                        allocated_port=lease.port,
+                        endpoint_host=lease.endpoint_host,
+                        ssh_port=lease.ssh_port,
+                    )
+                )
+                await session.commit()
+        return lease
 
     async def provision(
         self,
@@ -84,6 +108,7 @@ class TunnelService:
         owner_wallet: str,
         owner_account_id: str | None,
         idempotency_key: str | None,
+        request_hash: str | None = None,
     ) -> tuple[ReverseTunnelRow, LeaseResult]:
         """Create the daemon lease and persist the row (payment not yet settled).
 
@@ -115,6 +140,7 @@ class TunnelService:
             allowlist_cidrs=allowlist_cidrs,
             status="active",
             idempotency_key=idempotency_key,
+            request_hash=request_hash,
             expires_at=_parse_ts(lease.expires_at, default=_now() + timedelta(hours=hours)),
             payment_tx=None,
         )
@@ -136,9 +162,13 @@ class TunnelService:
         except Exception:
             # The daemon already allocated a port; a persistence failure would
             # otherwise leak it (unpaid retries could exhaust the range). Best-
-            # effort revoke on the daemon before surfacing the error.
+            # effort revoke on the daemon; if that doesn't confirm, persist a
+            # provisional marker so the sweep retries the teardown.
             log.error("tunnel_persist_failed", tunnel_id=tunnel_id, exc_info=True)
-            await self.provider.revoke_lease(tunnel_id)
+            if not await self.provider.revoke_lease(tunnel_id):
+                await self._persist_provisional_marker(
+                    tunnel_id, lease, owner_wallet, owner_account_id, allowlist_cidrs, hours
+                )
             raise
         return row, lease
 

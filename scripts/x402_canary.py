@@ -369,8 +369,18 @@ async def _verify_and_cleanup_tunnel(create_resp: httpx.Response) -> bool:
     token = data.get("token")
     tunnel_id = data.get("tunnel_id")
     port = data.get("public_port")
-    if not (token and tunnel_id and port):
-        print(f"    !! tunnel create omitted token/id/port: {create_resp.text[:200]}")
+    if not (token and tunnel_id):
+        # Can't manage/clean up without both; redact any token before logging.
+        redacted = create_resp.text.replace(token, "<redacted-token>") if token else create_resp.text
+        print(f"    !! tunnel create omitted token/id: {redacted[:200]}")
+        return False
+    if not port:
+        # An ID + token but no port: still a live paid lease. Revoke it (with
+        # redaction) rather than leaking it, then fail.
+        print("    !! tunnel create omitted public_port; attempting cleanup")
+        async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
+            rev = await http.delete(f"/v1/tunnel/{tunnel_id}", headers={"X-Tunnel-Token": token})
+            print(f"    cleanup revoke: HTTP {rev.status_code}")
         return False
     print(f"    tunnel {tunnel_id} -> {data.get('endpoint_host')}:{port}")
     # The ssh_command embeds the one-time token (the SSH username). Redact it in

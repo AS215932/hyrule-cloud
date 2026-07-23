@@ -510,6 +510,36 @@ async def test_create_rejects_empty_allowlist(wired):
 
 
 @pytest.mark.asyncio
+async def test_replay_with_different_body_conflicts(wired):
+    client, _state, _provider, _gate = wired
+    headers = {"X-Mock-Wallet": "0xabc", "x-payment": "auth-DIFF-1"}
+    first = await client.post("/v1/tunnel/create", json={"hours": 1}, headers=headers)
+    assert first.status_code == 200
+    # Same payment auth, different hours -> 409, not a silent replay.
+    second = await client.post("/v1/tunnel/create", json={"hours": 5}, headers=headers)
+    assert second.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_recover_resyncs_row_when_daemon_recreates(session_factory):
+    provider = FakeTunnelProvider()
+    svc = TunnelService(_config(), session_factory, provider)
+    tid = new_tunnel_id()
+    await svc.provision(tunnel_id=tid, hours=1, allowlist_cidrs=None, owner_wallet="0xabc", owner_account_id=None, idempotency_key=None)
+    from hyrule_cloud.middleware.anon_token import hash_anon_token
+
+    # Daemon lost the lease; a recover recreates it with a fresh token/port.
+    provider.leases.pop(tid, None)
+    provider.next_port = 20000
+    lease = await svc.recover_lease(tid)
+    assert lease is not None and lease.token
+    # The row is re-synced so its token_hash matches the recovered token.
+    row = await svc.get(tid)
+    assert row.token_hash == hash_anon_token(lease.token)
+    assert row.allocated_port == lease.port
+
+
+@pytest.mark.asyncio
 async def test_create_rejects_missing_daemon_token(wired):
     client, _state, provider, gate = wired
     provider.omit_token = True
