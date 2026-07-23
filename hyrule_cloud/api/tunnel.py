@@ -214,6 +214,13 @@ async def create_tunnel(body: TunnelCreateRequest, request: Request) -> TunnelRe
         # Delivered a live tunnel: settle. On settle failure the lease is durable
         # and revocable, so revoke it rather than hand out a paid-for-free tunnel.
         if not await gate.settle_verified(request, verified):
+            # A concurrent cross-replica request sharing this authorization may
+            # have already committed a winning row and settled it (this settle
+            # then fails as "already spent"). Re-check before revoking, so we
+            # don't tear down a lease another request already paid for.
+            settled_row = await svc.get(tunnel_id)
+            if settled_row is not None and settled_row.payment_tx is not None:
+                return _to_response(settled_row, token=lease.token)
             if not await svc.revoke(tunnel_id):
                 # The daemon revoke also failed; the lease self-expires at its
                 # lease time and the worker sweep retries. Log for visibility.
@@ -250,6 +257,10 @@ async def _replay_create(
         raise HTTPException(503, "tunnel control plane unavailable; retry") from exc
     if recovered is None or not recovered.token:
         raise HTTPException(410, "tunnel no longer available")
+    # recover_lease may have re-synced the row (daemon recreated the lease with a
+    # new port/endpoint); re-fetch so the response never pairs the new token with
+    # a stale endpoint/ssh command.
+    existing = await svc.get(existing.tunnel_id) or existing
     if existing.payment_tx is not None:
         # Already settled (payment_tx may be "" when the facilitator returns no
         # tx string — still settled). Replay the original settlement header so an
@@ -262,7 +273,13 @@ async def _replay_create(
     if isinstance(verified, Response):
         return verified
     if not await gate.settle_verified(request, verified):
-        raise HTTPException(402, "payment settlement failed")
+        # This is a replay of an ALREADY-provisioned lease, so a settle failure
+        # here most likely means the original attempt already settled this exact
+        # authorization (the facilitator rejects the second use) but its stamp was
+        # lost — recover the token rather than 402 away a paid tunnel. Best-effort
+        # re-stamp so future replays hit the fast path.
+        await svc.mark_settled(existing.tunnel_id, getattr(request.state, "payment_tx", "") or "", _settlement_header(request))
+        return _to_response(existing, token=recovered.token)
     await svc.mark_settled(existing.tunnel_id, getattr(request.state, "payment_tx", "") or "", _settlement_header(request))
     return _to_response(existing, token=recovered.token)
 

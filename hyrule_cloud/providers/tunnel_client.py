@@ -55,6 +55,16 @@ class LeaseResult:
         )
 
 
+def _parse_lease(resp: httpx.Response, op: str) -> LeaseResult:
+    """Parse a 200 lease response, converting a malformed/incomplete body into a
+    TunnelDaemonError so a route that already settled can hit its handled
+    reconciliation/refund path instead of a raw 500."""
+    try:
+        return LeaseResult.from_json(resp.json())
+    except Exception as exc:  # JSON decode / missing field / bad type
+        raise TunnelDaemonError(f"daemon {op} returned a malformed lease response: {exc}") from exc
+
+
 class TunnelProvider:
     def __init__(
         self,
@@ -117,7 +127,7 @@ class TunnelProvider:
             raise TunnelDaemonError("no free tunnel ports", ports_exhausted=True)
         if resp.status_code != 200:
             raise TunnelDaemonError(f"daemon create failed: HTTP {resp.status_code}")
-        return LeaseResult.from_json(resp.json())
+        return _parse_lease(resp, "create")
 
     async def extend_lease(self, tunnel_id: str, duration_seconds: int) -> LeaseResult:
         try:
@@ -131,7 +141,7 @@ class TunnelProvider:
             raise TunnelDaemonError("lease not found")
         if resp.status_code != 200:
             raise TunnelDaemonError(f"daemon extend failed: HTTP {resp.status_code}")
-        return LeaseResult.from_json(resp.json())
+        return _parse_lease(resp, "extend")
 
     async def revoke_lease(self, tunnel_id: str) -> bool:
         """Delete a lease on the daemon. Returns True on success or if absent."""

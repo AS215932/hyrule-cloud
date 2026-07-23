@@ -520,6 +520,26 @@ async def test_replay_with_different_body_conflicts(wired):
     assert second.status_code == 409
 
 
+def test_parse_lease_malformed_becomes_daemon_error():
+    from hyrule_cloud.providers.tunnel_client import _parse_lease
+
+    bad = object()
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            if self._payload is bad:
+                raise ValueError("not json")
+            return self._payload
+
+    # Malformed JSON and a missing required field both become TunnelDaemonError.
+    for payload in (bad, {"no_lease_id": True}):
+        with pytest.raises(TunnelDaemonError):
+            _parse_lease(_Resp(payload), "extend")
+
+
 @pytest.mark.asyncio
 async def test_recover_resyncs_row_when_daemon_recreates(session_factory):
     provider = FakeTunnelProvider()

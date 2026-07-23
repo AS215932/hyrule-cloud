@@ -80,23 +80,29 @@ class TunnelService:
         duration = max(1, int((expires - _now()).total_seconds()))
         lease = await self.provider.create_lease(tunnel_id, duration, row.allowlist_cidrs)
         new_hash = hash_anon_token(lease.token or "")
-        if lease.token and (
-            row.token_hash != new_hash
-            or row.allocated_port != lease.port
-            or row.endpoint_host != lease.endpoint_host
-        ):
-            async with self.session_factory() as session:
-                await session.execute(
-                    update(ReverseTunnelRow)
-                    .where(ReverseTunnelRow.tunnel_id == tunnel_id)
-                    .values(
-                        token_hash=new_hash,
-                        allocated_port=lease.port,
-                        endpoint_host=lease.endpoint_host,
-                        ssh_port=lease.ssh_port,
-                    )
+        # Re-sync the row (only if it still exists) so its token_hash matches the
+        # token we return. Use a conditional UPDATE keyed on the row still being
+        # present: if a concurrent owner revoke deleted the row while we were
+        # recreating the daemon lease, the UPDATE affects 0 rows — then revoke the
+        # lease we just recreated (don't leave an unmanageable orphan) and report
+        # gone. This bounds the recovery-vs-revocation race.
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(ReverseTunnelRow)
+                .where(ReverseTunnelRow.tunnel_id == tunnel_id)
+                .values(
+                    token_hash=new_hash,
+                    allocated_port=lease.port,
+                    endpoint_host=lease.endpoint_host,
+                    ssh_port=lease.ssh_port,
                 )
-                await session.commit()
+            )
+            await session.commit()
+            rows_updated: int = getattr(result, "rowcount", 0)
+        if rows_updated == 0:
+            # Row was revoked concurrently; don't orphan the recreated lease.
+            await self.provider.revoke_lease(tunnel_id)
+            return None
         return lease
 
     async def provision(
