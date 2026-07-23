@@ -21,6 +21,7 @@ Usage
   python x402_canary.py intel                # every network-intel probe (~$0.06)
   python x402_canary.py proxy                # direct + tor network requests
   python x402_canary.py domain --name mytest12345   # REAL account-owned registration
+  python x402_canary.py tunnel               # provision a real 1h reverse tunnel, then revoke it
   python x402_canary.py vm                   # provision a real VM + print SSH target
   python x402_canary.py vm --quote --destroy # via the locked-quote flow, then tear down
   python x402_canary.py path-report          # gated probe: run by name once a prober is live
@@ -172,6 +173,14 @@ TESTS: dict[str, dict] = {
         "usd": "0.05",
         "group": "proxy",
     },
+    # --- 3e reverse-SSH tunnel (provisions a real 1h lease, then revokes) ---
+    "tunnel": {
+        "path": "/v1/tunnel/create",
+        "body": {"hours": 1},
+        "usd": "0.05",
+        "group": "provision",
+        "spendy": True,
+    },
     # --- 3c domain (REAL registration, side effects) ---
     # The dedicated runner performs check -> quote -> authenticated x402 order
     # -> durable poll -> revisioned managed-DNS write -> public resolution.
@@ -314,6 +323,16 @@ async def _run_one(
     settled_ok, settle_detail = _settlement(r)
     print(f"    HTTP {r.status_code}   {settle_detail}")
     text = r.text
+    if name == "tunnel":
+        # The tunnel response carries the one-time token (SSH username + mgmt
+        # credential) in both `token` and `ssh_command`; redact before any log so
+        # a failed cleanup can't leave a live credential in CI logs.
+        try:
+            tok = r.json().get("token")
+            if tok:
+                text = text.replace(tok, "<redacted-token>")
+        except Exception:
+            pass
     print(f"    body: {text[:600]}{'...' if len(text) > 600 else ''}")
     if r.status_code == 501:
         # 501 is the intentional "not launched yet" signal (PR #42: a diagnostic
@@ -338,7 +357,56 @@ async def _run_one(
         # gate isn't passed until the VM reaches ready AND its launch-proof
         # (SSH smoke + DNS AAAA) verifies. Propagate that.
         return await _poll_and_report_vm(r, destroy=destroy, yes=yes)
+    if name == "tunnel":
+        return await _verify_and_cleanup_tunnel(r)
     return True
+
+
+async def _verify_and_cleanup_tunnel(create_resp: httpx.Response) -> bool:
+    """Assert the tunnel create returned a usable lease, then revoke it so the
+    canary never leaks a live tunnel (min lease is 1h; revoke frees it now)."""
+    data = create_resp.json()
+    token = data.get("token")
+    tunnel_id = data.get("tunnel_id")
+    port = data.get("public_port")
+    if not (token and tunnel_id):
+        # Can't manage/clean up without both; redact any token before logging.
+        redacted = create_resp.text.replace(token, "<redacted-token>") if token else create_resp.text
+        print(f"    !! tunnel create omitted token/id: {redacted[:200]}")
+        return False
+    if not port:
+        # An ID + token but no port: still a live paid lease. Revoke it (with
+        # redaction) rather than leaking it, then fail.
+        print("    !! tunnel create omitted public_port; attempting cleanup")
+        async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
+            rev = await http.delete(f"/v1/tunnel/{tunnel_id}", headers={"X-Tunnel-Token": token})
+            print(f"    cleanup revoke: HTTP {rev.status_code}")
+        return False
+    print(f"    tunnel {tunnel_id} -> {data.get('endpoint_host')}:{port}")
+    # The ssh_command embeds the one-time token (the SSH username). Redact it in
+    # logs — if the cleanup revoke below fails, an un-redacted log would leave a
+    # live credential exposed to every log reader for the rest of the lease.
+    ssh_command = str(data.get("ssh_command", "")).replace(token, "<redacted-token>")
+    print(f"    ssh: {ssh_command}")
+    async with httpx.AsyncClient(base_url=API, timeout=30.0) as http:
+        status_ok = False
+        try:
+            # Status is best-effort verification; a failure here must NOT skip the
+            # cleanup revoke below, or a paid tunnel leaks for the rest of its lease.
+            status = await http.get(f"/v1/tunnel/{tunnel_id}/status", headers={"X-Tunnel-Token": token})
+            status_ok = status.status_code == 200
+            print(f"    status: HTTP {status.status_code} (owner-token gated)")
+        except Exception as e:
+            print(f"    status check failed (continuing to cleanup): {e!r}")
+        finally:
+            rev = await http.delete(f"/v1/tunnel/{tunnel_id}", headers={"X-Tunnel-Token": token})
+            revoke_ok = rev.status_code in (200, 404)
+            print(f"    cleanup revoke: HTTP {rev.status_code}")
+    if not revoke_ok:
+        # A failed cleanup leaves a paid tunnel live with its printed token; fail
+        # the canary so automation notices and remediates the leaked lease.
+        print("    !! tunnel cleanup revoke failed — leaked lease; FAILING.")
+    return status_ok and revoke_ok
 
 
 async def _create_quote(order_payload: dict) -> str | None:

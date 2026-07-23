@@ -261,6 +261,9 @@ class PaymentConfig(BaseSettings):
     price_proxy_i2p: Decimal = Decimal("0.05")
     price_proxy_yggdrasil: Decimal = Decimal("0.03")
 
+    # Reverse-SSH tunnel: hourly lease rate. Total = hours * this rate.
+    price_tunnel_hourly: Decimal = Decimal("0.05")
+
     # Network intelligence / agentic support API prices. These are contract
     # defaults; route implementations can compute dynamic prices around them.
     price_bgp_lookup: Decimal = Decimal("0.005")
@@ -319,6 +322,20 @@ class HyruleConfig(BaseSettings):
     network_proxy_url: str = "http://127.0.0.1:8450"
     network_proxy_token: str = ""
     network_proxy_health_ttl_seconds: int = 15
+
+    # Reverse-SSH tunnel daemon (hyrule-tunnel-proxy), co-located on netproxy.
+    # Cloud verifies/settles x402 and mints leases via this internal control API.
+    tunnel_proxy_url: str = "http://127.0.0.1:8452"
+    tunnel_proxy_token: str = ""
+    tunnel_proxy_health_ttl_seconds: int = 15
+    tunnel_min_hours: int = 1
+    tunnel_max_hours: int = 720
+    tunnel_grace_period_minutes: int = 15
+    # How long a provisioned-but-unsettled tunnel may linger before the sweep
+    # reaps it (crash/restart between provision commit and settle).
+    tunnel_provisional_ttl_minutes: int = 15
+    # STUN test target for the /v1/voip/check STUN arm; empty keeps it stubbed.
+    stun_test_host: str = ""
 
     # Block F (Wave 5): origin bound into wallet-recovery challenges. Per-env so
     # staging / alternate domains emit a matching origin without a code change.

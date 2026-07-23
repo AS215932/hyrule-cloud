@@ -32,6 +32,7 @@ from hyrule_cloud.api.registry import router as registry_router
 from hyrule_cloud.api.routes import router
 from hyrule_cloud.api.status import router as status_router
 from hyrule_cloud.api.threat import router as threat_router
+from hyrule_cloud.api.tunnel import router as tunnel_router
 from hyrule_cloud.api.voip import router as voip_router
 from hyrule_cloud.api.web import router as web_router
 from hyrule_cloud.config import HyruleConfig
@@ -102,6 +103,18 @@ async def lifespan(app: FastAPI):
         health_ttl_seconds=config.network_proxy_health_ttl_seconds,
     )
 
+    # Reverse-SSH tunnel daemon client + lifecycle service. x402 stays in Hyrule
+    # Cloud; the daemon owns the public SSH intake and mints leases.
+    from hyrule_cloud.providers.tunnel_client import TunnelProvider
+    from hyrule_cloud.services.tunnel.service import TunnelService
+
+    tunnel_provider = TunnelProvider(
+        proxy_url=config.tunnel_proxy_url,
+        token=config.tunnel_proxy_token,
+        health_ttl_seconds=config.tunnel_proxy_health_ttl_seconds,
+    )
+    tunnel_service = TunnelService(config, session_factory, tunnel_provider)
+
     # Orchestrator
     orchestrator = Orchestrator(config, session_factory)
     await orchestrator.startup()
@@ -137,6 +150,8 @@ async def lifespan(app: FastAPI):
         orchestrator=orchestrator,
         payment_gate=payment_gate,
         network_provider=network_provider,
+        tunnel_provider=tunnel_provider,
+        tunnel_service=tunnel_service,
         native_crypto=native_crypto,
         rate_provider=rate_provider,
         native_payment_assets=native_payment_assets,
@@ -156,6 +171,7 @@ async def lifespan(app: FastAPI):
     await domains.close()
     await orchestrator.shutdown()
     await network_provider.close()
+    await tunnel_provider.close()
     await native_crypto.close()
     await rate_provider.close()
     await engine.dispose()
@@ -359,6 +375,7 @@ app.include_router(mx_router)
 app.include_router(path_router)
 app.include_router(ports_router)
 app.include_router(nat_router)
+app.include_router(tunnel_router)
 app.include_router(threat_router)
 app.include_router(voip_router)
 app.include_router(internal_bgp_router)

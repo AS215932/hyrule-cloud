@@ -216,6 +216,36 @@ class HyruleClient:
         """Hard reboot a VM."""
         return await self._request("POST", f"/v1/vm/{vm_id}/reboot")
 
+    async def create_tunnel(
+        self, hours: int, allowlist_cidrs: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Provision a reverse-SSH tunnel. Paid via x402. Returns 402 if unpaid."""
+        body: dict[str, Any] = {"hours": hours}
+        if allowlist_cidrs:
+            body["allowlist_cidrs"] = allowlist_cidrs
+        return await self._request("POST", "/v1/tunnel/create", json=body)
+
+    async def extend_tunnel(self, tunnel_id: str, token: str, hours: int) -> dict[str, Any]:
+        """Extend a tunnel lease. Paid via x402; requires the owner token."""
+        return await self._request(
+            "POST",
+            f"/v1/tunnel/{tunnel_id}/extend",
+            json={"hours": hours},
+            headers={"X-Tunnel-Token": token},
+        )
+
+    async def tunnel_status(self, tunnel_id: str, token: str) -> dict[str, Any]:
+        """Get live tunnel status (owner token required)."""
+        return await self._request(
+            "GET", f"/v1/tunnel/{tunnel_id}/status", headers={"X-Tunnel-Token": token}
+        )
+
+    async def revoke_tunnel(self, tunnel_id: str, token: str) -> dict[str, Any]:
+        """Tear down a tunnel early (owner token required)."""
+        return await self._request(
+            "DELETE", f"/v1/tunnel/{tunnel_id}", headers={"X-Tunnel-Token": token}
+        )
+
     async def destroy_vm(self, vm_id: str) -> dict[str, Any]:
         """Destroy a VM permanently."""
         return await self._request("DELETE", f"/v1/vm/{vm_id}")
