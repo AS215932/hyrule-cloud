@@ -160,7 +160,8 @@ MCP server config for Claude/Cursor:
 - Bazaar extension registration (discoverable: true in route config)
 - Automated abuse detection / VM content scanning
 - Refunds on provisioning failure
-- Real log streaming from VMs (current `/logs` is a placeholder)
+- Real log streaming from inside VMs (`/logs` returns the provisioning
+  lifecycle — control-plane events, not guest/application logs)
 - Production deployment config (systemd, TLS termination, rate limiting)
 
 ## Conventions

@@ -593,9 +593,42 @@ class DNSRecord(BaseModel):
     ttl: int = 3600
     prio: int | None = None
 
+class VMEventKey(enum.StrEnum):
+    """Customer-visible provisioning lifecycle vocabulary (`GET /v1/vm/{id}/logs`).
+
+    This is a public contract: keys are stable and only ever added to, never
+    renamed or repurposed. Every key describes something the platform actually
+    observed — nothing here is inferred.
+    """
+
+    # Lifecycle
+    PROVISIONING_STARTED = "provisioning_started"
+    # Emitted INSTEAD of real infrastructure work when the deployment runs in
+    # simulation mode (HCP_LAUNCH_PROOF_REAL_XCPNG unset). Marks every later
+    # event on that VM as simulated.
+    PROVISIONING_SIMULATED = "provisioning_simulated"
+    CLOUD_INIT_PREPARED = "cloud_init_prepared"
+    SETUP_SCRIPT_INJECTED = "setup_script_injected"
+    VM_CREATED = "vm_created"
+    NETWORK_READY = "network_ready"
+    DNS_CREATED = "dns_created"
+    SSH_REACHABLE = "ssh_reachable"
+    SSH_UNREACHABLE = "ssh_unreachable"
+    CUSTOM_DOMAIN_ATTACHED = "custom_domain_attached"
+    CUSTOM_DOMAIN_ATTACH_FAILED = "custom_domain_attach_failed"
+    # Terminal
+    READY = "ready"
+    PROVISIONING_FAILED = "provisioning_failed"
+
+
 class VMLogEvent(BaseModel):
     ts: str
     event: str
+    # Human-readable, customer-safe. Never carries provider text.
+    message: str | None = None
+    # Small structured payload (hostname, ipv6, simulated flag, ...). Only ever
+    # holds data the customer already owns — never internal infrastructure ids.
+    detail: dict | None = None
 
 class VMLogsResponse(BaseModel):
     vm_id: str
