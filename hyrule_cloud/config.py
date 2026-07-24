@@ -355,7 +355,9 @@ class HyruleConfig(BaseSettings):
     # because it is "the router" is the outage of 2026-07-24: it forwarded
     # traffic perfectly and ran no resolver, so every VM shipped unable to
     # resolve anything.
-    customer_ipv6_dns: str = "2a0c:b641:b51::1"
+    # AS215932's DNS64 resolver — verified answering from a customer /64 and
+    # synthesizing IPv4-only names into 64:ff9b::/96. NOT the gateway.
+    customer_ipv6_dns: str = "2a0c:b641:b50:2::1"
     # Hostname the launch proof asks that resolver to resolve before calling a
     # VM provisioned. Deliberately a real package-mirror name: it is what the
     # first thing a customer VM does (apt-get update) depends on.
