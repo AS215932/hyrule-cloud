@@ -71,14 +71,81 @@ provisions the quoted spec at the locked price and is idempotent across the
 
 ## Python Client
 
-```python
-from hyrule_cloud.client import HyruleClient
+Install (not on PyPI yet — `pip install hyrule-cloud` 404s today):
 
-async with HyruleClient("https://cloud.hyrule.host") as hc:
-    result = await hc.create_vm(duration_days=7, size="sm", ssh_pubkey="ssh-ed25519 ...")
+```bash
+pip install "git+https://github.com/AS215932/hyrule-cloud"
 ```
 
-Install: `pip install hyrule-cloud`
+### Autonomous payment (recommended)
+
+Hand `HyruleClient` a funded EVM private key and it settles the 402 for you —
+sign, retry, return the 2xx body. You never build an EIP-3009 payload by hand.
+
+```python
+import os
+from hyrule_cloud.client import HyruleClient
+
+async with HyruleClient(
+    "https://cloud.hyrule.host",
+    private_key=os.environ["HYRULE_AGENT_KEY"],  # USDC-funded wallet on Base
+    max_usd_per_call="5.00",                     # hard per-call spend cap
+) as hc:
+    result = await hc.provision_vm(
+        duration_days=7,
+        size="sm",
+        ssh_pubkey="ssh-ed25519 AAAA...",
+        quote_first=True,      # lock the price via POST /v1/vm/quote first
+    )
+
+    print(result.ssh)                 # "ssh root@<host>.deploy.hyrule.host"
+    print(result.vm_id, result.ipv6)
+    print(result.management_token)    # one-time — save it, it is never re-shown
+    print(result.settlement.transaction)  # on-chain settlement tx hash
+```
+
+`provision_vm()` does quote → paid create → poll `/v1/vm/{id}/status` until the
+VM is ready, and raises `ProvisioningError` / `ProvisioningTimeoutError` instead
+of returning a half-built VM.
+
+**Safety.** `max_usd_per_call` (default `"10.00"`) is enforced as an x402
+`max_amount` policy: a 402 asking for more is dropped *before* anything is
+signed and the call raises `HyrulePaymentError`. Payment is also pinned to one
+chain (`payment_network`, default `eip155:8453` Base), so the SDK never signs
+against whatever chain a challenge advertises first. A paid `2xx` that comes
+back without a settlement receipt raises `SettlementMissingError` — the agent
+must not treat an uncharged response as paid for.
+
+### Step-by-step
+
+```python
+async with HyruleClient("https://cloud.hyrule.host", private_key=KEY) as hc:
+    created = await hc.create_vm(duration_days=7, size="sm", ssh_pubkey="ssh-ed25519 ...")
+    token = created["management_token"]
+
+    # Public poll endpoint — no credential needed.
+    status = await hc.vm_status(created["vm_id"])
+
+    # Management-gated calls take the one-time token per call.
+    details = await hc.vm_details(created["vm_id"], management_token=token)
+    logs = await hc.vm_logs(created["vm_id"], management_token=token)
+    await hc.extend_vm(created["vm_id"], 7, management_token=token)
+    await hc.reboot_vm(created["vm_id"], management_token=token)
+    await hc.destroy_vm(created["vm_id"], management_token=token)
+
+    print(hc.last_settlement)  # receipt of the most recent paid call
+```
+
+The VM `management_token` is **not** the account `api_key`. `api_key=` on the
+constructor is the account bearer (Block D); the management token is the
+one-time per-VM credential returned by the create `202`.
+
+Read-only calls (`pricing`, `check_domain`, `vm_status`, …) need no key at all:
+
+```python
+async with HyruleClient("https://cloud.hyrule.host") as hc:
+    pricing = await hc.pricing()
+```
 
 ## Endpoints
 
@@ -186,7 +253,8 @@ Status values: `provisioning` → `ready` → `running` → `suspended` → `des
 Full VM view — adds the SSH command, firewall state, and error detail.
 Requires the one-time `management_token` from the create response, presented
 as `Authorization: Bearer <management_token>` (or `?token=`). Without valid
-management authority the endpoint returns 404, not 403.
+management authority the endpoint returns 404, not 403 — deliberately
+indistinguishable from "VM not found", so vm_id existence does not leak.
 
 ```
 GET /v1/vm/vm_a1b2c3d4e5f6
@@ -236,7 +304,8 @@ Provision a bare VM with SSH access. Returns 202 with a status URL to poll.
 }
 ```
 
-**`management_token` is shown once — store it now.** It is the only
+**`management_token` is shown once — store it now.** Only its sha256 is
+stored server-side, and it is not the account API key. It is the only
 credential for the full VM view, extend, reboot, logs, and DELETE. A replayed
 paid create (idempotent retry) returns the same VM with
 `management_token: null`. Poll the public `status_url` (no credentials
@@ -255,6 +324,8 @@ needed) while the VM provisions.
 3. Poll GET /v1/vm/{id}/status until `status` is `ready`
 4. SSH in: `ssh root@<hostname>`
 5. The VM is yours — install whatever you need
+
+The Python client does all five in one call — see `provision_vm()` above.
 
 #### POST /v1/vm/{vm_id}/extend
 Add days to a running VM. Requires `Authorization: Bearer <management_token>`
