@@ -62,7 +62,12 @@ via the Vault-rendered `.env`) — no Ansible run.
    ```
    vault kv get -field=dev_bypass_secret kv/hyrule-cloud   # must be absent/empty
    ```
-3. **Fund the canary wallet**: ~$5 USDC + gas on Base mainnet, operator-held.
+3. **Canary wallet** (Vault-held): the canary wallet lives in production
+   Vault at `kv/hyrule-cloud` — `canary_key` (private key, never leaves
+   Vault or gets written to disk/repo) and `canary_address`
+   (`0xc036D9c8f1B94394a60Fbd3cF90d0Df2940CC75F`). Fund `canary_address`
+   with ~$5–10 USDC on Base mainnet. No ETH for gas is needed — the
+   facilitator settles the signed EIP-3009 authorization on-chain.
 4. **Metrics token** (for Phase 2):
    ```
    vault kv patch kv/hyrule-cloud metrics_token=$(openssl rand -hex 32)
@@ -88,8 +93,15 @@ via the Vault-rendered `.env`) — no Ansible run.
 ### Live canary #1 — payai (first-ever real spend)
 
 `scripts/x402_canary.py` automates the 402→sign→retry→settle flow for every
-paid endpoint (a `max_amount` policy caps each call at its price +10%). Set
-`CANARY_KEY` to the funded wallet and run `python scripts/x402_canary.py dns`
+paid endpoint (a `max_amount` policy caps each call at its price +10%).
+Fetch the Vault-held canary key straight into the environment (never write
+it to disk or the repo):
+
+```bash
+export CANARY_KEY=$(ssh svag@vault.servify.network 'VAULT_ADDR=http://127.0.0.1:8200 vault kv get -field=canary_key kv/hyrule-cloud')
+```
+
+Then run `python scripts/x402_canary.py dns`
 for the cheapest first spend, `intel`/`proxy` for the Phase-3 groups, or
 `vm --quote --destroy` for the 3d gate — `--quote` exercises the documented
 `POST /v1/vm/quote` → paid create flow, and the script pauses for the manual

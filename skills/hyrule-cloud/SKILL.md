@@ -1,19 +1,22 @@
 ---
 name: hyrule-cloud
-description: "Deploy bare VMs and register, renew, or manage account-owned domains and DNS."
+description: "Deploy bare VMs with x402 payment and a free auto subdomain. Domain registration is deferred — not yet launched."
 ---
 
 # Hyrule Cloud — Agentic VPS Hosting
 
-Deploy bare VMs and register, renew, or manage account-owned domains and DNS.
+Deploy bare VMs with x402 payment (USDC on Base). Every VM gets a free auto
+subdomain under `deploy.hyrule.host`.
 
 ## When to Use
 
 Use this skill when:
 - You need to deploy an application to the internet (provision a VM, SSH in, set it up)
-- You need to register a domain name
-- You need managed authoritative DNS records (AAAA, A, CNAME, TXT, MX, etc.)
-- You need to check pricing or domain availability
+- You need to check VM pricing or available OS templates
+- You need a free auto subdomain for a VM (`<hash>.deploy.hyrule.host`)
+
+Domain registration, renewal, and managed DNS zones are **not yet launched**
+— see "Deferred — Not Yet Launched" below.
 
 ## API Base
 
@@ -25,7 +28,7 @@ Service discovery: `GET /.well-known/x402.json`
 
 ## Payment
 
-VMs, network services, and USDC domain orders use the **x402** protocol:
+VMs and network services use the **x402** protocol:
 1. Send the request without payment → get a `402` response with pricing + payment instructions
 2. Pay via the x402 facilitator (USDC on Base, chain `eip155:8453`)
 3. Resend the request with the `X-PAYMENT` header containing the payment proof
@@ -60,10 +63,6 @@ X-PAYMENT-REQUIRED: eyJ4NDAyVmVyc2lvbiI6Mn0...   # base64 of the body below
 Sign an EIP-3009 `TransferWithAuthorization` for the `accepts[].price`, base64-
 encode the x402 payment payload, and resend the same request with
 `X-PAYMENT: <base64>`.
-
-Domain orders also support native BTC and XMR payment intents. Domain purchase,
-renewal, and management require an account session or scoped API key; public
-availability checks and quotes do not.
 
 **Durable quotes (recommended):** call `POST /v1/vm/quote` first to lock a price
 and get a `quote_id`, then pass `quote_id` to `POST /v1/vm/create`. The server
@@ -150,20 +149,49 @@ spec → 409). Body: `{ "order_payload": { …VM spec… }, "client_order_id": "
 ```
 
 #### GET /v1/os/list
-Lists available OS templates.
+Lists available OS templates. The template list is dynamic — always read the
+live endpoint rather than relying on this example.
 
 ```json
 {
   "templates": [
-    {"name": "debian-13", "description": "Debian 13 (Trixie)", "default": true},
-    {"name": "alpine-3.21", "description": "Alpine Linux 3.21"},
-    {"name": "freebsd-14", "description": "FreeBSD 14.2"}
+    {"name": "debian-13", "description": "Debian 13 (Trixie)", "default": true}
   ]
 }
 ```
 
-#### GET /v1/vm/{vm_id}
-Get VM status, IP, hostname, SSH command, and expiry.
+#### GET /v1/vm/{vm_id}/status (public)
+Sanitized status view — poll this without credentials. Returns status,
+hostname, IPv6, expiry, profile/resources, and launch-proof fields
+(`launch_proof_status`, `payment_status`, `dns_aaaa_verified`,
+`ssh_smoke_status`, `rollback_available`, `customer_message`). It never
+includes the SSH command or firewall state.
+
+```json
+{
+  "vm_id": "vm_a1b2c3d4e5f6",
+  "status": "ready",
+  "ipv6": "2001:db8::1",
+  "hostname": "ab12cd34.deploy.hyrule.host",
+  "expires_at": "2026-04-08T00:00:00Z",
+  "launch_proof_status": "provisioned",
+  "dns_aaaa_verified": true,
+  "ssh_smoke_status": "passed"
+}
+```
+
+Status values: `provisioning` → `ready` → `running` → `suspended` → `destroyed` (or `failed`)
+
+#### GET /v1/vm/{vm_id} (management token required)
+Full VM view — adds the SSH command, firewall state, and error detail.
+Requires the one-time `management_token` from the create response, presented
+as `Authorization: Bearer <management_token>` (or `?token=`). Without valid
+management authority the endpoint returns 404, not 403.
+
+```
+GET /v1/vm/vm_a1b2c3d4e5f6
+Authorization: Bearer hyr_vm_...
+```
 
 ```json
 {
@@ -176,34 +204,6 @@ Get VM status, IP, hostname, SSH command, and expiry.
   "firewall": {"inbound_allow": [22, 80, 443], "policy": "deny"}
 }
 ```
-
-Status values: `provisioning` → `ready` → `running` → `suspended` → `destroyed` (or `failed`)
-
-#### GET /v1/domains/check?domain=example.dev
-Check strict ASCII, single-label domain eligibility, live availability, and
-separate registration/renewal prices. Premium and non-generic TLDs fail closed.
-
-```json
-{
-  "domain": "example.dev",
-  "eligible": true,
-  "available": true,
-  "premium": false,
-  "registration": {"provider_cost_usd":"10.00","hyrule_fee_usd":"3.00","tax_usd":"0.00","total_usd":"13.00","currency":"USD"},
-  "renewal": {"provider_cost_usd":"10.00","hyrule_fee_usd":"3.00","tax_usd":"0.00","total_usd":"13.00","currency":"USD"}
-}
-```
-
-#### POST /v1/domains/quotes
-Create a durable 15-minute registration or renewal quote.
-
-```json
-{"domain":"example.dev","action":"register"}
-```
-
-The response includes `quote_id`, `terms_version`, `expires_at`, and an exact
-USD price breakdown. Registration is always one year; renewal is manual and
-registrar auto-renew is disabled.
 
 ### Paid Endpoints
 
@@ -229,46 +229,40 @@ Provision a bare VM with SSH access. Returns 202 with a status URL to poll.
 {
   "vm_id": "vm_a1b2c3d4e5f6",
   "status": "provisioning",
-  "status_url": "https://cloud.hyrule.host/v1/vm/vm_a1b2c3d4e5f6",
-  "estimated_ready_seconds": 60
+  "status_url": "https://cloud.hyrule.host/v1/vm/vm_a1b2c3d4e5f6/status",
+  "estimated_ready_seconds": 60,
+  "management_token": "hyr_vm_...",
+  "management_url": "https://cloud.hyrule.host/v1/vm/vm_a1b2c3d4e5f6?token=hyr_vm_..."
 }
 ```
+
+**`management_token` is shown once — store it now.** It is the only
+credential for the full VM view, extend, reboot, logs, and DELETE. A replayed
+paid create (idempotent retry) returns the same VM with
+`management_token: null`. Poll the public `status_url` (no credentials
+needed) while the VM provisions.
 
 **Profiles:** `xs` (`1C-1G-10G`), `sm` (`1C-2G-20G`), `md` (`2C-4G-20G`), `lg` (`4C-4G-40G`). Optional exact `resources` are order-time only, in 1-vCPU/1-GB/10-GB increments up to 4/8/40; the API automatically selects the cheapest compatible profile.
 
 **Domain modes:**
-- `auto` — free subdomain `<hash>.deploy.hyrule.host` (default)
-- `custom` — requires `domain` field, registers via Openprovider (extra cost)
+- `auto` — free subdomain `<hash>.deploy.hyrule.host` (default; live)
+- `custom` — deferred along with domain registration (see "Deferred — Not
+  Yet Launched"); use `auto`
 
 **Workflow:**
 1. POST /v1/vm/create → 402 (get price) → pay → POST again with X-PAYMENT → 202
-2. Poll GET /v1/vm/{id} until `status` is `ready`
-3. SSH in: `ssh root@<hostname>`
-4. The VM is yours — install whatever you need
+2. Store the one-time `management_token` from the 202 — it is shown once
+3. Poll GET /v1/vm/{id}/status until `status` is `ready`
+4. SSH in: `ssh root@<hostname>`
+5. The VM is yours — install whatever you need
 
 #### POST /v1/vm/{vm_id}/extend
-Add days to a running VM.
+Add days to a running VM. Requires `Authorization: Bearer <management_token>`
+and is x402-paid (402 → pay → retry, same as create).
 
 ```json
 {"days": 30}
 ```
-
-#### POST /v1/domains/orders
-Place an idempotent account-owned registration or renewal order. Send
-`Authorization: Bearer <api-key>` and a stable `Idempotency-Key`. USDC orders
-use the normal 402/sign/retry flow; BTC/XMR return a 60-minute deposit intent.
-
-```json
-{
-  "quote_id": "dq_...",
-  "payment_method": "usdc",
-  "terms_version": "2026-07-15"
-}
-```
-
-Poll `GET /v1/domains/orders/{order_id}` until `active`, `provider_pending`,
-`refund_due`, or `failed`. A provider timeout remains pending for reconciliation;
-do not submit a second purchase with a new idempotency key.
 
 #### POST /v1/network/request
 Make one paid HTTP request through the internal Hyrule network proxy sidecar.
@@ -300,37 +294,49 @@ Response shape:
 }
 ```
 
-### Domain Management Endpoints (Account Required)
+### VM Management Endpoints (management token required)
 
-#### POST /v1/domains/{domain}/dns/changesets
-Atomically upsert/delete managed RRsets. Send the current numeric zone revision
-in `If-Match` and a stable `Idempotency-Key`; stale revisions return 412.
-
-```json
-{
-  "changes": [{
-    "action": "upsert",
-    "rrset": {"name":"www","type":"AAAA","ttl":300,"values":["2001:db8::1"]}
-  }]
-}
-```
-
-Use `GET /v1/domains/{domain}/dns` to read the current records and revision.
-`PUT /v1/domains/{domain}/nameservers` switches between Hyrule-managed and
-external delegation. `PUT /v1/domains/{domain}/dnssec` manages DNSSEC. Signed
-transfer-out uses `/v1/domains/{domain}/transfer-out/challenge` followed by
-`/v1/domains/{domain}/transfer-out`; the registrar auth code is reveal-once.
-
-### Management Endpoints (Free)
+All three require `Authorization: Bearer <management_token>` (the one-time
+token from the create response; `?token=` also works). Unauthorized calls
+return 404.
 
 #### POST /v1/vm/{vm_id}/reboot
 Hard reboot a VM.
 
+```
+POST /v1/vm/vm_a1b2c3d4e5f6/reboot
+Authorization: Bearer hyr_vm_...
+```
+
 #### DELETE /v1/vm/{vm_id}
 Destroy a VM permanently.
 
+```
+DELETE /v1/vm/vm_a1b2c3d4e5f6
+Authorization: Bearer hyr_vm_...
+```
+
 #### GET /v1/vm/{vm_id}/logs
 Get provisioning log for a VM.
+
+```
+GET /v1/vm/vm_a1b2c3d4e5f6/logs
+Authorization: Bearer hyr_vm_...
+```
+
+## Deferred — Not Yet Launched
+
+> **NOT YET LAUNCHED.** Domain registration is deferred from the current
+> launch catalog: `GET /v1/domains/tlds` returns 503 and the domain endpoints
+> are absent from the live manifest. Do not call them.
+
+This covers everything domain-shaped: availability checks (`/v1/domains/check`),
+quotes (`/v1/domains/quotes`), registration/renewal orders
+(`/v1/domains/orders`), managed DNS zones (changesets, nameservers, DNSSEC),
+and signed transfer-out. Free auto subdomains for VMs
+(`domain_mode: "auto"` → `<hash>.deploy.hyrule.host`) **are** live and are
+not affected. When domain registration launches, these endpoints will appear
+in `/.well-known/x402.json` and this skill will document them again.
 
 ## Typical Agent Workflow
 
@@ -338,19 +344,16 @@ Get provisioning log for a VM.
 1. GET /v1/pricing                          # check prices
 2. POST /v1/vm/create                       # → 402 with price
 3. Pay via x402 facilitator                 # USDC on Base
-4. POST /v1/vm/create + X-PAYMENT header    # → 202 + status_url
-5. Poll GET /v1/vm/{id}                     # wait for "ready"
+4. POST /v1/vm/create + X-PAYMENT header    # → 202 + status_url + one-time management_token (store it!)
+5. Poll GET /v1/vm/{id}/status              # wait for "ready" (public, no auth)
 6. ssh root@<hostname>                      # deploy your app
-7. (optional) POST /v1/domains/quotes       # lock registration price
-8. (optional) POST /v1/domains/orders       # idempotent account-owned purchase
-9. (optional) POST /v1/domains/{domain}/dns/changesets  # point domain at VM
-10. (optional) POST /v1/network/request     # paid Direct/Tor/I2P/Yggdrasil request
+7. (optional) POST /v1/network/request      # paid Direct/Tor/I2P/Yggdrasil request
 ```
 
 ## Infrastructure Details
 
 - **Network:** IPv6-only (NAT64/DNS64 for IPv4 destinations). All VMs get a public IPv6 address.
-- **DNS:** Auto subdomains under `deploy.hyrule.host`. Custom domains via Openprovider with Hyrule Cloud nameservers.
+- **DNS:** Auto subdomains under `deploy.hyrule.host`. Custom domain registration is deferred (not yet launched).
 - **Firewall:** Cloud-init sets UFW defaults (deny all inbound except 22/80/443, block outbound SMTP). Modify via SSH after boot.
 - **Expiry:** Prepaid model. VMs suspended at expiry, destroyed after 48h grace period. Extend with `/v1/vm/{id}/extend`.
 - **Network proxy:** `POST /v1/network/request` is x402-gated in Hyrule Cloud and executed by the internal `hyrule-network-proxy` Go sidecar.
