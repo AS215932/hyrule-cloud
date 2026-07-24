@@ -139,6 +139,21 @@ class DomainService:
     async def close(self) -> None:
         await self.dns.close()
 
+    async def public_discovery_ready(self) -> bool:
+        """Report whether public domain discovery can answer a customer.
+
+        ``/v1/domains/tlds`` and ``/v1/domains/check`` both fail closed with a
+        503 when the registrar catalog is missing or stale, so readiness is
+        read from that same predicate (``DomainCatalog.list_eligible``) rather
+        than re-derived from configuration. The public status page uses this so
+        it can never advertise the product as operational while its own entry
+        points reject every customer.
+        """
+        try:
+            return bool(await self.catalog.list_eligible())
+        except DomainProblem:
+            return False
+
     def require_purchase_launch(self, account_id: str) -> None:
         cfg = self.domain_config
         if not cfg.enabled or not cfg.purchases_enabled:
