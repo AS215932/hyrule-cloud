@@ -352,7 +352,11 @@ async def _enforce_prefix_capacity(orch, cfg) -> None:
             select(func.count()).select_from(VMRow).where(VMRow.ipv6_prefix_index.isnot(None))
         )
     if int(result.scalar() or 0) >= usable:
-        raise HTTPException(503, "No customer IPv6 capacity available right now")
+        raise HTTPException(
+            503,
+            "No customer IPv6 capacity available right now",
+            headers={"Retry-After": "600"},
+        )
 
 
 async def _enforce_compute_capacity(orch, order: VMCreateRequest) -> None:
@@ -362,17 +366,23 @@ async def _enforce_compute_capacity(orch, order: VMCreateRequest) -> None:
     ensure_capacity = getattr(orch, "ensure_vm_capacity", None)
     if not callable(ensure_capacity):
         log.error("vm_capacity_check_unavailable")
-        raise HTTPException(503, "VM capacity is temporarily unavailable")
+        raise HTTPException(
+            503, "VM capacity is temporarily unavailable", headers={"Retry-After": "60"}
+        )
     try:
         await ensure_capacity(order)
     except VMCapacityError as exc:
         log.info("vm_capacity_rejected", error=str(exc))
         raise HTTPException(
-            503, "The requested VM does not fit current host capacity"
+            503,
+            "The requested VM does not fit current host capacity",
+            headers={"Retry-After": "300"},
         ) from exc
     except Exception as exc:
         log.error("vm_capacity_check_failed", error=str(exc), exc_info=True)
-        raise HTTPException(503, "VM capacity is temporarily unavailable") from exc
+        raise HTTPException(
+            503, "VM capacity is temporarily unavailable", headers={"Retry-After": "60"}
+        ) from exc
 
 
 # --- Block B (Wave 2): runtime metrics ---
