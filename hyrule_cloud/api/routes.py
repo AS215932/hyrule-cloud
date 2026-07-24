@@ -924,13 +924,21 @@ async def create_vm(
             )
         except VMCapacityError as exc:
             raise HTTPException(
-                503, "The requested VM does not fit current host capacity"
+                503,
+                "The requested VM does not fit current host capacity",
+                headers={"Retry-After": "300"},
             ) from exc
         except ProviderError as exc:
             log.error("vm_capacity_check_failed", error=str(exc), exc_info=True)
-            raise HTTPException(503, "VM capacity is temporarily unavailable") from exc
+            raise HTTPException(
+                503, "VM capacity is temporarily unavailable", headers={"Retry-After": "60"}
+            ) from exc
         except RuntimeError:
-            raise HTTPException(503, "No customer IPv6 capacity available right now")
+            raise HTTPException(
+                503,
+                "No customer IPv6 capacity available right now",
+                headers={"Retry-After": "600"},
+            )
         if order.domain_mode == DomainMode.CUSTOM and order.domain:
             domains = getattr(await get_app_state(request), "domains", None)
             try:
