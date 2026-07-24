@@ -479,3 +479,38 @@ in `/.well-known/x402.json` and this skill will document them again.
 - **Expiry:** Prepaid model. VMs suspended at expiry, destroyed after 48h grace period. Extend with `/v1/vm/{id}/extend`.
 - **Network proxy:** `POST /v1/network/request` is x402-gated in Hyrule Cloud and executed by the internal `hyrule-network-proxy` Go sidecar.
 - **ASN:** AS215932 (RIPE)
+
+### DNS on your VM (IPv6-only + NAT64)
+
+Your VM has no IPv4 address. It reaches IPv4-only hosts through NAT64, which
+only works when its resolver is **DNS64-capable** — DNS64 answers an IPv4-only
+name with a synthetic AAAA in `64:ff9b::/96` that NAT64 then translates. A
+resolver without DNS64 (or one that does not answer at all) leaves the VM
+unable to reach — or even resolve — most of the internet, including package
+mirrors.
+
+Hyrule writes the resolver into the VM's netplan at build time (currently
+`2a0c:b641:b51::1` on the customer network). Check what your VM actually got:
+
+```bash
+resolvectl status || cat /etc/resolv.conf
+getent ahosts deb.debian.org        # must return addresses
+```
+
+`GET /v1/vm/{vm_id}/status` reports this as `dns_resolution_status`
+(`passed` | `failed` | `not_run`). A VM whose resolver does not answer is
+returned as `launch_proof_status: degraded` rather than `provisioned` — it is
+reachable over SSH but cannot resolve names.
+
+To override with your own DNS64 resolver (e.g. Google's public DNS64):
+
+```bash
+# quick fix, until reboot
+printf 'nameserver 2001:4860:4860::6464\n' > /etc/resolv.conf
+# persistent: edit nameservers.addresses in /etc/netplan/*.yaml, then
+netplan apply
+```
+
+Any resolver you pick must be reachable over IPv6 and DNS64-capable; a plain
+IPv6 resolver without DNS64 resolves names but still cannot reach IPv4-only
+destinations.

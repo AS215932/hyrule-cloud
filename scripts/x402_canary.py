@@ -598,14 +598,18 @@ async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool, yes
                 # The status endpoint returns launch-proof fields FLAT (issue
                 # #28). The VM reaching READY is not enough: real provisioning
                 # can mark READY while the SSH smoke test or DNS AAAA check
-                # failed. The Phase-3d gate only passes if both verify.
+                # failed. Both of those are INBOUND proofs, so the gate also
+                # requires the VM's own resolver to answer — a VM that cannot
+                # resolve a hostname is not a shippable VM.
                 dns_ok = bool(sj.get("dns_aaaa_verified"))
                 ssh_smoke = sj.get("ssh_smoke_status")
-                proof_ok = dns_ok and ssh_smoke == "passed"
+                dns_resolution = sj.get("dns_resolution_status")
+                proof_ok = dns_ok and ssh_smoke == "passed" and dns_resolution == "passed"
                 icon = "✅" if proof_ok else "⚠️"
                 print(
                     f"\n    {icon} VM {st.upper()} — launch-proof: "
-                    f"ssh_smoke_status={ssh_smoke} dns_aaaa_verified={dns_ok}"
+                    f"ssh_smoke_status={ssh_smoke} dns_aaaa_verified={dns_ok} "
+                    f"dns_resolution_status={dns_resolution}"
                 )
                 print("       manually verify over IPv6:")
                 print(f"        ssh root@{host or ipv6}")
@@ -617,7 +621,8 @@ async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool, yes
                     )
                 if not proof_ok:
                     print(
-                        "    !! launch-proof did NOT verify (ssh smoke / DNS AAAA); FAILING gate."
+                        "    !! launch-proof did NOT verify (ssh smoke / DNS AAAA / "
+                        "customer DNS resolution); FAILING gate."
                     )
                 destroy_ok = await _maybe_destroy(poll, vm_id, mgmt_token, destroy=destroy, yes=yes)
                 return proof_ok and destroy_ok

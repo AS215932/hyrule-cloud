@@ -199,9 +199,14 @@ evidence before treating 3a as complete.
    the launch-proof verifies and the DELETE returns 2xx):
    - `POST /v1/vm/quote` (`1C-1G-10G`, 1 day = $0.20) → pay via x402/CDP
    - poll `GET /v1/vm/{id}/status` until `launch_proof_status=provisioned`
-     with `ssh_smoke_status=passed` and `dns_aaaa_verified=true` (now
-     measured, not inferred)
-   - **manually `ssh root@<hostname>` over IPv6**
+     with `ssh_smoke_status=passed`, `dns_aaaa_verified=true` and
+     `dns_resolution_status=passed` (all measured, not inferred).
+     `launch_proof_status=degraded` + `dns_resolution_status=failed` means
+     `HYRULE_CUSTOMER_IPV6_DNS` is not answering — the VM is up but resolves
+     nothing, which is a launch blocker, not a per-VM incident.
+   - **manually `ssh root@<hostname>` over IPv6**, then on the VM:
+     `getent ahosts deb.debian.org` (IPv6-only + NAT64 needs a working DNS64
+     resolver; without it `apt-get` and every setup_script die)
    - `DELETE /v1/vm/{id}` and confirm destroy
    - ledger + Grafana provisioning panels moved
 4. **Failure drill**: provision one VM against a deliberately broken template

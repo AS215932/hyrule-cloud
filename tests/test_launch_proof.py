@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from unittest.mock import AsyncMock
 
 import pytest
@@ -20,6 +21,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from hyrule_cloud.app import app
 from hyrule_cloud.db import Base, VMQuoteRow, VMRow
 from hyrule_cloud.models import (
+    DNSResolutionStatus,
     LaunchProofStatus,
     PaymentStatus,
     SSHSmokeStatus,
@@ -446,6 +448,257 @@ async def test_verify_aaaa_fails_closed_without_dns_server() -> None:
 
     provider = DNSProvider(HyruleConfig(dns_server="", dns_tsig_key="dGVzdA=="))
     assert await provider.verify_aaaa("vm123", "2a0c:b641:b51::2") is False
+
+
+# --- Customer-side DNS resolution proof ---
+#
+# A real paid VM (vm_bDRgKbVbxsUcraNvVuSbxA) shipped as status=ready,
+# launch_proof_status=provisioned, ssh_smoke=passed, dns_aaaa_verified=true
+# while unable to resolve a single hostname: the inbound proofs never look at
+# whether the guest's own resolver answers.
+
+
+async def _ready_vm(state, vm_id: str, launch_proof: dict) -> None:
+    async with state.orchestrator.db() as session:
+        session.add(
+            VMRow(
+                vm_id=vm_id,
+                owner_wallet="0xwallet",
+                status=VMStatus.READY,
+                size=VMSize.XS,
+                os="debian-13",
+                hostname="a37e2372.deploy.hyrule.host",
+                ipv6="2a0c:b641:b51:d0f8::2",
+                ssh_pubkey="ssh-ed25519 AAAA test",
+                open_ports=[22],
+                expires_at=_now() + timedelta(days=1),
+                cost_total=Decimal("0.05"),
+                metadata_={"launch_proof": launch_proof},
+            )
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_dns_resolution_failure_reports_degraded_not_ready(lp_state, client):
+    """The live defect: reachable + correct AAAA, but resolves nothing."""
+    await _ready_vm(
+        lp_state,
+        "vm_dns_broken",
+        {
+            "ssh_smoke_status": "passed",
+            "dns_aaaa_verified": True,
+            "dns_resolution_status": DNSResolutionStatus.FAILED.value,
+        },
+    )
+
+    body = (await client.get("/v1/vm/vm_dns_broken/status")).json()
+
+    assert body["dns_resolution_status"] == DNSResolutionStatus.FAILED
+    # NOT a clean provisioned — but the VM is delivered, so not `failed`
+    # either (that state promises a refund).
+    assert body["launch_proof_status"] == LaunchProofStatus.DEGRADED
+    assert body["status"] == VMStatus.READY
+    assert body["ssh_smoke_status"] == SSHSmokeStatus.PASSED
+    assert body["dns_aaaa_verified"] is True
+    customer = body["customer_message"]
+    assert customer != "Your VM is ready."
+    assert "resolve" in customer.lower()
+    # The customer can unblock themselves while the operator fixes the fleet.
+    assert "resolv.conf" in customer
+    assert "HYRULE_CUSTOMER_IPV6_DNS" in (body["operator_message"] or "")
+
+
+@pytest.mark.asyncio
+async def test_dns_resolution_failure_overrides_stale_ready_message(lp_state, client):
+    """A persisted "Your VM is ready." must not outrank the degraded message."""
+    await _ready_vm(
+        lp_state,
+        "vm_dns_stale_msg",
+        {
+            "ssh_smoke_status": "passed",
+            "dns_resolution_status": DNSResolutionStatus.FAILED.value,
+            "customer_message": "Your VM is ready.",
+        },
+    )
+
+    body = (await client.get("/v1/vm/vm_dns_stale_msg/status")).json()
+
+    assert body["launch_proof_status"] == LaunchProofStatus.DEGRADED
+    assert body["customer_message"] != "Your VM is ready."
+
+
+@pytest.mark.asyncio
+async def test_dns_resolution_passed_stays_provisioned(lp_state, client):
+    await _ready_vm(
+        lp_state,
+        "vm_dns_ok",
+        {
+            "ssh_smoke_status": "passed",
+            "dns_aaaa_verified": True,
+            "dns_resolution_status": DNSResolutionStatus.PASSED.value,
+        },
+    )
+
+    body = (await client.get("/v1/vm/vm_dns_ok/status")).json()
+
+    assert body["dns_resolution_status"] == DNSResolutionStatus.PASSED
+    assert body["launch_proof_status"] == LaunchProofStatus.PROVISIONED
+    assert body["customer_message"] == "Your VM is ready."
+
+
+@pytest.mark.asyncio
+async def test_dns_resolution_unmeasured_reports_not_run(lp_state, client):
+    """Rows provisioned before the probe existed say "not checked" — the
+    status is never inferred from the VM being READY, which is the class of
+    guess that shipped the broken VM."""
+    await _ready_vm(lp_state, "vm_dns_unmeasured", {"ssh_smoke_status": "passed"})
+
+    body = (await client.get("/v1/vm/vm_dns_unmeasured/status")).json()
+
+    assert body["dns_resolution_status"] == DNSResolutionStatus.NOT_RUN
+    assert body["launch_proof_status"] == LaunchProofStatus.PROVISIONED
+
+
+# --- The probe itself ---
+
+
+class _StubResolverProtocol(asyncio.DatagramProtocol):
+    """Minimal UDP DNS responder: answers every query with `answer` (or NODATA)."""
+
+    def __init__(self, answer: str | None) -> None:
+        self.answer = answer
+        self.transport: asyncio.DatagramTransport | None = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, addr: tuple) -> None:
+        import dns.message
+        import dns.rrset
+
+        query = dns.message.from_wire(data)
+        response = dns.message.make_response(query)
+        if self.answer is not None:
+            response.answer.append(
+                dns.rrset.from_text(
+                    query.question[0].name, 60, "IN", "AAAA", self.answer
+                )
+            )
+        assert self.transport is not None
+        self.transport.sendto(response.to_wire(), addr)
+
+
+def _probe_orchestrator(dns_servers: str, hostname: str = "deb.debian.org"):
+    """Minimal `self` for the probe helpers (mirrors the _probe_ssh tests)."""
+    from types import SimpleNamespace
+
+    from hyrule_cloud.orchestrator import Orchestrator
+
+    orch = SimpleNamespace(
+        config=SimpleNamespace(
+            customer_ipv6_dns=dns_servers,
+            customer_dns_probe_hostname=hostname,
+        )
+    )
+    orch._query_customer_resolver = partial(Orchestrator._query_customer_resolver, orch)
+    orch._probe_customer_dns_resolution = partial(
+        Orchestrator._probe_customer_dns_resolution, orch
+    )
+    return orch
+
+
+async def _stub_resolver(answer: str | None) -> tuple[asyncio.DatagramTransport, int]:
+    loop = asyncio.get_running_loop()
+    transport, _ = await loop.create_datagram_endpoint(
+        lambda: _StubResolverProtocol(answer), local_addr=("127.0.0.1", 0)
+    )
+    port = transport.get_extra_info("socket").getsockname()[1]
+    return transport, port
+
+
+@pytest.mark.asyncio
+async def test_dns_probe_passes_when_resolver_answers() -> None:
+    # A DNS64-synthesized AAAA for an IPv4-only host: what NAT64 needs.
+    transport, port = await _stub_resolver("64:ff9b::9765:8b1e")
+    try:
+        result = await _probe_orchestrator("127.0.0.1")._probe_customer_dns_resolution(
+            timeout_seconds=2, port=port
+        )
+    finally:
+        transport.close()
+    assert result is DNSResolutionStatus.PASSED
+
+
+@pytest.mark.asyncio
+async def test_dns_probe_fails_when_resolver_returns_no_address() -> None:
+    """NOERROR/NODATA: the resolver answers but synthesises nothing, so an
+    IPv6-only guest still cannot reach the name."""
+    transport, port = await _stub_resolver(None)
+    try:
+        result = await _probe_orchestrator("127.0.0.1")._probe_customer_dns_resolution(
+            timeout_seconds=2, port=port
+        )
+    finally:
+        transport.close()
+    assert result is DNSResolutionStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_dns_probe_fails_when_nothing_listens() -> None:
+    """The live outage: the address routes traffic and refuses port 53."""
+    transport, port = await _stub_resolver("64:ff9b::1")
+    transport.close()
+    await asyncio.sleep(0)
+
+    result = await _probe_orchestrator("127.0.0.1")._probe_customer_dns_resolution(
+        timeout_seconds=1, port=port
+    )
+    assert result is DNSResolutionStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_dns_probe_falls_back_to_second_resolver() -> None:
+    transport, port = await _stub_resolver("2606:4700:4700::1111")
+    try:
+        # 127.0.0.2:port has no listener; the second resolver answers.
+        result = await _probe_orchestrator(
+            "127.0.0.2, 127.0.0.1"
+        )._probe_customer_dns_resolution(timeout_seconds=1, port=port)
+    finally:
+        transport.close()
+    assert result is DNSResolutionStatus.PASSED
+
+
+@pytest.mark.asyncio
+async def test_dns_probe_not_run_without_configuration() -> None:
+    assert (
+        await _probe_orchestrator("")._probe_customer_dns_resolution(timeout_seconds=1)
+        is DNSResolutionStatus.NOT_RUN
+    )
+    assert (
+        await _probe_orchestrator("127.0.0.1", hostname="")._probe_customer_dns_resolution(
+            timeout_seconds=1
+        )
+        is DNSResolutionStatus.NOT_RUN
+    )
+
+
+@pytest.mark.asyncio
+async def test_dns_probe_swallows_unexpected_errors() -> None:
+    """An internal probe bug must not crash provisioning (that would fail a
+    paid VM) and must not mark a healthy fleet degraded — it reports not_run."""
+    orch = _probe_orchestrator("127.0.0.1")
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("probe exploded")
+
+    orch._query_customer_resolver = _boom
+
+    assert (
+        await orch._probe_customer_dns_resolution(timeout_seconds=1)
+        is DNSResolutionStatus.NOT_RUN
+    )
 
 
 def test_explicit_dns_verification_failure_is_not_papered_over() -> None:

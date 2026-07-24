@@ -752,6 +752,7 @@ async def get_vm_public_status(
         payment_status=lp["payment_status"],
         dns_aaaa_verified=lp["dns_aaaa_verified"],
         ssh_smoke_status=lp["ssh_smoke_status"],
+        dns_resolution_status=lp["dns_resolution_status"],
         rollback_available=lp["rollback_available"],
         operator_message=lp["operator_message"],
         customer_message=lp["customer_message"],

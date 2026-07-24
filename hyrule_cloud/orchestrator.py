@@ -12,9 +12,15 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from ipaddress import IPv6Address, IPv6Network
 from typing import TYPE_CHECKING
 
+import dns.exception
+import dns.message
+import dns.query
+import dns.rcode
+import dns.rdatatype
 import structlog
 from sqlalchemy import delete as sql_delete
 from sqlalchemy import func, select, text, update
@@ -34,6 +40,7 @@ from hyrule_cloud.middleware.anon_token import hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
     CryptoIntentStatus,
+    DNSResolutionStatus,
     DomainMode,
     SSHSmokeStatus,
     VMCreateRequest,
@@ -81,6 +88,11 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 _VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable cross-worker PostgreSQL lock key
+
+# RFC 6052 well-known NAT64 prefix. A DNS64 resolver synthesizes AAAA records
+# inside it for IPv4-only names, which is how an IPv6-only customer VM reaches
+# the IPv4 internet.
+_NAT64_PREFIX = IPv6Network("64:ff9b::/96")
 
 
 class VMCapacityError(RuntimeError):
@@ -816,9 +828,15 @@ class Orchestrator:
             # TCP :22 and confirm the AAAA on the authoritative server. An
             # unreachable sshd doesn't fail the VM, but the customer-visible
             # proof reports it honestly.
-            ssh_ok, dns_verified = await asyncio.gather(
+            #
+            # Both of those are INBOUND proofs. A VM can pass both and still be
+            # unusable because it cannot resolve a single hostname, so the
+            # outbound side (the resolver the guest was handed) is measured
+            # too. It never raises, so it cannot fail a paid VM.
+            ssh_ok, dns_verified, dns_resolution = await asyncio.gather(
                 self._probe_ssh(ipv6),
                 self.dns.verify_aaaa(subdomain, ipv6),
+                self._probe_customer_dns_resolution(),
             )
             if ssh_ok:
                 await self._emit(
@@ -835,6 +853,14 @@ class Orchestrator:
                         "The VM is still delivered — first boot may simply not have "
                         "finished; retry the connection shortly."
                     ),
+                )
+            if dns_resolution is DNSResolutionStatus.FAILED:
+                log.error(
+                    "customer_dns_resolution_failed",
+                    vm_id=vm_id,
+                    ipv6=ipv6,
+                    resolvers=parse_dns_servers(self.config.customer_ipv6_dns),
+                    probe_hostname=self.config.customer_dns_probe_hostname,
                 )
 
             # Update DB with final state
@@ -856,6 +882,11 @@ class Orchestrator:
                     SSHSmokeStatus.PASSED.value if ssh_ok else SSHSmokeStatus.FAILED.value
                 )
                 lp["dns_aaaa_verified"] = bool(dns_verified)
+                lp["dns_resolution_status"] = dns_resolution.value
+                if dns_resolution is DNSResolutionStatus.FAILED:
+                    # A stale "Your VM is ready." from an earlier pass would
+                    # otherwise outrank the degraded message.
+                    lp.pop("customer_message", None)
                 meta["launch_proof"] = lp
                 row.metadata_ = meta
 
@@ -1333,6 +1364,7 @@ class Orchestrator:
             lp = meta.get("launch_proof", {})
             lp["dns_aaaa_verified"] = True
             lp["ssh_smoke_status"] = "passed"
+            lp["dns_resolution_status"] = DNSResolutionStatus.PASSED.value
             meta["launch_proof"] = lp
             row.metadata_ = meta
             hostname = row.hostname
@@ -1375,6 +1407,135 @@ class Orchestrator:
                 if loop.time() + interval_seconds >= deadline:
                     return False
                 await asyncio.sleep(interval_seconds)
+
+    async def _probe_customer_dns_resolution(
+        self,
+        *,
+        timeout_seconds: float = 5.0,
+        port: int = 53,
+    ) -> DNSResolutionStatus:
+        """Prove the resolver a customer VM is handed can actually resolve.
+
+        Customer VMs are IPv6-only behind NAT64 and take their resolver from
+        HYRULE_CUSTOMER_IPV6_DNS, written verbatim into the guest netplan. If
+        that address answers no queries the guest cannot resolve ANY hostname
+        — apt-get, the customer's setup_script and every outbound connection
+        by name fail — while SSH from outside keeps working. That is exactly
+        how the inbound-only launch proof (TCP :22 + public AAAA) reported a
+        clean `ready` for a VM that was dead on arrival.
+
+        The probe runs against the resolver rather than inside the guest
+        because Hyrule holds no credentials on a customer VM: cloud-init
+        installs only the CUSTOMER's public key, and the "SSH smoke" is a bare
+        TCP connect, not a session. Querying the exact addresses the guest was
+        configured with, over the same UDP/53 the guest would use, measures
+        the failing component instead of inferring health from VM state.
+
+        Never raises: an unexpected internal error returns `not_run`, so a bug
+        in the probe can neither fail a paid VM nor mark a healthy fleet
+        degraded.
+        """
+        resolvers = parse_dns_servers(self.config.customer_ipv6_dns)
+        hostname = (self.config.customer_dns_probe_hostname or "").strip()
+        if not resolvers or not hostname:
+            log.warning(
+                "customer_dns_probe_skipped",
+                resolvers=resolvers,
+                hostname=hostname or None,
+            )
+            return DNSResolutionStatus.NOT_RUN
+
+        try:
+            for resolver in resolvers:
+                addresses = await self._query_customer_resolver(
+                    resolver,
+                    hostname,
+                    timeout_seconds=timeout_seconds,
+                    port=port,
+                )
+                if addresses is None:
+                    continue
+                log.info(
+                    "customer_dns_probe_answered",
+                    resolver=resolver,
+                    hostname=hostname,
+                    addresses=addresses,
+                    # A synthesized AAAA inside the well-known NAT64 prefix is
+                    # the positive evidence that DNS64 is on; without it, only
+                    # natively dual-stacked destinations are reachable.
+                    nat64_synthesized=any(
+                        IPv6Address(address) in _NAT64_PREFIX for address in addresses
+                    ),
+                )
+                return DNSResolutionStatus.PASSED
+        except Exception:
+            log.exception("customer_dns_probe_error", hostname=hostname)
+            return DNSResolutionStatus.NOT_RUN
+
+        return DNSResolutionStatus.FAILED
+
+    async def _query_customer_resolver(
+        self,
+        resolver: str,
+        hostname: str,
+        *,
+        timeout_seconds: float,
+        port: int = 53,
+    ) -> list[str] | None:
+        """Ask one customer resolver for AAAA records.
+
+        Returns the addresses, or None when the resolver did not usefully
+        answer. An empty AAAA answer counts as "did not answer": on an
+        IPv6-only NAT64 network a resolver that returns no AAAA for a name is
+        not DNS64-capable, so the guest cannot reach that name either way.
+        """
+        query = dns.message.make_query(hostname, dns.rdatatype.AAAA)
+        loop = asyncio.get_running_loop()
+        try:
+            response = await loop.run_in_executor(
+                None,
+                partial(
+                    dns.query.udp,
+                    query,
+                    resolver,
+                    timeout=timeout_seconds,
+                    port=port,
+                ),
+            )
+        except (OSError, EOFError, dns.exception.DNSException) as exc:
+            # Refused / unreachable / timed out: what a routing-only address
+            # does. A definite "no answer", not an internal error.
+            log.warning(
+                "customer_dns_probe_no_answer",
+                resolver=resolver,
+                hostname=hostname,
+                error=str(exc) or type(exc).__name__,
+            )
+            return None
+
+        if response.rcode() != dns.rcode.NOERROR:
+            log.warning(
+                "customer_dns_probe_rcode",
+                resolver=resolver,
+                hostname=hostname,
+                rcode=dns.rcode.to_text(response.rcode()),
+            )
+            return None
+
+        addresses = [
+            str(rdata.address)
+            for rrset in response.answer
+            if rrset.rdtype == dns.rdatatype.AAAA
+            for rdata in rrset
+        ]
+        if not addresses:
+            log.warning(
+                "customer_dns_probe_no_aaaa",
+                resolver=resolver,
+                hostname=hostname,
+            )
+            return None
+        return addresses
 
     async def _wait_for_ipv6(
         self,
