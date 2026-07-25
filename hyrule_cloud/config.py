@@ -310,6 +310,10 @@ class PaymentConfig(BaseSettings):
     # Network intelligence / agentic support API prices. These are contract
     # defaults; route implementations can compute dynamic prices around them.
     price_bgp_lookup: Decimal = Decimal("0.005")
+    # Real-time RIS collector query (dataset live_looking_glass). Priced above
+    # the snapshot lookup: it costs an extra upstream call and is the only
+    # dataset that can answer "is this announcement live right now".
+    price_bgp_looking_glass: Decimal = Decimal("0.01")
     price_bgp_router_query: Decimal = Decimal("0.01")
     price_bgpstream_hour: Decimal = Decimal("0.05")
     price_bgpstream_rib: Decimal = Decimal("0.10")

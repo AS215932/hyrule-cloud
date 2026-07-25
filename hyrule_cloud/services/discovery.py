@@ -417,7 +417,9 @@ _BGP_LOOKUP_PRICE = PriceSpec(
     "dynamic",
     (
         ("price_bgp_lookup", "0.005"),
-        ("price_bgp_router_query", "0.01"),
+        ("price_bgp_looking_glass", "0.01"),
+        # price_bgp_router_query intentionally absent: /lookup never charges it
+        # (see api/bgp.py::_lookup_price_attr) until the router vantage exists.
     ),
 )
 _BGP_JOB_PRICE = PriceSpec(
@@ -697,13 +699,27 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
     ),
     _body_operation(
         "/v1/bgp/lookup",
-        "Paid BGP/routing lookup by prefix, IP, ASN, or AS215932 router-table dataset",
+        (
+            "BGP/routing lookup by prefix, IP, or ASN. Every result is labelled with "
+            "its data freshness, so you can tell a live observation from a snapshot. "
+            "Choose the dataset by the question you are asking: "
+            "`live_looking_glass` ($0.01) queries RIS collector RIBs at request time "
+            "and is the ONLY dataset that can answer 'is this prefix propagating right "
+            "now?' — use it after any announcement, withdrawal, or filter change. "
+            "`public_routing` ($0.005) is a periodically-recomputed snapshot that can "
+            "be many hours stale; it is fine for 'who normally originates this?' but "
+            "will report a freshly-announced prefix as invisible. Responses carry "
+            "results.<source>.freshness{class,observed_at,age_seconds,stale} and mark "
+            "sources stale rather than silently returning old data. "
+            "`rpki` adds origin validation. `as215932_router_tables` is the internal "
+            "AS215932 vantage (not yet implemented; reports not_configured)."
+        ),
         _BGP_LOOKUP_PRICE,
         models.BGPLookupRequest,
         {
             "subject_type": "prefix",
             "subject_value": "2a0c:b641:b50::/44",
-            "datasets": ["public_routing", "rpki"],
+            "datasets": ["live_looking_glass", "public_routing", "rpki"],
             "views": ["origins", "rpki"],
             "sources": ["auto"],
             "limit": 500,
