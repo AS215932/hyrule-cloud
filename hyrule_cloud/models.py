@@ -90,6 +90,7 @@ class LaunchProofStatus(enum.StrEnum):
     PAYMENT_REQUIRED = "payment_required"
     PROVISIONING = "provisioning"
     PROVISIONED = "provisioned"
+    DEGRADED = "degraded"
     FAILED = "failed"
     ROLLED_BACK = "rolled_back"
 
@@ -104,6 +105,22 @@ class PaymentStatus(enum.StrEnum):
 
 class SSHSmokeStatus(enum.StrEnum):
     """Issue #28: SSH smoke-test result for the launch-proof contract."""
+
+    NOT_RUN = "not_run"
+    PASSED = "passed"
+    FAILED = "failed"
+
+
+class DNSResolutionStatus(enum.StrEnum):
+    """Customer-side DNS resolution result for the launch-proof contract.
+
+    Customer VMs are IPv6-only behind NAT64, so a resolver that does not
+    answer (or does not synthesise AAAA for IPv4-only names) leaves the guest
+    unable to resolve ANY hostname — `apt-get`, the customer's setup_script
+    and every outbound connection by name fail even though the VM is up and
+    reachable over SSH. `not_run` means no measurement was taken; it is never
+    inferred from the VM being READY.
+    """
 
     NOT_RUN = "not_run"
     PASSED = "passed"
@@ -355,6 +372,9 @@ class VMPublicStatusResponse(BaseModel):
     payment_status: PaymentStatus | None = None
     dns_aaaa_verified: bool = False
     ssh_smoke_status: SSHSmokeStatus = SSHSmokeStatus.NOT_RUN
+    # Outbound proof: can the VM actually resolve names with the resolver it
+    # was handed? `dns_aaaa_verified` only proves the INBOUND public record.
+    dns_resolution_status: DNSResolutionStatus = DNSResolutionStatus.NOT_RUN
     rollback_available: bool = False
     operator_message: str | None = None
     customer_message: str | None = None
