@@ -124,6 +124,35 @@ class XCPNGProvider(Provider):
                 )
                 await self._xo_drop_ws_locked()
                 await self._xo_connect_locked()
+                if method == "vm.create":
+                    # vm.create is not safe to blind-retry: XO may have
+                    # already executed the clone before the connection died,
+                    # and resending would create a second same-label guest.
+                    # The pre-create stale-clone sweep in orchestrator.py
+                    # can't catch this — it only runs before this call, not
+                    # after a mid-call reconnect. Check whether the clone
+                    # already landed under its name_label and adopt it
+                    # instead of creating a duplicate.
+                    name_label = params.get("name_label")
+                    if name_label is not None:
+                        vms = await self._xo_exchange(
+                            "xo.getAllObjects", filter={"type": "VM"}
+                        )
+                        existing_uuid = next(
+                            (
+                                uuid
+                                for uuid, record in (vms or {}).items()
+                                if record.get("name_label") == name_label
+                            ),
+                            None,
+                        )
+                        if existing_uuid is not None:
+                            log.warning(
+                                "xo_ws_reconnect_adopted_clone",
+                                name_label=name_label,
+                                uuid=existing_uuid,
+                            )
+                            return existing_uuid
                 return await self._xo_exchange(method, **params)
 
     async def _xo_exchange(self, method: str, **params: Any) -> Any:
