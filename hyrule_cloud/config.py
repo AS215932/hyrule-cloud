@@ -381,7 +381,22 @@ class HyruleConfig(BaseSettings):
     # relying on RA/DHCPv6.
     customer_ipv6_supernet: str = "2a0c:b641:b51::/48"
     customer_ipv6_gateway: str = "2a0c:b641:b51::1"
-    customer_ipv6_dns: str = "2a0c:b641:b51::1"
+    # Comma-separated resolvers written into every customer VM's netplan
+    # `nameservers.addresses`. Customer VMs are IPv6-only behind NAT64, so this
+    # MUST be a resolver that (a) actually answers on port 53 from the customer
+    # /64 and (b) is DNS64-capable — without AAAA synthesis into the NAT64
+    # prefix, IPv4-only destinations (most of the internet, including package
+    # mirrors) are unreachable by name. Pointing this at the gateway address
+    # because it is "the router" is the outage of 2026-07-24: it forwarded
+    # traffic perfectly and ran no resolver, so every VM shipped unable to
+    # resolve anything.
+    # AS215932's DNS64 resolver — verified answering from a customer /64 and
+    # synthesizing IPv4-only names into 64:ff9b::/96. NOT the gateway.
+    customer_ipv6_dns: str = "2a0c:b641:b50:2::1"
+    # Hostname the launch proof asks that resolver to resolve before calling a
+    # VM provisioned. Deliberately a real package-mirror name: it is what the
+    # first thing a customer VM does (apt-get update) depends on.
+    customer_dns_probe_hostname: str = "deb.debian.org"
 
     # Network intelligence / BGP data storage
     bgp_data_enabled: bool = True

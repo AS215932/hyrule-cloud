@@ -17,9 +17,11 @@ from hyrule_cloud.config import HyruleConfig, PaymentConfig
 from hyrule_cloud.services.discovery import (
     DISCOVERY,
     PAID_OPERATIONS,
+    SUPPORTING_OPERATIONS,
     build_curated_openapi,
     build_x402_manifest,
     enabled_paid_operations,
+    enabled_supporting_operations,
 )
 from tests.test_payment_gate_x402 import _FakeServer, _gate, _request
 
@@ -75,8 +77,16 @@ def test_every_catalog_operation_has_complete_x402_openapi_metadata(
     config = HyruleConfig()
     schema = build_curated_openapi(app, config)
 
-    assert _schema_operations(schema) == {operation.key for operation in PAID_OPERATIONS}
+    assert _schema_operations(schema) == {
+        operation.key for operation in PAID_OPERATIONS
+    } | {operation.key for operation in SUPPORTING_OPERATIONS}
     assert "/v1/domain/register" not in schema["paths"]
+
+    for supporting in SUPPORTING_OPERATIONS:
+        documented = schema["paths"][supporting.path][supporting.method.lower()]
+        assert documented["security"] == [], supporting.key
+        assert documented["x-payment-info"] == {"price": {"mode": "free"}}, supporting.key
+        assert "402" not in documented.get("responses", {}), supporting.key
 
     for operation in PAID_OPERATIONS:
         documented = schema["paths"][operation.path][operation.method.lower()]
@@ -219,7 +229,12 @@ def test_manifest_openapi_and_bazaar_share_the_same_enabled_catalog(
         (resource["method"], resource["path"])
         for resource in manifest["resources"]
     }
-    assert catalog_keys == manifest_keys == _schema_operations(schema) == set(DISCOVERY)
+    supporting_keys = {operation.key for operation in enabled_supporting_operations()}
+    # The manifest and Bazaar catalog stay paid-only; the OpenAPI document is
+    # the paid catalog plus the free supporting workflow routes.
+    assert catalog_keys == manifest_keys == set(DISCOVERY)
+    assert _schema_operations(schema) == catalog_keys | supporting_keys
+    assert not catalog_keys & supporting_keys
     assert all(resource["discoverable"] is True for resource in manifest["resources"])
     assert ("POST", "/v1/domain/register") not in catalog_keys
 

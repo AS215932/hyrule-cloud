@@ -94,6 +94,7 @@ from hyrule_cloud.providers.openprovider import (
 from hyrule_cloud.providers.rates import RateProvider
 from hyrule_cloud.services.intents import IntentExistsError, create_intent
 from hyrule_cloud.services.quotes import link_quote_vm
+from hyrule_cloud.services.vm_events import customer_failure_message
 
 log = structlog.get_logger()
 
@@ -138,6 +139,43 @@ class DomainService:
 
     async def close(self) -> None:
         await self.dns.close()
+
+    async def public_discovery_ready(self) -> bool:
+        """Report whether the domains product can honour a customer end to
+        end: discovery finds an eligible TLD *and* registration is not
+        gated off.
+
+        ``/v1/domains/tlds`` and ``/v1/domains/check`` fail closed with a 503
+        when the registrar catalog is missing or stale, so the discovery half
+        is read from that same predicate (``DomainCatalog.list_eligible``)
+        rather than re-derived from configuration. But a synced catalog does
+        not mean registration works: ``create_order`` still fails closed
+        through ``require_purchase_launch`` while the purchase/legal/tax
+        switches are off or managed DNS is not configured. The public status
+        page labels this component "Registration and authoritative DNS" and
+        uses this predicate to decide operational vs. not-launched, so it
+        must reflect both halves — a synced catalog alone flipping status to
+        operational while checkout still 503s is exactly the false claim this
+        method exists to prevent.
+        """
+        if not self._registration_launch_ready():
+            return False
+        try:
+            return bool(await self.catalog.list_eligible())
+        except DomainProblem:
+            return False
+
+    def _registration_launch_ready(self) -> bool:
+        """Non-raising mirror of `require_purchase_launch`'s gates, for
+        readiness reporting where a 503 with a Retry-After isn't wanted."""
+        cfg = self.domain_config
+        return bool(
+            cfg.enabled
+            and cfg.purchases_enabled
+            and cfg.legal_approved
+            and cfg.tax_approved
+            and self.dns.configured
+        )
 
     def require_purchase_launch(self, account_id: str) -> None:
         cfg = self.domain_config
@@ -2950,7 +2988,11 @@ class DomainService:
                                 domain.vm_id = None
                                 if bundle_vm is not None:
                                     bundle_vm.status = VMStatus.FAILED
-                                    bundle_vm.error = str(exc)[:1000]
+                                    # VMRow.error is customer-visible (VM status
+                                    # view + /logs), so it never carries the raw
+                                    # provider text; the order's error_detail
+                                    # keeps that for the operator.
+                                    bundle_vm.error = customer_failure_message(exc)
                                     bundle_vm.ipv6_prefix_index = None
                                     bundle_vm.ipv6_prefix = None
                         if Decimal(order.vm_amount_usd) > 0:

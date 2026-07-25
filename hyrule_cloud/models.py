@@ -90,6 +90,7 @@ class LaunchProofStatus(enum.StrEnum):
     PAYMENT_REQUIRED = "payment_required"
     PROVISIONING = "provisioning"
     PROVISIONED = "provisioned"
+    DEGRADED = "degraded"
     FAILED = "failed"
     ROLLED_BACK = "rolled_back"
 
@@ -104,6 +105,22 @@ class PaymentStatus(enum.StrEnum):
 
 class SSHSmokeStatus(enum.StrEnum):
     """Issue #28: SSH smoke-test result for the launch-proof contract."""
+
+    NOT_RUN = "not_run"
+    PASSED = "passed"
+    FAILED = "failed"
+
+
+class DNSResolutionStatus(enum.StrEnum):
+    """Customer-side DNS resolution result for the launch-proof contract.
+
+    Customer VMs are IPv6-only behind NAT64, so a resolver that does not
+    answer (or does not synthesise AAAA for IPv4-only names) leaves the guest
+    unable to resolve ANY hostname — `apt-get`, the customer's setup_script
+    and every outbound connection by name fail even though the VM is up and
+    reachable over SSH. `not_run` means no measurement was taken; it is never
+    inferred from the VM being READY.
+    """
 
     NOT_RUN = "not_run"
     PASSED = "passed"
@@ -355,6 +372,9 @@ class VMPublicStatusResponse(BaseModel):
     payment_status: PaymentStatus | None = None
     dns_aaaa_verified: bool = False
     ssh_smoke_status: SSHSmokeStatus = SSHSmokeStatus.NOT_RUN
+    # Outbound proof: can the VM actually resolve names with the resolver it
+    # was handed? `dns_aaaa_verified` only proves the INBOUND public record.
+    dns_resolution_status: DNSResolutionStatus = DNSResolutionStatus.NOT_RUN
     rollback_available: bool = False
     operator_message: str | None = None
     customer_message: str | None = None
@@ -593,9 +613,42 @@ class DNSRecord(BaseModel):
     ttl: int = 3600
     prio: int | None = None
 
+class VMEventKey(enum.StrEnum):
+    """Customer-visible provisioning lifecycle vocabulary (`GET /v1/vm/{id}/logs`).
+
+    This is a public contract: keys are stable and only ever added to, never
+    renamed or repurposed. Every key describes something the platform actually
+    observed — nothing here is inferred.
+    """
+
+    # Lifecycle
+    PROVISIONING_STARTED = "provisioning_started"
+    # Emitted INSTEAD of real infrastructure work when the deployment runs in
+    # simulation mode (HCP_LAUNCH_PROOF_REAL_XCPNG unset). Marks every later
+    # event on that VM as simulated.
+    PROVISIONING_SIMULATED = "provisioning_simulated"
+    CLOUD_INIT_PREPARED = "cloud_init_prepared"
+    SETUP_SCRIPT_INJECTED = "setup_script_injected"
+    VM_CREATED = "vm_created"
+    NETWORK_READY = "network_ready"
+    DNS_CREATED = "dns_created"
+    SSH_REACHABLE = "ssh_reachable"
+    SSH_UNREACHABLE = "ssh_unreachable"
+    CUSTOM_DOMAIN_ATTACHED = "custom_domain_attached"
+    CUSTOM_DOMAIN_ATTACH_FAILED = "custom_domain_attach_failed"
+    # Terminal
+    READY = "ready"
+    PROVISIONING_FAILED = "provisioning_failed"
+
+
 class VMLogEvent(BaseModel):
     ts: str
     event: str
+    # Human-readable, customer-safe. Never carries provider text.
+    message: str | None = None
+    # Small structured payload (hostname, ipv6, simulated flag, ...). Only ever
+    # holds data the customer already owns — never internal infrastructure ids.
+    detail: dict | None = None
 
 class VMLogsResponse(BaseModel):
     vm_id: str

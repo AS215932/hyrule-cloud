@@ -12,6 +12,7 @@ import os
 from typing import TYPE_CHECKING
 
 from hyrule_cloud.models import (
+    DNSResolutionStatus,
     LaunchProofStatus,
     PaymentStatus,
     SSHSmokeStatus,
@@ -22,6 +23,24 @@ if TYPE_CHECKING:
     from hyrule_cloud.config import HyruleConfig
 
 _LAUNCH_PROOF_REAL = os.environ.get("HCP_LAUNCH_PROOF_REAL_XCPNG") == "1"
+
+# Customer-visible wording for a VM that came up and is reachable but cannot
+# resolve DNS. It names a concrete fix because the resolver is operator-side:
+# the customer cannot wait for us and can unblock themselves in one line.
+DNS_RESOLUTION_CUSTOMER_MESSAGE = (
+    "Your VM is running and reachable over SSH, but it could not resolve DNS "
+    "names with the resolver we configured. Installing packages and reaching "
+    "hosts by name will fail until it is fixed. You can unblock yourself now "
+    "by putting a working DNS64 resolver in /etc/resolv.conf on the VM (for "
+    "example: nameserver 2001:4860:4860::6464). Our team has been notified — "
+    "contact support if you would rather have a refund."
+)
+
+DNS_RESOLUTION_OPERATOR_MESSAGE = (
+    "customer DNS resolution probe failed: the resolver in "
+    "HYRULE_CUSTOMER_IPV6_DNS did not answer queries. Every VM handed that "
+    "resolver is unable to resolve any hostname."
+)
 
 
 def use_real_provisioning() -> bool:
@@ -131,6 +150,28 @@ def build_launch_proof(
     else:
         ssh_smoke = SSHSmokeStatus.NOT_RUN
 
+    # --- Customer-side DNS resolution ---
+    # NEVER inferred from the VM being READY: a VM can be up, reachable and
+    # still unable to resolve anything (the resolver it was handed answers no
+    # queries). Only a real measurement moves this off `not_run`, so rows
+    # provisioned before the probe existed report "we did not check" rather
+    # than a guess.
+    explicit_resolution = lp_meta.get("dns_resolution_status")
+    if explicit_resolution is not None:
+        dns_resolution = DNSResolutionStatus(str(explicit_resolution))
+    else:
+        dns_resolution = DNSResolutionStatus.NOT_RUN
+
+    # A measured resolution failure must not read as a clean `provisioned`.
+    # The VM is delivered and usable, so it is not `failed` either (that state
+    # promises a refund and belongs to VMs that never came up) — it is
+    # explicitly degraded.
+    if (
+        dns_resolution == DNSResolutionStatus.FAILED
+        and launch_status == LaunchProofStatus.PROVISIONED
+    ):
+        launch_status = LaunchProofStatus.DEGRADED
+
     # --- Rollback availability ---
     rollback_available = bool(
         lp_meta.get("rollback_available", False)
@@ -161,11 +202,21 @@ def build_launch_proof(
         if not customer_message:
             customer_message = "Your VM is ready."
 
+    if launch_status == LaunchProofStatus.DEGRADED:
+        # Overrides any "Your VM is ready." written above (including one
+        # persisted by an earlier provisioning pass) — reporting a VM that
+        # cannot resolve DNS as simply ready is the defect this fixes.
+        if not customer_message or customer_message == "Your VM is ready.":
+            customer_message = DNS_RESOLUTION_CUSTOMER_MESSAGE
+        if not operator_message:
+            operator_message = DNS_RESOLUTION_OPERATOR_MESSAGE
+
     return {
         "launch_proof_status": launch_status,
         "payment_status": payment_status,
         "dns_aaaa_verified": dns_aaaa_verified,
         "ssh_smoke_status": ssh_smoke,
+        "dns_resolution_status": dns_resolution,
         "rollback_available": rollback_available,
         "operator_message": operator_message,
         "customer_message": customer_message,
