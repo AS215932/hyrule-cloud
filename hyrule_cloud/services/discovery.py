@@ -27,6 +27,7 @@ from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 
 from hyrule_cloud import models
 from hyrule_cloud.config import HyruleConfig, PaymentConfig
+from hyrule_cloud.domains import models as domain_models
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -42,6 +43,7 @@ class PriceSpec:
     mode: PriceMode
     fields: tuple[tuple[str, str], ...]
     bounded: bool = True
+    literal_min: Decimal | None = None
 
     def values(self, payment: PaymentConfig) -> tuple[Decimal, ...]:
         return tuple(
@@ -50,6 +52,8 @@ class PriceSpec:
         )
 
     def minimum(self, payment: PaymentConfig) -> Decimal:
+        if self.literal_min is not None:
+            return self.literal_min
         return min(self.values(payment))
 
     def maximum(self, payment: PaymentConfig) -> Decimal | None:
@@ -78,6 +82,7 @@ class PriceSpec:
 # Bazaar resource tags per catalog area (spec: <=5 tags, each <=32 ASCII).
 _TAG_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/vm", ("compute", "vps")),
+    ("/v1/domains", ("domains", "registration")),
     ("/v1/network", ("proxy", "tor", "anonymity")),
     ("/v1/bgp", ("network-intel", "bgp")),
     ("/v1/ip", ("network-intel", "ip")),
@@ -422,6 +427,14 @@ _BGP_JOB_PRICE = PriceSpec(
         ("price_bgpstream_rib", "0.10"),
     ),
 )
+_DOMAIN_REGISTRATION_PRICE = PriceSpec(
+    "dynamic",
+    (),
+    bounded=False,
+    # The provider component varies by TLD and live availability. Hyrule's
+    # configured fee floor is a guaranteed lower bound for discovery.
+    literal_min=Decimal("3.00"),
+)
 
 _GENERATED_AT = "2026-07-15T00:00:00Z"
 
@@ -613,8 +626,34 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         },
         gate="real_vm",
     ),
-    # Domain registration is intentionally absent. Its provider/readiness fix
-    # is deferred to a separate PR and will opt the operation back in here.
+    _body_operation(
+        "/v1/domains/registrations",
+        "Register an eligible domain for one year, owned by the x402 payer wallet",
+        _DOMAIN_REGISTRATION_PRICE,
+        domain_models.DomainRegistrationRequest,
+        {
+            "domain": "agent-example.xyz",
+            "client_order_id": "agent-order-20260719-0001",
+            "accept_terms": True,
+            "max_price_usd": "10.00",
+        },
+        domain_models.DomainRegistrationResponse,
+        {
+            "registration_id": "dr_a1b2c3d4e5f6g7h8i9j0kl",
+            "order_id": "do_a1b2c3d4e5f6g7h8i9j0kl",
+            "domain": "agent-example.xyz",
+            "status": "queued",
+            "amount_usd": "6.15",
+            "owner_wallet": "0x1111111111111111111111111111111111111111",
+            "terms_version": "2026-07-19",
+            "status_url": "/v1/domains/registrations/status/ds_a1b2c3d4e5f6g7h8i9j0kl",
+            "management_url": "/v1/domains/agent-example.xyz",
+            "operation_id": "dop_a1b2c3d4e5f6g7h8i9j0k",
+            "created_at": _GENERATED_AT,
+            "updated_at": _GENERATED_AT,
+        },
+        gate="domain_marketplace",
+    ),
     _body_operation(
         "/v1/network/request",
         "Make a micro-proxy network request over Direct, Tor, I2P, or Yggdrasil",
@@ -1031,9 +1070,46 @@ DISCOVERY: dict[tuple[str, str], dict[str, Any]] = {
 }
 
 
-def _gate_enabled(gate: str) -> bool:
+def _gate_enabled(gate: str, config: HyruleConfig | None = None) -> bool:
     if gate == "always":
         return True
+    if gate == "domain_marketplace":
+        configured = config or HyruleConfig()
+        domain = getattr(configured, "domain", None)
+        provider = getattr(configured, "openprovider", None)
+        if domain is None or provider is None:
+            # Lightweight config doubles used by unrelated paid endpoints predate
+            # domain sales. Missing domain settings must fail closed, not break
+            # discovery or request middleware for those endpoints.
+            return False
+        payment = getattr(configured, "payment", None)
+        return bool(
+            getattr(domain, "enabled", False)
+            and getattr(domain, "purchases_enabled", False)
+            and getattr(domain, "marketplace_sales_enabled", False)
+            and getattr(domain, "legal_approved", False)
+            and getattr(domain, "tax_approved", False)
+            and not getattr(domain, "marketplace_payer_allowlist", ())
+            and (
+                getattr(domain, "allow_all_eligible_tlds", False)
+                or getattr(domain, "tld_allowlist", ())
+            )
+            and getattr(domain, "dns_control_url", "")
+            and getattr(domain, "dns_control_secret", "")
+            and getattr(provider, "username", "")
+            and getattr(provider, "password", "")
+            and getattr(provider, "owner_handle", "")
+            and getattr(provider, "admin_handle", "")
+            and getattr(provider, "tech_handle", "")
+            and getattr(provider, "billing_handle", "")
+            # The gate is the fail-closed launch-readiness decision: every
+            # other flag can be on while checkout is still structurally
+            # unable to settle a 402 (no receiver configured, or every
+            # payment network disabled) and every attempt 503s.
+            and payment is not None
+            and getattr(payment, "receiver_address", "")
+            and payment.enabled_networks()
+        )
     if gate == "real_vm":
         from hyrule_cloud.services.launch_proof import use_real_provisioning
 
@@ -1078,10 +1154,16 @@ def _gate_enabled(gate: str) -> bool:
     raise ValueError(f"Unknown paid-operation gate: {gate}")
 
 
-def enabled_paid_operations() -> tuple[PaidOperation, ...]:
+def enabled_paid_operations(
+    config: HyruleConfig | None = None,
+) -> tuple[PaidOperation, ...]:
     """Return the launch catalog after applying deployment readiness gates."""
 
-    return tuple(operation for operation in PAID_OPERATIONS if _gate_enabled(operation.gate))
+    return tuple(
+        operation
+        for operation in PAID_OPERATIONS
+        if _gate_enabled(operation.gate, config)
+    )
 
 
 def enabled_supporting_operations() -> tuple[SupportingOperation, ...]:
@@ -1092,20 +1174,30 @@ def enabled_supporting_operations() -> tuple[SupportingOperation, ...]:
     )
 
 
-def discovery_for(method: str, path: str) -> dict[str, Any] | None:
+def discovery_for(
+    method: str,
+    path: str,
+    config: HyruleConfig | None = None,
+) -> dict[str, Any] | None:
     operation = _OPERATIONS_BY_KEY.get((method.upper(), path))
-    if operation is None or not _gate_enabled(operation.gate):
+    if operation is None or not _gate_enabled(operation.gate, config):
         return None
     return operation.declaration
 
 
-def match_enabled_operation(method: str, concrete_path: str) -> PaidOperation | None:
+def match_enabled_operation(
+    method: str,
+    concrete_path: str,
+    config: HyruleConfig | None = None,
+) -> PaidOperation | None:
     """Match a request URL to an enabled catalog path template."""
 
     wanted_method = method.upper()
     normalized_path = concrete_path.rstrip("/") or "/"
     for operation, path_regex in _PATH_MATCHERS:
-        if operation.method != wanted_method:
+        if operation.method != wanted_method or not _gate_enabled(
+            operation.gate, config
+        ):
             continue
         if not path_regex.fullmatch(normalized_path):
             continue
@@ -1113,7 +1205,10 @@ def match_enabled_operation(method: str, concrete_path: str) -> PaidOperation | 
     return None
 
 
-def match_enabled_operation_any_method(concrete_path: str) -> PaidOperation | None:
+def match_enabled_operation_any_method(
+    concrete_path: str,
+    config: HyruleConfig | None = None,
+) -> PaidOperation | None:
     """Match a request path to an enabled operation regardless of method.
 
     Catalog paths are method-unique, so this is unambiguous; used where only
@@ -1121,7 +1216,7 @@ def match_enabled_operation_any_method(concrete_path: str) -> PaidOperation | No
     """
     normalized_path = concrete_path.rstrip("/") or "/"
     for operation, path_regex in _PATH_MATCHERS:
-        if not _gate_enabled(operation.gate):
+        if not _gate_enabled(operation.gate, config):
             continue
         if path_regex.fullmatch(normalized_path):
             return operation
@@ -1130,6 +1225,7 @@ def match_enabled_operation_any_method(concrete_path: str) -> PaidOperation | No
 
 _CATALOG_PHRASES: tuple[tuple[str, str], ...] = (
     ("/v1/vm", "IPv6-native compute"),
+    ("/v1/domains", "one-year domain registration"),
     ("/v1/network", "outbound requests over Direct, Tor, I2P, or Yggdrasil"),
     ("/v1/bgp", "BGP/routing intelligence"),
     ("/v1/ip", "IP/ASN intelligence"),
@@ -1154,14 +1250,14 @@ _CATALOG_PHRASES: tuple[tuple[str, str], ...] = (
 )
 
 
-def service_overview() -> str:
+def service_overview(config: HyruleConfig | None = None) -> str:
     """Marketplace-ready capability copy assembled from enabled routes only.
 
     Generated from live gate state so a product that is gated off (VM
     simulation, missing prober/worker/provider) can never appear in
     manifest/OpenAPI marketing copy.
     """
-    enabled_paths = [operation.path for operation in enabled_paid_operations()]
+    enabled_paths = [operation.path for operation in enabled_paid_operations(config)]
     phrases: list[str] = []
     for prefix, phrase in _CATALOG_PHRASES:
         if phrase in phrases:
@@ -1175,13 +1271,22 @@ def service_overview() -> str:
     )
 
 
-def catalog_description() -> str:
+def catalog_description(config: HyruleConfig | None = None) -> str:
     """Public catalog description plus current launch-scope caveats."""
 
-    return f"{service_overview()} Domain registration is deferred from this launch catalog."
+    overview = service_overview(config)
+    if any(
+        operation.path == "/v1/domains/registrations"
+        for operation in enabled_paid_operations(config)
+    ):
+        return overview
+    return f"{overview} Domain registration is deferred from this launch catalog."
 
 
-def marketplace_resource_description(operation: PaidOperation) -> str:
+def marketplace_resource_description(
+    operation: PaidOperation,
+    config: HyruleConfig | None = None,
+) -> str:
     """Make any endpoint safe for a marketplace to select as service copy.
 
     Agentic Market currently derives its service overview from one endpoint's
@@ -1191,12 +1296,12 @@ def marketplace_resource_description(operation: PaidOperation) -> str:
     """
 
     endpoint = operation.description.rstrip(".")
-    return f"{service_overview()} This endpoint: {endpoint}."
+    return f"{service_overview(config)} This endpoint: {endpoint}."
 
 
 def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
     resources: list[dict[str, Any]] = []
-    for operation in enabled_paid_operations():
+    for operation in enabled_paid_operations(config):
         resource: dict[str, Any] = {
             "path": operation.path,
             "method": operation.method,
@@ -1212,7 +1317,7 @@ def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
     return {
         "x402Version": 2,
         "name": "Hyrule Cloud",
-        "description": catalog_description(),
+        "description": catalog_description(config),
         "resources": resources,
         "facilitator": getattr(config.payment, "facilitator_url", ""),
         "contact": "https://github.com/AS215932",
@@ -1295,7 +1400,7 @@ def _annotate_operation(
 def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[str, Any]:
     """Generate the sole OpenAPI document from enabled launch operations."""
 
-    enabled = enabled_paid_operations()
+    enabled = enabled_paid_operations(config)
     enabled_keys = {operation.key for operation in enabled}
     supporting = enabled_supporting_operations()
     supporting_keys = {operation.key for operation in supporting}
@@ -1312,7 +1417,7 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
         openapi_version=application.openapi_version,
         summary=application.summary,
         description=(
-            f"{catalog_description()} This OpenAPI document contains the launch-ready, "
+            f"{catalog_description(config)} This OpenAPI document contains the launch-ready, "
             "independently payable agent surface plus the free supporting routes "
             "(quotes, status polling, pricing, template catalog) required to complete "
             "those workflows."

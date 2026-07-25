@@ -171,7 +171,17 @@ class DomainConfig(BaseSettings):
     purchases_enabled: bool = False
     legal_approved: bool = False
     tax_approved: bool = False
-    terms_version: str = "2026-07-15"
+    terms_version: str = "2026-07-19"
+
+    # The public x402 registration surface has its own launch switch and
+    # cohort.  Account checkout can therefore remain available while a
+    # marketplace canary is restricted to known payer wallets.  Discovery is
+    # only published when the payer allowlist is empty.
+    marketplace_sales_enabled: bool = False
+    marketplace_payer_allowlist: list[str] = Field(default_factory=list)
+    allow_all_eligible_tlds: bool = False
+    registration_limit_per_24h: int = Field(default=5, ge=1, le=100)
+    marketplace_preflights_per_hour: int = Field(default=60, ge=1, le=10_000)
 
     quote_ttl_seconds: int = Field(default=900, ge=60, le=3600)
     catalog_sync_seconds: int = Field(default=21600, ge=300, le=86400)
