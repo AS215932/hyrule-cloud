@@ -210,6 +210,39 @@ class DomainConfig(BaseSettings):
     transfer_authcode_ttl_seconds: int = Field(default=900, ge=60, le=3600)
 
 
+class DNSBlocklistConfig(BaseSettings):
+    """Downloaded domain-list catalog and compiled lookup index."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="DNS_BLOCKLIST_", env_file=".env", extra="ignore"
+    )
+
+    enabled: bool = True
+    data_dir: Path = Path("/var/lib/hyrule-cloud/blocklists")
+    refresh_seconds: int = Field(default=21600, ge=300, le=86400)
+    stale_after_seconds: int = Field(default=172800, ge=3600, le=2592000)
+    max_age_seconds: int = Field(default=604800, ge=86400, le=7776000)
+    minimum_coverage: float = Field(default=0.75, ge=0.5, le=1.0)
+    request_timeout_seconds: float = Field(default=30.0, ge=3.0, le=120.0)
+    max_download_bytes: int = Field(default=250_000_000, ge=1_000_000)
+    minimum_change_ratio: float = Field(default=0.5, gt=0.0, le=1.0)
+    maximum_change_ratio: float = Field(default=2.5, ge=1.0, le=20.0)
+
+
+class DNSFilteringConfig(BaseSettings):
+    """Live public DNS-filter resolver matrix."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="DNS_FILTERING_", env_file=".env", extra="ignore"
+    )
+
+    enabled: bool = True
+    query_timeout_seconds: float = Field(default=3.0, ge=0.5, le=15.0)
+    overall_timeout_seconds: float = Field(default=6.0, ge=1.0, le=30.0)
+    cache_ttl_seconds: int = Field(default=60, ge=0, le=600)
+    minimum_conclusive_profiles: int = Field(default=6, ge=1, le=8)
+
+
 class PaymentConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PAYMENT_", env_file=".env", extra="ignore")
 
@@ -273,6 +306,8 @@ class PaymentConfig(BaseSettings):
     price_bgp_router_table: Decimal = Decimal("0.10")
     price_ip_lookup: Decimal = Decimal("0.003")
     price_dns_lookup: Decimal = Decimal("0.001")
+    price_dns_blocklist_check: Decimal = Decimal("0.003")
+    price_dns_filtering_check: Decimal = Decimal("0.01")
     price_rdap_lookup: Decimal = Decimal("0.003")
     price_whois_lookup: Decimal = Decimal("0.005")
     price_mx_check: Decimal = Decimal("0.005")
@@ -363,7 +398,22 @@ class HyruleConfig(BaseSettings):
     # relying on RA/DHCPv6.
     customer_ipv6_supernet: str = "2a0c:b641:b51::/48"
     customer_ipv6_gateway: str = "2a0c:b641:b51::1"
-    customer_ipv6_dns: str = "2a0c:b641:b51::1"
+    # Comma-separated resolvers written into every customer VM's netplan
+    # `nameservers.addresses`. Customer VMs are IPv6-only behind NAT64, so this
+    # MUST be a resolver that (a) actually answers on port 53 from the customer
+    # /64 and (b) is DNS64-capable — without AAAA synthesis into the NAT64
+    # prefix, IPv4-only destinations (most of the internet, including package
+    # mirrors) are unreachable by name. Pointing this at the gateway address
+    # because it is "the router" is the outage of 2026-07-24: it forwarded
+    # traffic perfectly and ran no resolver, so every VM shipped unable to
+    # resolve anything.
+    # AS215932's DNS64 resolver — verified answering from a customer /64 and
+    # synthesizing IPv4-only names into 64:ff9b::/96. NOT the gateway.
+    customer_ipv6_dns: str = "2a0c:b641:b50:2::1"
+    # Hostname the launch proof asks that resolver to resolve before calling a
+    # VM provisioned. Deliberately a real package-mirror name: it is what the
+    # first thing a customer VM does (apt-get update) depends on.
+    customer_dns_probe_hostname: str = "deb.debian.org"
 
     # Network intelligence / BGP data storage
     bgp_data_enabled: bool = True
@@ -392,4 +442,6 @@ class HyruleConfig(BaseSettings):
     xcpng: XCPNGConfig = Field(default_factory=XCPNGConfig)
     openprovider: OpenproviderConfig = Field(default_factory=OpenproviderConfig)
     domain: DomainConfig = Field(default_factory=DomainConfig)
+    dns_blocklists: DNSBlocklistConfig = Field(default_factory=DNSBlocklistConfig)
+    dns_filtering: DNSFilteringConfig = Field(default_factory=DNSFilteringConfig)
     payment: PaymentConfig = Field(default_factory=PaymentConfig)

@@ -6,7 +6,10 @@ import hashlib
 from ipaddress import IPv6Address, IPv6Network
 from typing import Any, cast
 
+import structlog
 import yaml  # type: ignore[import-untyped]
+
+log = structlog.get_logger()
 
 CUSTOMER_VM_INTERFACE = "enX0"
 CUSTOMER_VM_ADDRESS_HOST_ID = 2
@@ -80,10 +83,32 @@ def validate_customer_network_settings(*, supernet: str, gateway: str, dns: str)
     servers = parse_dns_servers(dns)
     if not servers:
         raise ValueError("at least one customer DNS server is required")
+    resolvers: list[IPv6Address] = []
     for server in servers:
         # DNS may live outside the supernet (public/DNS64 resolver) but must
         # be a valid IPv6 address.
-        IPv6Address(server)
+        resolvers.append(IPv6Address(server))
+
+    # The gateway address is a legitimate resolver address IF something is
+    # actually listening on port 53 there, so this cannot hard-fail boot —
+    # refusing to start would take a healthy fleet offline over a legal
+    # config. But it is the exact shape of the 2026-07-24 outage (the router
+    # forwarded traffic and ran no resolver, so every VM shipped unable to
+    # resolve any name), so it is never assumed to be intentional.
+    if any(resolver == gateway_ip for resolver in resolvers):
+        log.warning(
+            "customer_dns_equals_gateway",
+            gateway=str(gateway_ip),
+            dns=dns,
+            hint=(
+                "HYRULE_CUSTOMER_IPV6_DNS points at the customer gateway. That "
+                "address only routes traffic unless a DNS64-capable resolver is "
+                "listening on port 53 — verify with "
+                "`dig @<gateway> deb.debian.org AAAA` from a customer VM. "
+                "Customer VMs are IPv6-only behind NAT64 and cannot resolve "
+                "anything if it does not answer."
+            ),
+        )
 
 
 def render_debian_network_config(

@@ -133,6 +133,79 @@ class PaidOperation:
         return True
 
 
+@dataclass(frozen=True, slots=True)
+class SupportingOperation:
+    """A free route the curated OpenAPI publishes alongside the paid catalog.
+
+    Paid operations alone are not a usable contract: an agent that reads only
+    ``/openapi.json`` must also see the unpaid routes that complete each
+    workflow (quotes, status polling, pricing, template catalog). These carry
+    no 402 challenge and no Bazaar declaration — the manifest stays paid-only.
+    """
+
+    method: str
+    path: str
+    description: str
+    gate: str = "always"
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.method, self.path
+
+
+SUPPORTING_OPERATIONS: tuple[SupportingOperation, ...] = (
+    SupportingOperation("GET", "/v1/pricing", "Current price list for all resources"),
+    SupportingOperation(
+        "GET", "/v1/products/vms", "Machine-readable VM catalog with customization pricing"
+    ),
+    SupportingOperation("GET", "/v1/os/list", "Available OS templates"),
+    SupportingOperation(
+        "GET",
+        "/v1/payments/networks",
+        "Enabled payment networks, receiver address, and facilitator",
+    ),
+    SupportingOperation(
+        "POST",
+        "/v1/vm/quote",
+        "Lock a durable VM price quote (free; pass quote_id to POST /v1/vm/create)",
+        gate="real_vm",
+    ),
+    SupportingOperation(
+        "GET", "/v1/vm/quote/{quote_id}", "Reload a previously locked VM quote", gate="real_vm"
+    ),
+    SupportingOperation(
+        "GET",
+        "/v1/vm/{vm_id}/status",
+        "Public provisioning and launch-proof status poll",
+        gate="real_vm",
+    ),
+    SupportingOperation(
+        "GET",
+        "/v1/vm/{vm_id}",
+        "Full VM view including SSH target (management token required)",
+        gate="real_vm",
+    ),
+    SupportingOperation(
+        "GET",
+        "/v1/vm/{vm_id}/logs",
+        "Provisioning log events (management token required)",
+        gate="real_vm",
+    ),
+    SupportingOperation(
+        "POST",
+        "/v1/vm/{vm_id}/reboot",
+        "Hard reboot a VM (management token required)",
+        gate="real_vm",
+    ),
+    SupportingOperation(
+        "DELETE",
+        "/v1/vm/{vm_id}",
+        "Destroy a VM permanently (management token required)",
+        gate="real_vm",
+    ),
+)
+
+
 def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
     """Resolve internal ``#/$defs/...`` references by substitution.
 
@@ -424,6 +497,72 @@ _DNS_LOOKUP_OUTPUT = {
     "trace": [],
     "generated_at": _GENERATED_AT,
 }
+_DNS_BLOCKLIST_OUTPUT = {
+    "request_id": "diag_a1b2c3d4",
+    "input_domain": "example.com",
+    "normalized_domain": "example.com",
+    "verdict": "not_listed",
+    "categories": [],
+    "checked_source_count": 16,
+    "matched_source_count": 0,
+    "required_source_count": 16,
+    "results": [
+        {
+            "source_id": "easylist",
+            "source_name": "EasyList",
+            "categories": ["ads"],
+            "outcome": "not_listed",
+            "source_status": "ok",
+            "source_age_seconds": 300,
+        }
+    ],
+    "catalog_version": "blcat_a1b2c3d4",
+    "snapshot_id": "blsnap_20260719T000000-a1b2c3d4",
+    "partial": False,
+    "generated_at": _GENERATED_AT,
+}
+_DNS_FILTERING_OUTPUT = {
+    "request_id": "diag_a1b2c3d4",
+    "input_domain": "example.com",
+    "normalized_domain": "example.com",
+    "vantage": "hyrule",
+    "overall": "allowed",
+    "blocked_profile_count": 0,
+    "allowed_profile_count": 8,
+    "conclusive_profile_count": 8,
+    "total_profile_count": 8,
+    "profiles": [
+        {
+            "profile_id": "cloudflare_security",
+            "name": "Cloudflare Malware Blocking",
+            "provider": "Cloudflare",
+            "categories": ["phishing", "malware"],
+            "status": "allowed",
+            "reason": "filtered resolver returned usable addresses",
+            "filtered": [
+                {
+                    "record_type": "A",
+                    "rcode": "NOERROR",
+                    "answers": ["93.184.216.34"],
+                    "latency_ms": 18.2,
+                }
+            ],
+            "control": [
+                {
+                    "record_type": "A",
+                    "rcode": "NOERROR",
+                    "answers": ["93.184.216.34"],
+                    "latency_ms": 16.4,
+                }
+            ],
+            "observed_at": _GENERATED_AT,
+        }
+    ],
+    "partial": False,
+    "observed_at": _GENERATED_AT,
+    "cache_age_seconds": 0,
+    "generated_at": _GENERATED_AT,
+}
 _MX_CHECK_OUTPUT = {
     "request_id": "mx_a1b2c3d4",
     "tool": "mx",
@@ -594,6 +733,26 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
         },
         models.DNSLookupResponse,
         _DNS_LOOKUP_OUTPUT,
+    ),
+    _body_operation(
+        "/v1/dns/blocklists/check",
+        "Paid domain membership check across Hyrule's maintained catalog of common DNS-capable ad, privacy, and security blocklists",
+        _fixed("price_dns_blocklist_check", "0.003"),
+        models.DNSDomainCheckRequest,
+        {"domain": "example.com"},
+        models.DNSBlocklistCheckResponse,
+        _DNS_BLOCKLIST_OUTPUT,
+        gate="dns_blocklists",
+    ),
+    _body_operation(
+        "/v1/dns/filtering/check",
+        "Paid live DNS filtering comparison across curated public security and ads/tracking resolver profiles from Hyrule's vantage",
+        _fixed("price_dns_filtering_check", "0.01"),
+        models.DNSDomainCheckRequest,
+        {"domain": "example.com"},
+        models.DNSFilteringCheckResponse,
+        _DNS_FILTERING_OUTPUT,
+        gate="dns_filtering",
     ),
     _body_operation(
         "/v1/dns/propagation",
@@ -908,6 +1067,14 @@ def _gate_enabled(gate: str) -> bool:
         from hyrule_cloud.services.tunnel.readiness import tunnel_service_ready
 
         return tunnel_service_ready()
+    if gate == "dns_blocklists":
+        from hyrule_cloud.services.dns.blocklists import blocklist_catalog_ready
+
+        return blocklist_catalog_ready()
+    if gate == "dns_filtering":
+        from hyrule_cloud.services.dns.filtering import dns_filtering_enabled
+
+        return dns_filtering_enabled()
     raise ValueError(f"Unknown paid-operation gate: {gate}")
 
 
@@ -915,6 +1082,14 @@ def enabled_paid_operations() -> tuple[PaidOperation, ...]:
     """Return the launch catalog after applying deployment readiness gates."""
 
     return tuple(operation for operation in PAID_OPERATIONS if _gate_enabled(operation.gate))
+
+
+def enabled_supporting_operations() -> tuple[SupportingOperation, ...]:
+    """Free workflow routes whose readiness gate passes."""
+
+    return tuple(
+        operation for operation in SUPPORTING_OPERATIONS if _gate_enabled(operation.gate)
+    )
 
 
 def discovery_for(method: str, path: str) -> dict[str, Any] | None:
@@ -930,10 +1105,11 @@ def match_enabled_operation(method: str, concrete_path: str) -> PaidOperation | 
     wanted_method = method.upper()
     normalized_path = concrete_path.rstrip("/") or "/"
     for operation, path_regex in _PATH_MATCHERS:
-        if operation.method != wanted_method or not _gate_enabled(operation.gate):
+        if operation.method != wanted_method:
             continue
-        if path_regex.fullmatch(normalized_path):
-            return operation
+        if not path_regex.fullmatch(normalized_path):
+            continue
+        return operation if _gate_enabled(operation.gate) else None
     return None
 
 
@@ -957,7 +1133,15 @@ _CATALOG_PHRASES: tuple[tuple[str, str], ...] = (
     ("/v1/network", "outbound requests over Direct, Tor, I2P, or Yggdrasil"),
     ("/v1/bgp", "BGP/routing intelligence"),
     ("/v1/ip", "IP/ASN intelligence"),
-    ("/v1/dns", "DNS diagnostics"),
+    # Keyed to each operation's actual path rather than the whole /v1/dns
+    # prefix: /v1/dns/lookup is ungated, but blocklist membership and
+    # filtering evidence each have their own readiness gate
+    # (dns_blocklists / dns_filtering) and must not be advertised just
+    # because DNS diagnostics happens to be live.
+    ("/v1/dns/lookup", "DNS diagnostics"),
+    ("/v1/dns/propagation", "DNS diagnostics"),
+    ("/v1/dns/blocklists", "blocklist membership checks"),
+    ("/v1/dns/filtering", "filtering evidence"),
     ("/v1/rdap", "RDAP/WHOIS registry lookups"),
     ("/v1/whois", "RDAP/WHOIS registry lookups"),
     ("/v1/web", "web and deep TLS checks"),
@@ -1113,11 +1297,14 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
 
     enabled = enabled_paid_operations()
     enabled_keys = {operation.key for operation in enabled}
+    supporting = enabled_supporting_operations()
+    supporting_keys = {operation.key for operation in supporting}
+    documented_keys = enabled_keys | supporting_keys
     selected_routes = [
         route
         for route in application.routes
         if isinstance(route, APIRoute)
-        and any((method.upper(), route.path) in enabled_keys for method in route.methods)
+        and any((method.upper(), route.path) in documented_keys for method in route.methods)
     ]
     schema = get_openapi(
         title=application.title,
@@ -1125,8 +1312,10 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
         openapi_version=application.openapi_version,
         summary=application.summary,
         description=(
-            f"{catalog_description()} This OpenAPI document intentionally contains only "
-            "the launch-ready, independently payable agent surface."
+            f"{catalog_description()} This OpenAPI document contains the launch-ready, "
+            "independently payable agent surface plus the free supporting routes "
+            "(quotes, status polling, pricing, template catalog) required to complete "
+            "those workflows."
         ),
         routes=selected_routes,
         tags=application.openapi_tags,
@@ -1140,11 +1329,13 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
         external_docs=application.openapi_external_docs,
     )
     schema["info"]["x-guidance"] = (
-        "Every operation in this document is an independently payable x402 v2 "
-        "resource. Call it without payment to receive the Payment-Required "
-        "challenge, then retry the same method, URL, and input with a valid "
-        "payment signature. Routes omitted from this document are not part of "
-        "the agent launch catalog."
+        "Operations whose x-payment-info carries a price are independently "
+        "payable x402 v2 resources: call one without payment to receive the "
+        "Payment-Required challenge, then retry the same method, URL, and "
+        "input with a valid payment signature. Operations marked "
+        '{"price": {"mode": "free"}} are unpaid supporting routes for those '
+        "workflows. Routes omitted from this document are not part of the "
+        "agent launch catalog."
     )
     schema.setdefault("components", {}).setdefault("schemas", {})[
         "X402PaymentRequired"
@@ -1152,14 +1343,29 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
 
     for operation in enabled:
         _annotate_operation(schema, operation, config.payment)
+    for supporting_operation in supporting:
+        _annotate_supporting_operation(schema, supporting_operation)
 
     # Be exact even if a future APIRoute gains more than one method.
     for path, path_item in list(schema.get("paths", {}).items()):
         for method in list(path_item):
             if method.upper() in {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"}:
-                if (method.upper(), path) not in enabled_keys:
+                if (method.upper(), path) not in documented_keys:
                     del path_item[method]
-        if not any((method.upper(), path) in enabled_keys for method in path_item):
+        if not any((method.upper(), path) in documented_keys for method in path_item):
             del schema["paths"][path]
 
     return schema
+
+
+def _annotate_supporting_operation(
+    schema: dict[str, Any],
+    operation: SupportingOperation,
+) -> None:
+    openapi_operation = schema["paths"][operation.path][operation.method.lower()]
+    openapi_operation["security"] = []
+    openapi_operation["x-payment-info"] = {"price": {"mode": "free"}}
+    openapi_operation.setdefault("summary", operation.description)
+    openapi_operation["description"] = (
+        f"{operation.description}. Free supporting route — no x402 payment required."
+    )

@@ -183,23 +183,36 @@ async def create_vm(
                 setup_script=setup_script,
                 resources=resources,
             )
-            return (
-                f"VM created!\n"
-                f"  ID: {result['vm_id']}\n"
-                f"  Status: {result['status']}\n"
-                f"  Poll: {result['status_url']}\n"
-                f"  ETA: ~{result.get('estimated_ready_seconds', 60)}s"
-            )
+            lines = [
+                "VM created!",
+                f"  ID: {result['vm_id']}",
+                f"  Status: {result['status']}",
+                f"  Poll: {result['status_url']}",
+                f"  ETA: ~{result.get('estimated_ready_seconds', 60)}s",
+            ]
+            if result.get("management_token"):
+                # Shown once and only hashed server-side. Without it the
+                # logs/reboot/extend/destroy tools 404.
+                lines.append(f"  Management token: {result['management_token']} (save once!)")
+            return "\n".join(lines)
     except HyruleError as e:
         return _err(e)
 
 
 @mcp.tool()
-async def vm_status(vm_id: str) -> str:
-    """Get VM status: IP address, hostname, SSH command, expiry, firewall state."""
+async def vm_status(vm_id: str, management_token: str | None = None) -> str:
+    """Get VM status: IP address, hostname, expiry.
+
+    Polls the public status endpoint. Pass the one-time `management_token`
+    from create_vm to also get the SSH command, firewall state and error
+    detail — those live behind the management-gated full view.
+    """
     try:
         async with _client() as hc:
-            s = await hc.vm_status(vm_id)
+            if management_token:
+                s = await hc.vm_details(vm_id, management_token=management_token)
+            else:
+                s = await hc.vm_status(vm_id)
             lines = [
                 f"VM: {s['vm_id']}",
                 f"Status: {s['status']}",
@@ -223,11 +236,15 @@ async def vm_status(vm_id: str) -> str:
 
 
 @mcp.tool()
-async def extend_vm(vm_id: str, days: int) -> str:
-    """Add more days to a running VM. Payment required via x402."""
+async def extend_vm(vm_id: str, days: int, management_token: str | None = None) -> str:
+    """Add more days to a running VM. Payment required via x402.
+
+    Requires the one-time `management_token` from create_vm unless the VM is
+    owned by the authenticated account.
+    """
     try:
         async with _client() as hc:
-            result = await hc.extend_vm(vm_id, days)
+            result = await hc.extend_vm(vm_id, days, management_token=management_token)
             return (
                 f"VM {vm_id} extended.\n"
                 f"  New expiry: {result.get('new_expiry', 'unknown')}\n"
@@ -238,11 +255,12 @@ async def extend_vm(vm_id: str, days: int) -> str:
 
 
 @mcp.tool()
-async def reboot_vm(vm_id: str) -> str:
-    """Hard reboot a VM."""
+async def reboot_vm(vm_id: str, management_token: str | None = None) -> str:
+    """Hard reboot a VM. Requires the one-time `management_token` from create_vm
+    unless the VM is owned by the authenticated account."""
     try:
         async with _client() as hc:
-            await hc.reboot_vm(vm_id)
+            await hc.reboot_vm(vm_id, management_token=management_token)
             return f"VM {vm_id} is rebooting."
     except HyruleError as e:
         return _err(e)
@@ -316,11 +334,13 @@ async def revoke_tunnel(tunnel_id: str, token: str) -> str:
 
 
 @mcp.tool()
-async def destroy_vm(vm_id: str) -> str:
-    """Destroy a VM permanently. This cannot be undone."""
+async def destroy_vm(vm_id: str, management_token: str | None = None) -> str:
+    """Destroy a VM permanently. This cannot be undone. Requires the one-time
+    `management_token` from create_vm unless the VM is owned by the
+    authenticated account."""
     try:
         async with _client() as hc:
-            await hc.destroy_vm(vm_id)
+            await hc.destroy_vm(vm_id, management_token=management_token)
             return f"VM {vm_id} destroyed."
     except HyruleError as e:
         return _err(e)
@@ -722,6 +742,26 @@ async def dns_lookup(name: str, record_type: str = "A", dnssec: bool = False, tr
     try:
         async with _client() as hc:
             return str(await hc.dns_lookup(name, record_type, dnssec=dnssec, trace=trace))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def dns_blocklist_check(domain: str) -> str:
+    """Paid domain check across common DNS-capable ad, privacy, and security lists."""
+    try:
+        async with _client() as hc:
+            return str(await hc.dns_blocklist_check(domain))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def dns_filtering_check(domain: str) -> str:
+    """Paid live public DNS filtering check from Hyrule's network vantage."""
+    try:
+        async with _client() as hc:
+            return str(await hc.dns_filtering_check(domain))
     except HyruleError as e:
         return _err(e)
 

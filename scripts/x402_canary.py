@@ -18,7 +18,7 @@ Usage
 
   python x402_canary.py list                 # show tests + prices, no spend
   python x402_canary.py dns                  # cheapest first live spend ($0.001)
-  python x402_canary.py intel                # every network-intel probe (~$0.06)
+  python x402_canary.py intel                # every network-intel probe
   python x402_canary.py proxy                # direct + tor network requests
   python x402_canary.py domain --name mytest12345   # REAL account-owned registration
   python x402_canary.py tunnel               # provision a real 1h reverse tunnel, then revoke it
@@ -64,6 +64,18 @@ TESTS: dict[str, dict] = {
         "path": "/v1/dns/lookup",
         "body": {"name": "example.com", "type": "AAAA"},
         "usd": "0.001",
+        "group": "intel",
+    },
+    "dns-blocklists": {
+        "path": "/v1/dns/blocklists/check",
+        "body": {"domain": "example.com"},
+        "usd": "0.003",
+        "group": "intel",
+    },
+    "dns-filtering": {
+        "path": "/v1/dns/filtering/check",
+        "body": {"domain": "example.com"},
+        "usd": "0.01",
         "group": "intel",
     },
     "ip": {
@@ -348,6 +360,34 @@ async def _run_one(
         # not actually charged — a broken gate, not a passing canary.
         print("    !! paid 2xx with no successful settlement — route not charged; FAILING.")
         return False
+
+    if name == "dns-blocklists":
+        try:
+            payload = r.json()
+        except ValueError:
+            print("    !! blocklist canary returned non-JSON evidence; FAILING.")
+            return False
+        if (
+            not payload.get("snapshot_id")
+            or payload.get("checked_source_count", 0) < 12
+            or payload.get("verdict") not in {"listed", "not_listed", "inconclusive"}
+        ):
+            print("    !! blocklist canary omitted catalog/coverage evidence; FAILING.")
+            return False
+
+    if name == "dns-filtering":
+        try:
+            payload = r.json()
+        except ValueError:
+            print("    !! DNS filtering canary returned non-JSON evidence; FAILING.")
+            return False
+        if (
+            payload.get("conclusive_profile_count", 0) < 6
+            or payload.get("total_profile_count") != 8
+            or payload.get("overall") not in {"blocked", "allowed", "mixed"}
+        ):
+            print("    !! DNS filtering canary did not meet the paid evidence floor; FAILING.")
+            return False
 
     if name == "vm":
         if r.status_code != 202:
@@ -666,14 +706,18 @@ async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool, yes
                 # The status endpoint returns launch-proof fields FLAT (issue
                 # #28). The VM reaching READY is not enough: real provisioning
                 # can mark READY while the SSH smoke test or DNS AAAA check
-                # failed. The Phase-3d gate only passes if both verify.
+                # failed. Both of those are INBOUND proofs, so the gate also
+                # requires the VM's own resolver to answer — a VM that cannot
+                # resolve a hostname is not a shippable VM.
                 dns_ok = bool(sj.get("dns_aaaa_verified"))
                 ssh_smoke = sj.get("ssh_smoke_status")
-                proof_ok = dns_ok and ssh_smoke == "passed"
+                dns_resolution = sj.get("dns_resolution_status")
+                proof_ok = dns_ok and ssh_smoke == "passed" and dns_resolution == "passed"
                 icon = "✅" if proof_ok else "⚠️"
                 print(
                     f"\n    {icon} VM {st.upper()} — launch-proof: "
-                    f"ssh_smoke_status={ssh_smoke} dns_aaaa_verified={dns_ok}"
+                    f"ssh_smoke_status={ssh_smoke} dns_aaaa_verified={dns_ok} "
+                    f"dns_resolution_status={dns_resolution}"
                 )
                 print("       manually verify over IPv6:")
                 print(f"        ssh root@{host or ipv6}")
@@ -685,7 +729,8 @@ async def _poll_and_report_vm(create_resp: httpx.Response, *, destroy: bool, yes
                     )
                 if not proof_ok:
                     print(
-                        "    !! launch-proof did NOT verify (ssh smoke / DNS AAAA); FAILING gate."
+                        "    !! launch-proof did NOT verify (ssh smoke / DNS AAAA / "
+                        "customer DNS resolution); FAILING gate."
                     )
                 destroy_ok = await _maybe_destroy(poll, vm_id, mgmt_token, destroy=destroy, yes=yes)
                 return proof_ok and destroy_ok

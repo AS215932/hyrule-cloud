@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -153,6 +153,40 @@ class VMRow(Base):
         Index("ix_vms_ipv6_prefix_index", "ipv6_prefix_index", unique=True),
         Index("ix_vms_ipv6_prefix", "ipv6_prefix", unique=True),
     )
+
+
+class VMEventRow(Base):
+    """Append-only provisioning lifecycle log for one VM.
+
+    Customer-visible through `GET /v1/vm/{vm_id}/logs` (management-token gated).
+    Everything written here has already been sanitized by
+    `hyrule_cloud.services.vm_events` — no provider text, no XO/XAPI ids, no
+    internal management addresses, no tokens.
+
+    A dedicated table (rather than a JSON column on VMRow) because emission is
+    append-only from a background task while other writers are concurrently
+    mutating the VM row: an insert cannot lose a concurrent event the way a
+    read-modify-write of a JSON list can.
+    """
+
+    __tablename__ = "vm_events"
+
+    # Monotonic surrogate key: it is also the tie-break for events written
+    # inside the same clock tick, so chronological order is always well defined.
+    event_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vm_id: Mapped[str] = mapped_column(String(32), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    # A VMEventKey value. Stored as text so an older reader never fails on a
+    # newer key (the enum is additive by contract).
+    event: Mapped[str] = mapped_column(String(48))
+    message: Mapped[str | None] = mapped_column(Text)
+    detail: Mapped[dict | None] = mapped_column(_JSONB)
+
+    __table_args__ = (Index("ix_vm_events_vm_created", "vm_id", "created_at"),)
 
 
 class DomainRow(Base):

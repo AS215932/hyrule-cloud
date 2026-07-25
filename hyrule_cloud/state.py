@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from hyrule_cloud.providers.network_client import NetworkProvider
     from hyrule_cloud.providers.rates import RateProvider
     from hyrule_cloud.providers.tunnel_client import TunnelProvider
+    from hyrule_cloud.services.dns.blocklists import BlocklistService
+    from hyrule_cloud.services.dns.filtering import DNSFilteringService
     from hyrule_cloud.services.tunnel.service import TunnelService
 
 
@@ -40,6 +42,8 @@ class AppState:
     session_factory: Any | None = field(default=None)
     domains: DomainService | None = field(default=None)
     wallet_auth: WalletAuthService | None = field(default=None)
+    dns_blocklists: BlocklistService | None = field(default=None)
+    dns_filtering: DNSFilteringService | None = field(default=None)
 
 
 async def get_app_state(request: Request) -> AppState:
