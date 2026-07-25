@@ -424,9 +424,14 @@ async def test_domains_probe_failure_never_reports_operational_or_leaks_detail(
     )
 
     response = await client.get("/v1/status")
+    body = response.json()
 
-    components = {component["id"]: component for component in response.json()["components"]}
-    assert components["domains_dns"]["status"] == "not_launched"
+    components = {component["id"]: component for component in body["components"]}
+    # A probe failure is unknown, not "not launched" — collapsing the two
+    # would let _overall_status's NOT_LAUNCHED exclusion hide this from the
+    # public rollup, exactly the false "everything's fine" this test guards.
+    assert components["domains_dns"]["status"] == "unknown"
+    assert body["status"] == "unknown"
     assert "openprovider" not in response.text
     assert "credentials" not in response.text
 
@@ -446,8 +451,8 @@ async def test_domains_probe_timeout_never_reports_operational(status_state, cli
     body = (await client.get("/v1/status")).json()
 
     components = {component["id"]: component for component in body["components"]}
-    assert components["domains_dns"]["status"] == "not_launched"
-    assert body["status"] == "operational"
+    assert components["domains_dns"]["status"] == "unknown"
+    assert body["status"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -548,6 +553,49 @@ async def test_domain_launch_clears_cached_not_launched_state(status_state, clie
     assert components["domains_dns"]["status"] == "operational"
     assert components["domains_dns"]["message"] == "Registration and authoritative DNS"
     assert domains.calls == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_domains_regression_after_launch_is_unknown_not_hidden(status_state, client):
+    """Codex P1: a probe failure on an already-launched product must not
+    collapse into not_launched. _overall_status excludes not_launched from
+    the public rollup (by design, so a deferred product never cries wolf),
+    so mislabeling a real regression that way would make it vanish from
+    /v1/status instead of showing as a disruption."""
+    from hyrule_cloud.api import status as status_api
+
+    domains = _DomainsProduct(ready=True)
+    app.state._typed_state.domains = domains
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    launched = await client.get("/v1/status")
+    status_api._STATUS_CACHE["expires_at"] = 0.0
+    domains.error = RuntimeError("registrar catalog query timed out")
+
+    regressed = await client.get("/v1/status")
+    status_api._STATUS_CACHE["expires_at"] = 0.0
+    domains.error = None
+
+    recovered = await client.get("/v1/status")
+
+    launched_components = {c["id"]: c for c in launched.json()["components"]}
+    assert launched_components["domains_dns"]["status"] == "operational"
+
+    regressed_body = regressed.json()
+    regressed_components = {c["id"]: c for c in regressed_body["components"]}
+    assert regressed_components["domains_dns"]["status"] == "unknown"
+    # The whole point: this must surface in the global rollup, not hide
+    # behind the not_launched exclusion.
+    assert regressed_body["status"] == "unknown"
+
+    recovered_body = recovered.json()
+    recovered_components = {c["id"]: c for c in recovered_body["components"]}
+    assert recovered_components["domains_dns"]["status"] == "operational"
+    assert recovered_body["status"] == "operational"
 
 
 @pytest.mark.asyncio
