@@ -16,7 +16,10 @@ def test_bgp_prefix_lookup_contract_does_not_require_asn():
 
 
 def test_openapi_exposes_only_enabled_paid_launch_contracts():
-    from hyrule_cloud.services.discovery import enabled_paid_operations
+    from hyrule_cloud.services.discovery import (
+        enabled_paid_operations,
+        enabled_supporting_operations,
+    )
 
     paths = app.openapi()["paths"]
     actual = {
@@ -25,7 +28,9 @@ def test_openapi_exposes_only_enabled_paid_launch_contracts():
         for method in path_item
         if method.lower() in {"get", "post", "put", "delete", "patch"}
     }
-    expected = {operation.key for operation in enabled_paid_operations()}
+    expected = {operation.key for operation in enabled_paid_operations()} | {
+        operation.key for operation in enabled_supporting_operations()
+    }
 
     assert actual == expected
     for required in {

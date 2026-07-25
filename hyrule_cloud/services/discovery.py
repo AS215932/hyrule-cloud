@@ -132,6 +132,79 @@ class PaidOperation:
         return True
 
 
+@dataclass(frozen=True, slots=True)
+class SupportingOperation:
+    """A free route the curated OpenAPI publishes alongside the paid catalog.
+
+    Paid operations alone are not a usable contract: an agent that reads only
+    ``/openapi.json`` must also see the unpaid routes that complete each
+    workflow (quotes, status polling, pricing, template catalog). These carry
+    no 402 challenge and no Bazaar declaration — the manifest stays paid-only.
+    """
+
+    method: str
+    path: str
+    description: str
+    gate: str = "always"
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.method, self.path
+
+
+SUPPORTING_OPERATIONS: tuple[SupportingOperation, ...] = (
+    SupportingOperation("GET", "/v1/pricing", "Current price list for all resources"),
+    SupportingOperation(
+        "GET", "/v1/products/vms", "Machine-readable VM catalog with customization pricing"
+    ),
+    SupportingOperation("GET", "/v1/os/list", "Available OS templates"),
+    SupportingOperation(
+        "GET",
+        "/v1/payments/networks",
+        "Enabled payment networks, receiver address, and facilitator",
+    ),
+    SupportingOperation(
+        "POST",
+        "/v1/vm/quote",
+        "Lock a durable VM price quote (free; pass quote_id to POST /v1/vm/create)",
+        gate="real_vm",
+    ),
+    SupportingOperation(
+        "GET", "/v1/vm/quote/{quote_id}", "Reload a previously locked VM quote", gate="real_vm"
+    ),
+    SupportingOperation(
+        "GET",
+        "/v1/vm/{vm_id}/status",
+        "Public provisioning and launch-proof status poll",
+        gate="real_vm",
+    ),
+    SupportingOperation(
+        "GET",
+        "/v1/vm/{vm_id}",
+        "Full VM view including SSH target (management token required)",
+        gate="real_vm",
+    ),
+    SupportingOperation(
+        "GET",
+        "/v1/vm/{vm_id}/logs",
+        "Provisioning log events (management token required)",
+        gate="real_vm",
+    ),
+    SupportingOperation(
+        "POST",
+        "/v1/vm/{vm_id}/reboot",
+        "Hard reboot a VM (management token required)",
+        gate="real_vm",
+    ),
+    SupportingOperation(
+        "DELETE",
+        "/v1/vm/{vm_id}",
+        "Destroy a VM permanently (management token required)",
+        gate="real_vm",
+    ),
+)
+
+
 def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
     """Resolve internal ``#/$defs/...`` references by substitution.
 
@@ -884,6 +957,14 @@ def enabled_paid_operations() -> tuple[PaidOperation, ...]:
     return tuple(operation for operation in PAID_OPERATIONS if _gate_enabled(operation.gate))
 
 
+def enabled_supporting_operations() -> tuple[SupportingOperation, ...]:
+    """Free workflow routes whose readiness gate passes."""
+
+    return tuple(
+        operation for operation in SUPPORTING_OPERATIONS if _gate_enabled(operation.gate)
+    )
+
+
 def discovery_for(method: str, path: str) -> dict[str, Any] | None:
     operation = _OPERATIONS_BY_KEY.get((method.upper(), path))
     if operation is None or not _gate_enabled(operation.gate):
@@ -1080,11 +1161,14 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
 
     enabled = enabled_paid_operations()
     enabled_keys = {operation.key for operation in enabled}
+    supporting = enabled_supporting_operations()
+    supporting_keys = {operation.key for operation in supporting}
+    documented_keys = enabled_keys | supporting_keys
     selected_routes = [
         route
         for route in application.routes
         if isinstance(route, APIRoute)
-        and any((method.upper(), route.path) in enabled_keys for method in route.methods)
+        and any((method.upper(), route.path) in documented_keys for method in route.methods)
     ]
     schema = get_openapi(
         title=application.title,
@@ -1092,8 +1176,10 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
         openapi_version=application.openapi_version,
         summary=application.summary,
         description=(
-            f"{catalog_description()} This OpenAPI document intentionally contains only "
-            "the launch-ready, independently payable agent surface."
+            f"{catalog_description()} This OpenAPI document contains the launch-ready, "
+            "independently payable agent surface plus the free supporting routes "
+            "(quotes, status polling, pricing, template catalog) required to complete "
+            "those workflows."
         ),
         routes=selected_routes,
         tags=application.openapi_tags,
@@ -1107,11 +1193,13 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
         external_docs=application.openapi_external_docs,
     )
     schema["info"]["x-guidance"] = (
-        "Every operation in this document is an independently payable x402 v2 "
-        "resource. Call it without payment to receive the Payment-Required "
-        "challenge, then retry the same method, URL, and input with a valid "
-        "payment signature. Routes omitted from this document are not part of "
-        "the agent launch catalog."
+        "Operations whose x-payment-info carries a price are independently "
+        "payable x402 v2 resources: call one without payment to receive the "
+        "Payment-Required challenge, then retry the same method, URL, and "
+        "input with a valid payment signature. Operations marked "
+        '{"price": {"mode": "free"}} are unpaid supporting routes for those '
+        "workflows. Routes omitted from this document are not part of the "
+        "agent launch catalog."
     )
     schema.setdefault("components", {}).setdefault("schemas", {})[
         "X402PaymentRequired"
@@ -1119,14 +1207,29 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
 
     for operation in enabled:
         _annotate_operation(schema, operation, config.payment)
+    for supporting_operation in supporting:
+        _annotate_supporting_operation(schema, supporting_operation)
 
     # Be exact even if a future APIRoute gains more than one method.
     for path, path_item in list(schema.get("paths", {}).items()):
         for method in list(path_item):
             if method.upper() in {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"}:
-                if (method.upper(), path) not in enabled_keys:
+                if (method.upper(), path) not in documented_keys:
                     del path_item[method]
-        if not any((method.upper(), path) in enabled_keys for method in path_item):
+        if not any((method.upper(), path) in documented_keys for method in path_item):
             del schema["paths"][path]
 
     return schema
+
+
+def _annotate_supporting_operation(
+    schema: dict[str, Any],
+    operation: SupportingOperation,
+) -> None:
+    openapi_operation = schema["paths"][operation.path][operation.method.lower()]
+    openapi_operation["security"] = []
+    openapi_operation["x-payment-info"] = {"price": {"mode": "free"}}
+    openapi_operation.setdefault("summary", operation.description)
+    openapi_operation["description"] = (
+        f"{operation.description}. Free supporting route — no x402 payment required."
+    )
