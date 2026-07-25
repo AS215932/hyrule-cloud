@@ -40,6 +40,13 @@ def _enable_all_catalog_gates(monkeypatch: pytest.MonkeyPatch) -> None:
         "OPENPROVIDER_ADMIN_HANDLE": "admin",
         "OPENPROVIDER_TECH_HANDLE": "tech",
         "OPENPROVIDER_BILLING_HANDLE": "billing",
+        # domain_marketplace's readiness gate now also requires a configured
+        # receiver + an enabled payment network (checkout can't settle a 402
+        # without both, so publishing the endpoint without them 503s every
+        # attempt). PAYMENT_* has no test-time default; set it explicitly so
+        # this fixture keeps meaning "every domain_marketplace precondition
+        # is met", not "every precondition except payment readiness".
+        "PAYMENT_RECEIVER_ADDRESS": "0x000000000000000000000000000000000000dEaD",
     }.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(
@@ -258,6 +265,39 @@ def test_domain_registration_discovery_waits_for_public_cohort(
     )
     assert registration["minPrice"] == "3.00"
     assert "maxPrice" not in registration
+
+
+def test_domain_registration_discovery_waits_for_payment_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The domain_marketplace gate is the fail-closed launch-readiness
+    decision: every legal/DNS/registrar flag can be satisfied while checkout
+    is still structurally unable to settle a 402 (no receiver configured, or
+    every payment network disabled), and every attempt would 503. The
+    marketplace path must not be advertised in that state."""
+    _enable_all_catalog_gates(monkeypatch)
+
+    monkeypatch.setenv("PAYMENT_RECEIVER_ADDRESS", "")
+    no_receiver = build_x402_manifest(HyruleConfig())
+    assert "/v1/domains/registrations" not in {
+        resource["path"] for resource in no_receiver["resources"]
+    }
+
+    monkeypatch.setenv("PAYMENT_RECEIVER_ADDRESS", "0x000000000000000000000000000000000000dEaD")
+    config = HyruleConfig()
+    config.payment.payment_networks = [
+        network.__class__(**{**vars(network), "enabled": False})
+        for network in config.payment.payment_networks
+    ]
+    no_networks = build_x402_manifest(config)
+    assert "/v1/domains/registrations" not in {
+        resource["path"] for resource in no_networks["resources"]
+    }
+
+    ready = build_x402_manifest(HyruleConfig())
+    assert "/v1/domains/registrations" in {
+        resource["path"] for resource in ready["resources"]
+    }
 
 
 @pytest.mark.asyncio

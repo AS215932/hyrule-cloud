@@ -339,6 +339,82 @@ async def test_domain_purchase_launch_requires_every_approval(domain_service):
 
 
 @pytest.mark.asyncio
+async def test_marketplace_registration_rejects_tld_narrowed_since_last_sync(
+    domain_service,
+):
+    """DomainTLDRow.eligible is only recomputed on the next successful catalog
+    sync (default every 6h). An operator narrowing tld_allowlist for a canary
+    must take effect on the very next registration, not after the next sync
+    — the fixture's .dev row is still eligible=True from its original seed,
+    but the live config no longer allows .dev."""
+    service, _provider, _sessions = domain_service
+    service.domain_config.marketplace_sales_enabled = True
+    service.domain_config.tld_allowlist = ["com"]  # narrowed away from .dev
+    body = DomainRegistrationRequest(
+        domain="wallet-owned.dev",
+        client_order_id="registration-client-order-narrowed",
+        accept_terms=True,
+        max_price_usd=Decimal("13.00"),
+    )
+    with pytest.raises(DomainProblem) as exc:
+        await service.prepare_registration(body, request_account_id=None)
+    assert exc.value.code == "unsupported_tld"
+
+
+@pytest.mark.asyncio
+async def test_replay_rebind_to_changed_terms_requires_explicit_reaccept(
+    domain_service,
+):
+    """An EIP-3009 authorization doesn't bind a terms version. If terms
+    change between the initial unpaid 402 and a client's paid retry, an
+    intent replay must not be silently rebound to a fresh quote carrying the
+    new terms_version — that would let an authorization signed against the
+    old challenge settle while the order records acceptance of terms the
+    client never explicitly saw."""
+    service, _provider, _sessions = domain_service
+    service.domain_config.marketplace_sales_enabled = True
+    service.domain_config.tld_allowlist = ["dev"]
+    original_terms = service.domain_config.terms_version
+    body = DomainRegistrationRequest(
+        domain="terms-drift.dev",
+        client_order_id="registration-client-order-terms",
+        accept_terms=True,
+        max_price_usd=Decimal("13.00"),
+    )
+    intent, quote, order = await service.prepare_registration(body, request_account_id=None)
+    assert order is None
+    assert quote.terms_version == original_terms
+
+    service.domain_config.terms_version = "2099-01-01"
+
+    # Force the existing quote stale so the replay path must decide whether
+    # to auto-refresh it.
+    async with service.db() as session:
+        stored_quote = await session.get(DomainQuoteRow, quote.quote_id)
+        stored_quote.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    with pytest.raises(DomainProblem) as exc:
+        await service.prepare_registration(body, request_account_id=None)
+    assert exc.value.code == "terms_changed"
+
+    reaccepted = DomainRegistrationRequest(
+        domain="terms-drift.dev",
+        client_order_id="registration-client-order-terms",
+        accept_terms=True,
+        terms_version="2099-01-01",
+        max_price_usd=Decimal("13.00"),
+    )
+    refreshed_intent, refreshed_quote, refreshed_order = await service.prepare_registration(
+        reaccepted, request_account_id=None
+    )
+    assert refreshed_order is None
+    assert refreshed_intent.registration_id == intent.registration_id
+    assert refreshed_quote.quote_id != quote.quote_id
+    assert refreshed_quote.terms_version == "2099-01-01"
+
+
+@pytest.mark.asyncio
 async def test_marketplace_registration_is_wallet_bound_idempotent_and_rate_limited(
     domain_service,
 ):
@@ -1803,6 +1879,68 @@ async def test_settlement_ledger_recovers_lost_x402_order_handoff(domain_service
     assert current is not None and current.status == "queued"
     assert current.payment_tx == "0xrecover"
     assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_settlement_recovery_converts_expired_order_to_refund_due(domain_service):
+    """If the quote sweeper expires an order before this recovery pass sees
+    its settlement event, the customer is still charged — recovery must
+    route the order through the same late-payment handling create_order's
+    direct settlement path uses (-> refund_due), not silently mark the
+    registration settled while the order stays publicly "expired" with no
+    refund obligation on record."""
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote("recover-expired.dev", DomainAction.REGISTER, "H1234567890")
+    order, _ = await service.create_order(
+        DomainOrderRequest(
+            quote_id=quote.quote_id,
+            payment_method=DomainPaymentMethod.USDC,
+            terms_version=service.domain_config.terms_version,
+        ),
+        owner_account_id="H1234567890",
+        idempotency_key="recover-expired",
+    )
+    async with sessions() as session:
+        stored_order = await session.get(DomainOrderRow, order.order_id)
+        stored_order.status = "expired"
+        await session.commit()
+
+    ledger = PaymentLedger(sessions)
+    event = ledger.build_event(
+        event_type="settled",
+        resource_path="/v1/domains/orders",
+        method="POST",
+        amount=Decimal("13"),
+        network="eip155:8453",
+        asset="USDC",
+        payer="0x" + "4" * 40,
+        tx_hash="0xrecover-expired",
+        extra={"order_id": order.order_id, "domain": "recover-expired.dev"},
+    )
+    async with sessions() as session:
+        session.add(event)
+        await session.commit()
+
+    assert await service.recover_x402_handoffs() == 1
+    async with sessions() as session:
+        current = await session.get(DomainOrderRow, order.order_id)
+        refund_events = list(
+            await session.scalars(
+                select(PaymentEventRow).where(PaymentEventRow.event_type == "refund_owed")
+            )
+        )
+    assert current is not None
+    assert current.status == "refund_due"
+    assert current.error_code == "payment_after_expiry"
+    assert current.payment_tx == "0xrecover-expired"
+    matching = [
+        e for e in refund_events
+        if isinstance(e.extra, dict) and e.extra.get("order_id") == order.order_id
+    ]
+    assert len(matching) == 1
+
+    # A repeat scan must not recount the now-refund_due order.
+    assert await service.recover_x402_handoffs() == 0
 
 
 @pytest.mark.asyncio

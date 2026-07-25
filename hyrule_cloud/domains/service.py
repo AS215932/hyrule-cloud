@@ -197,7 +197,7 @@ class DomainService:
                 403, "account_not_allowlisted", "This account is not in the launch cohort."
             )
 
-    def require_marketplace_launch(self) -> None:
+    def require_marketplace_launch(self, tld: str | None = None) -> None:
         self._require_purchase_readiness()
         cfg = self.domain_config
         if not cfg.marketplace_sales_enabled:
@@ -214,6 +214,19 @@ class DomainService:
                 "Public domain registration has no approved TLD scope.",
                 headers={"Retry-After": "3600"},
             )
+        if tld is not None and not cfg.allow_all_eligible_tlds:
+            # DomainTLDRow.eligible is only recomputed on the next successful
+            # catalog sync (default every 6h), so it can lag a narrowed
+            # tld_allowlist: a canary that tightens the cohort must take
+            # effect on the next registration, not after the next sync.
+            # Check the live config directly rather than trust the cache.
+            allowlist = {item.lower().lstrip(".") for item in cfg.tld_allowlist}
+            if tld.lower().lstrip(".") not in allowlist:
+                raise DomainProblem(
+                    422,
+                    "unsupported_tld",
+                    "That top-level domain is not eligible for Hyrule registration.",
+                )
 
     def require_marketplace_payer(self, payer_address: str) -> None:
         payer = payer_address.lower()
@@ -404,8 +417,8 @@ class DomainService:
     ) -> tuple[DomainRegistrationIntentRow, DomainQuoteRow, DomainOrderRow | None]:
         """Create or replay the uncharged half of a marketplace checkout."""
 
-        self.require_marketplace_launch()
-        _, _, fqdn = normalize_registrable_domain(body.domain)
+        _, tld, fqdn = normalize_registrable_domain(body.domain)
+        self.require_marketplace_launch(tld)
         async with self.db() as session:
             existing = (
                 await session.execute(
@@ -429,6 +442,22 @@ class DomainService:
                 )
             intent, quote, order = await self._load_registration(existing.registration_id)
             if order is None and self._registration_quote_needs_refresh(quote):
+                if (
+                    quote.terms_version != self.domain_config.terms_version
+                    and body.terms_version != self.domain_config.terms_version
+                ):
+                    # An EIP-3009 authorization doesn't bind the terms
+                    # version, so silently rebinding to a fresh quote here
+                    # would let an authorization signed against the old
+                    # challenge settle while the order records acceptance of
+                    # terms the client never explicitly re-confirmed. Force a
+                    # new challenge instead of refreshing transparently.
+                    raise DomainProblem(
+                        409,
+                        "terms_changed",
+                        "The domain terms changed; request a new quote and "
+                        "resubmit with the current terms_version.",
+                    )
                 if body.quote_id:
                     self._validate_registration_quote(
                         quote,
@@ -1833,42 +1862,42 @@ class DomainService:
                             )
                         )
                     ).scalar_one_or_none()
-                    awaiting = bool(
-                        order is not None
-                        and order.status == DomainOrderStatus.AWAITING_PAYMENT.value
-                    )
-                if not awaiting:
-                    if registration is not None and order is not None:
-                        async with self.db() as session:
-                            stored = await session.get(
-                                DomainRegistrationIntentRow,
-                                registration.registration_id,
-                            )
-                            if stored is not None and stored.settlement_state != "settled":
-                                stored.settlement_state = "settled"
-                                stored.settled_at = stored.settled_at or _now()
-                                stored.updated_at = _now()
-                                await session.commit()
+                if order is None:
                     continue
-                await self._mark_paid(
-                    order_id,
-                    payer=event.payer_wallet or "unknown",
-                    tx_hash=event.tx_hash,
-                    payment_network=event.network,
-                    payment_asset=event.asset,
-                )
+                # _mark_paid only ever mutates AWAITING_PAYMENT/EXPIRED orders
+                # (every other status is its own no-op return there) — call it
+                # unconditionally rather than short-circuiting on non-awaiting
+                # orders the way this used to: that shortcut skipped EXPIRED
+                # orders entirely, leaving them stuck publicly "expired" with
+                # a settled payment_event and no refund. Restricting the
+                # recovered-count/settlement-state bookkeeping below to those
+                # two states keeps a repeat call idempotent (an already fully
+                # processed order — queued/paid/refund_due/etc. — must not be
+                # recounted every time this scans the ledger again).
+                actionable = order.status in {
+                    DomainOrderStatus.AWAITING_PAYMENT.value,
+                    DomainOrderStatus.EXPIRED.value,
+                }
+                if actionable:
+                    await self._mark_paid(
+                        order_id,
+                        payer=event.payer_wallet or "unknown",
+                        tx_hash=event.tx_hash,
+                        payment_network=event.network,
+                        payment_asset=event.asset,
+                    )
+                    recovered += 1
                 if registration is not None:
                     async with self.db() as session:
                         stored = await session.get(
                             DomainRegistrationIntentRow,
                             registration.registration_id,
                         )
-                        if stored is not None:
+                        if stored is not None and stored.settlement_state != "settled":
                             stored.settlement_state = "settled"
                             stored.settled_at = stored.settled_at or _now()
                             stored.updated_at = _now()
                             await session.commit()
-                recovered += 1
             if len(events) < limit:
                 break
             last = events[-1]

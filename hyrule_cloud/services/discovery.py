@@ -894,6 +894,7 @@ def _gate_enabled(gate: str, config: HyruleConfig | None = None) -> bool:
             # domain sales. Missing domain settings must fail closed, not break
             # discovery or request middleware for those endpoints.
             return False
+        payment = getattr(configured, "payment", None)
         return bool(
             getattr(domain, "enabled", False)
             and getattr(domain, "purchases_enabled", False)
@@ -913,6 +914,13 @@ def _gate_enabled(gate: str, config: HyruleConfig | None = None) -> bool:
             and getattr(provider, "admin_handle", "")
             and getattr(provider, "tech_handle", "")
             and getattr(provider, "billing_handle", "")
+            # The gate is the fail-closed launch-readiness decision: every
+            # other flag can be on while checkout is still structurally
+            # unable to settle a 402 (no receiver configured, or every
+            # payment network disabled) and every attempt 503s.
+            and payment is not None
+            and getattr(payment, "receiver_address", "")
+            and payment.enabled_networks()
         )
     if gate == "real_vm":
         from hyrule_cloud.services.launch_proof import use_real_provisioning

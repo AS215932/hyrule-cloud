@@ -204,6 +204,12 @@ class DomainRegistrationRequest(BaseModel):
     domain: FQDN
     client_order_id: str = Field(min_length=16, max_length=128)
     accept_terms: Literal[True]
+    # `accept_terms` alone only proves a checkbox was ticked, not which terms
+    # text the client actually saw — an EIP-3009 payment authorization never
+    # binds a terms version either. Required whenever a registration attempt
+    # could rebind to terms newer than the one its (possibly already-signed)
+    # authorization was obtained under; see prepare_registration.
+    terms_version: str | None = Field(default=None, min_length=1, max_length=32)
     quote_id: str | None = Field(default=None, min_length=8, max_length=40)
     max_price_usd: Decimal | None = Field(default=None, ge=Decimal("0"))
 
