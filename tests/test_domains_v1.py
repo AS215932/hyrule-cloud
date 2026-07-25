@@ -330,6 +330,37 @@ async def test_domain_purchase_launch_requires_every_approval(domain_service):
 
 
 @pytest.mark.asyncio
+async def test_public_discovery_ready_reflects_registration_launch_gates(domain_service):
+    """A synced, eligible catalog alone must not report the domains product
+    as ready — the status page's "Registration and authoritative DNS"
+    component would flip to operational while `create_order` still 503s
+    through `require_purchase_launch`, one gate at a time."""
+    service, _provider, _sessions = domain_service
+
+    # Fixture starts fully launched (purchases/legal/tax approved, catalog
+    # has an eligible TLD, DNS configured) — sanity check it reports ready.
+    assert await service.public_discovery_ready() is True
+
+    service.domain_config.purchases_enabled = False
+    assert await service.public_discovery_ready() is False
+
+    service.domain_config.purchases_enabled = True
+    service.domain_config.legal_approved = False
+    assert await service.public_discovery_ready() is False
+
+    service.domain_config.legal_approved = True
+    service.domain_config.tax_approved = False
+    assert await service.public_discovery_ready() is False
+
+    service.domain_config.tax_approved = True
+    service.dns.configured = False
+    assert await service.public_discovery_ready() is False
+
+    service.dns.configured = True
+    assert await service.public_discovery_ready() is True
+
+
+@pytest.mark.asyncio
 async def test_paid_order_is_idempotent_and_fulfills_through_outbox(domain_service):
     service, provider, sessions = domain_service
     quote = await service.create_quote("example.dev", DomainAction.REGISTER, "H1234567890")

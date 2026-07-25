@@ -141,19 +141,41 @@ class DomainService:
         await self.dns.close()
 
     async def public_discovery_ready(self) -> bool:
-        """Report whether public domain discovery can answer a customer.
+        """Report whether the domains product can honour a customer end to
+        end: discovery finds an eligible TLD *and* registration is not
+        gated off.
 
-        ``/v1/domains/tlds`` and ``/v1/domains/check`` both fail closed with a
-        503 when the registrar catalog is missing or stale, so readiness is
-        read from that same predicate (``DomainCatalog.list_eligible``) rather
-        than re-derived from configuration. The public status page uses this so
-        it can never advertise the product as operational while its own entry
-        points reject every customer.
+        ``/v1/domains/tlds`` and ``/v1/domains/check`` fail closed with a 503
+        when the registrar catalog is missing or stale, so the discovery half
+        is read from that same predicate (``DomainCatalog.list_eligible``)
+        rather than re-derived from configuration. But a synced catalog does
+        not mean registration works: ``create_order`` still fails closed
+        through ``require_purchase_launch`` while the purchase/legal/tax
+        switches are off or managed DNS is not configured. The public status
+        page labels this component "Registration and authoritative DNS" and
+        uses this predicate to decide operational vs. not-launched, so it
+        must reflect both halves — a synced catalog alone flipping status to
+        operational while checkout still 503s is exactly the false claim this
+        method exists to prevent.
         """
+        if not self._registration_launch_ready():
+            return False
         try:
             return bool(await self.catalog.list_eligible())
         except DomainProblem:
             return False
+
+    def _registration_launch_ready(self) -> bool:
+        """Non-raising mirror of `require_purchase_launch`'s gates, for
+        readiness reporting where a 503 with a Retry-After isn't wanted."""
+        cfg = self.domain_config
+        return bool(
+            cfg.enabled
+            and cfg.purchases_enabled
+            and cfg.legal_approved
+            and cfg.tax_approved
+            and self.dns.configured
+        )
 
     def require_purchase_launch(self, account_id: str) -> None:
         cfg = self.domain_config
