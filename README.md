@@ -44,7 +44,8 @@ Hyrule Cloud API (FastAPI + x402 SDK)
 | `/v1/vm/create`       | POST   | Yes  | Provision a bare VM          |
 | `/v1/vm/quote`        | POST   | No   | Lock exact resources + price |
 | `/v1/products/vms`    | GET    | No   | Profiles + customization     |
-| `/v1/vm/{id}`         | GET    | No   | Status, IP, expiry           |
+| `/v1/vm/{id}/status`  | GET    | No   | Public status, IP, expiry    |
+| `/v1/vm/{id}`         | GET    | No   | Full view (management token) |
 | `/v1/vm/{id}/extend`  | POST   | Yes  | Add days to VM               |
 | `/v1/vm/{id}/reboot`  | POST   | No   | Hard reboot                  |
 | `/v1/vm/{id}`         | DELETE | No   | Destroy VM                   |
@@ -92,6 +93,32 @@ the dedicated worker):
 
 ```bash
 docker compose up
+```
+
+## Python Client
+
+`hyrule_cloud.client.HyruleClient` is the agent-facing async client. It is not
+published to PyPI yet — `pip install hyrule-cloud` 404s — so consumers install
+from git:
+
+```bash
+pip install "git+https://github.com/AS215932/hyrule-cloud"
+```
+
+Given a funded EVM key it settles 402s on its own, under a hard per-call spend
+cap and pinned to one chain:
+
+```python
+import os
+from hyrule_cloud.client import HyruleClient
+
+async with HyruleClient(
+    "https://cloud.hyrule.host",
+    private_key=os.environ["HYRULE_AGENT_KEY"],
+    max_usd_per_call="5.00",
+) as hc:
+    result = await hc.provision_vm(duration_days=7, size="sm", ssh_pubkey=PUBKEY)
+    print(result.ssh, result.management_token, result.settlement.transaction)
 ```
 
 ## XCP-NG Template Preparation
