@@ -20,6 +20,7 @@ from typing import Any
 
 import structlog
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 from hyrule_cloud.config import XCPNGConfig
 from hyrule_cloud.models import VM_SPECS, VMOrderResources, VMSize
@@ -87,16 +88,43 @@ class XCPNGProvider(Provider):
                 "session.signInWithToken", token=self.config.xo_token
             )
         except Exception:
-            await self._xo_ws.close()
-            self._xo_ws = None
+            await self._xo_drop_ws_locked()
             raise
         log.info("xo_login_success", user=(result or {}).get("email"))
+
+    async def _xo_drop_ws_locked(self) -> None:
+        """Drop the cached socket while the caller holds _xo_rpc_lock."""
+        ws, self._xo_ws = self._xo_ws, None
+        if ws is None:
+            return
+        try:
+            await ws.close()
+        except Exception:  # Best effort — the socket is usually already dead.
+            log.debug("xo_ws_close_failed", exc_info=True)
 
     async def _xo_call(self, method: str, **params: Any) -> Any:
         async with self._xo_rpc_lock:
             if self._xo_ws is None:
                 await self._xo_connect_locked()
-            return await self._xo_exchange(method, **params)
+            try:
+                return await self._xo_exchange(method, **params)
+            except ConnectionClosed as exc:
+                # The persistent socket died since the last call — typically a
+                # keepalive ping timeout after an idle period, while XO itself
+                # is still reachable. Drop the dead socket and retry exactly
+                # once on a fresh, re-authenticated connection; a second
+                # failure propagates so genuine XO outages still surface.
+                # Doing this under _xo_rpc_lock prevents a reconnect stampede:
+                # concurrent callers queue on the lock and find the fresh
+                # socket already in place.
+                log.warning(
+                    "xo_ws_reconnect",
+                    method=method,
+                    reason=str(exc),
+                )
+                await self._xo_drop_ws_locked()
+                await self._xo_connect_locked()
+                return await self._xo_exchange(method, **params)
 
     async def _xo_exchange(self, method: str, **params: Any) -> Any:
         """Perform one exchange while the caller holds _xo_rpc_lock."""
@@ -250,9 +278,7 @@ class XCPNGProvider(Provider):
 
     async def logout(self) -> None:
         async with self._xo_rpc_lock:
-            if self._xo_ws:
-                await self._xo_ws.close()
-                self._xo_ws = None
+            await self._xo_drop_ws_locked()
 
     # --- VM Lifecycle ---
 
