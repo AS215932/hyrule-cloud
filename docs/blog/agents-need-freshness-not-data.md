@@ -52,7 +52,9 @@ collectors: 4   peer entries: 6
 as_paths: ['49544 58057 215932', '58057 215932', '56755 215932']
 ```
 
-Live. Propagating. Visible via both our transit and our IX. The issue was filed on a false premise, and the "fix" it demanded was unnecessary.
+Live. Propagating. Visible via both our transit and our IX. The issue was filed on a false premise, and the fix it demanded — register IRR objects, chase the upstream — was not the thing standing in the way.
+
+There's a second-order lesson in the correction, too. Once we measured properly, comparing the more-specific against the covering aggregate as a control, the real constraint appeared: the /48s reached *exactly* the same six peer-paths as the aggregate did via that upstream. Nothing was being filtered. That upstream just has a small footprint — about 1.6% of the observed paths to our network. "Being filtered" and "announced through a transit with narrow reach" look identical if you only measure the prefix you changed. You need the control to tell them apart, and an agent will only think to use one if the tooling makes freshness and comparison natural rather than expert knowledge.
 
 ## Why this is an agent problem specifically
 
