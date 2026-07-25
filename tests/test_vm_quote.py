@@ -332,6 +332,7 @@ async def test_real_mode_quote_returns_503_when_live_capacity_is_exhausted(
 
     assert res.status_code == 503
     assert res.json()["detail"] == "The requested VM does not fit current host capacity"
+    assert res.headers["Retry-After"] == "300"
     async with quote_state.orchestrator.db() as session:
         quotes = list((await session.scalars(select(VMQuoteRow))).all())
     assert quotes == []

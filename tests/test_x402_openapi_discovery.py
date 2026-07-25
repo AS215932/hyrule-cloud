@@ -17,9 +17,11 @@ from hyrule_cloud.config import HyruleConfig, PaymentConfig
 from hyrule_cloud.services.discovery import (
     DISCOVERY,
     PAID_OPERATIONS,
+    SUPPORTING_OPERATIONS,
     build_curated_openapi,
     build_x402_manifest,
     enabled_paid_operations,
+    enabled_supporting_operations,
 )
 from tests.test_payment_gate_x402 import _FakeServer, _gate, _request
 
@@ -77,6 +79,14 @@ def _enable_all_catalog_gates(monkeypatch: pytest.MonkeyPatch) -> None:
         "hyrule_cloud.api.bgp.router_snapshot_download_enabled",
         lambda: True,
     )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.tunnel.readiness.tunnel_service_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.blocklists.blocklist_catalog_ready",
+        lambda: True,
+    )
 
 
 def _schema_operations(schema: dict) -> set[tuple[str, str]]:
@@ -95,8 +105,16 @@ def test_every_catalog_operation_has_complete_x402_openapi_metadata(
     config = HyruleConfig()
     schema = build_curated_openapi(app, config)
 
-    assert _schema_operations(schema) == {operation.key for operation in PAID_OPERATIONS}
+    assert _schema_operations(schema) == {
+        operation.key for operation in PAID_OPERATIONS
+    } | {operation.key for operation in SUPPORTING_OPERATIONS}
     assert "/v1/domain/register" not in schema["paths"]
+
+    for supporting in SUPPORTING_OPERATIONS:
+        documented = schema["paths"][supporting.path][supporting.method.lower()]
+        assert documented["security"] == [], supporting.key
+        assert documented["x-payment-info"] == {"price": {"mode": "free"}}, supporting.key
+        assert "402" not in documented.get("responses", {}), supporting.key
 
     for operation in PAID_OPERATIONS:
         documented = schema["paths"][operation.path][operation.method.lower()]
@@ -239,7 +257,12 @@ def test_manifest_openapi_and_bazaar_share_the_same_enabled_catalog(
         (resource["method"], resource["path"])
         for resource in manifest["resources"]
     }
-    assert catalog_keys == manifest_keys == _schema_operations(schema) == set(DISCOVERY)
+    supporting_keys = {operation.key for operation in enabled_supporting_operations()}
+    # The manifest and Bazaar catalog stay paid-only; the OpenAPI document is
+    # the paid catalog plus the free supporting workflow routes.
+    assert catalog_keys == manifest_keys == set(DISCOVERY)
+    assert _schema_operations(schema) == catalog_keys | supporting_keys
+    assert not catalog_keys & supporting_keys
     assert all(resource["discoverable"] is True for resource in manifest["resources"])
     assert ("POST", "/v1/domain/register") not in catalog_keys
 
@@ -298,6 +321,62 @@ def test_domain_registration_discovery_waits_for_payment_readiness(
     assert "/v1/domains/registrations" in {
         resource["path"] for resource in ready["resources"]
     }
+
+
+def test_dns_marketing_copy_is_gated_independently_per_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blocklist membership and filtering evidence must not be advertised
+    just because /v1/dns/lookup (ungated) is live: each has its own
+    readiness gate, and the previous combined /v1/dns phrase ignored that."""
+    from hyrule_cloud.services.discovery import service_overview
+
+    _enable_all_catalog_gates(monkeypatch)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.blocklists.blocklist_catalog_ready",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.filtering.dns_filtering_enabled",
+        lambda: False,
+    )
+    copy = service_overview()
+    assert "DNS diagnostics" in copy
+    assert "blocklist membership" not in copy
+    assert "filtering evidence" not in copy
+
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.blocklists.blocklist_catalog_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.filtering.dns_filtering_enabled",
+        lambda: True,
+    )
+    copy = service_overview()
+    assert "blocklist membership" in copy
+    assert "filtering evidence" in copy
+
+
+def test_supporting_routes_follow_their_readiness_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_all_catalog_gates(monkeypatch)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning",
+        lambda: False,
+    )
+    config = HyruleConfig()
+    schema = build_curated_openapi(app, config)
+    operations = _schema_operations(schema)
+
+    # Simulated provisioning: no VM routes (paid or supporting) may be
+    # advertised, while the always-on catalog/pricing routes remain.
+    assert not {key for key in operations if "/v1/vm/" in key[1]}
+    assert ("GET", "/v1/pricing") in operations
+    assert ("GET", "/v1/products/vms") in operations
+    assert ("GET", "/v1/os/list") in operations
+    assert ("GET", "/v1/payments/networks") in operations
 
 
 @pytest.mark.asyncio

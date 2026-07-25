@@ -8,7 +8,7 @@ or `/.well-known/x402.json` and pay with USDC on Base. Four service groups:
 - **Compute** — bare IPv6-native VMs with SSH, automatic HTTPS subdomains, and optional custom domains.
 - **Domains & DNS** — quoted registration and renewal, managed or external
   nameservers, DNSSEC, transfer-out, and revisioned DNS management.
-- **Network intelligence** — BGP/routing over AS215932's own tables plus RouteViews/RIPE RIS, IP geolocation/ASN/reputation, DNS (lookup, propagation, DNSSEC, record recommendations), RDAP/WHOIS, web reachability and deep TLS grading, MXToolbox-compatible mail deliverability (MX/SPF/DKIM/DMARC/blacklist/bounce), port and NAT/CGNAT reachability, and VoIP/SIP diagnostics.
+- **Network intelligence** — BGP/routing over AS215932's own tables plus RouteViews/RIPE RIS, IP geolocation/ASN/reputation, DNS (lookup, propagation, DNSSEC, domain blocklist membership, and live public filtering-resolver evidence), RDAP/WHOIS, web reachability and deep TLS grading, MXToolbox-compatible mail deliverability (MX/SPF/DKIM/DMARC/blacklist/bounce), port and NAT/CGNAT reachability, and VoIP/SIP diagnostics.
 - **Network proxy** — outbound requests over Direct, Tor, I2P, or Yggdrasil.
 
 ## Architecture
@@ -33,6 +33,7 @@ Hyrule Cloud API (FastAPI + x402 SDK)
   |-- DNS control API    Signed customer zones on ns1/ns2.hyrule.host
   |-- OpenProvider       Registrar-only registration and renewal
   |-- PostgreSQL         Persistent state (VMs, domains, tunnels)
+  |-- Blocklist index    Worker-built, atomically published read-only SQLite snapshots
   |-- x402 facilitator   Payment verification and settlement (official SDK)
   |-- network proxy      Internal Go sidecar for paid Direct/Tor/I2P/Yggdrasil requests
 ```
@@ -44,7 +45,8 @@ Hyrule Cloud API (FastAPI + x402 SDK)
 | `/v1/vm/create`       | POST   | Yes  | Provision a bare VM          |
 | `/v1/vm/quote`        | POST   | No   | Lock exact resources + price |
 | `/v1/products/vms`    | GET    | No   | Profiles + customization     |
-| `/v1/vm/{id}`         | GET    | No   | Status, IP, expiry           |
+| `/v1/vm/{id}/status`  | GET    | No   | Public status, IP, expiry    |
+| `/v1/vm/{id}`         | GET    | No   | Full view (management token) |
 | `/v1/vm/{id}/extend`  | POST   | Yes  | Add days to VM               |
 | `/v1/vm/{id}/reboot`  | POST   | No   | Hard reboot                  |
 | `/v1/vm/{id}`         | DELETE | No   | Destroy VM                   |
@@ -59,6 +61,10 @@ Hyrule Cloud API (FastAPI + x402 SDK)
 | `/v1/pricing`         | GET    | No   | Current pricing              |
 | `/v1/os/list`         | GET    | No   | Available OS templates       |
 | `/v1/network/request` | POST   | Yes  | One paid network request     |
+| `/v1/dns/blocklists/check` | POST | Yes | Common DNS-capable list membership ($0.003) |
+| `/v1/dns/filtering/check` | POST | Yes | Live public filtering-resolver matrix ($0.01) |
+| `/v1/dns/blocklists/sources` | GET | No | Catalog licensing, freshness, and readiness |
+| `/v1/dns/filtering/resolvers` | GET | No | Fixed resolver profiles and controls |
 
 VM profiles use technical names (`1C-1G-10G` through `4C-4G-40G`) and can be
 customized during ordering up to 4 vCPU, 8 GB RAM, and 40 GB SSD. See
@@ -92,6 +98,32 @@ the dedicated worker):
 
 ```bash
 docker compose up
+```
+
+## Python Client
+
+`hyrule_cloud.client.HyruleClient` is the agent-facing async client. It is not
+published to PyPI yet — `pip install hyrule-cloud` 404s — so consumers install
+from git:
+
+```bash
+pip install "git+https://github.com/AS215932/hyrule-cloud"
+```
+
+Given a funded EVM key it settles 402s on its own, under a hard per-call spend
+cap and pinned to one chain:
+
+```python
+import os
+from hyrule_cloud.client import HyruleClient
+
+async with HyruleClient(
+    "https://cloud.hyrule.host",
+    private_key=os.environ["HYRULE_AGENT_KEY"],
+    max_usd_per_call="5.00",
+) as hc:
+    result = await hc.provision_vm(duration_days=7, size="sm", ssh_pubkey=PUBKEY)
+    print(result.ssh, result.management_token, result.settlement.transaction)
 ```
 
 ## XCP-NG Template Preparation
@@ -163,6 +195,14 @@ VMs are suspended at expiry, destroyed after a 48h grace period.
 payment, checks sidecar mode availability, and then delegates execution to the
 internal `hyrule-network-proxy` Go sidecar. Supported modes are `direct`, `tor`,
 `i2p`, and `yggdrasil`; residential proxying is intentionally not offered.
+
+The DNS blocklist product searches one normalized domain against the exact
+catalog published by `/v1/dns/blocklists/sources`. The worker refreshes and
+compiles that catalog; the endpoint disappears from x402 discovery when the
+snapshot cannot meet its freshness/coverage floor. The live DNS filtering
+product compares fixed security and ads/tracking DoH profiles with unfiltered
+controls from Hyrule's vantage. Both prepare evidence before settlement, so
+source outages and inconclusive fanout are not charged.
 
 ## Database
 

@@ -1,7 +1,7 @@
 """Public x402 domain-registration checkout intents.
 
-Revision ID: 017
-Revises: 016
+Revision ID: 019
+Revises: 018
 Create Date: 2026-07-19
 """
 
@@ -11,8 +11,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision: str = "017"
-down_revision: str | None = "016"
+revision: str = "019"
+down_revision: str | None = "018"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

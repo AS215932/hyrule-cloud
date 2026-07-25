@@ -14,6 +14,10 @@ if TYPE_CHECKING:
     from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
     from hyrule_cloud.providers.network_client import NetworkProvider
     from hyrule_cloud.providers.rates import RateProvider
+    from hyrule_cloud.providers.tunnel_client import TunnelProvider
+    from hyrule_cloud.services.dns.blocklists import BlocklistService
+    from hyrule_cloud.services.dns.filtering import DNSFilteringService
+    from hyrule_cloud.services.tunnel.service import TunnelService
 
 
 @dataclass
@@ -22,6 +26,10 @@ class AppState:
     orchestrator: Orchestrator
     payment_gate: PaymentGate
     network_provider: NetworkProvider
+    # Reverse-SSH tunnel path. Optional so existing tests can wire only what they
+    # need; the tunnel routes 501 when these are absent.
+    tunnel_provider: TunnelProvider | None = field(default=None)
+    tunnel_service: TunnelService | None = field(default=None)
     # Block E: native crypto path. Optional so existing tests can wire only
     # what they need; routes that require them check for None.
     native_crypto: NativeCryptoProvider | None = field(default=None)
@@ -34,6 +42,8 @@ class AppState:
     session_factory: Any | None = field(default=None)
     domains: DomainService | None = field(default=None)
     wallet_auth: WalletAuthService | None = field(default=None)
+    dns_blocklists: BlocklistService | None = field(default=None)
+    dns_filtering: DNSFilteringService | None = field(default=None)
 
 
 async def get_app_state(request: Request) -> AppState:

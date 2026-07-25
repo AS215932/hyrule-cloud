@@ -5,12 +5,13 @@ Domain models for Hyrule Cloud resources.
 from __future__ import annotations
 
 import enum
+import ipaddress
 import secrets
 import string
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Block A0: widen vm_id from 48-bit hex (vm_<12 hex>) to ~131-bit base62
 # (vm_<22 base62>). The legacy 48-bit space was borderline guessable; with
@@ -90,6 +91,7 @@ class LaunchProofStatus(enum.StrEnum):
     PAYMENT_REQUIRED = "payment_required"
     PROVISIONING = "provisioning"
     PROVISIONED = "provisioned"
+    DEGRADED = "degraded"
     FAILED = "failed"
     ROLLED_BACK = "rolled_back"
 
@@ -104,6 +106,22 @@ class PaymentStatus(enum.StrEnum):
 
 class SSHSmokeStatus(enum.StrEnum):
     """Issue #28: SSH smoke-test result for the launch-proof contract."""
+
+    NOT_RUN = "not_run"
+    PASSED = "passed"
+    FAILED = "failed"
+
+
+class DNSResolutionStatus(enum.StrEnum):
+    """Customer-side DNS resolution result for the launch-proof contract.
+
+    Customer VMs are IPv6-only behind NAT64, so a resolver that does not
+    answer (or does not synthesise AAAA for IPv4-only names) leaves the guest
+    unable to resolve ANY hostname — `apt-get`, the customer's setup_script
+    and every outbound connection by name fail even though the VM is up and
+    reachable over SSH. `not_run` means no measurement was taken; it is never
+    inferred from the VM being READY.
+    """
 
     NOT_RUN = "not_run"
     PASSED = "passed"
@@ -355,6 +373,9 @@ class VMPublicStatusResponse(BaseModel):
     payment_status: PaymentStatus | None = None
     dns_aaaa_verified: bool = False
     ssh_smoke_status: SSHSmokeStatus = SSHSmokeStatus.NOT_RUN
+    # Outbound proof: can the VM actually resolve names with the resolver it
+    # was handed? `dns_aaaa_verified` only proves the INBOUND public record.
+    dns_resolution_status: DNSResolutionStatus = DNSResolutionStatus.NOT_RUN
     rollback_available: bool = False
     operator_message: str | None = None
     customer_message: str | None = None
@@ -467,6 +488,69 @@ class NetworkResponse(BaseModel):
     elapsed_seconds: float
     proxy_mode: ProxyMode
     error: str | None = None
+
+
+class TunnelCreateRequest(BaseModel):
+    """Provision a reverse-SSH tunnel for a host behind NAT.
+
+    The host runs `ssh -N -R 0:localhost:<port> <token>@<endpoint> -p 2222` and
+    becomes reachable on the allocated public TCP port.
+    """
+
+    # Absolute sanity ceiling only; the configured tunnel_min_hours/
+    # tunnel_max_hours window is enforced in the route so deployments can
+    # tighten (or widen up to this cap) the policy without a schema change.
+    hours: int = Field(ge=1, le=8760, description="Lease duration in hours")
+    allowlist_cidrs: list[str] | None = Field(
+        default=None,
+        max_length=64,
+        description="Optional source-CIDR allowlist for visitors; omit to allow all",
+    )
+
+    @field_validator("allowlist_cidrs")
+    @classmethod
+    def _validate_cidrs(cls, value: list[str] | None) -> list[str] | None:
+        # Fail closed: a typo'd restriction must be rejected, never silently
+        # dropped (which would leave the port open to everyone).
+        if value is None:
+            return None
+        if len(value) == 0:
+            # An explicit empty list is ambiguous (deny-all vs the "omit to allow
+            # all" contract) — reject it so it can't be silently treated as open.
+            raise ValueError("allowlist_cidrs must be non-empty; omit the field to allow all visitors")
+        for entry in value:
+            try:
+                ipaddress.ip_network(entry, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"invalid CIDR in allowlist_cidrs: {entry!r}") from exc
+        return value
+
+
+class TunnelExtendRequest(BaseModel):
+    hours: int = Field(ge=1, le=8760, description="Additional hours to add")
+
+
+class TunnelResponse(BaseModel):
+    tunnel_id: str
+    token: str | None = Field(
+        default=None,
+        description="SSH username for the tunnel; returned once on create only",
+    )
+    endpoint_host: str
+    ssh_port: int
+    public_port: int = Field(description="Public TCP port the tunnel is reachable on")
+    ssh_command: str = Field(description="Ready-to-run ssh -R command for the NAT'd host")
+    status: str
+    expires_at: datetime
+    connected: bool = False
+    visitor_conns: int = 0
+
+
+class TunnelPricingResponse(BaseModel):
+    hourly_usd: str
+    min_hours: int
+    max_hours: int
+    currency: str = "USDC"
 
 
 class CryptoIntentRequest(BaseModel):
@@ -593,9 +677,42 @@ class DNSRecord(BaseModel):
     ttl: int = 3600
     prio: int | None = None
 
+class VMEventKey(enum.StrEnum):
+    """Customer-visible provisioning lifecycle vocabulary (`GET /v1/vm/{id}/logs`).
+
+    This is a public contract: keys are stable and only ever added to, never
+    renamed or repurposed. Every key describes something the platform actually
+    observed — nothing here is inferred.
+    """
+
+    # Lifecycle
+    PROVISIONING_STARTED = "provisioning_started"
+    # Emitted INSTEAD of real infrastructure work when the deployment runs in
+    # simulation mode (HCP_LAUNCH_PROOF_REAL_XCPNG unset). Marks every later
+    # event on that VM as simulated.
+    PROVISIONING_SIMULATED = "provisioning_simulated"
+    CLOUD_INIT_PREPARED = "cloud_init_prepared"
+    SETUP_SCRIPT_INJECTED = "setup_script_injected"
+    VM_CREATED = "vm_created"
+    NETWORK_READY = "network_ready"
+    DNS_CREATED = "dns_created"
+    SSH_REACHABLE = "ssh_reachable"
+    SSH_UNREACHABLE = "ssh_unreachable"
+    CUSTOM_DOMAIN_ATTACHED = "custom_domain_attached"
+    CUSTOM_DOMAIN_ATTACH_FAILED = "custom_domain_attach_failed"
+    # Terminal
+    READY = "ready"
+    PROVISIONING_FAILED = "provisioning_failed"
+
+
 class VMLogEvent(BaseModel):
     ts: str
     event: str
+    # Human-readable, customer-safe. Never carries provider text.
+    message: str | None = None
+    # Small structured payload (hostname, ipv6, simulated flag, ...). Only ever
+    # holds data the customer already owns — never internal infrastructure ids.
+    detail: dict | None = None
 
 class VMLogsResponse(BaseModel):
     vm_id: str
@@ -1311,6 +1428,161 @@ class DNSLookupResponse(BaseModel):
 
 class DNSPricingResponse(BaseModel):
     lookup_usd: str
+    blocklist_check_usd: str
+    filtering_check_usd: str
+
+
+class DNSDomainCheckRequest(BaseModel):
+    domain: str = Field(min_length=1, max_length=253)
+
+
+class DNSBlocklistCategory(enum.StrEnum):
+    ADS = "ads"
+    TRACKERS = "trackers"
+    TELEMETRY = "telemetry"
+    PHISHING = "phishing"
+    MALWARE = "malware"
+    SCAM = "scam"
+    C2 = "c2"
+
+
+class DNSBlocklistVerdict(enum.StrEnum):
+    LISTED = "listed"
+    NOT_LISTED = "not_listed"
+    INCONCLUSIVE = "inconclusive"
+
+
+class DNSBlocklistSourceOutcome(enum.StrEnum):
+    LISTED = "listed"
+    NOT_LISTED = "not_listed"
+    EXCEPTED = "excepted"
+    UNAVAILABLE = "unavailable"
+
+
+class DNSBlocklistSourceResult(BaseModel):
+    source_id: str
+    source_name: str
+    categories: list[DNSBlocklistCategory]
+    outcome: DNSBlocklistSourceOutcome
+    matched_domain: str | None = None
+    match_kind: str | None = None
+    source_status: SourceStatus | str
+    source_age_seconds: int | None = None
+
+
+class DNSBlocklistSourceInfo(BaseModel):
+    source_id: str
+    name: str
+    categories: list[DNSBlocklistCategory]
+    license: str
+    license_url: str
+    source_url: str
+    format: str
+    status: SourceStatus | str
+    content_updated_at: datetime | None = None
+    last_checked_at: datetime | None = None
+    age_seconds: int | None = None
+    rule_count: int = 0
+    rejected_rule_count: int = 0
+    error: str | None = None
+
+
+class DNSBlocklistSourcesResponse(BaseModel):
+    ready: bool
+    catalog_version: str
+    snapshot_id: str | None = None
+    required_source_count: int
+    usable_source_count: int
+    minimum_usable_source_count: int
+    sources: list[DNSBlocklistSourceInfo]
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class DNSBlocklistCheckResponse(BaseModel):
+    request_id: str = Field(default_factory=generate_diagnostic_request_id)
+    input_domain: str
+    normalized_domain: str
+    verdict: DNSBlocklistVerdict
+    categories: list[DNSBlocklistCategory] = Field(default_factory=list)
+    checked_source_count: int
+    matched_source_count: int
+    required_source_count: int
+    results: list[DNSBlocklistSourceResult]
+    catalog_version: str
+    snapshot_id: str
+    partial: bool = False
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class DNSFilteringProfileStatus(enum.StrEnum):
+    BLOCKED = "blocked"
+    ALLOWED = "allowed"
+    INCONCLUSIVE = "inconclusive"
+    UNAVAILABLE = "unavailable"
+
+
+class DNSFilteringOverallStatus(enum.StrEnum):
+    BLOCKED = "blocked"
+    ALLOWED = "allowed"
+    MIXED = "mixed"
+    INCONCLUSIVE = "inconclusive"
+
+
+class DNSFilteringObservation(BaseModel):
+    record_type: str
+    rcode: str | None = None
+    answers: list[str] = Field(default_factory=list)
+    cname_chain: list[str] = Field(default_factory=list)
+    ede_codes: list[int] = Field(default_factory=list)
+    authority_count: int = 0
+    latency_ms: float | None = None
+    error: str | None = None
+
+
+class DNSFilteringProfileResult(BaseModel):
+    profile_id: str
+    name: str
+    provider: str
+    categories: list[DNSBlocklistCategory]
+    status: DNSFilteringProfileStatus
+    reason: str
+    filtered: list[DNSFilteringObservation]
+    control: list[DNSFilteringObservation]
+    observed_at: datetime
+
+
+class DNSFilteringResolverInfo(BaseModel):
+    profile_id: str
+    name: str
+    provider: str
+    categories: list[DNSBlocklistCategory]
+    filtered_endpoint: str
+    control_endpoint: str
+    blocking_signals: list[str]
+    status: str = "configured"
+
+
+class DNSFilteringResolversResponse(BaseModel):
+    enabled: bool
+    profiles: list[DNSFilteringResolverInfo]
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class DNSFilteringCheckResponse(BaseModel):
+    request_id: str = Field(default_factory=generate_diagnostic_request_id)
+    input_domain: str
+    normalized_domain: str
+    vantage: str = "hyrule"
+    overall: DNSFilteringOverallStatus
+    blocked_profile_count: int
+    allowed_profile_count: int
+    conclusive_profile_count: int
+    total_profile_count: int
+    profiles: list[DNSFilteringProfileResult]
+    partial: bool = False
+    observed_at: datetime
+    cache_age_seconds: int = 0
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class DNSPropagationRequest(BaseModel):

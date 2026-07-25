@@ -11,6 +11,7 @@ import respx
 from httpx import ASGITransport, AsyncClient, Response
 
 from hyrule_cloud.app import app
+from hyrule_cloud.models import VMCreateRequest, VMSize
 from hyrule_cloud.providers.prometheus import PrometheusClient
 from hyrule_cloud.state import AppState
 
@@ -127,22 +128,69 @@ def _alert(
     }
 
 
-@pytest_asyncio.fixture
-async def status_state():
-    from hyrule_cloud.api.status import _STATUS_CACHE
+class _AdmissionOrchestrator:
+    def __init__(self, error: Exception | None = None, *, block: bool = False) -> None:
+        self.error = error
+        self.block = block
+        self.calls = 0
+        self.requests: list[VMCreateRequest] = []
 
-    _STATUS_CACHE.update(value=None, expires_at=0.0, successful_at=0.0)
+    async def ensure_vm_capacity(self, request: VMCreateRequest) -> None:
+        self.calls += 1
+        self.requests.append(request)
+        if self.block:
+            await asyncio.Event().wait()
+        if self.error is not None:
+            raise self.error
+
+
+class _DomainsProduct:
+    """Stand-in for the DomainService readiness predicate behind /v1/domains."""
+
+    def __init__(
+        self,
+        ready: bool = True,
+        *,
+        error: Exception | None = None,
+        block: bool = False,
+    ) -> None:
+        self.ready = ready
+        self.error = error
+        self.block = block
+        self.calls = 0
+
+    async def public_discovery_ready(self) -> bool:
+        self.calls += 1
+        if self.block:
+            await asyncio.Event().wait()
+        if self.error is not None:
+            raise self.error
+        return self.ready
+
+
+@pytest_asyncio.fixture
+async def status_state(monkeypatch):
+    from hyrule_cloud.api import status as status_api
+
+    status_cache = status_api._STATUS_CACHE
+
+    status_cache.update(value=None, expires_at=0.0, successful_at=0.0)
+    monkeypatch.setattr(status_api, "use_real_provisioning", lambda: False)
     previous = getattr(app.state, "_typed_state", None)
     app.state._typed_state = AppState(
-        config=SimpleNamespace(prometheus_url="http://prom.test:9090"),
+        config=SimpleNamespace(
+            prometheus_url="http://prom.test:9090",
+            require_real_provisioning=False,
+        ),
         orchestrator=None,
         payment_gate=None,
         network_provider=None,
+        domains=_DomainsProduct(),
     )
     try:
         yield
     finally:
-        _STATUS_CACHE.update(value=None, expires_at=0.0, successful_at=0.0)
+        status_cache.update(value=None, expires_at=0.0, successful_at=0.0)
         if previous is None:
             delattr(app.state, "_typed_state")
         else:
@@ -178,6 +226,376 @@ async def test_no_public_alerts_is_operational(status_state, client):
     ]
     assert {component["status"] for component in body["components"]} == {"operational"}
     assert body["incidents"] == []
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_live_admission_failure_degrades_vm_checkout_without_leaking_error(
+    status_state,
+    client,
+    monkeypatch,
+):
+    from hyrule_cloud.api import status as status_api
+
+    orchestrator = _AdmissionOrchestrator(RuntimeError("private XO schema details"))
+    app.state._typed_state.orchestrator = orchestrator
+    monkeypatch.setattr(status_api, "use_real_provisioning", lambda: True)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    response = await client.get("/v1/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "degraded"
+    assert body["stale"] is False
+    components = {component["id"]: component for component in body["components"]}
+    assert components["api_checkout"]["status"] == "degraded"
+    assert components["compute"]["status"] == "degraded"
+    assert components["intelligence"]["status"] == "operational"
+    assert components["domains_dns"]["status"] == "operational"
+    assert components["network_proxy"]["status"] == "operational"
+    assert len(body["incidents"]) == 1
+    assert body["incidents"][0]["title"] == "New VM orders temporarily unavailable"
+    assert body["incidents"][0]["component_ids"] == ["api_checkout", "compute"]
+    assert "private XO" not in response.text
+    assert orchestrator.calls == 1
+    assert orchestrator.requests[0].size == VMSize.XS
+    assert orchestrator.requests[0].resources is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_live_admission_success_is_cached_with_monitoring_snapshot(
+    status_state,
+    client,
+    monkeypatch,
+):
+    from hyrule_cloud.api import status as status_api
+
+    orchestrator = _AdmissionOrchestrator()
+    app.state._typed_state.orchestrator = orchestrator
+    monkeypatch.setattr(status_api, "use_real_provisioning", lambda: True)
+    rules_route = _mock_loaded_rules()
+    alerts_route = respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    first = await client.get("/v1/status")
+    second = await client.get("/v1/status")
+
+    assert first.json()["status"] == "operational"
+    assert second.json()["status"] == "operational"
+    assert orchestrator.calls == 1
+    assert rules_route.call_count == 1
+    assert alerts_route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_live_capacity_probe_timeout_degrades_instead_of_hanging(
+    status_state,
+    client,
+    monkeypatch,
+):
+    from hyrule_cloud.api import status as status_api
+
+    app.state._typed_state.orchestrator = _AdmissionOrchestrator(block=True)
+    monkeypatch.setattr(status_api, "use_real_provisioning", lambda: True)
+    monkeypatch.setattr(status_api, "_CAPACITY_PROBE_TIMEOUT_SECONDS", 0.01)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "degraded"
+    assert body["incidents"][0]["component_ids"] == ["api_checkout", "compute"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_live_admission_recovery_clears_cached_incident_during_prometheus_outage(
+    status_state,
+    client,
+    monkeypatch,
+):
+    from hyrule_cloud.api import status as status_api
+
+    orchestrator = _AdmissionOrchestrator(RuntimeError("capacity unavailable"))
+    app.state._typed_state.orchestrator = orchestrator
+    monkeypatch.setattr(status_api, "use_real_provisioning", lambda: True)
+    rules_route = respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"})
+    rules_route.side_effect = [
+        Response(200, json=_prometheus_rules()),
+        Response(503, text="unavailable"),
+    ]
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    first = await client.get("/v1/status")
+    status_api._STATUS_CACHE["expires_at"] = 0.0
+    orchestrator.error = None
+
+    recovered = await client.get("/v1/status")
+
+    assert first.json()["status"] == "degraded"
+    body = recovered.json()
+    assert body["status"] == "operational"
+    assert body["stale"] is True
+    assert body["incidents"] == []
+    assert {component["status"] for component in body["components"]} == {"operational"}
+    assert orchestrator.calls == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_launched_domains_report_operational(status_state, client):
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert body["status"] == "operational"
+    assert components["domains_dns"]["status"] == "operational"
+    assert components["domains_dns"]["message"] == "Registration and authoritative DNS"
+    assert app.state._typed_state.domains.calls == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unlaunched_domains_never_report_operational(status_state, client):
+    app.state._typed_state.domains = _DomainsProduct(ready=False)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert components["domains_dns"]["status"] == "not_launched"
+    assert (
+        components["domains_dns"]["message"]
+        == "Domain registration and managed DNS are not yet launched."
+    )
+    # A deferred product is not a disruption of the products that are live.
+    assert body["status"] == "operational"
+    assert body["incidents"] == []
+    assert components["api_checkout"]["status"] == "operational"
+    assert components["compute"]["status"] == "operational"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_missing_domains_service_never_reports_operational(status_state, client):
+    app.state._typed_state.domains = None
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert components["domains_dns"]["status"] == "not_launched"
+    assert body["status"] == "operational"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_domains_probe_failure_never_reports_operational_or_leaks_detail(
+    status_state,
+    client,
+):
+    app.state._typed_state.domains = _DomainsProduct(
+        error=RuntimeError("openprovider credentials for hyrule.host rejected")
+    )
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    response = await client.get("/v1/status")
+    body = response.json()
+
+    components = {component["id"]: component for component in body["components"]}
+    # A probe failure is unknown, not "not launched" — collapsing the two
+    # would let _overall_status's NOT_LAUNCHED exclusion hide this from the
+    # public rollup, exactly the false "everything's fine" this test guards.
+    assert components["domains_dns"]["status"] == "unknown"
+    assert body["status"] == "unknown"
+    assert "openprovider" not in response.text
+    assert "credentials" not in response.text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_domains_probe_timeout_never_reports_operational(status_state, client, monkeypatch):
+    from hyrule_cloud.api import status as status_api
+
+    app.state._typed_state.domains = _DomainsProduct(block=True)
+    monkeypatch.setattr(status_api, "_DOMAINS_PROBE_TIMEOUT_SECONDS", 0.01)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert components["domains_dns"]["status"] == "unknown"
+    assert body["status"] == "unknown"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dns_incident_outranks_unlaunched_domains(status_state, client):
+    app.state._typed_state.domains = _DomainsProduct(ready=False)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(
+            200,
+            json=_prometheus(
+                [
+                    _alert(
+                        name="HyrulePublicDNSOutage",
+                        state="outage",
+                        components="domains_dns",
+                    )
+                ]
+            ),
+        )
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert components["domains_dns"]["status"] == "outage"
+    assert body["status"] == "outage"
+    assert len(body["incidents"]) == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unlaunched_domains_do_not_hide_other_degradation(
+    status_state,
+    client,
+    monkeypatch,
+):
+    from hyrule_cloud.api import status as status_api
+
+    app.state._typed_state.domains = _DomainsProduct(ready=False)
+    app.state._typed_state.orchestrator = _AdmissionOrchestrator(RuntimeError("no capacity"))
+    monkeypatch.setattr(status_api, "use_real_provisioning", lambda: True)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert body["status"] == "degraded"
+    assert components["domains_dns"]["status"] == "not_launched"
+    assert components["compute"]["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unknown_snapshot_keeps_domains_unconfirmed(status_state, client):
+    app.state._typed_state.domains = _DomainsProduct(ready=False)
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(200, json=_prometheus_rules(("SomeInternalRule",)))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert {component["status"] for component in body["components"]} == {"unknown"}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_domain_launch_clears_cached_not_launched_state(status_state, client):
+    from hyrule_cloud.api import status as status_api
+
+    domains = _DomainsProduct(ready=False)
+    app.state._typed_state.domains = domains
+    rules_route = respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"})
+    rules_route.side_effect = [
+        Response(200, json=_prometheus_rules()),
+        Response(503, text="unavailable"),
+    ]
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    first = await client.get("/v1/status")
+    status_api._STATUS_CACHE["expires_at"] = 0.0
+    domains.ready = True
+
+    launched = await client.get("/v1/status")
+
+    first_components = {component["id"]: component for component in first.json()["components"]}
+    assert first_components["domains_dns"]["status"] == "not_launched"
+    body = launched.json()
+    components = {component["id"]: component for component in body["components"]}
+    assert body["status"] == "operational"
+    assert body["stale"] is True
+    assert components["domains_dns"]["status"] == "operational"
+    assert components["domains_dns"]["message"] == "Registration and authoritative DNS"
+    assert domains.calls == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_domains_regression_after_launch_is_unknown_not_hidden(status_state, client):
+    """Codex P1: a probe failure on an already-launched product must not
+    collapse into not_launched. _overall_status excludes not_launched from
+    the public rollup (by design, so a deferred product never cries wolf),
+    so mislabeling a real regression that way would make it vanish from
+    /v1/status instead of showing as a disruption."""
+    from hyrule_cloud.api import status as status_api
+
+    domains = _DomainsProduct(ready=True)
+    app.state._typed_state.domains = domains
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    launched = await client.get("/v1/status")
+    status_api._STATUS_CACHE["expires_at"] = 0.0
+    domains.error = RuntimeError("registrar catalog query timed out")
+
+    regressed = await client.get("/v1/status")
+    status_api._STATUS_CACHE["expires_at"] = 0.0
+    domains.error = None
+
+    recovered = await client.get("/v1/status")
+
+    launched_components = {c["id"]: c for c in launched.json()["components"]}
+    assert launched_components["domains_dns"]["status"] == "operational"
+
+    regressed_body = regressed.json()
+    regressed_components = {c["id"]: c for c in regressed_body["components"]}
+    assert regressed_components["domains_dns"]["status"] == "unknown"
+    # The whole point: this must surface in the global rollup, not hide
+    # behind the not_launched exclusion.
+    assert regressed_body["status"] == "unknown"
+
+    recovered_body = recovered.json()
+    recovered_components = {c["id"]: c for c in recovered_body["components"]}
+    assert recovered_components["domains_dns"]["status"] == "operational"
+    assert recovered_body["status"] == "operational"
 
 
 @pytest.mark.asyncio
