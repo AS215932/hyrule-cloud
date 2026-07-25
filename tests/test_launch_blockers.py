@@ -399,6 +399,9 @@ async def test_signed_vm_create_returns_503_when_capacity_provider_is_unavailabl
 
     assert res.status_code == 503
     assert res.json()["detail"] == "VM capacity is temporarily unavailable"
+    # An agent hitting a transient capacity 503 needs machine-readable
+    # retry guidance, not a dead end (first-dogfood finding).
+    assert res.headers["Retry-After"] == "60"
 
 
 @pytest.mark.asyncio
