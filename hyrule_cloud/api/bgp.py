@@ -141,10 +141,15 @@ def _lookup_price_attr(body: BGPLookupRequest | None) -> tuple[str, str]:
     Tiers are not additive — a request selecting several premium datasets is
     charged once, at the dearest tier, so the quote a caller is shown always
     matches what /lookup charges for the same body.
+
+    AS215932_ROUTER_TABLES does not get its own tier here: the internal
+    router vantage isn't wired up yet (lookup._prefix_lookup returns a
+    not_configured stub for it, contributing no data beyond the base
+    lookup), so a request selecting it — alone or in place of a real premium
+    dataset — must not be charged the router-query rate for nothing. Restore
+    the branch once that vantage is real.
     """
     datasets = body.datasets if body is not None else []
-    if BGPDataset.AS215932_ROUTER_TABLES in datasets:
-        return "price_bgp_router_query", "0.01"
     if BGPDataset.LIVE_LOOKING_GLASS in datasets:
         return "price_bgp_looking_glass", "0.01"
     return "price_bgp_lookup", "0.005"

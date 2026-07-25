@@ -363,17 +363,33 @@ async def lookup_bgp(req: BGPLookupRequest) -> BGPLookupResponse:
 
 
 async def as215932_status() -> BGPStatusResponse:
+    # Same incident as /v1/bgp/lookup, on our most public surface: without the
+    # live looking-glass dataset, prefix_visible is derived solely from
+    # routing_status, a batch snapshot that can be hours behind. This free
+    # status endpoint would then report our own prefix as unrouted for hours
+    # after a real announcement. Opting in here costs one extra public
+    # RIPEstat call per status request — this call bypasses /lookup's payment
+    # gate entirely (it invokes lookup_bgp directly), so it is not billed.
     req = BGPLookupRequest.model_validate(
         {
             "subject": {"type": "prefix", "value": "2a0c:b641:b50::/44"},
+            "datasets": [BGPDataset.PUBLIC_ROUTING, BGPDataset.LIVE_LOOKING_GLASS, BGPDataset.RPKI],
             "assertions": {"expected_origin_asns": [215932], "expected_rpki": "valid"},
         }
     )
     result = await lookup_bgp(req)
     visibility: dict[str, object] = {}
+    freshness: dict[str, object] = {}
     routing_status = result.results.get("routing_status")
     if isinstance(routing_status, dict):
         visibility = routing_status.get("visibility", {}) or {}
+        freshness = routing_status.get("freshness", {}) or {}
+    # The live looking-glass observation, when it saw the prefix, is what
+    # actually decided routed=True below — report its (realtime) freshness
+    # instead of the stale snapshot's, so callers see what backs the verdict.
+    looking_glass = result.results.get("looking_glass")
+    if isinstance(looking_glass, dict) and looking_glass.get("visible"):
+        freshness = looking_glass.get("freshness", freshness) or freshness
     rpki_status = None
     for origin in result.resolved.origins:
         if origin.asn == 215932:
@@ -392,6 +408,7 @@ async def as215932_status() -> BGPStatusResponse:
             "observed_origin_asns": result.resolved.observed_origin_asns,
             "rpki_status": rpki_status or "unknown",
             "visibility": visibility,
+            "freshness": freshness,
         },
         sources={name: health.status for name, health in result.sources.items()},
         updated_at=result.generated_at,

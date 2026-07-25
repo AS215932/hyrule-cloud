@@ -405,7 +405,8 @@ _BGP_LOOKUP_PRICE = PriceSpec(
     (
         ("price_bgp_lookup", "0.005"),
         ("price_bgp_looking_glass", "0.01"),
-        ("price_bgp_router_query", "0.01"),
+        # price_bgp_router_query intentionally absent: /lookup never charges it
+        # (see api/bgp.py::_lookup_price_attr) until the router vantage exists.
     ),
 )
 _BGP_JOB_PRICE = PriceSpec(

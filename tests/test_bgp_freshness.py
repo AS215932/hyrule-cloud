@@ -73,7 +73,7 @@ def test_recent_snapshot_is_not_marked_stale():
 
 
 def test_missing_query_time_is_unknown_not_silently_fresh():
-    health, freshness = bgp_lookup._delayed_source_health({}, "https://example/routing-status")
+    _health, freshness = bgp_lookup._delayed_source_health({}, "https://example/routing-status")
     assert freshness["class"] == DataFreshness.UNKNOWN.value
     assert freshness["age_seconds"] is None
 
@@ -155,8 +155,9 @@ async def test_stale_snapshot_does_not_override_live_visibility(monkeypatch):
 async def test_internal_vantage_declares_itself_not_configured(monkeypatch):
     """Selecting the internal dataset must not look like a successful answer.
 
-    It is billed at the router-query tier, so returning silence would mean
-    charging for data that was never produced.
+    It is not charged a premium tier (see test_router_tables_alone_is_not_a_premium_tier
+    below), so a quiet not_configured stub can't be mistaken for a paid,
+    populated result.
     """
     _stub_get_json(
         monkeypatch,
@@ -171,3 +172,52 @@ async def test_internal_vantage_declares_itself_not_configured(monkeypatch):
     assert result.sources["as215932_router_tables"].status == "not_configured"
     assert result.results["as215932_router_tables"]["status"] == "not_configured"
     assert result.partial is True
+
+
+def test_router_tables_alone_is_not_a_premium_tier():
+    """Regression: AS215932_ROUTER_TABLES isn't wired up (returns a
+    not_configured stub, no additional data over the base lookup), so
+    selecting it must not bill the $0.01 router-query rate — that would
+    charge double for nothing."""
+    from hyrule_cloud.api.bgp import _lookup_price_attr
+
+    attr, default = _lookup_price_attr(_req([BGPDataset.AS215932_ROUTER_TABLES.value]))
+    assert (attr, default) == ("price_bgp_lookup", "0.005")
+
+
+def test_router_tables_combined_with_looking_glass_still_charges_looking_glass():
+    from hyrule_cloud.api.bgp import _lookup_price_attr
+
+    attr, default = _lookup_price_attr(
+        _req([BGPDataset.AS215932_ROUTER_TABLES.value, BGPDataset.LIVE_LOOKING_GLASS.value])
+    )
+    assert (attr, default) == ("price_bgp_looking_glass", "0.01")
+
+
+@pytest.mark.asyncio
+async def test_as215932_status_reflects_live_visibility_despite_stale_snapshot(monkeypatch):
+    """Same incident as test_stale_snapshot_does_not_override_live_visibility,
+    but on the free /v1/bgp/status endpoint: it used to build its lookup
+    request without live_looking_glass, so prefix_visible came solely from
+    the batch routing_status snapshot and could read False for hours after a
+    real announcement, on Hyrule's most public status surface."""
+    stale = (datetime.now(UTC) - timedelta(hours=10)).isoformat()
+    _stub_get_json(
+        monkeypatch,
+        {
+            "prefix-overview": {"announced": False, "asns": []},
+            "routing-status": {"query_time": stale, "origins": [], "last_seen": {}},
+            "looking-glass": {
+                "query_time": datetime.now(UTC).isoformat(),
+                "rrcs": [{"rrc": "RRC20", "peers": [{"as_path": "58057 215932"}]}],
+            },
+            "rpki-validation": {"status": "valid"},
+        },
+    )
+    status = await bgp_lookup.as215932_status()
+    assert status.routing["prefix_visible"] is True
+    assert 215932 in status.routing["observed_origin_asns"]
+    assert status.status == "ok"
+    # The verdict came from the realtime looking-glass observation, not the
+    # stale snapshot — the reported freshness must say so.
+    assert status.routing["freshness"]["class"] == DataFreshness.REALTIME.value
