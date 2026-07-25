@@ -64,6 +64,32 @@ class _AliveWebSocket:
     async def close(self) -> None: ...
 
 
+class _ObjectQueryWebSocket:
+    """Responds to xo.getAllObjects with a preset VM object map; any other
+    method (e.g. a resent vm.create) echoes its request id as the result,
+    matching _AliveWebSocket's convention. Records every method sent so a
+    test can assert whether vm.create was actually resent.
+    """
+
+    def __init__(self, objects: dict[str, dict]) -> None:
+        self._objects = objects
+        self.pending: list[tuple[int, str]] = []
+        self.sent_methods: list[str] = []
+
+    async def send(self, raw: str) -> None:
+        msg = json.loads(raw)
+        self.pending.append((int(msg["id"]), msg["method"]))
+        self.sent_methods.append(msg["method"])
+
+    async def recv(self) -> str:
+        await asyncio.sleep(0)
+        request_id, method = self.pending.pop(0)
+        result = self._objects if method == "xo.getAllObjects" else request_id
+        return json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    async def close(self) -> None: ...
+
+
 @pytest.mark.asyncio
 async def test_xo_call_reconnects_once_after_keepalive_death(monkeypatch):
     provider = XCPNGProvider(XCPNGConfig())
@@ -126,3 +152,52 @@ async def test_concurrent_callers_share_one_reconnect(monkeypatch):
 
     assert first != second
     assert reconnects == [1]
+
+
+@pytest.mark.asyncio
+async def test_xo_call_vm_create_adopts_existing_clone_after_reconnect(monkeypatch):
+    """XO can execute vm.create and lose the response before the connection
+    dies. Blindly retrying would create a second same-label guest that the
+    orchestrator's pre-create stale-clone sweep never sees (it only runs
+    before this call). After reconnecting, _xo_call must find the clone
+    that already landed under its name_label and adopt it instead of
+    resending vm.create."""
+    provider = XCPNGProvider(XCPNGConfig())
+    provider._xo_ws = cast(Any, _DeadWebSocket())
+    responder = _ObjectQueryWebSocket(
+        objects={"existing-uuid": {"name_label": "hyrule-vm123", "type": "VM"}}
+    )
+
+    async def connect_locked() -> None:
+        provider._xo_ws = cast(Any, responder)
+
+    monkeypatch.setattr(provider, "_xo_connect_locked", connect_locked)
+
+    result = await provider._xo_call(
+        "vm.create", name_label="hyrule-vm123", template="tpl-uuid"
+    )
+
+    assert result == "existing-uuid"
+    assert responder.sent_methods == ["xo.getAllObjects"]
+
+
+@pytest.mark.asyncio
+async def test_xo_call_vm_create_retries_when_no_clone_landed(monkeypatch):
+    """If XO never executed the create (connection died before send
+    completed, or genuinely failed), no clone exists under name_label and
+    the normal single-retry behavior resends vm.create."""
+    provider = XCPNGProvider(XCPNGConfig())
+    provider._xo_ws = cast(Any, _DeadWebSocket())
+    responder = _ObjectQueryWebSocket(objects={})
+
+    async def connect_locked() -> None:
+        provider._xo_ws = cast(Any, responder)
+
+    monkeypatch.setattr(provider, "_xo_connect_locked", connect_locked)
+
+    result = await provider._xo_call(
+        "vm.create", name_label="hyrule-vm123", template="tpl-uuid"
+    )
+
+    assert result is not None
+    assert responder.sent_methods == ["xo.getAllObjects", "vm.create"]

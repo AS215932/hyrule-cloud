@@ -55,6 +55,7 @@ from x402.http.clients import x402_httpx_transport
 from x402.http.clients.httpx import x402AsyncTransport
 from x402.mechanisms.evm.exact import register_exact_evm_client
 from x402.mechanisms.evm.signers import EthAccountSigner
+from x402.mechanisms.evm.v1.constants import V1_DEFAULT_ASSETS, V1_NETWORK_CHAIN_IDS
 
 #: Base mainnet. Paid calls are pinned to exactly one chain so the SDK never
 #: signs for whatever EVM network the challenge happens to advertise first.
@@ -101,15 +102,21 @@ class HyrulePaymentError(HyruleError):
 
 
 class SettlementMissingError(HyruleError):
-    """Raised when a paid call succeeded but carried no settlement receipt.
+    """Raised when a paid call's settlement receipt could not be read.
 
-    A 2xx that follows a 402 -> sign -> retry cycle *must* come back with a
-    settlement header. If it does not, the request was not actually charged
-    (ungated route, or broken settlement middleware) and the caller must not
-    treat the resource as paid for.
+    A 2xx that follows a 402 -> sign -> retry cycle should come back with a
+    settlement header, but a proxy or middleware between the API and this
+    client can strip it after the underlying charge and provisioning have
+    already succeeded. Settlement is therefore UNKNOWN here, not "unpaid":
+    asserting the call was never charged would tell a caller it is safe to
+    retry an unquoted request, which can purchase a second resource while
+    the reveal-once data (e.g. a VM's management token) from the first is
+    lost. `response_body` carries the underlying response's parsed JSON
+    (when parseable) so a caller can recover it instead.
     """
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, *, response_body: dict[str, Any] | None = None) -> None:
+        self.response_body = response_body
         super().__init__(502, detail)
 
 
@@ -139,17 +146,22 @@ class Settlement:
     raw: str
 
     @classmethod
-    def from_header(cls, raw: str) -> Settlement:
+    def from_header(
+        cls, raw: str, *, response_body: dict[str, Any] | None = None
+    ) -> Settlement:
         """Decode a `PAYMENT-RESPONSE` header value.
 
         Raises `SettlementMissingError` when the header is present but
-        undecodable — an unreadable receipt is no better than none.
+        undecodable — an unreadable receipt leaves settlement unknown, same
+        as a missing one. `response_body` is forwarded onto the error so a
+        caller can still recover the underlying response's data.
         """
         try:
             decoded = decode_payment_response_header(raw)
         except Exception as exc:  # any decode failure is fatal — an unreadable receipt is none
             raise SettlementMissingError(
-                f"settlement header present but undecodable: {exc}"
+                f"settlement header present but undecodable: {exc}",
+                response_body=response_body,
             ) from exc
         transaction = getattr(decoded, "transaction", None) or getattr(decoded, "tx_hash", None)
         success = getattr(decoded, "success", None)
@@ -217,6 +229,41 @@ def _as_usd(value: Decimal | str | int) -> Decimal:
 def _atomic_units(usd: Decimal) -> int:
     """USD -> 6-decimal atomic token units, rounded down so the cap never creeps up."""
     return int((usd * Decimal(10**_USDC_DECIMALS)).to_integral_value(rounding=ROUND_DOWN))
+
+
+def _chain_id(caip2_network: str) -> int:
+    """Parse the numeric chain id out of a CAIP-2 EVM network string."""
+    return int(caip2_network.split(":", 1)[1])
+
+
+def _pinned_usdc_address(payment_network: str) -> str:
+    """Canonical USDC address for `payment_network`, off the SDK's own
+    legacy-network asset table (keyed by chain id so it stays in sync with
+    whichever chains the SDK's v1 registration actually supports)."""
+    chain_id = _chain_id(payment_network)
+    for name, known_chain_id in V1_NETWORK_CHAIN_IDS.items():
+        if known_chain_id == chain_id:
+            asset = V1_DEFAULT_ASSETS.get(name)
+            if asset is not None:
+                return asset["address"]
+    raise ValueError(
+        f"no known USDC address for payment_network={payment_network!r}; "
+        "add it to the pin table before pointing a client at this chain"
+    )
+
+
+def _asset_allowlist(expected_asset: str) -> Any:
+    """x402 PaymentPolicy: accept only the one asset address we expect.
+
+    `max_amount()` alone checks the raw atomic amount, not the asset — a 402
+    advertising a different token (wrong decimals, or simply not USDC) could
+    pass the nominal cap while authorizing a much larger real spend.
+    """
+
+    def policy(_version: int, reqs: list[Any]) -> list[Any]:
+        return [r for r in reqs if r.asset.lower() == expected_asset.lower()]
+
+    return policy
 
 
 class HyruleClient:
@@ -309,15 +356,31 @@ class HyruleClient:
         )
 
     def _build_x402_client(self, private_key: str) -> x402Client:
-        """Wire an `x402Client` that can only spend up to the cap, on one chain."""
+        """Wire an `x402Client` that can only spend up to the cap, in the
+        expected stablecoin, on one chain — never whatever a 402 advertises."""
         signer = EthAccountSigner(Account.from_key(private_key))
         client = x402Client()
         register_exact_evm_client(
             client,
             signer,
             networks=self.payment_network,
-            policies=[max_amount(_atomic_units(self.max_usd_per_call))],
+            policies=[
+                _asset_allowlist(_pinned_usdc_address(self.payment_network)),
+                max_amount(_atomic_units(self.max_usd_per_call)),
+            ],
         )
+        # `networks=` above only restricts the V2 registration.
+        # register_exact_evm_client unconditionally registers the V1 legacy
+        # scheme for every network it supports, so a v1-format 402 naming a
+        # different chain (Polygon, Avalanche, ...) would still be signed by
+        # this same key despite the single-chain pin. Drop every V1
+        # registration except the one matching our pinned chain.
+        pinned_chain_id = _chain_id(self.payment_network)
+        client._schemes_v1 = {
+            name: schemes
+            for name, schemes in client._schemes_v1.items()
+            if V1_NETWORK_CHAIN_IDS.get(name) == pinned_chain_id
+        }
         return client
 
     @property
@@ -386,13 +449,21 @@ class HyruleClient:
             raise HyruleError(resp.status_code, detail)
 
         if resp.extensions.get(_PAID_MARKER):
+            try:
+                body: dict[str, Any] | None = resp.json()
+            except Exception:
+                body = None
             raw = self._settlement_header(resp)
             if not raw:
                 raise SettlementMissingError(
-                    f"{method} {path} returned {resp.status_code} after payment but no "
-                    "settlement header — the call was not charged; treat it as unpaid"
+                    f"{method} {path} returned {resp.status_code} but the settlement "
+                    "header is missing (likely stripped by a proxy) — settlement is "
+                    "UNKNOWN, not unpaid; the call may already be charged and the "
+                    "resource provisioned. Do not blindly retry an unquoted request; "
+                    "see response_body for any recoverable resource/token data.",
+                    response_body=body,
                 )
-            settlement = Settlement.from_header(raw)
+            settlement = Settlement.from_header(raw, response_body=body)
             if not settlement.success:
                 raise HyrulePaymentError(
                     f"{method} {path} settlement failed (tx={settlement.transaction}, "
@@ -553,6 +624,36 @@ class HyruleClient:
         """Hard reboot a VM. Management-gated (see `vm_details`)."""
         return await self._request(
             "POST", f"/v1/vm/{vm_id}/reboot", management_token=management_token
+        )
+
+    async def create_tunnel(
+        self, hours: int, allowlist_cidrs: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Provision a reverse-SSH tunnel. Paid via x402. Returns 402 if unpaid."""
+        body: dict[str, Any] = {"hours": hours}
+        if allowlist_cidrs:
+            body["allowlist_cidrs"] = allowlist_cidrs
+        return await self._request("POST", "/v1/tunnel/create", json=body)
+
+    async def extend_tunnel(self, tunnel_id: str, token: str, hours: int) -> dict[str, Any]:
+        """Extend a tunnel lease. Paid via x402; requires the owner token."""
+        return await self._request(
+            "POST",
+            f"/v1/tunnel/{tunnel_id}/extend",
+            json={"hours": hours},
+            headers={"X-Tunnel-Token": token},
+        )
+
+    async def tunnel_status(self, tunnel_id: str, token: str) -> dict[str, Any]:
+        """Get live tunnel status (owner token required)."""
+        return await self._request(
+            "GET", f"/v1/tunnel/{tunnel_id}/status", headers={"X-Tunnel-Token": token}
+        )
+
+    async def revoke_tunnel(self, tunnel_id: str, token: str) -> dict[str, Any]:
+        """Tear down a tunnel early (owner token required)."""
+        return await self._request(
+            "DELETE", f"/v1/tunnel/{tunnel_id}", headers={"X-Tunnel-Token": token}
         )
 
     async def destroy_vm(
@@ -788,6 +889,26 @@ class HyruleClient:
             "POST",
             "/v1/dns/lookup",
             json={"name": name, "type": record_type, "dnssec": dnssec, "trace": trace},
+        )
+
+    async def dns_blocklist_sources(self) -> dict[str, Any]:
+        """Free blocklist catalog, licensing, freshness, and readiness metadata."""
+        return await self._request("GET", "/v1/dns/blocklists/sources")
+
+    async def dns_filtering_resolvers(self) -> dict[str, Any]:
+        """Free description of the fixed public DNS filtering matrix."""
+        return await self._request("GET", "/v1/dns/filtering/resolvers")
+
+    async def dns_blocklist_check(self, domain: str) -> dict[str, Any]:
+        """Paid domain check across the maintained DNS-capable blocklist catalog."""
+        return await self._request(
+            "POST", "/v1/dns/blocklists/check", json={"domain": domain}
+        )
+
+    async def dns_filtering_check(self, domain: str) -> dict[str, Any]:
+        """Paid live check across curated public DNS filtering profiles."""
+        return await self._request(
+            "POST", "/v1/dns/filtering/check", json={"domain": domain}
         )
 
     async def dns_propagation(

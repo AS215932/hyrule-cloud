@@ -27,6 +27,30 @@ from tests.test_payment_gate_x402 import _FakeServer, _gate, _request
 
 
 def _enable_all_catalog_gates(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key, value in {
+        "DOMAIN_PURCHASES_ENABLED": "true",
+        "DOMAIN_MARKETPLACE_SALES_ENABLED": "true",
+        "DOMAIN_LEGAL_APPROVED": "true",
+        "DOMAIN_TAX_APPROVED": "true",
+        "DOMAIN_ALLOW_ALL_ELIGIBLE_TLDS": "true",
+        "DOMAIN_MARKETPLACE_PAYER_ALLOWLIST": "[]",
+        "DOMAIN_DNS_CONTROL_URL": "http://[2001:db8::53]:8453",
+        "DOMAIN_DNS_CONTROL_SECRET": "d" * 32,
+        "OPENPROVIDER_USERNAME": "catalog-test",
+        "OPENPROVIDER_PASSWORD": "catalog-test",
+        "OPENPROVIDER_OWNER_HANDLE": "owner",
+        "OPENPROVIDER_ADMIN_HANDLE": "admin",
+        "OPENPROVIDER_TECH_HANDLE": "tech",
+        "OPENPROVIDER_BILLING_HANDLE": "billing",
+        # domain_marketplace's readiness gate now also requires a configured
+        # receiver + an enabled payment network (checkout can't settle a 402
+        # without both, so publishing the endpoint without them 503s every
+        # attempt). PAYMENT_* has no test-time default; set it explicitly so
+        # this fixture keeps meaning "every domain_marketplace precondition
+        # is met", not "every precondition except payment readiness".
+        "PAYMENT_RECEIVER_ADDRESS": "0x000000000000000000000000000000000000dEaD",
+    }.items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setattr(
         "hyrule_cloud.services.launch_proof.use_real_provisioning",
         lambda: True,
@@ -53,6 +77,14 @@ def _enable_all_catalog_gates(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(
         "hyrule_cloud.api.bgp.router_snapshot_download_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.tunnel.readiness.tunnel_service_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.blocklists.blocklist_catalog_ready",
         lambda: True,
     )
 
@@ -233,6 +265,97 @@ def test_manifest_openapi_and_bazaar_share_the_same_enabled_catalog(
     assert not catalog_keys & supporting_keys
     assert all(resource["discoverable"] is True for resource in manifest["resources"])
     assert ("POST", "/v1/domain/register") not in catalog_keys
+
+
+def test_domain_registration_discovery_waits_for_public_cohort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_all_catalog_gates(monkeypatch)
+    config = HyruleConfig()
+    config.domain.marketplace_payer_allowlist = ["0x" + "1" * 40]
+
+    canary = build_x402_manifest(config)
+    assert "/v1/domains/registrations" not in {
+        resource["path"] for resource in canary["resources"]
+    }
+
+    config.domain.marketplace_payer_allowlist = []
+    public = build_x402_manifest(config)
+    registration = next(
+        resource
+        for resource in public["resources"]
+        if resource["path"] == "/v1/domains/registrations"
+    )
+    assert registration["minPrice"] == "3.00"
+    assert "maxPrice" not in registration
+
+
+def test_domain_registration_discovery_waits_for_payment_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The domain_marketplace gate is the fail-closed launch-readiness
+    decision: every legal/DNS/registrar flag can be satisfied while checkout
+    is still structurally unable to settle a 402 (no receiver configured, or
+    every payment network disabled), and every attempt would 503. The
+    marketplace path must not be advertised in that state."""
+    _enable_all_catalog_gates(monkeypatch)
+
+    monkeypatch.setenv("PAYMENT_RECEIVER_ADDRESS", "")
+    no_receiver = build_x402_manifest(HyruleConfig())
+    assert "/v1/domains/registrations" not in {
+        resource["path"] for resource in no_receiver["resources"]
+    }
+
+    monkeypatch.setenv("PAYMENT_RECEIVER_ADDRESS", "0x000000000000000000000000000000000000dEaD")
+    config = HyruleConfig()
+    config.payment.payment_networks = [
+        network.__class__(**{**vars(network), "enabled": False})
+        for network in config.payment.payment_networks
+    ]
+    no_networks = build_x402_manifest(config)
+    assert "/v1/domains/registrations" not in {
+        resource["path"] for resource in no_networks["resources"]
+    }
+
+    ready = build_x402_manifest(HyruleConfig())
+    assert "/v1/domains/registrations" in {
+        resource["path"] for resource in ready["resources"]
+    }
+
+
+def test_dns_marketing_copy_is_gated_independently_per_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blocklist membership and filtering evidence must not be advertised
+    just because /v1/dns/lookup (ungated) is live: each has its own
+    readiness gate, and the previous combined /v1/dns phrase ignored that."""
+    from hyrule_cloud.services.discovery import service_overview
+
+    _enable_all_catalog_gates(monkeypatch)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.blocklists.blocklist_catalog_ready",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.filtering.dns_filtering_enabled",
+        lambda: False,
+    )
+    copy = service_overview()
+    assert "DNS diagnostics" in copy
+    assert "blocklist membership" not in copy
+    assert "filtering evidence" not in copy
+
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.blocklists.blocklist_catalog_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.filtering.dns_filtering_enabled",
+        lambda: True,
+    )
+    copy = service_overview()
+    assert "blocklist membership" in copy
+    assert "filtering evidence" in copy
 
 
 def test_supporting_routes_follow_their_readiness_gate(

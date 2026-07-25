@@ -23,6 +23,7 @@ from hyrule_cloud.models import (
 from hyrule_cloud.services.diagnostics.sources import (
     source_not_configured,
     source_ok,
+    source_unavailable,
     source_usable,
 )
 from hyrule_cloud.services.dns.lookup import lookup
@@ -31,11 +32,39 @@ from hyrule_cloud.services.safety import assert_safe_active_probe_target, normal
 _NUMBER_PROVIDERS = ["twilio", "telnyx", "numverify", "cnam_provider", "e911_provider", "number_spam_reputation"]
 
 
+def _stun_host() -> str:
+    from hyrule_cloud.config import HyruleConfig
+
+    return HyruleConfig().stun_test_host
+
+
+def _stun_host_valid() -> bool:
+    """Whether a STUN host is configured AND parses to a usable host:port. A
+    malformed value must not admit the paid STUN check (it would raise after
+    settlement and 500)."""
+    host = _stun_host()
+    if not host:
+        return False
+    from hyrule_cloud.services.voip.stun_probe import split_host_port
+
+    try:
+        hostname, port = split_host_port(host)
+    except (ValueError, OverflowError):
+        return False
+    return bool(hostname) and 1 <= port <= 65535
+
+
 def voip_sources() -> dict[str, SourceHealth]:
+    if not _stun_host():
+        stun_source = source_not_configured("STUN active tester is not configured (set HYRULE_STUN_TEST_HOST).")
+    elif not _stun_host_valid():
+        stun_source = source_not_configured("HYRULE_STUN_TEST_HOST is misconfigured (bad host:port).")
+    else:
+        stun_source = source_ok()
     sources = {
         "dns": source_ok(),
         "sip_tls": source_ok(),
-        "stun_turn": source_not_configured("STUN/TURN active tester is not configured in server-only MVP."),
+        "stun_turn": stun_source,
     }
     sources.update({provider: source_not_configured("number intelligence provider API key is not configured") for provider in _NUMBER_PROVIDERS})
     return sources
@@ -64,9 +93,61 @@ def voip_check_has_live_backend(checks: list[VoIPCheck]) -> bool:
 
     A voip_check request that only asks for SIP_OPTIONS/STUN_TURN gets nothing
     but contract findings, so the route must 501 before charging rather than
-    bill for a non-answer — mirroring the number-lookup and path gates.
+    bill for a non-answer — mirroring the number-lookup and path gates. STUN
+    becomes live once a public STUN responder is configured.
     """
-    return any(check in _LIVE_VOIP_CHECKS for check in checks)
+    live = set(_LIVE_VOIP_CHECKS)
+    if _stun_host_valid():  # only admit STUN when a VALID responder is configured
+        live.add(VoIPCheck.STUN_TURN)
+    return any(check in live for check in checks)
+
+
+async def _stun_check() -> tuple[list[DiagnosticFinding], SourceHealth]:
+    """Confirm a public STUN responder is reachable.
+
+    Returns the findings and the resolved ``stun_turn`` source health, so the
+    response never reports the source as healthy while a finding says the
+    responder is unreachable.
+    """
+    host = _stun_host()
+    if not host:
+        return (
+            [
+                _finding(
+                    DiagnosticStatus.INFO,
+                    "stun_turn_not_configured",
+                    "STUN tester requires a configured public STUN responder.",
+                )
+            ],
+            source_not_configured("STUN active tester is not configured (set HYRULE_STUN_TEST_HOST)."),
+        )
+    from hyrule_cloud.services.voip.stun_probe import split_host_port, stun_binding
+
+    hostname, port = split_host_port(host)
+    mapped = await stun_binding(hostname, port)
+    if mapped is None:
+        return (
+            [
+                _finding(
+                    DiagnosticStatus.WARNING,
+                    "stun_responder_unreachable",
+                    f"Public STUN responder {host} did not answer a binding request.",
+                )
+            ],
+            source_unavailable(f"configured STUN responder {host} did not answer a binding request"),
+        )
+    return (
+        [
+            _finding(
+                DiagnosticStatus.OK,
+                "stun_responder_available",
+                f"Public STUN responder {host} answered; mapped address {mapped[0]}:{mapped[1]}.",
+                mapped_ip=mapped[0],
+                mapped_port=mapped[1],
+            )
+        ],
+        source_ok(),
+    )
 
 
 async def voip_check(body: VoIPCheckRequest) -> DiagnosticResponse:
@@ -84,15 +165,19 @@ async def voip_check(body: VoIPCheckRequest) -> DiagnosticResponse:
         findings.extend(await _sip_tls(target, body.sip_port))
     if VoIPCheck.SIP_OPTIONS in body.checks:
         findings.append(_finding(DiagnosticStatus.INFO, "sip_options_contract", "SIP OPTIONS active probe is supported by contract and runs from configured VoIP-safe vantages when enabled."))
+    sources = voip_sources()
     if VoIPCheck.STUN_TURN in body.checks:
-        findings.append(_finding(DiagnosticStatus.INFO, "stun_turn_not_configured", "STUN/TURN tester requires configured relay/test credentials."))
+        stun_findings, stun_source = await _stun_check()
+        findings.extend(stun_findings)
+        # Reflect the live probe outcome, not just "a host is configured".
+        sources["stun_turn"] = stun_source
     status = DiagnosticStatus.OK if findings and all(f.severity in {DiagnosticStatus.OK, DiagnosticStatus.INFO} for f in findings) else DiagnosticStatus.WARNING
     return DiagnosticResponse(
         status=status,
         summary=f"VoIP/SIP check for {target}: {len(findings)} finding(s).",
         target=DiagnosticTarget(input=body.target, normalized=target, type=DiagnosticTargetType.DOMAIN),
         findings=findings,
-        sources=voip_sources(),
+        sources=sources,
         raw=raw if body.include_raw else None,
         generated_at=datetime.now(UTC),
     )

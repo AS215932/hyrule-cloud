@@ -349,6 +349,40 @@ class DomainOrderRow(Base):
     )
 
 
+class DomainRegistrationIntentRow(Base):
+    """Durable public x402 checkout state keyed by a client-generated id."""
+
+    __tablename__ = "domain_registration_intents"
+
+    registration_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    client_order_id: Mapped[str] = mapped_column(String(128), unique=True)
+    fqdn: Mapped[str] = mapped_column(String(253), index=True)
+    quote_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("domain_quotes.quote_id", ondelete="RESTRICT"), index=True
+    )
+    order_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("domain_orders.order_id", ondelete="SET NULL"),
+        unique=True,
+    )
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+    payer_address: Mapped[str | None] = mapped_column(String(42), index=True)
+    public_status_id: Mapped[str] = mapped_column(String(32), unique=True)
+    payment_authorization_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    settlement_state: Mapped[str] = mapped_column(
+        String(24), default="awaiting_payment", server_default="awaiting_payment", index=True
+    )
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class DomainOperationRow(Base):
     __tablename__ = "domain_operations"
 
@@ -498,6 +532,53 @@ class VPNTunnelRow(Base):
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     payment_tx: Mapped[str | None] = mapped_column(String(128))
+
+
+class ReverseTunnelRow(Base):
+    """Reverse-SSH tunnel lease.
+
+    Hyrule Cloud is the billing authority; the hyrule-tunnel-proxy daemon owns
+    the SSH intake and allocates the token + public port. This row is the
+    cloud-side record used for ownership, expiry sweeps, and reconcile.
+    """
+
+    __tablename__ = "reverse_tunnels"
+
+    # tunnel_id is our generated id (rtun_<hex>) and the daemon's lease_id.
+    tunnel_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_wallet: Mapped[str] = mapped_column(String(64), index=True, default="")
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+    # sha256 hex of the lease token (the SSH username + management credential).
+    # Only the hash is stored so a DB disclosure never yields a live credential;
+    # the cleartext token is returned to the caller only once, at creation.
+    token_hash: Mapped[str] = mapped_column(String(64), index=True)
+    allocated_port: Mapped[int] = mapped_column(Integer)
+    endpoint_host: Mapped[str] = mapped_column(String(128))
+    ssh_port: Mapped[int] = mapped_column(Integer, default=2222)
+    allowlist_cidrs: Mapped[list | None] = mapped_column(_JSONB)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    # sha256 of the x402 payment authorization; makes create idempotent so a
+    # client retry (after a lost response) recovers the same tunnel + token
+    # instead of paying again or leaking a port. UNIQUE so two concurrent
+    # replicas with the same authorization cannot both provision.
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    # sha256 of the canonical create request (hours + allowlist); an idempotent
+    # replay with the SAME payment auth but a DIFFERENT body is a 409 conflict,
+    # not a silent return of the original tunnel.
+    request_hash: Mapped[str | None] = mapped_column(String(64))
+    # x402 settlement response header from the original create, replayed on an
+    # idempotent retry so a standard x402 client sees settlement proof.
+    settlement_header: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    payment_tx: Mapped[str | None] = mapped_column(String(128))
+
+    __table_args__ = (Index("ix_reverse_tunnels_owner_status", "owner_wallet", "status"),)
 
 
 class CryptoIntentRow(Base):
