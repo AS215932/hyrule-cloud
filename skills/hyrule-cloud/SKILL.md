@@ -388,7 +388,57 @@ Authorization: Bearer hyr_vm_...
 ```
 
 #### GET /v1/vm/{vm_id}/logs
-Get provisioning log for a VM.
+Provisioning history for a VM, oldest event first. Requires the management
+token (same auth as `GET /v1/vm/{id}`).
+
+```json
+{
+  "vm_id": "vm_...",
+  "status": "ready",
+  "events": [
+    {"ts": "2026-07-24T12:00:01Z", "event": "provisioning_started",
+     "message": "Provisioning started."},
+    {"ts": "2026-07-24T12:00:31Z", "event": "ready",
+     "message": "Your VM is ready.",
+     "detail": {"hostname": "abc.deploy.hyrule.host", "ipv6": "2a0c:...",
+                "dns_aaaa_verified": true, "ssh_reachable": true}}
+  ],
+  "error": null
+}
+```
+
+Event vocabulary (stable; new keys may be added, existing ones never change
+meaning). Treat unknown keys as informational.
+
+| `event` | Meaning |
+|---|---|
+| `provisioning_started` | The background provisioner picked up the order. |
+| `provisioning_simulated` | Simulation mode: no real VM/DNS/network was created. Every later event on this VM is simulated. |
+| `cloud_init_prepared` | First-boot config rendered (SSH key, firewall defaults). |
+| `setup_script_injected` | Your `setup_script` was embedded in first-boot user-data. |
+| `vm_created` | The machine was created and powered on. |
+| `network_ready` | The VM booted and brought up its IPv6 address. |
+| `dns_created` | The AAAA record for your hostname was published. |
+| `ssh_reachable` / `ssh_unreachable` | TCP :22 answered / did not answer within the check window. `ssh_unreachable` is not fatal — the VM is still delivered. |
+| `custom_domain_attached` / `custom_domain_attach_failed` | Custom domain pointed at the VM, or attachment deferred to retry. |
+| `ready` | Terminal success. `detail` carries hostname, ipv6, `dns_aaaa_verified`, `ssh_reachable`. |
+| `provisioning_failed` | Terminal failure. `message` is the customer-facing reason; a paid VM is refunded. |
+
+What this endpoint **cannot** tell you:
+
+- **It is not a log stream from inside your VM.** These are control-plane
+  events observed by Hyrule while building the machine — no console output, no
+  syslog, no application logs.
+- **`setup_script` outcome is not observable.** Hyrule sees the script injected
+  into user-data (`setup_script_injected`) and nothing after that: there is no
+  agent channel into the guest, so a script that ran, failed, or never started
+  looks identical from here. To check it, SSH in and read
+  `/var/log/hyrule-setup.log` (the script runs as root at first boot; a
+  non-zero exit does not fail the VM).
+- **Failure messages are deliberately generic** (capacity / boot timeout / DNS /
+  internal). Infrastructure detail is not exposed; the operator has it.
+- VMs created before provisioning events existed return a single
+  `provisioning_started` entry derived from their creation time.
 
 ```
 GET /v1/vm/vm_a1b2c3d4e5f6/logs

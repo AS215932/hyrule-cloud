@@ -46,7 +46,6 @@ from hyrule_cloud.models import (
     VMCreateRequest,
     VMCreateResponse,
     VMExtendRequest,
-    VMLogEvent,
     VMLogsResponse,
     VMPriceBreakdown,
     VMProduct,
@@ -76,6 +75,7 @@ from hyrule_cloud.services.quotes import (
     is_expired,
     link_quote_vm,
 )
+from hyrule_cloud.services.vm_events import vm_log_events
 from hyrule_cloud.services.vm_pricing import (
     VMResourceValidationError,
     current_daily_price_for_vm,
@@ -790,13 +790,27 @@ async def get_vm_status(
 @router.get("/vm/{vm_id}/logs", response_model=VMLogsResponse)
 async def get_vm_logs(
     row=Depends(_vm_for_management),
+    orch=Depends(get_orch),
 ) -> VMLogsResponse:
+    """Provisioning lifecycle for one VM, oldest event first.
+
+    These are control-plane events (see `VMEventKey`) — what Hyrule observed
+    while building the VM: first-boot config prepared, machine created, IPv6 up,
+    DNS published, SSH reachability, ready/failed. They are NOT logs from inside
+    the guest.
+
+    A supplied `setup_script` is observable only up to `setup_script_injected`:
+    the platform has no channel into the guest, so whether the script ran,
+    succeeded, or failed is not reported here. Read /var/log/hyrule-setup.log on
+    the VM over SSH for that.
+
+    VMs created before provisioning events existed return the single legacy
+    `provisioning_started` entry derived from their creation time.
+    """
     return VMLogsResponse(
         vm_id=row.vm_id,
         status=row.status,
-        events=[
-            VMLogEvent(ts=row.created_at.isoformat(), event="provisioning_started"),
-        ],
+        events=await vm_log_events(orch, row),
         error=row.error,
     )
 

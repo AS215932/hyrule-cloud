@@ -37,6 +37,7 @@ from hyrule_cloud.models import (
     DomainMode,
     SSHSmokeStatus,
     VMCreateRequest,
+    VMEventKey,
     VMOrderResources,
     VMPriceBreakdown,
     VMSize,
@@ -61,6 +62,13 @@ from hyrule_cloud.providers.openprovider import OpenproviderClient
 from hyrule_cloud.providers.xcpng import XCPNGProvider
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
+from hyrule_cloud.services.vm_events import (
+    FAILURE_DNS,
+    ProvisioningFailedError,
+    customer_failure_message,
+    internal_failure_detail,
+    record_vm_event,
+)
 from hyrule_cloud.services.vm_pricing import (
     billing_addons_from_snapshot,
     price_vm_order,
@@ -598,11 +606,38 @@ class Orchestrator:
                 await session.delete(row)
                 await session.commit()
 
+    async def _emit(
+        self,
+        vm_id: str,
+        event: VMEventKey,
+        *,
+        message: str | None = None,
+        detail: dict[str, object] | None = None,
+    ) -> None:
+        """Append a customer-visible provisioning event. Never raises.
+
+        Only customer-safe content may be passed: hostnames and addresses the
+        customer already owns, their ordered resources, and fixed messages. No
+        XO/XAPI identifiers, template UUIDs, internal management addresses,
+        tokens, or provider text.
+        """
+        await record_vm_event(self.db, vm_id, event, message=message, detail=detail)
+
     async def _provision_vm(self, vm_id: str) -> None:
         """Background provisioning: create VM, wait for IPv6, configure DNS.
 
         Issue #28: controlled simulation by default. Real XCP-NG / DNS only
         when HCP_LAUNCH_PROOF_REAL_XCPNG=1.
+
+        Every stage boundary and failure path here appends a customer-visible
+        event (see `VMEventKey`) that `GET /v1/vm/{vm_id}/logs` returns. Event
+        writes are best-effort by construction: they can never fail a paid VM.
+
+        Limit worth knowing: a supplied `setup_script` is only observable up to
+        the point it is injected into cloud-init user-data. The platform has no
+        channel into the guest, so whether the script actually ran, succeeded,
+        or failed is NOT reported here — the customer reads
+        /var/log/hyrule-setup.log inside their own VM for that.
         """
         from hyrule_cloud.services.launch_proof import use_real_provisioning
 
@@ -614,9 +649,18 @@ class Orchestrator:
             row = await session.get(VMRow, vm_id)
             if row is None or str(row.status) != VMStatus.PROVISIONING.value:
                 return
-            if row.provision_started_at is None:
+            first_start = row.provision_started_at is None
+            if first_start:
                 row.provision_started_at = _now()
                 await session.commit()
+
+        # Only on the first start: a retried provision keeps one started event.
+        if first_start:
+            await self._emit(
+                vm_id,
+                VMEventKey.PROVISIONING_STARTED,
+                message="Provisioning started.",
+            )
 
         if not use_real_provisioning():
             await self._simulate_provisioning(vm_id)
@@ -668,6 +712,23 @@ class Orchestrator:
                 open_ports=open_ports,
                 setup_script=setup_script,
             )
+            await self._emit(
+                vm_id,
+                VMEventKey.CLOUD_INIT_PREPARED,
+                message="First-boot configuration prepared (SSH key, firewall defaults).",
+                detail={"os": os_name, "open_ports": open_ports},
+            )
+            if setup_script:
+                await self._emit(
+                    vm_id,
+                    VMEventKey.SETUP_SCRIPT_INJECTED,
+                    message=(
+                        "Your setup script was injected into first-boot user-data and "
+                        "will run as root once the VM boots. Its exit status is not "
+                        "visible to the platform — read /var/log/hyrule-setup.log on "
+                        "the VM to see what it did."
+                    ),
+                )
 
             if xcpng_uuid is None:
                 # Admission snapshots and the pending→XO handoff share one
@@ -710,6 +771,19 @@ class Orchestrator:
                                 row.xcpng_uuid = xcpng_uuid
                                 await session.commit()
 
+                        # The hypervisor identity of the clone is internal; the
+                        # customer only learns their machine exists and started.
+                        await self._emit(
+                            vm_id,
+                            VMEventKey.VM_CREATED,
+                            message="Virtual machine created and powered on.",
+                            detail={
+                                "vcpu": resources.vcpu,
+                                "ram_mb": resources.ram_mb,
+                                "disk_gb": resources.disk_gb,
+                            },
+                        )
+
             # Wait for IPv6 (outside DB session to avoid long-held connections)
             ipv6 = await self._wait_for_ipv6(
                 xcpng_uuid,
@@ -718,10 +792,25 @@ class Orchestrator:
             )
             if not ipv6:
                 raise TimeoutError(f"VM did not report expected IPv6 {expected_ipv6} within 120s")
+            await self._emit(
+                vm_id,
+                VMEventKey.NETWORK_READY,
+                message="The VM booted and brought up its IPv6 address.",
+                detail={"ipv6": ipv6},
+            )
 
             # Create DNS
             subdomain = self._generate_hostname(vm_id)
-            await self.dns.create_aaaa(subdomain, ipv6)
+            try:
+                await self.dns.create_aaaa(subdomain, ipv6)
+            except Exception as dns_exc:
+                raise ProvisioningFailedError(FAILURE_DNS) from dns_exc
+            await self._emit(
+                vm_id,
+                VMEventKey.DNS_CREATED,
+                message="DNS AAAA record published for your hostname.",
+                detail={"hostname": subdomain, "ipv6": ipv6},
+            )
 
             # Launch proof (issue #28): measure instead of inferring — probe
             # TCP :22 and confirm the AAAA on the authoritative server. An
@@ -731,6 +820,22 @@ class Orchestrator:
                 self._probe_ssh(ipv6),
                 self.dns.verify_aaaa(subdomain, ipv6),
             )
+            if ssh_ok:
+                await self._emit(
+                    vm_id,
+                    VMEventKey.SSH_REACHABLE,
+                    message="SSH accepted a TCP connection on port 22.",
+                )
+            else:
+                await self._emit(
+                    vm_id,
+                    VMEventKey.SSH_UNREACHABLE,
+                    message=(
+                        "SSH was not reachable on port 22 within the check window. "
+                        "The VM is still delivered — first boot may simply not have "
+                        "finished; retry the connection shortly."
+                    ),
+                )
 
             # Update DB with final state
             custom_domain: str | None = None
@@ -758,7 +863,21 @@ class Orchestrator:
                     custom_domain = row.domain
                     custom_account_id = row.owner_account_id
 
+                hostname = row.hostname
+
                 await session.commit()
+
+            await self._emit(
+                vm_id,
+                VMEventKey.READY,
+                message="Your VM is ready.",
+                detail={
+                    "hostname": hostname,
+                    "ipv6": ipv6,
+                    "dns_aaaa_verified": bool(dns_verified),
+                    "ssh_reachable": bool(ssh_ok),
+                },
+            )
 
             # A DNS control-plane outage must not turn a healthy, paid VM into
             # a refund. The VM is already READY; attachment is retryable and
@@ -771,11 +890,27 @@ class Orchestrator:
                         ipv6=ipv6,
                         owner_account_id=custom_account_id,
                     )
+                    await self._emit(
+                        vm_id,
+                        VMEventKey.CUSTOM_DOMAIN_ATTACHED,
+                        message="Your custom domain now points at this VM.",
+                        detail={"domain": custom_domain},
+                    )
                 except Exception:
                     log.exception(
                         "custom_domain_attachment_failed",
                         vm_id=vm_id,
                         domain=custom_domain,
+                    )
+                    await self._emit(
+                        vm_id,
+                        VMEventKey.CUSTOM_DOMAIN_ATTACH_FAILED,
+                        message=(
+                            "Your custom domain could not be pointed at this VM yet. "
+                            "The VM is running and the attachment will be retried; "
+                            "the auto subdomain works in the meantime."
+                        ),
+                        detail={"domain": custom_domain},
                     )
                     try:
                         assert custom_account_id is not None and self.domains is not None
@@ -796,12 +931,19 @@ class Orchestrator:
 
         except Exception as e:
             log.error("provision_failed", vm_id=vm_id, error=str(e), exc_info=True)
+            # The customer sees a fixed, safe message; the operator keeps the
+            # real one in the log line above and in the refund ledger reason.
+            customer_message = customer_failure_message(e)
+            internal_reason = internal_failure_detail(e)
             owner_wallet, amount, payment_tx, settled = "", None, None, None
             async with self.db() as session:
                 row = await session.get(VMRow, vm_id)
                 if row is not None:
                     row.status = VMStatus.FAILED
-                    row.error = str(e)
+                    # row.error is customer-visible (management status view and
+                    # the public launch proof's operator_message), so it stores
+                    # the sanitized message — never provider text.
+                    row.error = customer_message
                     owner_wallet = row.owner_wallet
                     amount = row.cost_total
                     payment_tx = row.payment_tx
@@ -820,13 +962,20 @@ class Orchestrator:
                         )
                     ).scalar_one_or_none()
                 await session.commit()
+            await self._emit(
+                vm_id,
+                VMEventKey.PROVISIONING_FAILED,
+                message=customer_message,
+            )
             if self.domains is not None:
                 try:
                     await self.domains.release_vm_attachment_claim(vm_id)
                 except Exception:
                     log.exception("custom_domain_claim_release_failed", vm_id=vm_id)
+            # The refund reason is operator-facing (payment ledger), so it keeps
+            # the internal detail.
             await self._record_vm_refund(
-                vm_id, owner_wallet, amount, payment_tx, settled, reason=str(e)
+                vm_id, owner_wallet, amount, payment_tx, settled, reason=internal_reason
             )
 
     async def _record_vm_refund(
@@ -916,7 +1065,14 @@ class Orchestrator:
         PROVISIONING with a non-empty owner_wallet, which the reservation sweeper
         (unpaid rows only, owner_wallet == "") never reclaims — so without this
         it pins its customer /64 and keeps counting as live until expiry.
+
+        `error` is an internal reason string from the caller. It is logged for
+        the operator and NEVER stored on the row: row.error is customer-visible,
+        so it gets the fixed sanitized message instead.
         """
+        log.warning("vm_marked_failed", vm_id=vm_id, error=error)
+        customer_message = customer_failure_message(error)
+        failed = False
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if row is not None and row.status not in (VMStatus.DESTROYED, VMStatus.FAILED):
@@ -928,7 +1084,7 @@ class Orchestrator:
                 if domain is not None and domain.vm_ipv6 is None:
                     domain.vm_id = None
                 row.status = VMStatus.FAILED
-                row.error = error
+                row.error = customer_message
                 # Free the customer /64: _allocate_customer_prefix counts any
                 # non-null prefix index as used and check_expiries skips FAILED
                 # rows, so leaving these set would pin the prefix forever. Nothing
@@ -936,6 +1092,13 @@ class Orchestrator:
                 row.ipv6_prefix_index = None
                 row.ipv6_prefix = None
                 await session.commit()
+                failed = True
+        if failed:
+            await self._emit(
+                vm_id,
+                VMEventKey.PROVISIONING_FAILED,
+                message=customer_message,
+            )
 
     async def persist_charged_amount(self, vm_id: str, amount: Decimal) -> None:
         """Persist the locked, actually-charged quote amount onto the VM.
@@ -1131,10 +1294,23 @@ class Orchestrator:
         Skips XCP-NG, DNS, and Openprovider. Sets a fake IPv6 and flips
         the VM to READY after a short delay so the launch-proof contract
         can be exercised end-to-end without touching real infra.
+
+        Every event emitted here is explicitly marked simulated, both in its own
+        key and in `detail.simulated`, so a customer reading `/logs` can never
+        mistake a simulated run for a real one.
         """
         import random
 
         log.info("provision_simulate_start", vm_id=vm_id)
+        await self._emit(
+            vm_id,
+            VMEventKey.PROVISIONING_SIMULATED,
+            message=(
+                "SIMULATED provisioning: this deployment ran in simulation mode. "
+                "No real virtual machine, DNS record, or network was created."
+            ),
+            detail={"simulated": True},
+        )
 
         # Simulate brief provisioning work
         await asyncio.sleep(0.1)
@@ -1159,7 +1335,15 @@ class Orchestrator:
             lp["ssh_smoke_status"] = "passed"
             meta["launch_proof"] = lp
             row.metadata_ = meta
+            hostname = row.hostname
             await session.commit()
+
+        await self._emit(
+            vm_id,
+            VMEventKey.READY,
+            message="SIMULATED: the VM was marked ready without real infrastructure.",
+            detail={"simulated": True, "hostname": hostname, "ipv6": fake_ipv6},
+        )
 
         log.info("provision_simulate_complete", vm_id=vm_id, ipv6=fake_ipv6)
 

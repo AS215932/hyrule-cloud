@@ -94,6 +94,7 @@ from hyrule_cloud.providers.openprovider import (
 from hyrule_cloud.providers.rates import RateProvider
 from hyrule_cloud.services.intents import IntentExistsError, create_intent
 from hyrule_cloud.services.quotes import link_quote_vm
+from hyrule_cloud.services.vm_events import customer_failure_message
 
 log = structlog.get_logger()
 
@@ -2965,7 +2966,11 @@ class DomainService:
                                 domain.vm_id = None
                                 if bundle_vm is not None:
                                     bundle_vm.status = VMStatus.FAILED
-                                    bundle_vm.error = str(exc)[:1000]
+                                    # VMRow.error is customer-visible (VM status
+                                    # view + /logs), so it never carries the raw
+                                    # provider text; the order's error_detail
+                                    # keeps that for the operator.
+                                    bundle_vm.error = customer_failure_message(exc)
                                     bundle_vm.ipv6_prefix_index = None
                                     bundle_vm.ipv6_prefix = None
                         if Decimal(order.vm_amount_usd) > 0:
