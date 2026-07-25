@@ -1,7 +1,7 @@
 """Reverse-SSH tunnel leases.
 
-Revision ID: 017
-Revises: 016
+Revision ID: 018
+Revises: 017
 Create Date: 2026-07-22
 
 """
@@ -15,8 +15,8 @@ from alembic import op
 
 _JSONB = postgresql.JSONB(astext_type=sa.Text()).with_variant(sa.JSON(), "sqlite")
 
-revision: str = "017"
-down_revision: str | None = "016"
+revision: str = "018"
+down_revision: str | None = "017"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
