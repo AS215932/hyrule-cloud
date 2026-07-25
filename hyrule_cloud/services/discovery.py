@@ -1019,7 +1019,15 @@ _CATALOG_PHRASES: tuple[tuple[str, str], ...] = (
     ("/v1/network", "outbound requests over Direct, Tor, I2P, or Yggdrasil"),
     ("/v1/bgp", "BGP/routing intelligence"),
     ("/v1/ip", "IP/ASN intelligence"),
-    ("/v1/dns", "DNS diagnostics, blocklist membership, and filtering evidence"),
+    # Keyed to each operation's actual path rather than the whole /v1/dns
+    # prefix: /v1/dns/lookup is ungated, but blocklist membership and
+    # filtering evidence each have their own readiness gate
+    # (dns_blocklists / dns_filtering) and must not be advertised just
+    # because DNS diagnostics happens to be live.
+    ("/v1/dns/lookup", "DNS diagnostics"),
+    ("/v1/dns/propagation", "DNS diagnostics"),
+    ("/v1/dns/blocklists", "blocklist membership checks"),
+    ("/v1/dns/filtering", "filtering evidence"),
     ("/v1/rdap", "RDAP/WHOIS registry lookups"),
     ("/v1/whois", "RDAP/WHOIS registry lookups"),
     ("/v1/web", "web and deep TLS checks"),

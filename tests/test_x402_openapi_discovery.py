@@ -224,6 +224,62 @@ def test_manifest_openapi_and_bazaar_share_the_same_enabled_catalog(
     assert ("POST", "/v1/domain/register") not in catalog_keys
 
 
+def test_dns_marketing_copy_is_gated_independently_per_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blocklist membership and filtering evidence must not be advertised
+    just because /v1/dns/lookup (ungated) is live: each has its own
+    readiness gate, and the previous combined /v1/dns phrase ignored that."""
+    from hyrule_cloud.services.discovery import service_overview
+
+    _enable_all_catalog_gates(monkeypatch)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.blocklists.blocklist_catalog_ready",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.filtering.dns_filtering_enabled",
+        lambda: False,
+    )
+    copy = service_overview()
+    assert "DNS diagnostics" in copy
+    assert "blocklist membership" not in copy
+    assert "filtering evidence" not in copy
+
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.blocklists.blocklist_catalog_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.filtering.dns_filtering_enabled",
+        lambda: True,
+    )
+    copy = service_overview()
+    assert "blocklist membership" in copy
+    assert "filtering evidence" in copy
+
+
+def test_supporting_routes_follow_their_readiness_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_all_catalog_gates(monkeypatch)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning",
+        lambda: False,
+    )
+    config = HyruleConfig()
+    schema = build_curated_openapi(app, config)
+    operations = _schema_operations(schema)
+
+    # Simulated provisioning: no VM routes (paid or supporting) may be
+    # advertised, while the always-on catalog/pricing routes remain.
+    assert not {key for key in operations if "/v1/vm/" in key[1]}
+    assert ("GET", "/v1/pricing") in operations
+    assert ("GET", "/v1/products/vms") in operations
+    assert ("GET", "/v1/os/list") in operations
+    assert ("GET", "/v1/payments/networks") in operations
+
+
 @pytest.mark.asyncio
 async def test_unpaid_catalog_probes_reach_valid_402_before_validation(
     monkeypatch: pytest.MonkeyPatch,

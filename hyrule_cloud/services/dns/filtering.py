@@ -67,6 +67,11 @@ _SECURITY = (
 _CLOUDFLARE_CONTROL = "https://cloudflare-dns.com/dns-query"
 _MULLVAD_CONTROL = "https://dns.mullvad.net/dns-query"
 
+#: rcodes that mean the resolver itself failed or refused to answer, not
+#: that it definitively resolved the name. Only NOERROR (possibly with no
+#: answer) and NXDOMAIN are decisive enough to conclude non-resolution.
+_RESOLVER_FAILURE_RCODES = frozenset({"SERVFAIL", "REFUSED"})
+
 RESOLVER_PROFILES: tuple[ResolverProfile, ...] = (
     ResolverProfile(
         "cloudflare_security",
@@ -220,7 +225,7 @@ class DNSFilteringService:
         cached = self._cache.get(normalized)
         if cached is not None:
             age = max(0, int(time.monotonic() - cached.cached_at))
-            return cached.response.model_copy(
+            response = cached.response.model_copy(
                 update={
                     "request_id": generate_diagnostic_request_id(),
                     "input_domain": input_domain,
@@ -228,8 +233,25 @@ class DNSFilteringService:
                     "generated_at": datetime.now(UTC),
                 }
             )
+            # The route still settles a payment and delivers this result, so
+            # it must count in the outcome metrics — just not the upstream
+            # latency samples, since no resolver call actually happened.
+            self._record_outcome_counts(response, record_latency=False)
+            return response
 
         response = await self._collect(input_domain, normalized)
+        self._record_outcome_counts(response, record_latency=True)
+        if self.meets_quality_floor(response) and self.config.cache_ttl_seconds:
+            self._cache.set(
+                normalized,
+                _CachedResult(response=response, cached_at=time.monotonic()),
+                ttl_seconds=self.config.cache_ttl_seconds,
+            )
+        return response
+
+    def _record_outcome_counts(
+        self, response: DNSFilteringCheckResponse, *, record_latency: bool
+    ) -> None:
         self._overall_counts[response.overall.value] = (
             self._overall_counts.get(response.overall.value, 0) + 1
         )
@@ -237,6 +259,8 @@ class DNSFilteringService:
             key = (result.profile_id, result.status.value)
             self._profile_counts[key] = self._profile_counts.get(key, 0) + 1
             self._last_profile_status[result.profile_id] = result.status.value
+            if not record_latency:
+                continue
             latencies = [
                 observation.latency_ms
                 for observation in result.filtered
@@ -251,13 +275,6 @@ class DNSFilteringService:
                     self._profile_latency_samples.get(result.profile_id, 0)
                     + len(latencies)
                 )
-        if self.meets_quality_floor(response) and self.config.cache_ttl_seconds:
-            self._cache.set(
-                normalized,
-                _CachedResult(response=response, cached_at=time.monotonic()),
-                ttl_seconds=self.config.cache_ttl_seconds,
-            )
-        return response
 
     async def _collect(
         self,
@@ -302,10 +319,12 @@ class DNSFilteringService:
         any_control_answer = any(
             _non_null_answers(observation) for observation in control_observations.values()
         )
-        any_control_dns_response = any(
-            observation.rcode is not None for observation in control_observations.values()
+        any_control_decisive_response = any(
+            observation.rcode is not None
+            and observation.rcode not in _RESOLVER_FAILURE_RCODES
+            for observation in control_observations.values()
         )
-        if not any_control_answer and any_control_dns_response:
+        if not any_control_answer and any_control_decisive_response:
             raise DomainNotResolvableError(
                 "domain has no A or AAAA answer from the control resolvers"
             )
