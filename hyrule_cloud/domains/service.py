@@ -1926,16 +1926,28 @@ class DomainService:
                     )
                     recovered += 1
                 if registration is not None:
+                    # Worker sweep and inline replay recovery (api.py) can race on
+                    # the same row across processes; a conditional UPDATE is the
+                    # compare-and-swap — a concurrent loser's WHERE matches zero
+                    # rows instead of clobbering the winner's read-then-write.
+                    now = _now()
                     async with self.db() as session:
-                        stored = await session.get(
-                            DomainRegistrationIntentRow,
-                            registration.registration_id,
+                        await session.execute(
+                            update(DomainRegistrationIntentRow)
+                            .where(
+                                DomainRegistrationIntentRow.registration_id
+                                == registration.registration_id,
+                                DomainRegistrationIntentRow.settlement_state != "settled",
+                            )
+                            .values(
+                                settlement_state="settled",
+                                settled_at=func.coalesce(
+                                    DomainRegistrationIntentRow.settled_at, now
+                                ),
+                                updated_at=now,
+                            )
                         )
-                        if stored is not None and stored.settlement_state != "settled":
-                            stored.settlement_state = "settled"
-                            stored.settled_at = stored.settled_at or _now()
-                            stored.updated_at = _now()
-                            await session.commit()
+                        await session.commit()
             if len(events) < limit:
                 break
             last = events[-1]

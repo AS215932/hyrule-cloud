@@ -36,6 +36,7 @@ from hyrule_cloud.db import (
 )
 from hyrule_cloud.domains.api import (
     _REGISTRATION_PREFLIGHTS,
+    _payment_chain_id,
     register_domain_x402,
 )
 from hyrule_cloud.domains.api import (
@@ -2873,3 +2874,21 @@ async def test_wallet_login_and_two_signature_rotation(tmp_path):
     assert action is WalletAction.ROTATE
     assert rotated.address.lower() == replacement.address.lower()
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_payment_chain_id_rejects_network_outside_the_enabled_whitelist(domain_service):
+    """The facilitator's `network` string is untrusted input. Regression for a
+    fallback that parsed the numeric suffix off ANY `eip155:<n>` string,
+    bypassing the enabled-networks whitelist loop above it — a compromised or
+    misbehaving facilitator could name an unsupported chain (e.g. Ethereum
+    mainnet, not the pinned Base canary) and have it accepted verbatim."""
+    service, _provider, _sessions = domain_service
+    gate = SimpleNamespace(config=service.config.payment)
+    verified = SimpleNamespace(
+        dev_bypass=False,
+        matching_requirements=SimpleNamespace(network="eip155:1"),
+    )
+    with pytest.raises(DomainProblem) as excinfo:
+        _payment_chain_id(verified, gate)
+    assert excinfo.value.code == "unsupported_chain"

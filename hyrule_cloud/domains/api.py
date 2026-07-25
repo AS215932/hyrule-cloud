@@ -109,14 +109,13 @@ def _payment_chain_id(verified: Any, gate: PaymentGate) -> int:
         return 8453
     requirements = getattr(verified, "matching_requirements", None)
     network = str(getattr(requirements, "network", ""))
+    # Only ever return a chain id our own config has whitelisted. The
+    # facilitator's `network` string is untrusted input; parsing an
+    # `eip155:<n>` fallback here would let a compromised/misbehaving
+    # facilitator name an unsupported chain and have it accepted verbatim.
     for configured in gate.config.enabled_networks():
         if configured.caip2 == network and configured.chain_id is not None:
             return configured.chain_id
-    if network.startswith("eip155:"):
-        try:
-            return int(network.split(":", 1)[1])
-        except ValueError:
-            pass
     raise DomainProblem(422, "unsupported_chain", "The payment network is not supported.")
 
 
