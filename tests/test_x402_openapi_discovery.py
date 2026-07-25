@@ -56,6 +56,10 @@ def _enable_all_catalog_gates(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda: True,
     )
     monkeypatch.setattr(
+        "hyrule_cloud.services.tunnel.readiness.tunnel_service_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
         "hyrule_cloud.services.dns.blocklists.blocklist_catalog_ready",
         lambda: True,
     )

@@ -18,8 +18,10 @@ from hyrule_cloud.logging_config import SAFE_DICT_TRACEBACKS
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.providers.tunnel_client import TunnelProvider
 from hyrule_cloud.services.dns.blocklists import BlocklistService
 from hyrule_cloud.services.intents import scan_pending_intents
+from hyrule_cloud.services.tunnel.service import TunnelService
 
 structlog.configure(
     processors=[
@@ -76,6 +78,12 @@ async def run_worker() -> None:
         orchestrator,
     )
     orchestrator.domains = domains
+    tunnel_provider = TunnelProvider(
+        proxy_url=config.tunnel_proxy_url,
+        token=config.tunnel_proxy_token,
+        health_ttl_seconds=config.tunnel_proxy_health_ttl_seconds,
+    )
+    tunnel_service = TunnelService(config, sessions, tunnel_provider)
     dns_blocklists = BlocklistService(config.dns_blocklists)
     recovered_bundles = await domains.recover_bundle_provisioning()
 
@@ -96,6 +104,7 @@ async def run_worker() -> None:
     next_catalog = now
     next_reconcile = now
     next_renewal_state = now
+    next_tunnel_expiry = now
     next_dns_blocklists = now
     dns_blocklist_task: asyncio.Task[None] | None = None
     worker_id = f"{socket.gethostname()}:{id(stop)}"
@@ -136,6 +145,12 @@ async def run_worker() -> None:
                 except Exception:
                     log.exception("vm_expiry_scan_failed")
                 next_expiry = now + timedelta(minutes=5)
+            if now >= next_tunnel_expiry:
+                try:
+                    await tunnel_service.sweep_expiries()
+                except Exception:
+                    log.exception("tunnel_expiry_sweep_failed")
+                next_tunnel_expiry = now + timedelta(minutes=1)
             if now >= next_quotes:
                 try:
                     await domains.expire_quotes()
@@ -196,6 +211,7 @@ async def run_worker() -> None:
         await domains.close()
         await native.close()
         await rates.close()
+        await tunnel_provider.close()
         await orchestrator.shutdown()
         await engine.dispose()
         log.info("worker_stopped")
