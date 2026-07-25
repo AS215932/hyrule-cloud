@@ -28,7 +28,8 @@ from hyrule_cloud.services.dns.blocklists import (
     BLOCKLIST_SOURCES,
     BlocklistService,
     BlocklistSource,
-    parse_rule_line,
+    _rule_counts,
+    parse_rule_lines,
 )
 from hyrule_cloud.services.dns.domain import normalize_domain
 from hyrule_cloud.services.dns.filtering import (
@@ -117,16 +118,59 @@ def _blocklist_service(tmp_path, *, stale_second_source: bool = False) -> Blockl
 
 def test_domain_normalization_and_dns_decidable_rule_parser() -> None:
     assert normalize_domain("BÜCHER.example.") == "xn--bcher-kva.example"
-    assert parse_rule_line("0.0.0.0 exact.example").match_kind == "exact"
-    assert parse_rule_line("||parent.example^").match_kind == "suffix"
-    assert parse_rule_line("*.wild.example").match_kind == "wildcard"
-    assert parse_rule_line("@@||allowed.example^").action == "allow"
-    assert parse_rule_line("||browser.example^$third-party") is None
-    assert parse_rule_line("example.com/path.js") is None
+    assert parse_rule_lines("0.0.0.0 exact.example")[0].match_kind == "exact"
+    assert parse_rule_lines("||parent.example^")[0].match_kind == "suffix"
+    assert parse_rule_lines("*.wild.example")[0].match_kind == "wildcard"
+    assert parse_rule_lines("@@||allowed.example^")[0].action == "allow"
+    assert parse_rule_lines("||browser.example^$third-party") == []
+    assert parse_rule_lines("example.com/path.js") == []
     with pytest.raises(ValueError, match="not a URL"):
         normalize_domain("https://example.com/path")
     with pytest.raises(ValueError, match="IP addresses"):
         normalize_domain("192.0.2.1")
+
+
+def test_important_modifier_is_parsed_and_beats_exception_on_tie() -> None:
+    plain = parse_rule_lines("||foo.example^")[0]
+    assert plain.important is False
+
+    important = parse_rule_lines("||foo.example^$important")[0]
+    assert important.action == "block"
+    assert important.important is True
+
+
+def test_cosmetic_filter_is_rejected_not_truncated_into_a_domain_block() -> None:
+    """`publisher.example##.ad` must not compile to an exact block for
+    publisher.example: the '#' is a cosmetic-filter operator here, not a
+    hosts-file inline comment."""
+    assert parse_rule_lines("publisher.example##.ad") == []
+    assert parse_rule_lines("publisher.example#@#.ad") == []
+    # A genuine hosts-line inline comment is still stripped correctly.
+    assert parse_rule_lines("0.0.0.0 real.example # comment") == [
+        parse_rule_lines("0.0.0.0 real.example")[0]
+    ]
+
+
+def test_hosts_line_compiles_every_hostname() -> None:
+    rules = parse_rule_lines("0.0.0.0 first.example second.example")
+    assert {rule.domain for rule in rules} == {"first.example", "second.example"}
+    assert all(rule.match_kind == "exact" and rule.action == "block" for rule in rules)
+
+    # A leading localhost entry no longer swallows the real hostnames after it.
+    rules = parse_rule_lines("0.0.0.0 localhost real.example")
+    assert [rule.domain for rule in rules] == ["real.example"]
+
+
+def test_rule_counts_deduplicates_repeated_domains(tmp_path) -> None:
+    """A source that repeats one domain thousands of times (an upstream
+    generation failure) must not report an inflated accepted count that
+    would pass the minimum/change-ratio gates only to collapse once
+    INSERT OR IGNORE dedupes it at compile time."""
+    raw = tmp_path / "flooded.txt"
+    raw.write_text("\n".join(["dup.example"] * 5000 + ["other.example"]), encoding="utf-8")
+    accepted, rejected = _rule_counts(raw)
+    assert accepted == 2
+    assert rejected == 0
 
 
 def test_hagezi_tif_medium_uses_current_dns_capable_feed() -> None:
@@ -135,6 +179,35 @@ def test_hagezi_tif_medium_uses_current_dns_capable_feed() -> None:
     )
     assert source.source_url.endswith("/adblock/tif.medium.txt")
     assert source.format == "adblock-dns"
+
+
+def test_important_block_beats_exception_at_equal_specificity(tmp_path) -> None:
+    source = _source("mixed", (DNSBlocklistCategory.ADS,))
+    config = DNSBlocklistConfig(_env_file=None, data_dir=tmp_path, minimum_coverage=1.0)
+    service = BlocklistService(config, sources=(source,))
+    _seed_source(
+        service,
+        source,
+        "\n".join(
+            (
+                "||important.example^$important",
+                "@@||important.example^",
+                "||plain.example^",
+                "@@||plain.example^",
+            )
+        ),
+    )
+    service.compile_snapshot()
+
+    # $important flips the usual allow-wins-on-tie precedence.
+    important = service._check_sync("important.example", "important.example")
+    result = next(r for r in important.results if r.source_id == "mixed")
+    assert result.outcome == DNSBlocklistSourceOutcome.LISTED
+
+    # Without $important, the exception still wins the tie as before.
+    plain = service._check_sync("plain.example", "plain.example")
+    result = next(r for r in plain.results if r.source_id == "mixed")
+    assert result.outcome == DNSBlocklistSourceOutcome.EXCEPTED
 
 
 def test_compiled_blocklist_matching_exceptions_and_wildcards(tmp_path) -> None:
@@ -267,6 +340,54 @@ async def test_filtering_matrix_rejects_non_resolving_control() -> None:
     try:
         with pytest.raises(DomainNotResolvableError):
             await service.check("missing.example")
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_still_counts_toward_outcome_metrics() -> None:
+    """A cached result still settles a payment and delivers a verdict, so
+    it must count in hyrule_dns_filtering_checks_total / profile outcome
+    metrics — the route returning early on a cache hit must not make the
+    request invisible to those counters. Latency samples, which reflect an
+    actual upstream query, must stay unchanged on a cache hit."""
+    service = _StubFilteringService(_observations())
+    try:
+        first = await service.check("example.com")
+        snapshot_after_first = service.metrics_snapshot()
+        overall_after_first = snapshot_after_first["overall"][first.overall.value]
+        latency_samples_after_first = dict(snapshot_after_first["profile_latency_samples"])
+
+        second = await service.check("example.com")
+        assert second.request_id != first.request_id  # genuinely a cache hit, not a fresh query
+        snapshot_after_second = service.metrics_snapshot()
+        assert snapshot_after_second["overall"][first.overall.value] == overall_after_first + 1
+        for profile_id, samples in latency_samples_after_first.items():
+            assert snapshot_after_second["profile_latency_samples"][profile_id] == samples
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_control_resolver_failure_is_inconclusive_not_domain_error() -> None:
+    """SERVFAIL/REFUSED from the control resolver means the resolver failed,
+    not that the domain doesn't exist — it must not be reported as a caller
+    error (422), unlike a genuine NXDOMAIN (see the sibling
+    test_filtering_matrix_rejects_non_resolving_control)."""
+    observations = _observations()
+    for record_type in ("A", "AAAA"):
+        observations[("https://control.test/dns-query", record_type)] = DNSFilteringObservation(
+            record_type=record_type, rcode="SERVFAIL", answers=[]
+        )
+    service = _StubFilteringService(observations)
+    try:
+        # A raised DomainNotResolvableError fails this test directly — no
+        # special-casing needed, that's exactly the regression being caught.
+        result = await service.check("example.com")
+        assert {r.status for r in result.profiles} <= {
+            DNSFilteringProfileStatus.INCONCLUSIVE,
+            DNSFilteringProfileStatus.UNAVAILABLE,
+        }
     finally:
         await service.close()
 

@@ -239,6 +239,41 @@ def test_manifest_openapi_and_bazaar_share_the_same_enabled_catalog(
     assert ("POST", "/v1/domain/register") not in catalog_keys
 
 
+def test_dns_marketing_copy_is_gated_independently_per_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blocklist membership and filtering evidence must not be advertised
+    just because /v1/dns/lookup (ungated) is live: each has its own
+    readiness gate, and the previous combined /v1/dns phrase ignored that."""
+    from hyrule_cloud.services.discovery import service_overview
+
+    _enable_all_catalog_gates(monkeypatch)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.blocklists.blocklist_catalog_ready",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.filtering.dns_filtering_enabled",
+        lambda: False,
+    )
+    copy = service_overview()
+    assert "DNS diagnostics" in copy
+    assert "blocklist membership" not in copy
+    assert "filtering evidence" not in copy
+
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.blocklists.blocklist_catalog_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "hyrule_cloud.services.dns.filtering.dns_filtering_enabled",
+        lambda: True,
+    )
+    copy = service_overview()
+    assert "blocklist membership" in copy
+    assert "filtering evidence" in copy
+
+
 def test_supporting_routes_follow_their_readiness_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

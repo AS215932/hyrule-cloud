@@ -35,6 +35,12 @@ structlog.configure(
 
 log = structlog.get_logger().bind(service="hyrule-cloud-worker")
 
+#: Retry sooner than the full refresh interval (default 6h) while the
+#: catalog hasn't reached all-source readiness yet, so a transient feed
+#: failure on the first refresh doesn't leave the paid blocklist route
+#: undiscoverable for hours after the feed has recovered.
+_DNS_BLOCKLIST_UNREADY_RETRY_SECONDS = 300
+
 
 async def _refresh_dns_blocklists(service: BlocklistService) -> None:
     try:
@@ -166,9 +172,19 @@ async def run_worker() -> None:
                     dns_blocklist_task = asyncio.create_task(
                         _refresh_dns_blocklists(dns_blocklists)
                     )
-                next_dns_blocklists = now + timedelta(
-                    seconds=config.dns_blocklists.refresh_seconds
+                # Retry soon, not after the full interval, while the catalog
+                # hasn't reached all-source readiness — reflects the last
+                # completed refresh's outcome, since this dispatch's own task
+                # runs concurrently and hasn't finished yet.
+                retry_seconds = (
+                    config.dns_blocklists.refresh_seconds
+                    if dns_blocklists.is_ready()
+                    else min(
+                        _DNS_BLOCKLIST_UNREADY_RETRY_SECONDS,
+                        config.dns_blocklists.refresh_seconds,
+                    )
                 )
+                next_dns_blocklists = now + timedelta(seconds=retry_seconds)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=1.0)
             except TimeoutError:

@@ -221,39 +221,53 @@ class ParsedRule:
     domain: str
     match_kind: str
     action: str
+    important: bool = False
 
 
 _HOSTS_IPS = frozenset({"0.0.0.0", "127.0.0.1", "::", "::1"})
 _ABP_RE = re.compile(r"^\|\|([^/^$|*]+)\^(?:\$([^\s]+))?$")
 _RPZ_RE = re.compile(r"^(\*\.)?([^\s]+)\s+(?:\d+\s+)?(?:IN\s+)?CNAME\s+\.$", re.I)
+_LOCALHOST_NAMES = frozenset({"localhost", "localhost.localdomain"})
 
 
-def parse_rule_line(line: str) -> ParsedRule | None:
-    """Parse only rules whose result is decidable from a domain name alone."""
+def parse_rule_lines(line: str) -> list[ParsedRule]:
+    """Parse only rules whose result is decidable from a domain name alone.
+
+    A hosts-format line may list more than one hostname after its address,
+    so this can yield more than one rule for a single input line.
+    """
 
     value = line.lstrip("\ufeff").strip()
     if not value or value.startswith(("!", "#", "[")):
-        return None
+        return []
 
-    # Hosts sources may include an inline comment and more than one hostname.
-    if "#" in value:
-        value = value.split("#", 1)[0].strip()
+    # Detect the hosts format on the raw address token BEFORE stripping any
+    # '#'. Hosts lines may carry a trailing inline comment, but an AdBlock
+    # cosmetic filter (e.g. `publisher.example##.ad`) also contains '#' \u2014
+    # stripping unconditionally would truncate it into a bare domain and
+    # smuggle it past the cosmetic-syntax rejection below.
     fields = value.split()
     if fields and fields[0] in _HOSTS_IPS:
-        if len(fields) < 2 or fields[1].lower() in {"localhost", "localhost.localdomain"}:
-            return None
-        try:
-            return ParsedRule(normalize_domain(fields[1]), "exact", "block")
-        except ValueError:
-            return None
+        if "#" in value:
+            value = value.split("#", 1)[0].strip()
+            fields = value.split()
+        rules = []
+        for hostname in fields[1:]:
+            if hostname.lower() in _LOCALHOST_NAMES:
+                continue
+            try:
+                rules.append(ParsedRule(normalize_domain(hostname), "exact", "block"))
+            except ValueError:
+                continue
+        return rules
 
     rpz = _RPZ_RE.fullmatch(value)
     if rpz:
         try:
             domain = normalize_domain(rpz.group(2))
         except ValueError:
-            return None
-        return ParsedRule(domain, "wildcard" if rpz.group(1) else "exact", "block")
+            return []
+        return [ParsedRule(domain, "wildcard" if rpz.group(1) else "exact", "block")]
 
     action = "block"
     if value.startswith("@@"):
@@ -264,50 +278,61 @@ def parse_rule_line(line: str) -> ParsedRule | None:
         modifiers = set(filter(None, (adblock.group(2) or "").lower().split(",")))
         # `important` changes precedence but not whether the hostname itself
         # matches. Every other modifier needs URL/browser request context.
+        important = "important" in modifiers
         if modifiers - {"important"}:
-            return None
+            return []
         try:
             domain = normalize_domain(adblock.group(1))
         except ValueError:
-            return None
-        return ParsedRule(domain, "suffix", action)
+            return []
+        return [ParsedRule(domain, "suffix", action, important)]
 
     if value.startswith("*."):
         try:
-            return ParsedRule(normalize_domain(value[2:]), "wildcard", action)
+            return [ParsedRule(normalize_domain(value[2:]), "wildcard", action)]
         except ValueError:
-            return None
+            return []
 
     # Reject cosmetic filters, regexes, URLs, options and any other browser
     # syntax rather than guessing at DNS semantics.
     if any(token in value for token in ("/", "$", "|", "^", "##", "#@#", "*")):
-        return None
+        return []
     try:
-        return ParsedRule(normalize_domain(value), "exact", action)
+        return [ParsedRule(normalize_domain(value), "exact", action)]
     except ValueError:
-        return None
+        return []
 
 
 def iter_parsed_rules(path: Path) -> Iterator[ParsedRule]:
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            parsed = parse_rule_line(line)
-            if parsed is not None:
-                yield parsed
+            yield from parse_rule_lines(line)
 
 
 def _rule_counts(path: Path) -> tuple[int, int]:
-    accepted = 0
-    total_candidates = 0
+    """Return (unique compiled rule count, rejected line count).
+
+    The rule count is deduplicated by (domain, match_kind, action), matching
+    what `INSERT OR IGNORE` collapses at compile time. Counting accepted
+    *lines* instead would let a source that repeats one domain thousands of
+    times (a common upstream generation failure) pass the minimum-rules and
+    change-ratio quality gates on an inflated raw line count, then collapse
+    to almost nothing once actually compiled \u2014 an outage the gates exist to
+    catch.
+    """
+    unique_rules: set[tuple[str, str, str]] = set()
+    rejected = 0
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             stripped = line.lstrip("\ufeff").strip()
             if not stripped or stripped.startswith(("!", "#", "[")):
                 continue
-            total_candidates += 1
-            if parse_rule_line(line) is not None:
-                accepted += 1
-    return accepted, max(0, total_candidates - accepted)
+            parsed = parse_rule_lines(line)
+            if not parsed:
+                rejected += 1
+                continue
+            unique_rules.update((rule.domain, rule.match_kind, rule.action) for rule in parsed)
+    return len(unique_rules), rejected
 
 
 def _parse_datetime(value: object) -> datetime | None:
@@ -637,6 +662,7 @@ class BlocklistService:
                     domain TEXT NOT NULL,
                     match_kind TEXT NOT NULL,
                     action TEXT NOT NULL,
+                    important INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (source_id, domain, match_kind, action)
                 ) WITHOUT ROWID;
                 CREATE INDEX rules_domain_idx ON rules(domain);
@@ -649,19 +675,27 @@ class BlocklistService:
                 source_states[source.source_id] = dict(state)
                 if not raw_path.is_file():
                     continue
-                batch: list[tuple[str, str, str, str]] = []
+                batch: list[tuple[str, str, str, str, int]] = []
                 parsed_count = 0
                 for rule in iter_parsed_rules(raw_path):
-                    batch.append((source.source_id, rule.domain, rule.match_kind, rule.action))
+                    batch.append(
+                        (
+                            source.source_id,
+                            rule.domain,
+                            rule.match_kind,
+                            rule.action,
+                            int(rule.important),
+                        )
+                    )
                     parsed_count += 1
                     if len(batch) >= 10_000:
                         connection.executemany(
-                            "INSERT OR IGNORE INTO rules VALUES (?, ?, ?, ?)", batch
+                            "INSERT OR IGNORE INTO rules VALUES (?, ?, ?, ?, ?)", batch
                         )
                         batch.clear()
                 if batch:
                     connection.executemany(
-                        "INSERT OR IGNORE INTO rules VALUES (?, ?, ?, ?)", batch
+                        "INSERT OR IGNORE INTO rules VALUES (?, ?, ?, ?, ?)", batch
                     )
                 unique_count = int(
                     connection.execute(
@@ -759,14 +793,15 @@ class BlocklistService:
         try:
             connection.execute("PRAGMA query_only=ON")
             rows = connection.execute(
-                f"SELECT source_id, domain, match_kind, action FROM rules WHERE domain IN ({placeholders})",
+                f"SELECT source_id, domain, match_kind, action, important "
+                f"FROM rules WHERE domain IN ({placeholders})",
                 candidates,
             ).fetchall()
         finally:
             connection.close()
 
-        best: dict[str, tuple[str, str, str]] = {}
-        for source_id, domain, match_kind, action in rows:
+        best: dict[str, tuple[str, str, str, bool]] = {}
+        for source_id, domain, match_kind, action, important in rows:
             if match_kind == "exact" and domain != normalized:
                 continue
             if match_kind == "wildcard" and domain == normalized:
@@ -774,17 +809,22 @@ class BlocklistService:
             if normalized != domain and not normalized.endswith(f".{domain}"):
                 continue
             current = best.get(source_id)
-            rank = (domain.count("."), len(domain), action == "allow")
+            # `important` outranks the default allow-wins-on-tie precedence:
+            # a source can carry both `||foo.example^$important` (block) and
+            # `@@||foo.example^` (allow) for the same domain, and $important
+            # exists specifically to make the block win that tie.
+            rank = (domain.count("."), len(domain), bool(important), action == "allow")
             if current is None:
-                best[source_id] = (domain, match_kind, action)
+                best[source_id] = (domain, match_kind, action, bool(important))
                 continue
             current_rank = (
                 current[0].count("."),
                 len(current[0]),
+                current[3],
                 current[2] == "allow",
             )
             if rank > current_rank:
-                best[source_id] = (domain, match_kind, action)
+                best[source_id] = (domain, match_kind, action, bool(important))
 
         info_by_id = {info.source_id: info for info in sources_response.sources}
         results: list[DNSBlocklistSourceResult] = []
