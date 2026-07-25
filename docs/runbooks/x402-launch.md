@@ -62,7 +62,12 @@ via the Vault-rendered `.env`) — no Ansible run.
    ```
    vault kv get -field=dev_bypass_secret kv/hyrule-cloud   # must be absent/empty
    ```
-3. **Fund the canary wallet**: ~$5 USDC + gas on Base mainnet, operator-held.
+3. **Canary wallet** (Vault-held): the canary wallet lives in production
+   Vault at `kv/hyrule-cloud` — `canary_key` (private key, never leaves
+   Vault or gets written to disk/repo) and `canary_address`
+   (`0xc036D9c8f1B94394a60Fbd3cF90d0Df2940CC75F`). Fund `canary_address`
+   with ~$5–10 USDC on Base mainnet. No ETH for gas is needed — the
+   facilitator settles the signed EIP-3009 authorization on-chain.
 4. **Metrics token** (for Phase 2):
    ```
    vault kv patch kv/hyrule-cloud metrics_token=$(openssl rand -hex 32)
@@ -88,8 +93,15 @@ via the Vault-rendered `.env`) — no Ansible run.
 ### Live canary #1 — payai (first-ever real spend)
 
 `scripts/x402_canary.py` automates the 402→sign→retry→settle flow for every
-paid endpoint (a `max_amount` policy caps each call at its price +10%). Set
-`CANARY_KEY` to the funded wallet and run `python scripts/x402_canary.py dns`
+paid endpoint (a `max_amount` policy caps each call at its price +10%).
+Fetch the Vault-held canary key straight into the environment (never write
+it to disk or the repo):
+
+```bash
+export CANARY_KEY=$(ssh svag@vault.servify.network 'VAULT_ADDR=http://127.0.0.1:8200 vault kv get -field=canary_key kv/hyrule-cloud')
+```
+
+Then run `python scripts/x402_canary.py dns`
 for the cheapest first spend, `intel`/`proxy` for the Phase-3 groups, or
 `vm --quote --destroy` for the 3d gate — `--quote` exercises the documented
 `POST /v1/vm/quote` → paid create flow, and the script pauses for the manual
@@ -141,7 +153,8 @@ revenue.)
 ### 3a Network-intel (no code changes)
 
 One paid call each; response must contain substantive real data:
-`/v1/dns/lookup`, `/v1/ip/lookup`, `/v1/bgp/lookup`, `/v1/rdap/lookup`,
+`/v1/dns/lookup`, `/v1/dns/blocklists/check`, `/v1/dns/filtering/check`,
+`/v1/ip/lookup`, `/v1/bgp/lookup`, `/v1/rdap/lookup`,
 `/v1/whois/lookup`, `/v1/web/check`, `/v1/web/tls/deep`, `/v1/mx/check`,
 `/v1/path/ping`, `/v1/path/report`, `/v1/ports/check`, `/v1/nat/port-forward/check`,
 `/v1/voip/check`, **`/v1/threat/lookup`** (inspect quality — its service
@@ -153,6 +166,33 @@ once an active-probe vantage (Globalping/RIPE Atlas) is configured; until then
 the canary reports them **SKIPPED (501)**, not failed. Configure a prober and
 re-run `python scripts/x402_canary.py path-report` to validate the paid path
 evidence before treating 3a as complete.
+
+#### DNS blocklist and filtering readiness
+
+1. Provision `/var/lib/hyrule-cloud/blocklists` as durable worker-writable
+   storage and mount the same path read-only in every API process. In Compose,
+   the `blocklist_data` volume already provides this split.
+2. Start the worker and wait for its first `dns_blocklist_snapshot_published`
+   event. Then require:
+   ```bash
+   curl -fsS https://cloud.hyrule.host/v1/dns/blocklists/sources \
+     | jq -e '.ready and .required_source_count == 16 and .usable_source_count >= 12'
+   ```
+   First activation requires all 16 feeds to have succeeded once. The paid
+   operation is absent from OpenAPI/x402 discovery until the snapshot is ready.
+3. Verify `GET /v1/dns/filtering/resolvers` returns eight configured profiles,
+   with both security and ads/tracking policies and their unfiltered controls.
+4. Run `python scripts/x402_canary.py dns-blocklists --yes` and
+   `python scripts/x402_canary.py dns-filtering --yes`. The former must return a
+   snapshot ID with at least 12 checked sources; the latter must return at least
+   six conclusive profiles. Both must carry successful settlement headers.
+5. Failure drill: make the catalog path temporarily unreadable or mock six DoH
+   profiles unavailable. The request must return 503 without a new `settled`
+   ledger event. A syntactically valid but non-resolving domain must return 422
+   without settlement.
+
+The resolver product sends each submitted domain to the public providers named
+by `/v1/dns/filtering/resolvers`; keep that disclosure in customer-facing copy.
 
 ### 3b Network proxy
 
@@ -185,11 +225,16 @@ evidence before treating 3a as complete.
 3. **Gate** (`python scripts/x402_canary.py vm --quote --destroy` automates the
    quote→pay→poll→pause-for-SSH→destroy sequence and only reports success when
    the launch-proof verifies and the DELETE returns 2xx):
-   - `POST /v1/vm/quote` (xs, 1 day = $0.05) → pay via x402/CDP
+   - `POST /v1/vm/quote` (`1C-1G-10G`, 1 day = $0.20) → pay via x402/CDP
    - poll `GET /v1/vm/{id}/status` until `launch_proof_status=provisioned`
-     with `ssh_smoke_status=passed` and `dns_aaaa_verified=true` (now
-     measured, not inferred)
-   - **manually `ssh root@<hostname>` over IPv6**
+     with `ssh_smoke_status=passed`, `dns_aaaa_verified=true` and
+     `dns_resolution_status=passed` (all measured, not inferred).
+     `launch_proof_status=degraded` + `dns_resolution_status=failed` means
+     `HYRULE_CUSTOMER_IPV6_DNS` is not answering — the VM is up but resolves
+     nothing, which is a launch blocker, not a per-VM incident.
+   - **manually `ssh root@<hostname>` over IPv6**, then on the VM:
+     `getent ahosts deb.debian.org` (IPv6-only + NAT64 needs a working DNS64
+     resolver; without it `apt-get` and every setup_script die)
    - `DELETE /v1/vm/{id}` and confirm destroy
    - ledger + Grafana provisioning panels moved
 4. **Failure drill**: provision one VM against a deliberately broken template

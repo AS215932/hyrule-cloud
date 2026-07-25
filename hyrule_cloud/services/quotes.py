@@ -98,6 +98,7 @@ async def create_quote(
     session_factory: async_sessionmaker,
     order_payload: VMCreateRequest,
     amount_usd: Decimal,
+    pricing_snapshot: dict,
     client_order_id: str | None,
     owner_account_id: str | None = None,
 ) -> VMQuoteRow:
@@ -119,6 +120,7 @@ async def create_quote(
         quote_id=generate_quote_id(),
         order_payload=payload,
         amount_usd=amount_usd,
+        pricing_snapshot=pricing_snapshot,
         status=QuoteStatus.CREATED,
         client_order_id=client_order_id,
         owner_account_id=owner_account_id,

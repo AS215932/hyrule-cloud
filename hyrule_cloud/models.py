@@ -5,12 +5,13 @@ Domain models for Hyrule Cloud resources.
 from __future__ import annotations
 
 import enum
+import ipaddress
 import secrets
 import string
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Block A0: widen vm_id from 48-bit hex (vm_<12 hex>) to ~131-bit base62
 # (vm_<22 base62>). The legacy 48-bit space was borderline guessable; with
@@ -65,10 +66,13 @@ def generate_diagnostic_job_access_token() -> str:
 
 
 class VMSize(enum.StrEnum):
-    XS = "xs"  # 1 vCPU, 1 GB, 10 GB
-    SM = "sm"  # 1 vCPU, 1 GB, 20 GB
-    MD = "md"  # 2 vCPU, 2 GB, 40 GB
-    LG = "lg"  # 4 vCPU, 4 GB, 80 GB
+    # Stable API/database identifiers. Public display names are technical and
+    # come from VM_PROFILE_LABELS below; the IDs deliberately do not encode a
+    # spec so catalog changes do not require an enum/database migration.
+    XS = "xs"
+    SM = "sm"
+    MD = "md"
+    LG = "lg"
 
 
 class VMStatus(enum.StrEnum):
@@ -87,6 +91,7 @@ class LaunchProofStatus(enum.StrEnum):
     PAYMENT_REQUIRED = "payment_required"
     PROVISIONING = "provisioning"
     PROVISIONED = "provisioned"
+    DEGRADED = "degraded"
     FAILED = "failed"
     ROLLED_BACK = "rolled_back"
 
@@ -101,6 +106,22 @@ class PaymentStatus(enum.StrEnum):
 
 class SSHSmokeStatus(enum.StrEnum):
     """Issue #28: SSH smoke-test result for the launch-proof contract."""
+
+    NOT_RUN = "not_run"
+    PASSED = "passed"
+    FAILED = "failed"
+
+
+class DNSResolutionStatus(enum.StrEnum):
+    """Customer-side DNS resolution result for the launch-proof contract.
+
+    Customer VMs are IPv6-only behind NAT64, so a resolver that does not
+    answer (or does not synthesise AAAA for IPv4-only names) leaves the guest
+    unable to resolve ANY hostname — `apt-get`, the customer's setup_script
+    and every outbound connection by name fail even though the VM is up and
+    reachable over SSH. `not_run` means no measurement was taken; it is never
+    inferred from the VM being READY.
+    """
 
     NOT_RUN = "not_run"
     PASSED = "passed"
@@ -181,10 +202,42 @@ VM_SPECS: dict[VMSize, dict] = {
     # rejects the shrink with MEMORY_CONSTRAINT_VIOLATION_ORDER) and OOMs on
     # cloud-init/apt anyway; 1 GB is the smallest viable Debian tier.
     VMSize.XS: {"vcpu": 1, "memory_mb": 1024, "disk_gb": 10},
-    VMSize.SM: {"vcpu": 1, "memory_mb": 1024, "disk_gb": 20},
-    VMSize.MD: {"vcpu": 2, "memory_mb": 2048, "disk_gb": 40},
-    VMSize.LG: {"vcpu": 4, "memory_mb": 4096, "disk_gb": 80},
+    VMSize.SM: {"vcpu": 1, "memory_mb": 2048, "disk_gb": 20},
+    VMSize.MD: {"vcpu": 2, "memory_mb": 4096, "disk_gb": 20},
+    VMSize.LG: {"vcpu": 4, "memory_mb": 4096, "disk_gb": 40},
 }
+
+VM_PROFILE_LABELS: dict[VMSize, str] = {
+    VMSize.XS: "1C-1G-10G",
+    VMSize.SM: "1C-2G-20G",
+    VMSize.MD: "2C-4G-20G",
+    VMSize.LG: "4C-4G-40G",
+}
+
+
+class VMResourceSpec(BaseModel):
+    """Exact resources assigned to a VM.
+
+    This unbounded positive shape also represents legacy machines (notably the
+    retired 80-GB `lg` profile). New-order limits and increments are enforced by
+    the canonical pricing service, rather than making old snapshots unparseable.
+    """
+
+    vcpu: int = Field(gt=0)
+    ram_mb: int = Field(gt=0)
+    disk_gb: int = Field(gt=0)
+
+
+class VMOrderResources(VMResourceSpec):
+    """Requested final resources; validated against the live catalog server-side."""
+
+    @model_validator(mode="after")
+    def validate_increments(self) -> VMOrderResources:
+        if self.ram_mb % 1024:
+            raise ValueError("ram_mb must be a whole number of GiB")
+        if self.disk_gb % 10:
+            raise ValueError("disk_gb must be in 10-GB increments")
+        return self
 
 
 # --- API Request/Response Models ---
@@ -193,6 +246,14 @@ VM_SPECS: dict[VMSize, dict] = {
 class VMCreateRequest(BaseModel):
     duration_days: int = Field(ge=1, le=365, description="Hosting duration in days")
     size: VMSize = Field(default=VMSize.XS, description="VM size tier")
+    resources: VMOrderResources | None = Field(
+        default=None,
+        description=(
+            "Optional exact final resources. New orders support 1-4 vCPU, "
+            "1-8 GiB RAM, and 10-40 GB SSD. The server selects the cheapest "
+            "compatible base profile."
+        ),
+    )
     os: str = Field(default="debian-13", description="OS template name")
     ssh_pubkey: str = Field(description="SSH public key for root access (ed25519 or rsa)")
     domain_mode: DomainMode = Field(default=DomainMode.AUTO)
@@ -264,7 +325,9 @@ class VMQuoteResponse(BaseModel):
     quote_id: str
     status: QuoteStatus
     order_payload: VMCreateRequest
+    resources: VMResourceSpec
     amount_usd: str
+    pricing: VMPriceBreakdown
     currency: str = "USD"
     accepted_payment_methods: AcceptedPaymentMethods
     created_at: datetime
@@ -279,6 +342,8 @@ class VMStatusResponse(BaseModel):
     hostname: str | None = None
     ssh: str | None = None
     expires_at: datetime | None = None
+    profile: VMSize | None = None
+    resources: VMResourceSpec | None = None
     firewall: FirewallState | None = None
     error: str | None = None
     cost_breakdown: CostBreakdown | None = None
@@ -301,11 +366,16 @@ class VMPublicStatusResponse(BaseModel):
     ipv6_prefix: str | None = None
     hostname: str | None = None
     expires_at: datetime | None = None
+    profile: VMSize | None = None
+    resources: VMResourceSpec | None = None
     # Launch-proof contract fields (issue #28)
     launch_proof_status: LaunchProofStatus | None = None
     payment_status: PaymentStatus | None = None
     dns_aaaa_verified: bool = False
     ssh_smoke_status: SSHSmokeStatus = SSHSmokeStatus.NOT_RUN
+    # Outbound proof: can the VM actually resolve names with the resolver it
+    # was handed? `dns_aaaa_verified` only proves the INBOUND public record.
+    dns_resolution_status: DNSResolutionStatus = DNSResolutionStatus.NOT_RUN
     rollback_available: bool = False
     operator_message: str | None = None
     customer_message: str | None = None
@@ -331,6 +401,7 @@ class PricingResponse(BaseModel):
     vm_prices: dict[str, str]  # size -> $/day
     domain_auto: str
     proxy_prices: dict[str, str] | None = None
+    vm_customization: VMCustomization | None = None
     currency: str = "USDC"
     network: str = "Base (eip155:8453)"
 
@@ -346,6 +417,40 @@ class VMProduct(BaseModel):
     price_usd_day: str
 
 
+class VMResourceLimits(BaseModel):
+    vcpu: int
+    ram_mb: int
+    disk_gb: int
+
+
+class VMAddonPrices(BaseModel):
+    vcpu_usd_day: str
+    ram_gb_usd_day: str
+    disk_10gb_usd_day: str
+
+
+class VMCustomization(BaseModel):
+    minimum: VMResourceLimits
+    maximum: VMResourceLimits
+    increments: VMResourceLimits
+    addon_prices: VMAddonPrices
+
+
+class VMPriceBreakdown(BaseModel):
+    base_profile: VMSize
+    base_label: str
+    base_price_usd_day: str
+    addon_vcpu: int = 0
+    addon_ram_mb: int = 0
+    addon_disk_gb: int = 0
+    addon_vcpu_usd_day: str = "0.00"
+    addon_ram_usd_day: str = "0.00"
+    addon_disk_usd_day: str = "0.00"
+    daily_price_usd: str
+    duration_days: int
+    total_usd: str
+
+
 class VMProductsResponse(BaseModel):
     """Agent-facing VM catalog so non-browser clients get specs + pricing
     without scraping the /services HTML."""
@@ -353,6 +458,7 @@ class VMProductsResponse(BaseModel):
     currency: str = "USD"
     billing: str = "prepaid-daily"
     products: list[VMProduct]
+    customization: VMCustomization
     os_templates_url: str
 
 
@@ -382,6 +488,69 @@ class NetworkResponse(BaseModel):
     elapsed_seconds: float
     proxy_mode: ProxyMode
     error: str | None = None
+
+
+class TunnelCreateRequest(BaseModel):
+    """Provision a reverse-SSH tunnel for a host behind NAT.
+
+    The host runs `ssh -N -R 0:localhost:<port> <token>@<endpoint> -p 2222` and
+    becomes reachable on the allocated public TCP port.
+    """
+
+    # Absolute sanity ceiling only; the configured tunnel_min_hours/
+    # tunnel_max_hours window is enforced in the route so deployments can
+    # tighten (or widen up to this cap) the policy without a schema change.
+    hours: int = Field(ge=1, le=8760, description="Lease duration in hours")
+    allowlist_cidrs: list[str] | None = Field(
+        default=None,
+        max_length=64,
+        description="Optional source-CIDR allowlist for visitors; omit to allow all",
+    )
+
+    @field_validator("allowlist_cidrs")
+    @classmethod
+    def _validate_cidrs(cls, value: list[str] | None) -> list[str] | None:
+        # Fail closed: a typo'd restriction must be rejected, never silently
+        # dropped (which would leave the port open to everyone).
+        if value is None:
+            return None
+        if len(value) == 0:
+            # An explicit empty list is ambiguous (deny-all vs the "omit to allow
+            # all" contract) — reject it so it can't be silently treated as open.
+            raise ValueError("allowlist_cidrs must be non-empty; omit the field to allow all visitors")
+        for entry in value:
+            try:
+                ipaddress.ip_network(entry, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"invalid CIDR in allowlist_cidrs: {entry!r}") from exc
+        return value
+
+
+class TunnelExtendRequest(BaseModel):
+    hours: int = Field(ge=1, le=8760, description="Additional hours to add")
+
+
+class TunnelResponse(BaseModel):
+    tunnel_id: str
+    token: str | None = Field(
+        default=None,
+        description="SSH username for the tunnel; returned once on create only",
+    )
+    endpoint_host: str
+    ssh_port: int
+    public_port: int = Field(description="Public TCP port the tunnel is reachable on")
+    ssh_command: str = Field(description="Ready-to-run ssh -R command for the NAT'd host")
+    status: str
+    expires_at: datetime
+    connected: bool = False
+    visitor_conns: int = 0
+
+
+class TunnelPricingResponse(BaseModel):
+    hourly_usd: str
+    min_hours: int
+    max_hours: int
+    currency: str = "USDC"
 
 
 class CryptoIntentRequest(BaseModel):
@@ -452,8 +621,11 @@ class VMRecord(BaseModel):
     cost_total: Decimal = Decimal("0")
 
 
-# Forward ref resolution
+# Forward ref resolution for models whose compact public placement precedes
+# one of their nested response types.
+VMQuoteResponse.model_rebuild()
 VMStatusResponse.model_rebuild()
+PricingResponse.model_rebuild()
 
 class GenericActionResponse(BaseModel):
     status: str
@@ -505,9 +677,42 @@ class DNSRecord(BaseModel):
     ttl: int = 3600
     prio: int | None = None
 
+class VMEventKey(enum.StrEnum):
+    """Customer-visible provisioning lifecycle vocabulary (`GET /v1/vm/{id}/logs`).
+
+    This is a public contract: keys are stable and only ever added to, never
+    renamed or repurposed. Every key describes something the platform actually
+    observed — nothing here is inferred.
+    """
+
+    # Lifecycle
+    PROVISIONING_STARTED = "provisioning_started"
+    # Emitted INSTEAD of real infrastructure work when the deployment runs in
+    # simulation mode (HCP_LAUNCH_PROOF_REAL_XCPNG unset). Marks every later
+    # event on that VM as simulated.
+    PROVISIONING_SIMULATED = "provisioning_simulated"
+    CLOUD_INIT_PREPARED = "cloud_init_prepared"
+    SETUP_SCRIPT_INJECTED = "setup_script_injected"
+    VM_CREATED = "vm_created"
+    NETWORK_READY = "network_ready"
+    DNS_CREATED = "dns_created"
+    SSH_REACHABLE = "ssh_reachable"
+    SSH_UNREACHABLE = "ssh_unreachable"
+    CUSTOM_DOMAIN_ATTACHED = "custom_domain_attached"
+    CUSTOM_DOMAIN_ATTACH_FAILED = "custom_domain_attach_failed"
+    # Terminal
+    READY = "ready"
+    PROVISIONING_FAILED = "provisioning_failed"
+
+
 class VMLogEvent(BaseModel):
     ts: str
     event: str
+    # Human-readable, customer-safe. Never carries provider text.
+    message: str | None = None
+    # Small structured payload (hostname, ipv6, simulated flag, ...). Only ever
+    # holds data the customer already owns — never internal infrastructure ids.
+    detail: dict | None = None
 
 class VMLogsResponse(BaseModel):
     vm_id: str
@@ -939,9 +1144,28 @@ class BGPSubjectType(enum.StrEnum):
 
 class BGPDataset(enum.StrEnum):
     PUBLIC_ROUTING = "public_routing"
+    # Real-time RIS collector RIB (RIPEstat looking-glass). Use this — not
+    # PUBLIC_ROUTING — to answer "is this prefix propagating right now?".
+    # PUBLIC_ROUTING is a batch snapshot that can be many hours behind, which
+    # reads as "not announced" for anything deployed since the last batch run.
+    LIVE_LOOKING_GLASS = "live_looking_glass"
     RPKI = "rpki"
     PEERINGDB = "peeringdb"
     AS215932_ROUTER_TABLES = "as215932_router_tables"
+
+
+class DataFreshness(enum.StrEnum):
+    """How current a result is, stated explicitly rather than implied.
+
+    REALTIME  — observed from a live collector RIB at query time.
+    DELAYED   — a periodically-recomputed snapshot; carries an observed_at and
+                age_seconds so the caller can decide whether it is usable.
+    UNKNOWN   — the upstream returned no usable timestamp.
+    """
+
+    REALTIME = "realtime"
+    DELAYED = "delayed"
+    UNKNOWN = "unknown"
 
 
 class BGPView(enum.StrEnum):
@@ -1039,6 +1263,7 @@ class BGPSourcesResponse(BaseModel):
 
 class BGPPricingResponse(BaseModel):
     public_latest_lookup_usd: str
+    live_looking_glass_lookup_usd: str = "0.01"
     router_table_lookup_usd: str
     bgpstream_update_hour_usd: str
     bgpstream_rib_usd: str
@@ -1224,6 +1449,161 @@ class DNSLookupResponse(BaseModel):
 
 class DNSPricingResponse(BaseModel):
     lookup_usd: str
+    blocklist_check_usd: str
+    filtering_check_usd: str
+
+
+class DNSDomainCheckRequest(BaseModel):
+    domain: str = Field(min_length=1, max_length=253)
+
+
+class DNSBlocklistCategory(enum.StrEnum):
+    ADS = "ads"
+    TRACKERS = "trackers"
+    TELEMETRY = "telemetry"
+    PHISHING = "phishing"
+    MALWARE = "malware"
+    SCAM = "scam"
+    C2 = "c2"
+
+
+class DNSBlocklistVerdict(enum.StrEnum):
+    LISTED = "listed"
+    NOT_LISTED = "not_listed"
+    INCONCLUSIVE = "inconclusive"
+
+
+class DNSBlocklistSourceOutcome(enum.StrEnum):
+    LISTED = "listed"
+    NOT_LISTED = "not_listed"
+    EXCEPTED = "excepted"
+    UNAVAILABLE = "unavailable"
+
+
+class DNSBlocklistSourceResult(BaseModel):
+    source_id: str
+    source_name: str
+    categories: list[DNSBlocklistCategory]
+    outcome: DNSBlocklistSourceOutcome
+    matched_domain: str | None = None
+    match_kind: str | None = None
+    source_status: SourceStatus | str
+    source_age_seconds: int | None = None
+
+
+class DNSBlocklistSourceInfo(BaseModel):
+    source_id: str
+    name: str
+    categories: list[DNSBlocklistCategory]
+    license: str
+    license_url: str
+    source_url: str
+    format: str
+    status: SourceStatus | str
+    content_updated_at: datetime | None = None
+    last_checked_at: datetime | None = None
+    age_seconds: int | None = None
+    rule_count: int = 0
+    rejected_rule_count: int = 0
+    error: str | None = None
+
+
+class DNSBlocklistSourcesResponse(BaseModel):
+    ready: bool
+    catalog_version: str
+    snapshot_id: str | None = None
+    required_source_count: int
+    usable_source_count: int
+    minimum_usable_source_count: int
+    sources: list[DNSBlocklistSourceInfo]
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class DNSBlocklistCheckResponse(BaseModel):
+    request_id: str = Field(default_factory=generate_diagnostic_request_id)
+    input_domain: str
+    normalized_domain: str
+    verdict: DNSBlocklistVerdict
+    categories: list[DNSBlocklistCategory] = Field(default_factory=list)
+    checked_source_count: int
+    matched_source_count: int
+    required_source_count: int
+    results: list[DNSBlocklistSourceResult]
+    catalog_version: str
+    snapshot_id: str
+    partial: bool = False
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class DNSFilteringProfileStatus(enum.StrEnum):
+    BLOCKED = "blocked"
+    ALLOWED = "allowed"
+    INCONCLUSIVE = "inconclusive"
+    UNAVAILABLE = "unavailable"
+
+
+class DNSFilteringOverallStatus(enum.StrEnum):
+    BLOCKED = "blocked"
+    ALLOWED = "allowed"
+    MIXED = "mixed"
+    INCONCLUSIVE = "inconclusive"
+
+
+class DNSFilteringObservation(BaseModel):
+    record_type: str
+    rcode: str | None = None
+    answers: list[str] = Field(default_factory=list)
+    cname_chain: list[str] = Field(default_factory=list)
+    ede_codes: list[int] = Field(default_factory=list)
+    authority_count: int = 0
+    latency_ms: float | None = None
+    error: str | None = None
+
+
+class DNSFilteringProfileResult(BaseModel):
+    profile_id: str
+    name: str
+    provider: str
+    categories: list[DNSBlocklistCategory]
+    status: DNSFilteringProfileStatus
+    reason: str
+    filtered: list[DNSFilteringObservation]
+    control: list[DNSFilteringObservation]
+    observed_at: datetime
+
+
+class DNSFilteringResolverInfo(BaseModel):
+    profile_id: str
+    name: str
+    provider: str
+    categories: list[DNSBlocklistCategory]
+    filtered_endpoint: str
+    control_endpoint: str
+    blocking_signals: list[str]
+    status: str = "configured"
+
+
+class DNSFilteringResolversResponse(BaseModel):
+    enabled: bool
+    profiles: list[DNSFilteringResolverInfo]
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class DNSFilteringCheckResponse(BaseModel):
+    request_id: str = Field(default_factory=generate_diagnostic_request_id)
+    input_domain: str
+    normalized_domain: str
+    vantage: str = "hyrule"
+    overall: DNSFilteringOverallStatus
+    blocked_profile_count: int
+    allowed_profile_count: int
+    conclusive_profile_count: int
+    total_profile_count: int
+    profiles: list[DNSFilteringProfileResult]
+    partial: bool = False
+    observed_at: datetime
+    cache_age_seconds: int = 0
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class DNSPropagationRequest(BaseModel):

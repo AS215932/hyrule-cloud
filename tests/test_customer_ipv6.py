@@ -6,6 +6,7 @@ from ipaddress import IPv6Network
 import pytest
 import pytest_asyncio
 import yaml
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.config import HyruleConfig
@@ -31,6 +32,18 @@ async def session_factory():
         yield factory
     finally:
         await engine.dispose()
+
+
+def _stub_customer_resolver(monkeypatch, orch, answer: list[str] | None) -> None:
+    """Keep the customer-DNS launch probe off the real network in tests.
+
+    `answer=None` models a resolver that does not answer (the live outage).
+    """
+
+    async def _query(resolver: str, hostname: str, **kwargs) -> list[str] | None:
+        return answer
+
+    monkeypatch.setattr(orch, "_query_customer_resolver", _query)
 
 
 def test_customer_prefix_index_maps_to_expected_64_and_address():
@@ -195,6 +208,7 @@ async def test_restarted_provisioner_replaces_untracked_exact_label_clone(
         return True
 
     monkeypatch.setattr(orch, "_probe_ssh", probe_ssh)
+    _stub_customer_resolver(monkeypatch, orch, ["64:ff9b::9765:8b1e"])
     async with session_factory() as session:
         session.add(
             VMRow(
@@ -221,6 +235,150 @@ async def test_restarted_provisioner_replaces_untracked_exact_label_clone(
     assert recovered.xcpng_uuid == "fresh-clone"
     assert recovered.status == VMStatus.READY
     assert recovered.ipv6 == "2a0c:b641:b51:9::2"
+
+
+class _ProvisionStubXCPNG:
+    async def find_vm_ids_by_name_label(self, name_label: str) -> list[str]:
+        return []
+
+    async def create_vm(self, **kwargs) -> str:
+        return "clone-uuid"
+
+    async def get_vm_ipv6(self, vm_uuid: str) -> str | None:
+        return "2a0c:b641:b51:9::2"
+
+
+class _ProvisionStubDNS:
+    async def create_aaaa(self, subdomain: str, ipv6: str) -> None:
+        return None
+
+    async def verify_aaaa(self, subdomain: str, ipv6: str) -> bool:
+        return True
+
+
+async def _run_provision(session_factory, monkeypatch, vm_id: str) -> Orchestrator:
+    """Drive the real provisioning path with stubbed infra. Returns the orch
+    so the caller can stub the customer-resolver query first."""
+    monkeypatch.setattr("hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True)
+    cfg = HyruleConfig()
+    cfg.xcpng.templates["debian-13"] = "template"
+    orch = Orchestrator(cfg, session_factory)
+    orch.xcpng = _ProvisionStubXCPNG()
+    orch.dns = _ProvisionStubDNS()
+
+    async def probe_ssh(ipv6: str) -> bool:
+        return True
+
+    monkeypatch.setattr(orch, "_probe_ssh", probe_ssh)
+    async with session_factory() as session:
+        session.add(
+            VMRow(
+                vm_id=vm_id,
+                owner_wallet="0x" + "1" * 40,
+                status=VMStatus.PROVISIONING,
+                size=VMSize.XS,
+                os="debian-13",
+                ipv6_prefix_index=9,
+                ipv6_prefix="2a0c:b641:b51:9::/64",
+                ssh_pubkey="ssh-ed25519 AAAA test",
+                open_ports=[22],
+                cost_total=Decimal("0.05"),
+                payment_tx="0xCHARGE",
+            )
+        )
+        await session.commit()
+    return orch
+
+
+@pytest.mark.asyncio
+async def test_provision_records_dns_resolution_failure_but_keeps_the_vm(
+    session_factory, monkeypatch
+):
+    """Policy: a VM that cannot resolve DNS is delivered-but-degraded.
+
+    It is up, reachable and paid for, so it is NOT flipped to FAILED (which
+    would promise a refund for a machine the customer can still use) — but the
+    proof records the failure instead of reporting a clean `ready`.
+    """
+    from hyrule_cloud.db import PaymentEventRow
+
+    orch = await _run_provision(session_factory, monkeypatch, "vm_dns_down")
+    _stub_customer_resolver(monkeypatch, orch, None)
+
+    await orch._provision_vm("vm_dns_down")
+
+    async with session_factory() as session:
+        row = await session.get(VMRow, "vm_dns_down")
+        events = list((await session.execute(select(PaymentEventRow))).scalars())
+    assert row.status == VMStatus.READY
+    assert row.metadata_["launch_proof"]["dns_resolution_status"] == "failed"
+    assert row.metadata_["launch_proof"]["ssh_smoke_status"] == "passed"
+    # Degraded is not a refund: the customer keeps a usable VM.
+    assert [e for e in events if e.event_type == "refund_owed"] == []
+
+
+@pytest.mark.asyncio
+async def test_provision_records_dns_resolution_pass(session_factory, monkeypatch):
+    orch = await _run_provision(session_factory, monkeypatch, "vm_dns_up")
+    _stub_customer_resolver(monkeypatch, orch, ["64:ff9b::9765:8b1e"])
+
+    await orch._provision_vm("vm_dns_up")
+
+    async with session_factory() as session:
+        row = await session.get(VMRow, "vm_dns_up")
+    assert row.status == VMStatus.READY
+    assert row.metadata_["launch_proof"]["dns_resolution_status"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_provision_survives_a_dns_probe_error(session_factory, monkeypatch):
+    """A probe that blows up must not fail a paid VM — that would charge the
+    customer, destroy the order and owe a refund because of a probe bug."""
+    orch = await _run_provision(session_factory, monkeypatch, "vm_dns_boom")
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("resolver client exploded")
+
+    monkeypatch.setattr(orch, "_query_customer_resolver", _boom)
+
+    await orch._provision_vm("vm_dns_boom")
+
+    async with session_factory() as session:
+        row = await session.get(VMRow, "vm_dns_boom")
+    assert row.status == VMStatus.READY
+    assert row.error is None
+    # Unknown, not "failed": a broken probe must not brand a healthy VM.
+    assert row.metadata_["launch_proof"]["dns_resolution_status"] == "not_run"
+
+
+def test_validate_customer_network_settings_warns_when_dns_equals_gateway():
+    """The exact 2026-07-24 misconfiguration: the resolver is the gateway,
+    which routes traffic but answers no DNS. Warn loudly — never hard-fail,
+    because a resolver CAN legitimately live on the gateway address."""
+    import structlog
+
+    with structlog.testing.capture_logs() as logs:
+        validate_customer_network_settings(
+            supernet="2a0c:b641:b51::/48",
+            gateway="2a0c:b641:b51::1",
+            dns="2a0c:b641:b51::1",
+        )
+    warnings = [e for e in logs if e["event"] == "customer_dns_equals_gateway"]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+    assert "DNS64" in warnings[0]["hint"]
+
+
+def test_validate_customer_network_settings_quiet_for_distinct_resolver():
+    import structlog
+
+    with structlog.testing.capture_logs() as logs:
+        validate_customer_network_settings(
+            supernet="2a0c:b641:b51::/48",
+            gateway="2a0c:b641:b51::1",
+            dns="2001:4860:4860::6464",
+        )
+    assert [e for e in logs if e["event"] == "customer_dns_equals_gateway"] == []
 
 
 def test_debian_network_config_allows_off_supernet_dns():
@@ -673,6 +831,29 @@ async def test_reservation_lifecycle(session_factory, monkeypatch):
     await orch.release_vm_reservation(reserved2.vm_id)
     async with session_factory() as session:
         assert await session.get(VMRow, reserved2.vm_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_reservation_persists_exact_sub_cent_snapshot_total(session_factory):
+    from hyrule_cloud.models import VMCreateRequest
+    from hyrule_cloud.services.vm_pricing import price_vm_order
+
+    cfg = HyruleConfig()
+    cfg.payment.price_vm_xs = Decimal("0.005")
+    orch = Orchestrator(cfg, session_factory)
+    order = VMCreateRequest(
+        duration_days=1,
+        size=VMSize.XS,
+        ssh_pubkey="ssh-ed25519 AAAA sub-cent",
+    )
+    priced = price_vm_order(order, cfg.payment)
+
+    reserved, _ = await orch.reserve_vm(
+        priced.order,
+        pricing_snapshot=priced.pricing_snapshot,
+    )
+
+    assert reserved.cost_total == Decimal("0.005")
 
 
 @pytest.mark.asyncio

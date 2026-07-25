@@ -13,10 +13,10 @@ from hyrule_cloud.state import AppState
 
 
 class _Pay:
-    price_vm_xs = Decimal("0.05")
-    price_vm_sm = Decimal("0.10")
-    price_vm_md = Decimal("0.20")
-    price_vm_lg = Decimal("0.40")
+    price_vm_xs = Decimal("0.20")
+    price_vm_sm = Decimal("0.40")
+    price_vm_md = Decimal("0.60")
+    price_vm_lg = Decimal("0.80")
 
 
 class _Cfg:
@@ -60,8 +60,22 @@ async def test_products_lists_all_sizes_with_specs_and_prices(products_state, cl
     assert by_size["xs"]["vcpu"] == 1
     assert by_size["xs"]["ram_mb"] == 1024
     assert by_size["xs"]["disk_gb"] == 10
-    assert by_size["xs"]["price_usd_day"] == "0.05"
-    assert by_size["xs"]["name"] == "Starter"
-    assert by_size["lg"]["name"] == "Performance"
-    assert by_size["lg"]["price_usd_day"] == "0.40"
+    assert by_size["xs"]["price_usd_day"] == "0.20"
+    assert by_size["xs"]["name"] == "1C-1G-10G"
+    assert by_size["sm"]["ram_mb"] == 2048
+    assert by_size["md"]["ram_mb"] == 4096
+    assert by_size["md"]["disk_gb"] == 20
+    assert by_size["lg"]["name"] == "4C-4G-40G"
+    assert by_size["lg"]["disk_gb"] == 40
+    assert by_size["lg"]["price_usd_day"] == "0.80"
+    assert body["customization"] == {
+        "minimum": {"vcpu": 1, "ram_mb": 1024, "disk_gb": 10},
+        "maximum": {"vcpu": 4, "ram_mb": 8192, "disk_gb": 40},
+        "increments": {"vcpu": 1, "ram_mb": 1024, "disk_gb": 10},
+        "addon_prices": {
+            "vcpu_usd_day": "0.10",
+            "ram_gb_usd_day": "0.15",
+            "disk_10gb_usd_day": "0.05",
+        },
+    }
     assert body["os_templates_url"].endswith("/v1/os/list")

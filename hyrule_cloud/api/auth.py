@@ -42,6 +42,9 @@ from hyrule_cloud.middleware.auth import (
     require_browser_session,
 )
 from hyrule_cloud.models import (
+    VM_PROFILE_LABELS,
+    VMResourceSpec,
+    VMSize,
     VMStatus,
     generate_anon_management_token,
 )
@@ -78,6 +81,7 @@ from hyrule_cloud.services.sessions import (
     revoke_all_sessions_for,
     revoke_session,
 )
+from hyrule_cloud.services.vm_pricing import resources_for_profile
 from hyrule_cloud.state import AppState, get_app_state
 
 log = structlog.get_logger()
@@ -206,6 +210,8 @@ class MeVMSummary(BaseModel):
     status: VMStatus
     os: str | None = None
     size: str | None = None
+    profile: str | None = None
+    resources: VMResourceSpec | None = None
     ipv6: str | None = None
     hostname: str | None = None
     expires_at: datetime | None = None
@@ -818,6 +824,16 @@ async def list_my_vms(
                 status=VMStatus(r.status),
                 os=r.os,
                 size=str(r.size) if r.size else None,
+                profile=VM_PROFILE_LABELS[VMSize(r.size)] if r.size else None,
+                resources=(
+                    VMResourceSpec(
+                        vcpu=r.vcpu or resources_for_profile(VMSize(r.size)).vcpu,
+                        ram_mb=r.memory_mb or resources_for_profile(VMSize(r.size)).ram_mb,
+                        disk_gb=r.disk_gb or resources_for_profile(VMSize(r.size)).disk_gb,
+                    )
+                    if r.size
+                    else None
+                ),
                 ipv6=r.ipv6,
                 hostname=r.hostname,
                 expires_at=r.expires_at,

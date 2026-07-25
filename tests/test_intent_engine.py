@@ -13,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.app import app
@@ -30,6 +32,8 @@ from hyrule_cloud.models import (
     CryptoIntentStatus,
     DomainMode,
     QuoteStatus,
+    VMCreateRequest,
+    VMOrderResources,
     VMSize,
     VMStatus,
 )
@@ -42,6 +46,7 @@ from hyrule_cloud.services.intents import (
     IntentExistsError,
     create_intent,
     poll_one_intent,
+    scan_pending_intents,
 )
 
 
@@ -103,6 +108,8 @@ class _StubOrchestrator:
     def __init__(self, session_factory: async_sessionmaker) -> None:
         self.db = session_factory
         self.created_vms: list[tuple[str, str | None]] = []
+        self.created_vm_requests: list[VMCreateRequest] = []
+        self.created_vm_options: list[dict[str, object]] = []
         self.provisioning_started: list[str] = []
         self.native_refunds: list[str] = []
         self.native_refund_reasons: dict[str, str] = {}
@@ -146,6 +153,26 @@ class _StubOrchestrator:
         owner_account_id: str | None = None,
         vm_id: str | None = None,
         start_provisioning: bool = True,
+        **kwargs,
+    ):
+        row, anon_token = await self._insert_vm(
+            request,
+            owner_wallet=owner_wallet,
+            owner_account_id=owner_account_id,
+            vm_id=vm_id,
+            **kwargs,
+        )
+        self.created_vms.append((row.vm_id, owner_account_id))
+        return row, anon_token
+
+    async def _insert_vm(
+        self,
+        request,
+        *,
+        owner_wallet: str,
+        owner_account_id: str | None,
+        vm_id: str | None,
+        **kwargs,
     ):
         from hyrule_cloud.middleware.anon_token import hash_anon_token
         from hyrule_cloud.models import (
@@ -154,6 +181,8 @@ class _StubOrchestrator:
         )
 
         vm_id = vm_id or generate_vm_id()
+        self.created_vm_requests.append(request)
+        self.created_vm_options.append(kwargs)
         anon_token = generate_anon_management_token()
         anon_hash = hash_anon_token(anon_token)
         async with self.db() as session:
@@ -163,7 +192,10 @@ class _StubOrchestrator:
                 owner_account_id=owner_account_id,
                 anon_management_token_hash=anon_hash,
                 status=VMStatus.PROVISIONING,
-                size=VMSize.XS,
+                size=VMSize(request.size),
+                vcpu=request.resources.vcpu if request.resources else 1,
+                memory_mb=request.resources.ram_mb if request.resources else 1024,
+                disk_gb=request.resources.disk_gb if request.resources else 10,
                 os=request.os,
                 ssh_pubkey=request.ssh_pubkey,
                 open_ports=[22, 80, 443],
@@ -176,8 +208,56 @@ class _StubOrchestrator:
             # InvalidRequestError on refresh after commit. For the stub we just
             # need a row in DB; the orchestrator's return path doesn't depend
             # on server-defaults beyond what we already populated above.
-        self.created_vms.append((vm_id, owner_account_id))
         return row, anon_token
+
+    async def reserve_vm_with_capacity(
+        self,
+        request,
+        owner_account_id: str | None = None,
+        vm_id: str | None = None,
+        **kwargs,
+    ):
+        capacity_error = getattr(self, "capacity_error", None)
+        if capacity_error is not None:
+            raise capacity_error
+        async with self.db() as db:
+            durable_intent = await db.scalar(
+                select(CryptoIntentRow).where(CryptoIntentRow.vm_id == vm_id)
+            )
+        assert durable_intent is not None, "planned VM id must be persisted before reserve"
+        return await self._insert_vm(
+            request,
+            owner_wallet="",
+            owner_account_id=owner_account_id,
+            vm_id=vm_id,
+            **kwargs,
+        )
+
+    async def activate_vm_reservation(
+        self,
+        vm_id: str,
+        owner_wallet: str,
+        *,
+        start_provisioning: bool = True,
+    ):
+        async with self.db() as db:
+            row = await db.get(VMRow, vm_id)
+            if row is None:
+                return None
+            row.owner_wallet = owner_wallet
+            await db.commit()
+            await db.refresh(row)
+        self.created_vms.append((vm_id, row.owner_account_id))
+        if start_provisioning:
+            self.start_provisioning(vm_id)
+        return row
+
+    async def release_vm_reservation(self, vm_id: str) -> None:
+        async with self.db() as db:
+            row = await db.get(VMRow, vm_id)
+            if row is not None and not row.owner_wallet:
+                await db.delete(row)
+                await db.commit()
 
 
 def _vm_create_request():
@@ -202,6 +282,7 @@ async def _seed_quote(
     amount_usd: Decimal = Decimal("4.25"),
     owner_account_id: str | None = None,
     order=None,
+    pricing_snapshot: dict | None = None,
 ) -> VMQuoteRow:
     order = order or _vm_create_request()
     row = VMQuoteRow(
@@ -211,6 +292,7 @@ async def _seed_quote(
         status=QuoteStatus.CREATED,
         client_order_id=None,
         owner_account_id=owner_account_id,
+        pricing_snapshot=pricing_snapshot,
         expires_at=_now() + timedelta(minutes=15),
     )
     async with state.orchestrator.db() as db:
@@ -420,6 +502,52 @@ async def test_poll_overpay_settles_and_provisions(intent_state):
     )
     assert updated.vm_id is not None
     assert updated.anon_token_cleartext is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_unquoted_intent_preserves_retired_resources_and_amount(intent_state):
+    """NULL pricing snapshots identify pre-customization native orders.
+
+    They may carry the retired 80-GB lg disk and must provision that exact
+    footprint at the already-settled historical amount.
+    """
+    order = VMCreateRequest(
+        duration_days=1,
+        size=VMSize.LG,
+        resources=VMOrderResources(vcpu=4, ram_mb=4096, disk_gb=80),
+        os="debian-13",
+        ssh_pubkey="ssh-ed25519 AAAA test",
+    )
+    intent = await create_intent(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        asset="BTC",
+        order_payload=order,
+        amount_usd=Decimal("0.40"),
+        client_order_id=None,
+        owner_account_id=None,
+    )
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+
+    updated = await poll_one_intent(
+        intent_id=intent.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    assert updated.status == CryptoIntentStatus.PROVISIONED
+    assert intent_state.orchestrator.created_vm_requests[-1].resources == order.resources
+    assert intent_state.orchestrator.created_vm_options[-1]["legacy_billing"] is True
+    async with intent_state.orchestrator.db() as db:
+        vm = await db.get(VMRow, updated.vm_id)
+    assert vm.cost_total == Decimal("0.40")
 
 
 @pytest.mark.asyncio
@@ -725,6 +853,95 @@ async def test_intent_create_uses_durable_quote_spec_and_locked_amount(intent_st
 
 
 @pytest.mark.asyncio
+async def test_native_intent_preserves_quoted_profile_after_catalog_price_change(
+    intent_state,
+    client,
+    monkeypatch,
+):
+    from hyrule_cloud.services.vm_pricing import price_vm_order
+
+    requested = _vm_create_request().model_copy(
+        update={
+            "size": VMSize.MD,
+            "resources": VMOrderResources(vcpu=2, ram_mb=4096, disk_gb=20),
+        }
+    )
+    priced = price_vm_order(requested, intent_state.config.payment)
+    assert priced.order.size is VMSize.MD
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_profile_lock",
+        amount_usd=priced.total,
+        order=priced.order,
+        pricing_snapshot=priced.pricing_snapshot,
+    )
+
+    # The same resources now price cheapest from SM. The still-valid quote must
+    # nevertheless retain MD as its billing base for future extensions.
+    monkeypatch.setattr(
+        intent_state.config.payment,
+        "price_vm_sm",
+        Decimal("0.01"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        intent_state.config.payment,
+        "price_vm_md",
+        Decimal("5.00"),
+        raising=False,
+    )
+    posted = dict(quote.order_payload)
+    posted["quote_id"] = quote.quote_id
+    response = await client.post(
+        "/v1/intent/create",
+        json={"asset": "BTC", "order_payload": posted},
+    )
+
+    assert response.status_code == 200, response.text
+    async with intent_state.orchestrator.db() as db:
+        intent = await db.get(CryptoIntentRow, response.json()["intent_id"])
+    assert intent is not None
+    assert intent.order_payload["size"] == VMSize.MD.value
+    assert intent.pricing_snapshot["base_profile"] == VMSize.MD.value
+
+
+@pytest.mark.asyncio
+async def test_native_intent_accepts_original_custom_shortcut_after_quote_rebase(
+    intent_state,
+    client,
+):
+    from hyrule_cloud.services.vm_pricing import price_vm_order
+
+    original = _vm_create_request().model_copy(
+        update={
+            "size": VMSize.XS,
+            "resources": VMOrderResources(vcpu=2, ram_mb=4096, disk_gb=20),
+        }
+    )
+    priced = price_vm_order(original, intent_state.config.payment)
+    assert priced.order.size is VMSize.MD
+    quote = await _seed_quote(
+        intent_state,
+        quote_id="q_native_shortcut_rebase",
+        amount_usd=priced.total,
+        order=priced.order,
+        pricing_snapshot=priced.pricing_snapshot,
+    )
+    posted = original.model_dump(mode="json")
+    posted["quote_id"] = quote.quote_id
+
+    response = await client.post(
+        "/v1/intent/create",
+        json={"asset": "BTC", "order_payload": posted},
+    )
+
+    assert response.status_code == 200, response.text
+    async with intent_state.orchestrator.db() as db:
+        intent = await db.get(CryptoIntentRow, response.json()["intent_id"])
+    assert intent.order_payload["size"] == VMSize.MD.value
+
+
+@pytest.mark.asyncio
 async def test_native_intent_rejects_cross_account_quote(intent_state, client):
     quote = await _seed_quote(
         intent_state,
@@ -940,7 +1157,7 @@ async def test_quote_bound_native_intent_consumes_and_links_quote(intent_state):
 
 
 @pytest.mark.asyncio
-async def test_native_custom_domain_is_claimed_before_vm_creation_at_settlement(
+async def test_native_custom_domain_is_claimed_before_reservation_activation_at_settlement(
     intent_state,
 ):
     owner_account_id = "HOWNER00001"
@@ -1507,10 +1724,12 @@ async def test_get_intent_by_client_order_id_returns_existing(intent_state):
 
 
 @pytest.mark.asyncio
-async def test_native_intent_records_refund_when_create_vm_fails(intent_state, monkeypatch):
-    """If create_vm raises AFTER the native funds settle (capacity exhausted, DB
-    insert failure, unsupported old order), the intent service records the native
-    refund — the settled customer must not be left with only a FAILED intent."""
+async def test_native_intent_refunds_when_atomic_capacity_reservation_fails(
+    intent_state,
+    monkeypatch,
+):
+    """A settled native payment that loses serialized capacity admission gets
+    an explicit refund instead of racing onward to a separate VM insert."""
     row = await _seed_intent(intent_state, asset="BTC")
     intent_state.native_crypto.scan_results[row.address] = AddressScanResult(
         address=row.address, received_total=row.amount_crypto * Decimal("1.20"), confirmations=2
@@ -1519,7 +1738,7 @@ async def test_native_intent_records_refund_when_create_vm_fails(intent_state, m
     async def _boom(*args, **kwargs):
         raise RuntimeError("capacity exhausted between settlement and create")
 
-    monkeypatch.setattr(intent_state.orchestrator, "create_vm", _boom)
+    monkeypatch.setattr(intent_state.orchestrator, "reserve_vm_with_capacity", _boom)
 
     await poll_one_intent(
         intent_id=row.intent_id,
@@ -1531,6 +1750,131 @@ async def test_native_intent_records_refund_when_create_vm_fails(intent_state, m
 
     # The refund path ran (not just a silent FAILED).
     assert intent_state.orchestrator.native_refunds == [row.intent_id]
+    assert (
+        intent_state.orchestrator.native_refund_reasons[row.intent_id]
+        == "vm_capacity_unavailable_at_settlement"
+    )
     async with intent_state.orchestrator.db() as db:
         intent = await db.get(CryptoIntentRow, row.intent_id)
         assert intent.status == CryptoIntentStatus.REFUND_MANUAL
+
+
+@pytest.mark.asyncio
+async def test_scanner_refunds_interrupted_native_vm_reservation(intent_state):
+    """A worker crash after the atomic reservation leaves enough durable state
+    for the scanner to release the exact VM row and record the settled refund."""
+    intent = await _seed_intent(intent_state, asset="BTC")
+    planned_vm_id = "vm_native_recovery"
+    order = VMCreateRequest.model_validate(intent.order_payload)
+    async with intent_state.orchestrator.db() as db:
+        stored = await db.get(CryptoIntentRow, intent.intent_id)
+        stored.status = CryptoIntentStatus.PROVISIONING
+        stored.paid_at = _now()
+        stored.provisioning_triggered_at = _now()
+        stored.vm_id = planned_vm_id
+        await db.commit()
+    await intent_state.orchestrator.reserve_vm_with_capacity(
+        order,
+        vm_id=planned_vm_id,
+    )
+
+    # A healthy in-flight worker keeps its reservation; only a stale handoff is
+    # recoverable, preventing another poller from racing normal activation.
+    assert (
+        await scan_pending_intents(
+            session_factory=intent_state.orchestrator.db,
+            provider=intent_state.native_crypto,
+            rates=intent_state.rate_provider,
+            orch=intent_state.orchestrator,
+        )
+        == 0
+    )
+    async with intent_state.orchestrator.db() as db:
+        assert await db.get(VMRow, planned_vm_id) is not None
+        stored = await db.get(CryptoIntentRow, intent.intent_id)
+        stored.provisioning_triggered_at = _now() - timedelta(minutes=6)
+        await db.commit()
+
+    touched = await scan_pending_intents(
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    assert touched == 1
+    async with intent_state.orchestrator.db() as db:
+        recovered = await db.get(CryptoIntentRow, intent.intent_id)
+        reservation = await db.get(VMRow, planned_vm_id)
+    assert recovered.status == CryptoIntentStatus.REFUND_MANUAL
+    assert reservation is None
+    assert (
+        intent_state.orchestrator.native_refund_reasons[intent.intent_id]
+        == "provisioning_interrupted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_fences_slow_native_worker_before_activation(
+    intent_state,
+    monkeypatch,
+):
+    intent = await _seed_intent(intent_state, asset="BTC")
+    intent_state.native_crypto.scan_results[intent.address] = AddressScanResult(
+        address=intent.address,
+        received_total=intent.amount_crypto,
+        confirmations=2,
+    )
+    reserve_entered = asyncio.Event()
+    release_reserve = asyncio.Event()
+    real_reserve = intent_state.orchestrator.reserve_vm_with_capacity
+
+    async def slow_reserve(*args, **kwargs):
+        reserve_entered.set()
+        await release_reserve.wait()
+        return await real_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(
+        intent_state.orchestrator,
+        "reserve_vm_with_capacity",
+        slow_reserve,
+    )
+    original_worker = asyncio.create_task(
+        poll_one_intent(
+            intent_id=intent.intent_id,
+            session_factory=intent_state.orchestrator.db,
+            provider=intent_state.native_crypto,
+            rates=intent_state.rate_provider,
+            orch=intent_state.orchestrator,
+        )
+    )
+    try:
+        await reserve_entered.wait()
+        async with intent_state.orchestrator.db() as db:
+            stored = await db.get(CryptoIntentRow, intent.intent_id)
+            planned_vm_id = stored.vm_id
+            assert planned_vm_id is not None
+        recovery_now = _now() + timedelta(minutes=6)
+        monkeypatch.setattr(
+            "hyrule_cloud.services.intents._now",
+            lambda: recovery_now,
+        )
+
+        touched = await scan_pending_intents(
+            session_factory=intent_state.orchestrator.db,
+            provider=intent_state.native_crypto,
+            rates=intent_state.rate_provider,
+            orch=intent_state.orchestrator,
+        )
+    finally:
+        release_reserve.set()
+        await original_worker
+
+    assert touched == 1
+    async with intent_state.orchestrator.db() as db:
+        recovered = await db.get(CryptoIntentRow, intent.intent_id)
+        vm = await db.get(VMRow, planned_vm_id)
+    assert recovered.status == CryptoIntentStatus.REFUND_MANUAL
+    assert vm is None
+    assert intent_state.orchestrator.created_vms == []
+    assert intent_state.orchestrator.provisioning_started == []

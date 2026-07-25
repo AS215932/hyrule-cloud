@@ -16,10 +16,10 @@ _TEST_TOKEN = "hyr_vm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 class MockConfig:
     class Payment:
-        price_vm_xs = Decimal("0.05")
-        price_vm_sm = Decimal("0.10")
-        price_vm_md = Decimal("0.20")
-        price_vm_lg = Decimal("0.40")
+        price_vm_xs = Decimal("0.20")
+        price_vm_sm = Decimal("0.40")
+        price_vm_md = Decimal("0.60")
+        price_vm_lg = Decimal("0.80")
         price_domain_markup = Decimal("1.00")
         price_proxy_direct = Decimal("0.01")
         price_proxy_tor = Decimal("0.05")
@@ -137,7 +137,12 @@ async def test_get_pricing(override_state):
         res = await client.get("/v1/pricing")
         assert res.status_code == 200
         data = res.json()
-        assert data["vm_prices"]["xs (1vCPU/1GB/10GB)"] == "$0.05/day"
+        assert data["vm_prices"]["xs (1C-1G-10G)"] == "$0.20/day"
+        assert data["vm_customization"]["maximum"] == {
+            "vcpu": 4,
+            "ram_mb": 8192,
+            "disk_gb": 40,
+        }
         assert data["domain_auto"] == "$0.00 (subdomain under deploy.hyrule.host)"
         assert data["proxy_prices"] == {
             "direct": "$0.01/request",

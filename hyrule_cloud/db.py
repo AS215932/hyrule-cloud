@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -84,6 +84,18 @@ class VMRow(Base):
         Enum(VMSize, name="vm_size", create_constraint=True, values_callable=lambda e: [m.value for m in e]),
         default=VMSize.XS,
     )
+    # Exact provisioned resources. Nullable at the ORM level so databases can
+    # roll through the migration safely; migration 016 backfills every legacy
+    # row before new writes begin.
+    vcpu: Mapped[int | None] = mapped_column(Integer)
+    memory_mb: Mapped[int | None] = mapped_column(Integer)
+    disk_gb: Mapped[int | None] = mapped_column(Integer)
+    # Add-on quantities are stored independently from exact resources. This is
+    # what lets extensions use current catalog rates without reinterpreting
+    # legacy machines (including retired 80-GB disks) as newly purchased add-ons.
+    billing_addon_vcpu: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    billing_addon_ram_mb: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    billing_addon_disk_gb: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     os: Mapped[str] = mapped_column(String(64), default="debian-13")
     ipv6: Mapped[str | None] = mapped_column(String(64))
     ipv6_prefix_index: Mapped[int | None] = mapped_column(Integer)
@@ -141,6 +153,40 @@ class VMRow(Base):
         Index("ix_vms_ipv6_prefix_index", "ipv6_prefix_index", unique=True),
         Index("ix_vms_ipv6_prefix", "ipv6_prefix", unique=True),
     )
+
+
+class VMEventRow(Base):
+    """Append-only provisioning lifecycle log for one VM.
+
+    Customer-visible through `GET /v1/vm/{vm_id}/logs` (management-token gated).
+    Everything written here has already been sanitized by
+    `hyrule_cloud.services.vm_events` — no provider text, no XO/XAPI ids, no
+    internal management addresses, no tokens.
+
+    A dedicated table (rather than a JSON column on VMRow) because emission is
+    append-only from a background task while other writers are concurrently
+    mutating the VM row: an insert cannot lose a concurrent event the way a
+    read-modify-write of a JSON list can.
+    """
+
+    __tablename__ = "vm_events"
+
+    # Monotonic surrogate key: it is also the tie-break for events written
+    # inside the same clock tick, so chronological order is always well defined.
+    event_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vm_id: Mapped[str] = mapped_column(String(32), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    # A VMEventKey value. Stored as text so an older reader never fails on a
+    # newer key (the enum is additive by contract).
+    event: Mapped[str] = mapped_column(String(48))
+    message: Mapped[str | None] = mapped_column(Text)
+    detail: Mapped[dict | None] = mapped_column(_JSONB)
+
+    __table_args__ = (Index("ix_vm_events_vm_created", "vm_id", "created_at"),)
 
 
 class DomainRow(Base):
@@ -303,6 +349,40 @@ class DomainOrderRow(Base):
     )
 
 
+class DomainRegistrationIntentRow(Base):
+    """Durable public x402 checkout state keyed by a client-generated id."""
+
+    __tablename__ = "domain_registration_intents"
+
+    registration_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    client_order_id: Mapped[str] = mapped_column(String(128), unique=True)
+    fqdn: Mapped[str] = mapped_column(String(253), index=True)
+    quote_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("domain_quotes.quote_id", ondelete="RESTRICT"), index=True
+    )
+    order_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("domain_orders.order_id", ondelete="SET NULL"),
+        unique=True,
+    )
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+    payer_address: Mapped[str | None] = mapped_column(String(42), index=True)
+    public_status_id: Mapped[str] = mapped_column(String(32), unique=True)
+    payment_authorization_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    settlement_state: Mapped[str] = mapped_column(
+        String(24), default="awaiting_payment", server_default="awaiting_payment", index=True
+    )
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class DomainOperationRow(Base):
     __tablename__ = "domain_operations"
 
@@ -454,6 +534,53 @@ class VPNTunnelRow(Base):
     payment_tx: Mapped[str | None] = mapped_column(String(128))
 
 
+class ReverseTunnelRow(Base):
+    """Reverse-SSH tunnel lease.
+
+    Hyrule Cloud is the billing authority; the hyrule-tunnel-proxy daemon owns
+    the SSH intake and allocates the token + public port. This row is the
+    cloud-side record used for ownership, expiry sweeps, and reconcile.
+    """
+
+    __tablename__ = "reverse_tunnels"
+
+    # tunnel_id is our generated id (rtun_<hex>) and the daemon's lease_id.
+    tunnel_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_wallet: Mapped[str] = mapped_column(String(64), index=True, default="")
+    owner_account_id: Mapped[str | None] = mapped_column(
+        String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
+    )
+    # sha256 hex of the lease token (the SSH username + management credential).
+    # Only the hash is stored so a DB disclosure never yields a live credential;
+    # the cleartext token is returned to the caller only once, at creation.
+    token_hash: Mapped[str] = mapped_column(String(64), index=True)
+    allocated_port: Mapped[int] = mapped_column(Integer)
+    endpoint_host: Mapped[str] = mapped_column(String(128))
+    ssh_port: Mapped[int] = mapped_column(Integer, default=2222)
+    allowlist_cidrs: Mapped[list | None] = mapped_column(_JSONB)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    # sha256 of the x402 payment authorization; makes create idempotent so a
+    # client retry (after a lost response) recovers the same tunnel + token
+    # instead of paying again or leaking a port. UNIQUE so two concurrent
+    # replicas with the same authorization cannot both provision.
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    # sha256 of the canonical create request (hours + allowlist); an idempotent
+    # replay with the SAME payment auth but a DIFFERENT body is a 409 conflict,
+    # not a silent return of the original tunnel.
+    request_hash: Mapped[str | None] = mapped_column(String(64))
+    # x402 settlement response header from the original create, replayed on an
+    # idempotent retry so a standard x402 client sees settlement proof.
+    settlement_header: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    payment_tx: Mapped[str | None] = mapped_column(String(128))
+
+    __table_args__ = (Index("ix_reverse_tunnels_owner_status", "owner_wallet", "status"),)
+
+
 class CryptoIntentRow(Base):
     """Tracking for native crypto payment intents (BTC/XMR).
 
@@ -487,6 +614,9 @@ class CryptoIntentRow(Base):
     client_order_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
     # Full VM creation spec carried through to the orchestrator on settlement.
     order_payload: Mapped[dict | None] = mapped_column(_JSONB)
+    # Server-generated VM pricing snapshot. NULL identifies an intent created
+    # before configurable resources shipped; those rows retain zero add-ons.
+    pricing_snapshot: Mapped[dict | None] = mapped_column(_JSONB)
     # Rate at intent creation; payment must arrive before rate_valid_until OR
     # qualify under the LENIENT re-quote rule (see providers/native_crypto.py).
     rate_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
@@ -495,7 +625,8 @@ class CryptoIntentRow(Base):
     # What actually landed on-chain — may differ from amount_crypto (over/under-pay).
     amount_received_crypto: Mapped[Decimal | None] = mapped_column(Numeric(24, 12))
     # Exactly-once provisioning trigger: orchestrator pickup is gated by an
-    # atomic UPDATE ... WHERE provisioning_triggered_at IS NULL RETURNING.
+    # atomic UPDATE ... WHERE provisioning_triggered_at IS NULL RETURNING. A
+    # stale VM handoff also advances this timestamp as its recovery lease.
     provisioning_triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # XMR-specific: subaddress index inside the view-only wallet account.
     xmr_subaddr_index: Mapped[int | None] = mapped_column(Integer, unique=True)
@@ -504,7 +635,8 @@ class CryptoIntentRow(Base):
     owner_account_id: Mapped[str | None] = mapped_column(
         String(11), ForeignKey("accounts.account_id", ondelete="SET NULL"), index=True
     )
-    # Once provisioned, link back to the VM created on settlement.
+    # Replay-safe planned VM id, persisted before settlement reservation; once
+    # provisioned it remains the link to the created VM.
     vm_id: Mapped[str | None] = mapped_column(String(32), index=True)
     # One-shot reveal: cleartext anon-management token created at provision time.
     # The next successful GET /v1/intent/{id} returns this AND nulls the column,
@@ -575,6 +707,9 @@ class VMQuoteRow(Base):
     order_payload: Mapped[dict] = mapped_column(_JSONB)
     # Price locked at quote creation; the 402 challenge uses this, not a recompute.
     amount_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    # Immutable, server-generated daily/base/add-on breakdown shown on review
+    # pages and copied to native intents. NULL means a migrated legacy quote.
+    pricing_snapshot: Mapped[dict | None] = mapped_column(_JSONB)
     status: Mapped[str] = mapped_column(
         Enum(
             QuoteStatus,

@@ -147,15 +147,29 @@ async def create_vm(
     domain: str | None = None,
     open_ports: str = "80,443",
     setup_script: str | None = None,
+    vcpu: int | None = None,
+    ram_gb: int | None = None,
+    disk_gb: int | None = None,
 ) -> str:
     """
     Provision a bare VM with SSH access.
 
-    Sizes: xs (1vCPU/1GB/10GB), sm (1vCPU/1GB/20GB), md (2vCPU/2GB/40GB), lg (4vCPU/4GB/80GB).
+    Profiles: xs (1C-1G-10G), sm (1C-2G-20G), md (2C-4G-20G), lg (4C-4G-40G).
+    To customize, provide all of vcpu, ram_gb, and disk_gb. Limits: 4/8/40.
     Domain modes: 'auto' (free subdomain), 'custom' (register domain, extra cost).
     Returns 402 with payment instructions if no payment is attached.
     """
     ports = [int(p.strip()) for p in open_ports.split(",") if p.strip()]
+    custom_values = (vcpu, ram_gb, disk_gb)
+    if any(value is not None for value in custom_values) and not all(
+        value is not None for value in custom_values
+    ):
+        return "Error: vcpu, ram_gb, and disk_gb must be provided together"
+    resources = (
+        {"vcpu": vcpu, "ram_mb": ram_gb * 1024, "disk_gb": disk_gb}
+        if all(value is not None for value in custom_values)
+        else None
+    )
     try:
         async with _client() as hc:
             result = await hc.create_vm(
@@ -167,24 +181,38 @@ async def create_vm(
                 domain=domain,
                 open_ports=ports,
                 setup_script=setup_script,
+                resources=resources,
             )
-            return (
-                f"VM created!\n"
-                f"  ID: {result['vm_id']}\n"
-                f"  Status: {result['status']}\n"
-                f"  Poll: {result['status_url']}\n"
-                f"  ETA: ~{result.get('estimated_ready_seconds', 60)}s"
-            )
+            lines = [
+                "VM created!",
+                f"  ID: {result['vm_id']}",
+                f"  Status: {result['status']}",
+                f"  Poll: {result['status_url']}",
+                f"  ETA: ~{result.get('estimated_ready_seconds', 60)}s",
+            ]
+            if result.get("management_token"):
+                # Shown once and only hashed server-side. Without it the
+                # logs/reboot/extend/destroy tools 404.
+                lines.append(f"  Management token: {result['management_token']} (save once!)")
+            return "\n".join(lines)
     except HyruleError as e:
         return _err(e)
 
 
 @mcp.tool()
-async def vm_status(vm_id: str) -> str:
-    """Get VM status: IP address, hostname, SSH command, expiry, firewall state."""
+async def vm_status(vm_id: str, management_token: str | None = None) -> str:
+    """Get VM status: IP address, hostname, expiry.
+
+    Polls the public status endpoint. Pass the one-time `management_token`
+    from create_vm to also get the SSH command, firewall state and error
+    detail — those live behind the management-gated full view.
+    """
     try:
         async with _client() as hc:
-            s = await hc.vm_status(vm_id)
+            if management_token:
+                s = await hc.vm_details(vm_id, management_token=management_token)
+            else:
+                s = await hc.vm_status(vm_id)
             lines = [
                 f"VM: {s['vm_id']}",
                 f"Status: {s['status']}",
@@ -208,11 +236,15 @@ async def vm_status(vm_id: str) -> str:
 
 
 @mcp.tool()
-async def extend_vm(vm_id: str, days: int) -> str:
-    """Add more days to a running VM. Payment required via x402."""
+async def extend_vm(vm_id: str, days: int, management_token: str | None = None) -> str:
+    """Add more days to a running VM. Payment required via x402.
+
+    Requires the one-time `management_token` from create_vm unless the VM is
+    owned by the authenticated account.
+    """
     try:
         async with _client() as hc:
-            result = await hc.extend_vm(vm_id, days)
+            result = await hc.extend_vm(vm_id, days, management_token=management_token)
             return (
                 f"VM {vm_id} extended.\n"
                 f"  New expiry: {result.get('new_expiry', 'unknown')}\n"
@@ -223,22 +255,92 @@ async def extend_vm(vm_id: str, days: int) -> str:
 
 
 @mcp.tool()
-async def reboot_vm(vm_id: str) -> str:
-    """Hard reboot a VM."""
+async def reboot_vm(vm_id: str, management_token: str | None = None) -> str:
+    """Hard reboot a VM. Requires the one-time `management_token` from create_vm
+    unless the VM is owned by the authenticated account."""
     try:
         async with _client() as hc:
-            await hc.reboot_vm(vm_id)
+            await hc.reboot_vm(vm_id, management_token=management_token)
             return f"VM {vm_id} is rebooting."
     except HyruleError as e:
         return _err(e)
 
 
 @mcp.tool()
-async def destroy_vm(vm_id: str) -> str:
-    """Destroy a VM permanently. This cannot be undone."""
+async def create_tunnel(hours: int, allowlist_cidrs: str | None = None) -> str:
+    """
+    Expose a host behind NAT on a public TCP port via reverse SSH. Paid via x402
+    (per hour). Returns 402 with payment instructions if no payment is attached.
+
+    On the NAT'd host, run the returned ssh command (works from a stock rescue
+    image, no install). Use `-R 0:` so ssh prints the allocated port. Wrap it in
+    autossh so it reconnects. allowlist_cidrs is an optional comma-separated list
+    of source CIDRs allowed to reach the public port (default: open to all).
+    Save the returned token — it is the SSH username AND the management credential.
+    """
+    cidrs = [c.strip() for c in allowlist_cidrs.split(",")] if allowlist_cidrs else None
     try:
         async with _client() as hc:
-            await hc.destroy_vm(vm_id)
+            r = await hc.create_tunnel(hours, cidrs)
+            return (
+                f"Tunnel created!\n"
+                f"  ID: {r['tunnel_id']}\n"
+                f"  Token (SSH username + management): {r.get('token')}\n"
+                f"  Public endpoint: {r['endpoint_host']}:{r['public_port']}\n"
+                f"  Expires: {r['expires_at']}\n"
+                f"  Run on the NAT'd host:\n    {r['ssh_command']}"
+            )
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def extend_tunnel(tunnel_id: str, token: str, hours: int) -> str:
+    """Extend a reverse-SSH tunnel lease by N hours. Paid via x402; needs the token."""
+    try:
+        async with _client() as hc:
+            r = await hc.extend_tunnel(tunnel_id, token, hours)
+            return f"Tunnel {tunnel_id} extended.\n  New expiry: {r.get('expires_at', 'unknown')}"
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def tunnel_status(tunnel_id: str, token: str) -> str:
+    """Get live status of a reverse-SSH tunnel (connected? visitors?). Needs the token."""
+    try:
+        async with _client() as hc:
+            r = await hc.tunnel_status(tunnel_id, token)
+            return (
+                f"Tunnel {tunnel_id}\n"
+                f"  Endpoint: {r['endpoint_host']}:{r['public_port']}\n"
+                f"  Status: {r['status']}  Connected: {r.get('connected')}\n"
+                f"  Visitors: {r.get('visitor_conns', 0)}\n"
+                f"  Expires: {r['expires_at']}"
+            )
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def revoke_tunnel(tunnel_id: str, token: str) -> str:
+    """Tear down a reverse-SSH tunnel before its lease expires. Needs the token."""
+    try:
+        async with _client() as hc:
+            await hc.revoke_tunnel(tunnel_id, token)
+            return f"Tunnel {tunnel_id} revoked."
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def destroy_vm(vm_id: str, management_token: str | None = None) -> str:
+    """Destroy a VM permanently. This cannot be undone. Requires the one-time
+    `management_token` from create_vm unless the VM is owned by the
+    authenticated account."""
+    try:
+        async with _client() as hc:
+            await hc.destroy_vm(vm_id, management_token=management_token)
             return f"VM {vm_id} destroyed."
     except HyruleError as e:
         return _err(e)
@@ -640,6 +742,26 @@ async def dns_lookup(name: str, record_type: str = "A", dnssec: bool = False, tr
     try:
         async with _client() as hc:
             return str(await hc.dns_lookup(name, record_type, dnssec=dnssec, trace=trace))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def dns_blocklist_check(domain: str) -> str:
+    """Paid domain check across common DNS-capable ad, privacy, and security lists."""
+    try:
+        async with _client() as hc:
+            return str(await hc.dns_blocklist_check(domain))
+    except HyruleError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def dns_filtering_check(domain: str) -> str:
+    """Paid live public DNS filtering check from Hyrule's network vantage."""
+    try:
+        async with _client() as hc:
+            return str(await hc.dns_filtering_check(domain))
     except HyruleError as e:
         return _err(e)
 

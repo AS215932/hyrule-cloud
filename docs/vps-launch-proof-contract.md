@@ -20,6 +20,7 @@ status fields.
 | `payment_required`| Payment not yet settled; 402 returned on create  | `QuoteStatus.CREATED` + 402       |
 | `provisioning`   | Payment confirmed; VM build in progress           | `VMStatus.PROVISIONING`           |
 | `provisioned`    | VM build completed; ready for SSH                 | `VMStatus.READY` / `RUNNING`      |
+| `degraded`       | VM is up and reachable but a proof failed (today: it cannot resolve DNS) | `VMStatus.READY` + `dns_resolution_status=failed` |
 | `failed`         | Build failed; rollback may be available           | `VMStatus.FAILED`                 |
 | `rolled_back`    | Failed VM was cleaned up / destroyed              | `VMStatus.DESTROYED` after failed |
 
@@ -28,13 +29,19 @@ status fields.
 `GET /v1/vm/{vm_id}/status` returns these launch-proof fields in addition to
 the existing public status shape:
 
-- **`launch_proof_status`** — one of the six states above.
+- **`launch_proof_status`** — one of the seven states above.
 - **`payment_status`** — `paid` | `payment_required` | `not_required`.
 - **`dns_aaaa_verified`** — `true` when the AAAA record for the VM hostname is
   confirmed (controlled simulation by default; real DNS check only when
   `HCP_LAUNCH_PROOF_REAL_XCPNG=1`).
 - **`ssh_smoke_status`** — `not_run` | `passed` | `failed` (controlled simulation
   by default; real SSH smoke only when `HCP_LAUNCH_PROOF_REAL_XCPNG=1`).
+- **`dns_resolution_status`** — `not_run` | `passed` | `failed`. Whether the
+  resolver the VM was handed (`HYRULE_CUSTOMER_IPV6_DNS`) actually answers a
+  query for `HYRULE_CUSTOMER_DNS_PROBE_HOSTNAME`. `dns_aaaa_verified` and the
+  SSH smoke are both *inbound* proofs: a VM can pass both and still resolve
+  nothing, which makes it unusable (no `apt-get`, no setup script). Never
+  inferred from the VM being READY — `not_run` means no measurement was taken.
 - **`rollback_available`** — `true` when the VM is in `failed` and has not yet
   been destroyed.
 - **`operator_message`** — Internal detail for operators (raw error, etc.).
@@ -47,6 +54,20 @@ the existing public status shape:
   SSH smoke and DNS verification are derived from the VM row state.
 - **Real mode** — Set `HCP_LAUNCH_PROOF_REAL_XCPNG=1`. The orchestrator
   executes the full real provisioning path and runs actual DNS/SSH checks.
+
+## Degraded Contract
+
+A VM that is up, reachable and paid for, but fails an outbound proof, is
+reported as `degraded` — not `provisioned` (that would be a lie) and not
+`failed` (that promises a refund for a machine the customer can use):
+
+1. `launch_proof_status` is `degraded`; `status` stays `ready`.
+2. `dns_resolution_status` is `failed` — the machine-readable reason.
+3. `customer_message` says what does not work and how to unblock it (point the
+   VM at a working DNS64 resolver), and offers support/refund.
+4. `operator_message` names the misconfigured setting.
+5. No refund is auto-recorded: the VM was delivered and is usable. A customer
+   who does not want it asks support.
 
 ## Failure Contract
 
@@ -64,6 +85,6 @@ When provisioning reaches `failed`:
 ```
 POST /v1/vm/quote          → quote_id, status=created    (launch: accepted)
 POST /v1/vm/create 402     → payment required              (launch: payment_required)
-POST /v1/vm/create 200     → vm_id, status=provisioning   (launch: provisioning)
+POST /v1/vm/create 202     → vm_id, status=provisioning   (launch: provisioning)
 GET  /v1/vm/{id}/status    → ssh_smoke=passed, dns=true   (launch: provisioned)
 ```

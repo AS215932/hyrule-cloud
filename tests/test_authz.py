@@ -389,7 +389,14 @@ class _OrchForCreate:
         self.provisioning_started = getattr(self, "provisioning_started", [])
         self.provisioning_started.append(vm_id)
 
-    async def create_vm(self, request, owner_wallet, owner_account_id=None, start_provisioning=True):
+    async def create_vm(
+        self,
+        request,
+        owner_wallet,
+        owner_account_id=None,
+        start_provisioning=True,
+        **kwargs,
+    ):
         from hyrule_cloud.models import generate_anon_management_token, generate_vm_id
 
         class _Row:
@@ -427,7 +434,7 @@ async def test_vm_create_surfaces_management_token_and_url(_state_create):
                 "ssh_pubkey": "ssh-ed25519 AAAA",
             },
         )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     data = res.json()
     assert data["management_token"].startswith("hyr_vm_")
     assert data["management_url"].endswith(f"?token={data['management_token']}")
