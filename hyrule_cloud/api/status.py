@@ -516,11 +516,15 @@ def _apply_domains_launch(
 ) -> ServiceStatusResponse:
     """Reconcile the Domains & DNS component with the product's real readiness.
 
-    The launch signal only ever replaces an operational claim (or a prior
-    "could not confirm" reading of one). A firing incident (authoritative DNS
-    is live even before registration launches) and the fail-closed unknown
-    snapshot both outrank it, so this can never mask a real problem — it only
-    removes a claim the product cannot honour.
+    The launch signal only ever replaces an operational claim. A firing
+    incident (authoritative DNS is live even before registration launches)
+    and the fail-closed unknown snapshot both outrank it, so this can never
+    mask a real problem — it only removes a claim the product cannot honour.
+    That includes the *global* fail-closed snapshot (``_unknown_response()``
+    starts every component, including this one, at ``UNKNOWN`` when
+    Prometheus itself is unreachable) — a healthy domains probe must not
+    paper over that with a lone "operational", so promotion only ever
+    triggers from ``NOT_LAUNCHED``, never from ``UNKNOWN``.
 
     ``discovery_state`` is one of:
     - ``None``: no live probe ran this cycle — no-op.
@@ -532,7 +536,9 @@ def _apply_domains_launch(
       ``_overall_status`` excludes ``NOT_LAUNCHED`` from the rollup, so
       mislabeling a probe failure that way would let a real regression on an
       already-launched product hide behind "deferred" instead of degrading
-      the public status.
+      the public status. A component that lands on ``UNKNOWN`` this way
+      clears on the next fully-fresh computation (which always starts
+      components at ``OPERATIONAL`` again), not by a same-response promotion.
     """
     if discovery_state is None:
         return response
@@ -545,7 +551,7 @@ def _apply_domains_launch(
         return response
 
     if discovery_state == ServiceState.OPERATIONAL:
-        if component.status not in (ServiceState.NOT_LAUNCHED, ServiceState.UNKNOWN):
+        if component.status != ServiceState.NOT_LAUNCHED:
             return response
         state = ServiceState.OPERATIONAL
         message = _COMPONENTS[_DOMAINS_COMPONENT_ID][1]
