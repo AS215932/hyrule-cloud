@@ -849,13 +849,25 @@ class DomainService:
             payment_network=payment_network,
             payment_asset=payment_asset,
         )
+        # Same conditional UPDATE as recover_x402_handoffs: if this write is
+        # lost to a transient DB error, the intent stays "awaiting_payment"
+        # against an already-paid order, but recovery converges it from the
+        # settlement ledger rather than a second caller racing this one.
+        now = _now()
         async with self.db() as session:
-            stored = await session.get(DomainRegistrationIntentRow, intent.registration_id)
-            if stored is not None:
-                stored.settlement_state = "settled"
-                stored.settled_at = stored.settled_at or _now()
-                stored.updated_at = _now()
-                await session.commit()
+            await session.execute(
+                update(DomainRegistrationIntentRow)
+                .where(
+                    DomainRegistrationIntentRow.registration_id == intent.registration_id,
+                    DomainRegistrationIntentRow.settlement_state != "settled",
+                )
+                .values(
+                    settlement_state="settled",
+                    settled_at=func.coalesce(DomainRegistrationIntentRow.settled_at, now),
+                    updated_at=now,
+                )
+            )
+            await session.commit()
         return current
 
     async def mark_registration_settlement(
