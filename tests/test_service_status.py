@@ -144,6 +144,30 @@ class _AdmissionOrchestrator:
             raise self.error
 
 
+class _DomainsProduct:
+    """Stand-in for the DomainService readiness predicate behind /v1/domains."""
+
+    def __init__(
+        self,
+        ready: bool = True,
+        *,
+        error: Exception | None = None,
+        block: bool = False,
+    ) -> None:
+        self.ready = ready
+        self.error = error
+        self.block = block
+        self.calls = 0
+
+    async def public_discovery_ready(self) -> bool:
+        self.calls += 1
+        if self.block:
+            await asyncio.Event().wait()
+        if self.error is not None:
+            raise self.error
+        return self.ready
+
+
 @pytest_asyncio.fixture
 async def status_state(monkeypatch):
     from hyrule_cloud.api import status as status_api
@@ -161,6 +185,7 @@ async def status_state(monkeypatch):
         orchestrator=None,
         payment_gate=None,
         network_provider=None,
+        domains=_DomainsProduct(),
     )
     try:
         yield
@@ -325,6 +350,204 @@ async def test_live_admission_recovery_clears_cached_incident_during_prometheus_
     assert body["incidents"] == []
     assert {component["status"] for component in body["components"]} == {"operational"}
     assert orchestrator.calls == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_launched_domains_report_operational(status_state, client):
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert body["status"] == "operational"
+    assert components["domains_dns"]["status"] == "operational"
+    assert components["domains_dns"]["message"] == "Registration and authoritative DNS"
+    assert app.state._typed_state.domains.calls == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unlaunched_domains_never_report_operational(status_state, client):
+    app.state._typed_state.domains = _DomainsProduct(ready=False)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert components["domains_dns"]["status"] == "not_launched"
+    assert (
+        components["domains_dns"]["message"]
+        == "Domain registration and managed DNS are not yet launched."
+    )
+    # A deferred product is not a disruption of the products that are live.
+    assert body["status"] == "operational"
+    assert body["incidents"] == []
+    assert components["api_checkout"]["status"] == "operational"
+    assert components["compute"]["status"] == "operational"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_missing_domains_service_never_reports_operational(status_state, client):
+    app.state._typed_state.domains = None
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert components["domains_dns"]["status"] == "not_launched"
+    assert body["status"] == "operational"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_domains_probe_failure_never_reports_operational_or_leaks_detail(
+    status_state,
+    client,
+):
+    app.state._typed_state.domains = _DomainsProduct(
+        error=RuntimeError("openprovider credentials for hyrule.host rejected")
+    )
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    response = await client.get("/v1/status")
+
+    components = {component["id"]: component for component in response.json()["components"]}
+    assert components["domains_dns"]["status"] == "not_launched"
+    assert "openprovider" not in response.text
+    assert "credentials" not in response.text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_domains_probe_timeout_never_reports_operational(status_state, client, monkeypatch):
+    from hyrule_cloud.api import status as status_api
+
+    app.state._typed_state.domains = _DomainsProduct(block=True)
+    monkeypatch.setattr(status_api, "_DOMAINS_PROBE_TIMEOUT_SECONDS", 0.01)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert components["domains_dns"]["status"] == "not_launched"
+    assert body["status"] == "operational"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dns_incident_outranks_unlaunched_domains(status_state, client):
+    app.state._typed_state.domains = _DomainsProduct(ready=False)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(
+            200,
+            json=_prometheus(
+                [
+                    _alert(
+                        name="HyrulePublicDNSOutage",
+                        state="outage",
+                        components="domains_dns",
+                    )
+                ]
+            ),
+        )
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert components["domains_dns"]["status"] == "outage"
+    assert body["status"] == "outage"
+    assert len(body["incidents"]) == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unlaunched_domains_do_not_hide_other_degradation(
+    status_state,
+    client,
+    monkeypatch,
+):
+    from hyrule_cloud.api import status as status_api
+
+    app.state._typed_state.domains = _DomainsProduct(ready=False)
+    app.state._typed_state.orchestrator = _AdmissionOrchestrator(RuntimeError("no capacity"))
+    monkeypatch.setattr(status_api, "use_real_provisioning", lambda: True)
+    _mock_loaded_rules()
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    components = {component["id"]: component for component in body["components"]}
+    assert body["status"] == "degraded"
+    assert components["domains_dns"]["status"] == "not_launched"
+    assert components["compute"]["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unknown_snapshot_keeps_domains_unconfirmed(status_state, client):
+    app.state._typed_state.domains = _DomainsProduct(ready=False)
+    respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"}).mock(
+        return_value=Response(200, json=_prometheus_rules(("SomeInternalRule",)))
+    )
+
+    body = (await client.get("/v1/status")).json()
+
+    assert body["status"] == "unknown"
+    assert {component["status"] for component in body["components"]} == {"unknown"}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_domain_launch_clears_cached_not_launched_state(status_state, client):
+    from hyrule_cloud.api import status as status_api
+
+    domains = _DomainsProduct(ready=False)
+    app.state._typed_state.domains = domains
+    rules_route = respx.get("http://prom.test:9090/api/v1/rules", params={"type": "alert"})
+    rules_route.side_effect = [
+        Response(200, json=_prometheus_rules()),
+        Response(503, text="unavailable"),
+    ]
+    respx.get("http://prom.test:9090/api/v1/alerts").mock(
+        return_value=Response(200, json=_prometheus([]))
+    )
+
+    first = await client.get("/v1/status")
+    status_api._STATUS_CACHE["expires_at"] = 0.0
+    domains.ready = True
+
+    launched = await client.get("/v1/status")
+
+    first_components = {component["id"]: component for component in first.json()["components"]}
+    assert first_components["domains_dns"]["status"] == "not_launched"
+    body = launched.json()
+    components = {component["id"]: component for component in body["components"]}
+    assert body["status"] == "operational"
+    assert body["stale"] is True
+    assert components["domains_dns"]["status"] == "operational"
+    assert components["domains_dns"]["message"] == "Registration and authoritative DNS"
+    assert domains.calls == 2
 
 
 @pytest.mark.asyncio

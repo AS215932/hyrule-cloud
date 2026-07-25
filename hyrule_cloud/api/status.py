@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
@@ -23,6 +24,7 @@ log = structlog.get_logger()
 
 class ServiceState(StrEnum):
     OPERATIONAL = "operational"
+    NOT_LAUNCHED = "not_launched"
     DEGRADED = "degraded"
     OUTAGE = "outage"
     UNKNOWN = "unknown"
@@ -61,6 +63,9 @@ _COMPONENTS: dict[str, tuple[str, str]] = {
 }
 _RANK = {
     ServiceState.OPERATIONAL: 0,
+    # A product that has not launched is not a disruption of the products that
+    # have, so it never outranks anything in the top-level rollup.
+    ServiceState.NOT_LAUNCHED: 0,
     ServiceState.UNKNOWN: 1,
     ServiceState.DEGRADED: 2,
     ServiceState.OUTAGE: 3,
@@ -68,6 +73,9 @@ _RANK = {
 _CACHE_TTL_SECONDS = 15
 _STALE_MAX_SECONDS = 120
 _CAPACITY_PROBE_TIMEOUT_SECONDS = 3.0
+_DOMAINS_COMPONENT_ID = "domains_dns"
+_DOMAINS_PROBE_TIMEOUT_SECONDS = 3.0
+_DOMAINS_NOT_LAUNCHED_MESSAGE = "Domain registration and managed DNS are not yet launched."
 _CAPACITY_INCIDENT_ID = "inc_" + hashlib.sha256(b"vm-capacity-admission").hexdigest()[:16]
 _CAPACITY_INCIDENT_TITLE = "New VM orders temporarily unavailable"
 _CAPACITY_INCIDENT_MESSAGE = (
@@ -141,6 +149,24 @@ def _component_rows(state: ServiceState = ServiceState.OPERATIONAL) -> list[Serv
         )
         for component_id, (name, description) in _COMPONENTS.items()
     ]
+
+
+def _overall_status(components: Iterable[ServiceComponentStatus]) -> ServiceState:
+    """Roll components up to one customer-visible state.
+
+    Components that have not launched are excluded: a deferred product is not
+    an incident on the products that are live, and letting it drag the global
+    status to degraded would cry wolf on every working product.
+    """
+    return max(
+        (
+            component.status
+            for component in components
+            if component.status != ServiceState.NOT_LAUNCHED
+        ),
+        key=lambda state: _RANK[state],
+        default=ServiceState.OPERATIONAL,
+    )
 
 
 def _unknown_response() -> ServiceStatusResponse:
@@ -295,13 +321,8 @@ def _build_response(alerts: list[dict[str, Any]]) -> ServiceStatusResponse:
                 component.status = incident.status
                 component.message = incident.message
 
-    overall = max(
-        (component.status for component in components.values()),
-        key=lambda state: _RANK[state],
-        default=ServiceState.OPERATIONAL,
-    )
     return ServiceStatusResponse(
-        status=overall,
+        status=_overall_status(components.values()),
         checked_at=_now(),
         components=list(components.values()),
         incidents=incidents,
@@ -342,6 +363,46 @@ async def _probe_vm_admission(app_state: Any) -> bool | None:
         log.warning("status_vm_admission_probe_failed", error_type=type(exc).__name__)
         return False
     return True
+
+
+async def _probe_domains_discovery(app_state: Any) -> bool | None:
+    """Prove that the Domains & DNS entry points could answer a customer.
+
+    Mirrors the compute-capacity probe: the status page asks the product
+    itself, so a deferred or unconfigured launch can never be advertised as
+    operational while ``/v1/domains/tlds`` and ``/v1/domains/check`` return 503.
+    """
+    if app_state is None:
+        return None
+
+    service = getattr(app_state, "domains", None)
+    if service is None:
+        # Exactly the condition the /v1/domains dependency fails closed on.
+        return False
+
+    discovery_ready = getattr(service, "public_discovery_ready", None)
+    if not callable(discovery_ready):
+        log.warning("status_domains_discovery_probe_unavailable")
+        return False
+
+    try:
+        return bool(
+            await asyncio.wait_for(
+                discovery_ready(),
+                timeout=_DOMAINS_PROBE_TIMEOUT_SECONDS,
+            )
+        )
+    except TimeoutError:
+        log.warning(
+            "status_domains_discovery_probe_timed_out",
+            timeout_seconds=_DOMAINS_PROBE_TIMEOUT_SECONDS,
+        )
+        return False
+    except Exception as exc:
+        # As with the capacity probe, only the exception type reaches the
+        # private log; the public response never carries provider detail.
+        log.warning("status_domains_discovery_probe_failed", error_type=type(exc).__name__)
+        return False
 
 
 async def _load_public_monitoring(
@@ -403,11 +464,7 @@ def _apply_vm_capacity_health(
             component.status = incident.status
             component.message = incident.message
 
-    updated.status = max(
-        (component.status for component in updated.components),
-        key=lambda state: _RANK[state],
-        default=ServiceState.OPERATIONAL,
-    )
+    updated.status = _overall_status(updated.components)
     return updated
 
 
@@ -438,12 +495,61 @@ def _clear_vm_capacity_health(response: ServiceStatusResponse) -> ServiceStatusR
     updated = response.model_copy(deep=True)
     updated.incidents = remaining_incidents
     updated.components = list(components.values())
-    updated.status = max(
-        (component.status for component in updated.components),
-        key=lambda state: _RANK[state],
-        default=ServiceState.OPERATIONAL,
-    )
+    updated.status = _overall_status(updated.components)
     return updated
+
+
+def _apply_domains_launch(
+    response: ServiceStatusResponse,
+    discovery_ready: bool | None,
+) -> ServiceStatusResponse:
+    """Reconcile the Domains & DNS component with the product's real readiness.
+
+    The launch signal only ever replaces an operational claim. A firing
+    incident (authoritative DNS is live even before registration launches) and
+    the fail-closed unknown snapshot both outrank it, so this can never mask a
+    real problem — it only removes a claim the product cannot honour.
+    """
+    if discovery_ready is None:
+        return response
+
+    component = next(
+        (item for item in response.components if item.id == _DOMAINS_COMPONENT_ID),
+        None,
+    )
+    if component is None:
+        return response
+
+    if discovery_ready:
+        if component.status != ServiceState.NOT_LAUNCHED:
+            return response
+        state = ServiceState.OPERATIONAL
+        message = _COMPONENTS[_DOMAINS_COMPONENT_ID][1]
+    else:
+        if component.status != ServiceState.OPERATIONAL:
+            return response
+        state = ServiceState.NOT_LAUNCHED
+        message = _DOMAINS_NOT_LAUNCHED_MESSAGE
+
+    updated = response.model_copy(deep=True)
+    for item in updated.components:
+        if item.id == _DOMAINS_COMPONENT_ID:
+            item.status = state
+            item.message = message
+    updated.status = _overall_status(updated.components)
+    return updated
+
+
+def _apply_live_readiness(
+    response: ServiceStatusResponse,
+    capacity_available: bool | None,
+    domains_ready: bool | None,
+) -> ServiceStatusResponse:
+    """Layer both live product probes onto an alert-derived snapshot."""
+    return _apply_domains_launch(
+        _apply_vm_capacity_health(response, capacity_available),
+        domains_ready,
+    )
 
 
 @router.get("", response_model=ServiceStatusResponse)
@@ -467,15 +573,17 @@ async def get_service_status(request: Request) -> ServiceStatusResponse:
         app_state = getattr(request.app.state, "_typed_state", None)
         config = getattr(app_state, "config", None)
         prometheus_url = getattr(config, "prometheus_url", "") or ""
-        (alerts, rules_unready), capacity_available = await asyncio.gather(
+        (alerts, rules_unready), capacity_available, domains_ready = await asyncio.gather(
             _load_public_monitoring(prometheus_url),
             _probe_vm_admission(app_state),
+            _probe_domains_discovery(app_state),
         )
 
         if alerts is not None:
-            response = _apply_vm_capacity_health(
+            response = _apply_live_readiness(
                 _build_response(alerts),
                 capacity_available,
+                domains_ready,
             )
             _STATUS_CACHE.update(
                 value=response,
@@ -485,7 +593,7 @@ async def get_service_status(request: Request) -> ServiceStatusResponse:
             return response
 
         if rules_unready:
-            unknown = _apply_vm_capacity_health(_unknown_response(), capacity_available)
+            unknown = _apply_live_readiness(_unknown_response(), capacity_available, domains_ready)
             _STATUS_CACHE.update(value=unknown, expires_at=now_ts + _CACHE_TTL_SECONDS)
             return unknown
 
@@ -494,12 +602,13 @@ async def get_service_status(request: Request) -> ServiceStatusResponse:
             isinstance(cached, ServiceStatusResponse)
             and now_ts - successful_at <= _STALE_MAX_SECONDS
         ):
-            stale = _apply_vm_capacity_health(
+            stale = _apply_live_readiness(
                 cached.model_copy(update={"stale": True}),
                 capacity_available,
+                domains_ready,
             )
             _STATUS_CACHE.update(value=stale, expires_at=now_ts + _CACHE_TTL_SECONDS)
             return stale
-        unknown = _apply_vm_capacity_health(_unknown_response(), capacity_available)
+        unknown = _apply_live_readiness(_unknown_response(), capacity_available, domains_ready)
         _STATUS_CACHE.update(value=unknown, expires_at=now_ts + _CACHE_TTL_SECONDS)
         return unknown
