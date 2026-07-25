@@ -48,12 +48,12 @@ _VM_ID = "vm_dogfood1"
 _MGMT_TOKEN = "hyr_vm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 
-def _payment_required_header(amount_units: str) -> str:
-    """A well-formed x402 v2 challenge for `amount_units` atomic USDC."""
+def _payment_required_header(amount_units: str, *, asset: str = _USDC) -> str:
+    """A well-formed x402 v2 challenge for `amount_units` atomic units of `asset`."""
     requirements = PaymentRequirements(
         scheme="exact",
         network=_NETWORK,
-        asset=_USDC,
+        asset=asset,
         amount=amount_units,
         pay_to="0x000000000000000000000000000000000000dEaD",
         max_timeout_seconds=300,
@@ -92,11 +92,13 @@ class _FakeAPI:
         self,
         *,
         price_units: str = "1400000",  # $1.40 — 7 days of `sm`
+        asset: str = _USDC,
         emit_settlement: bool = True,
         settlement_ok: bool = True,
         statuses: list[dict[str, object]] | None = None,
     ) -> None:
         self.price_units = price_units
+        self.asset = asset
         self.emit_settlement = emit_settlement
         self.settlement_ok = settlement_ok
         self.statuses = statuses or [{"vm_id": _VM_ID, "status": "ready", "hostname": "a.test"}]
@@ -113,7 +115,11 @@ class _FakeAPI:
             return httpx.Response(
                 402,
                 json={"detail": "payment required"},
-                headers={PAYMENT_REQUIRED_HEADER: _payment_required_header(self.price_units)},
+                headers={
+                    PAYMENT_REQUIRED_HEADER: _payment_required_header(
+                        self.price_units, asset=self.asset
+                    )
+                },
             )
         headers = {}
         if self.emit_settlement:
@@ -250,6 +256,23 @@ async def test_payment_is_pinned_to_one_chain() -> None:
     assert api.paths == ["/v1/vm/create"]
 
 
+@pytest.mark.asyncio
+async def test_spend_cap_does_not_authorize_a_non_usdc_asset() -> None:
+    """`max_amount()` alone checks only the raw atomic amount, not the
+    asset: a 402 advertising a token other than the expected USDC could
+    pass the nominal $-cap while authorizing a spend of a different, more
+    valuable asset. A cheap-looking amount on the wrong token must not be
+    signed for."""
+    not_usdc = "0x000000000000000000000000000000000000dEaD"
+    api = _FakeAPI(price_units="1", asset=not_usdc)  # trivially "cheap" by amount alone
+    async with _client(api, max_usd_per_call="5.00") as hc:
+        with pytest.raises(HyrulePaymentError):
+            await hc.create_vm(duration_days=7, ssh_pubkey="ssh-ed25519 AAAA")
+
+    assert api.paths == ["/v1/vm/create"]
+    assert not any(r.headers.get(PAYMENT_SIGNATURE_HEADER) for r in api.requests)
+
+
 @pytest.mark.parametrize("bad", ["0", "-1.00", "abc", "0.0000001"])
 def test_invalid_spend_caps_are_rejected_at_construction(bad: str) -> None:
     if bad == "0.0000001":
@@ -268,13 +291,27 @@ def test_invalid_spend_caps_are_rejected_at_construction(bad: str) -> None:
 
 @pytest.mark.asyncio
 async def test_paid_2xx_without_settlement_header_raises() -> None:
+    """A proxy stripping the settlement header does not mean the call was
+    never charged — the signed retry already went through and XO may have
+    provisioned the VM. Settlement is UNKNOWN, not "unpaid": the message
+    must not claim otherwise (that would invite a caller to retry an
+    unquoted request and buy a second VM), and the successful create body
+    — including the reveal-once management token — must be recoverable
+    from the exception instead of being discarded."""
     api = _FakeAPI(emit_settlement=False)
     async with _client(api) as hc:
         with pytest.raises(SettlementMissingError) as exc:
             await hc.create_vm(duration_days=7, ssh_pubkey="ssh-ed25519 AAAA")
 
-    assert "not charged" in str(exc.value)
+    assert "not charged" not in str(exc.value)
+    assert "unknown" in str(exc.value).lower()
     assert hc.last_settlement is None
+    # The signed retry really happened — this isn't the free/no-key path.
+    assert api.paths == ["/v1/vm/create", "/v1/vm/create"]
+    assert api.requests[1].headers.get(PAYMENT_SIGNATURE_HEADER)
+    assert exc.value.response_body is not None
+    assert exc.value.response_body["vm_id"] == _VM_ID
+    assert exc.value.response_body["management_token"] == _MGMT_TOKEN
 
 
 @pytest.mark.asyncio
