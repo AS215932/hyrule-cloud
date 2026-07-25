@@ -146,10 +146,11 @@ async def test_health_failure_yields_no_healthy_vantages():
 
 
 class _FakeProber:
-    def __init__(self, *, healthy=("as215932",), outcomes=None, configured=True):
+    def __init__(self, *, healthy=("as215932",), outcomes=None, configured=True, probed_address="2001:db8::1"):
         self._healthy = set(healthy)
         self._outcomes = outcomes or {}
         self._configured = configured
+        self._probed_address = probed_address
         self.probe_calls: list[dict] = []
 
     def configured(self) -> bool:
@@ -166,7 +167,7 @@ class _FakeProber:
             kind=kwargs["kind"],
             family=kwargs["family"],
             resolved_addresses=["2001:db8::1"],
-            probed_address="2001:db8::1",
+            probed_address=self._probed_address,
             results=results,
         )
 
@@ -247,6 +248,42 @@ async def test_path_probe_none_provider_raises_unavailable():
     body = PathProbeRequest(target="example.com", probe=PathProbeKind.PING)
     with pytest.raises(ProbeUnavailableError):
         await pd.path_probe(body, None)
+
+
+@pytest.mark.asyncio
+async def test_path_probe_rejects_prober_address_outside_the_validated_set():
+    """DNS-rebinding regression: assert_safe_active_probe_target validates the
+    resolved address once before the call, but the prober resolves the target
+    again itself. A near-zero-TTL target that flips to an internal address
+    between the two lookups must not be silently trusted just because the
+    prober claims to have measured it — cross-check probed_address and refuse
+    (never settle) on a mismatch."""
+    prober = _FakeProber(
+        outcomes={"ping": [_ping_result("as215932", 0.0)]},
+        probed_address="10.0.0.5",  # not in the pre-validated ["2001:db8::1"]
+    )
+    body = PathProbeRequest(target="example.com", probe=PathProbeKind.PING)
+    with pytest.raises(ProbeRejectedError):
+        await pd.path_probe(body, prober)
+
+
+@pytest.mark.asyncio
+async def test_path_probe_accepts_differently_formatted_but_equal_probed_address():
+    # Same address, different case/representation — must compare as parsed IPs,
+    # not raw strings, so a harmless formatting difference doesn't false-reject.
+    prober = _FakeProber(
+        outcomes={"ping": [_ping_result("as215932", 0.0)]},
+        probed_address="2001:DB8::1",
+    )
+    body = PathProbeRequest(target="example.com", probe=PathProbeKind.PING)
+    resp = await pd.path_probe(body, prober)
+    assert resp.status == DiagnosticStatus.OK
+
+
+def test_prober_repr_never_includes_the_token():
+    provider = ProberProvider(prober_url="http://prober.test", token="super-secret-token")
+    assert "super-secret-token" not in repr(provider)
+    assert "redacted" in repr(provider)
 
 
 @pytest.mark.asyncio
@@ -401,6 +438,28 @@ async def test_ping_route_does_not_settle_when_prober_down(monkeypatch):
     assert res.status_code == 502  # undelivered
     assert gate.verify_calls == 1
     assert gate.settle_calls == 0  # never charged
+
+
+@pytest.mark.asyncio
+async def test_ping_route_does_not_settle_on_rebinding_mismatch(monkeypatch):
+    monkeypatch.setenv("HYRULE_PROBER_TOKEN", "x")
+    gate = _FakeGate()
+    prober = _FakeProber(
+        outcomes={"ping": [_ping_result("as215932", 0.0)]},
+        probed_address="10.0.0.5",
+    )
+    old = getattr(app.state, "_typed_state", None)
+    app.state._typed_state = _wire_state(gate, prober)
+    try:
+        res = await _post({"target": "example.com"})
+    finally:
+        if old is not None:
+            app.state._typed_state = old
+        else:
+            delattr(app.state, "_typed_state")
+    assert res.status_code == 400
+    assert gate.verify_calls == 1
+    assert gate.settle_calls == 0  # never charged for a rejected/unsafe target
 
 
 @pytest.mark.asyncio

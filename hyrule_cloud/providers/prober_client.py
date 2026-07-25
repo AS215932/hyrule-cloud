@@ -84,6 +84,12 @@ class ProberProvider:
         the operator has not provisioned the prober, so path/* stays gated."""
         return bool(self.token)
 
+    def __repr__(self) -> str:
+        # Never let the bearer token reach a traceback, an unhandled-exception
+        # dump, or an accidental `log.warning(..., provider=self)` — the
+        # default dataclass-style repr would include self.token verbatim.
+        return f"ProberProvider(prober_url={self.prober_url!r}, token=<redacted>)"
+
     async def close(self) -> None:
         await self._client.aclose()
 

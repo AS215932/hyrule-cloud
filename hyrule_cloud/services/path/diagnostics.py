@@ -9,9 +9,12 @@ raises ProbeUnavailableError so the route returns without charging.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import socket
 from datetime import UTC, datetime
 from typing import Any
+
+import structlog
 
 from hyrule_cloud.models import (
     DiagnosticAddressFamily,
@@ -42,6 +45,8 @@ from hyrule_cloud.services.diagnostics.sources import (
     source_usable,
 )
 from hyrule_cloud.services.safety import assert_safe_active_probe_target, normalize_host
+
+log = structlog.get_logger()
 
 __all__ = [
     "ProbeRejectedError",
@@ -130,6 +135,7 @@ async def _run_prober(
     count: int,
     vantages: list[DiagnosticVantage],
     timeout_ms: int,
+    allowed_addresses: list[str],
 ) -> tuple[ProbeOutcome, list[DiagnosticVantage]]:
     """Execute one probe kind on the healthy subset of requested prober vantages.
 
@@ -154,6 +160,37 @@ async def _run_prober(
         vantages=[v.value for v in to_run],
         timeout_s=max(2, min(30, round(timeout_ms / 1000))),
     )
+    # assert_safe_active_probe_target validated `host`'s resolved addresses
+    # before this call, but the prober resolves `host` again itself when it
+    # runs the real ping/traceroute — a TOCTOU window a DNS-rebinding target
+    # (near-zero TTL, flips to an RFC1918 address between the two lookups)
+    # could exploit to reach an internal address through the prober. Cross-
+    # check what the prober says it actually probed against the pre-validated
+    # set; a mismatch is treated the same as the prober's own defense-in-depth
+    # rejection — 400, never settled.
+    #
+    # Addresses are compared as parsed ip_address objects, not raw strings:
+    # this cross-check is a second, defense-in-depth layer on top of the
+    # primary assert_safe_active_probe_target gate above, which stands on its
+    # own. If the prober (a separate service) ever reports probed_address in
+    # a form Python can't parse, fail open on *this* check rather than reject
+    # every real request — an unparseable string is a formatting mismatch,
+    # not evidence of an unsafe target.
+    if outcome.probed_address is not None:
+        try:
+            probed = ipaddress.ip_address(outcome.probed_address)
+            safe = {ipaddress.ip_address(addr) for addr in allowed_addresses}
+        except ValueError:
+            log.warning(
+                "prober_probed_address_unparseable",
+                probed_address=outcome.probed_address,
+            )
+        else:
+            if probed not in safe:
+                raise ProbeRejectedError(
+                    f"prober resolved {host} to {outcome.probed_address}, which was not in "
+                    "the pre-validated address set — refusing a possible DNS-rebinding target"
+                )
     return outcome, to_run
 
 
@@ -256,6 +293,7 @@ async def path_probe(body: PathProbeRequest, provider: ProberProvider | None) ->
         count=body.count,
         vantages=body.vantages,
         timeout_ms=body.timeout_ms,
+        allowed_addresses=addresses,
     )
 
     findings: list[DiagnosticFinding] = []
@@ -332,10 +370,12 @@ async def path_report(body: PathReportRequest, provider: ProberProvider | None) 
     ping_outcome, ran = await _run_prober(
         provider, host=host, kind="ping", family=body.address_family,
         count=4, vantages=body.vantages, timeout_ms=10000,
+        allowed_addresses=addresses,
     )
     trace_outcome, _ = await _run_prober(
         provider, host=host, kind="traceroute", family=body.address_family,
         count=4, vantages=body.vantages, timeout_ms=15000,
+        allowed_addresses=addresses,
     )
 
     findings: list[DiagnosticFinding] = []
