@@ -14,12 +14,14 @@ import httpx
 
 from hyrule_cloud.models import (
     BGPAssertions,
+    BGPDataset,
     BGPLookupRequest,
     BGPLookupResponse,
     BGPOriginObservation,
     BGPResolvedSubject,
     BGPStatusResponse,
     BGPSubjectType,
+    DataFreshness,
     SourceHealth,
 )
 from hyrule_cloud.services.cache import TTLCache
@@ -41,6 +43,123 @@ async def _get_json(url: str, params: dict[str, Any]) -> tuple[dict[str, Any] | 
 def _normalize_asn(value: str | int) -> int:
     text = str(value).strip().upper().removeprefix("AS")
     return int(text)
+
+
+# A routing-status snapshot older than this is old enough that a recently
+# deployed announcement would be invisible in it. Callers asking a propagation
+# question against data this old are answering yesterday's question.
+_STALE_AFTER_SECONDS = 3600
+
+
+def _parse_query_time(data: dict[str, Any]) -> datetime | None:
+    raw = data.get("query_time") or data.get("latest_time")
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _delayed_source_health(data: dict[str, Any], source_url: str) -> tuple[SourceHealth, dict[str, Any]]:
+    """Health + freshness block for a snapshot source.
+
+    RIPEstat serves real-time and batch data calls from one hostname, with the
+    snapshot time buried in the payload as `query_time`. Reporting a stale batch
+    result as status="ok" is how a caller concludes a prefix is not announced
+    when it went live minutes ago. Surface the age instead of hiding it.
+    """
+    observed_at = _parse_query_time(data)
+    if observed_at is None:
+        return (
+            SourceHealth(status="ok", message="upstream returned no query_time", source_url=source_url),
+            {"class": DataFreshness.UNKNOWN.value, "observed_at": None, "age_seconds": None},
+        )
+    age = max(0, int((datetime.now(UTC) - observed_at).total_seconds()))
+    stale = age > _STALE_AFTER_SECONDS
+    return (
+        SourceHealth(
+            status="stale" if stale else "ok",
+            age_seconds=age,
+            checked_at=observed_at,
+            source_url=source_url,
+            message=(
+                f"snapshot is {age}s old; it cannot reflect announcements made since "
+                f"{observed_at.isoformat()}. Use dataset live_looking_glass for a "
+                "real-time answer."
+                if stale
+                else None
+            ),
+        ),
+        {
+            "class": DataFreshness.DELAYED.value,
+            "observed_at": observed_at.isoformat(),
+            "age_seconds": age,
+            "stale": stale,
+        },
+    )
+
+
+async def _looking_glass(prefix: str) -> tuple[dict[str, Any], SourceHealth]:
+    """Real-time propagation view from RIS collector RIBs.
+
+    Unlike routing-status this is computed at query time, so a prefix announced
+    a minute ago shows up. This is the dataset that answers "is it live?".
+    """
+    source_url = f"{_RIPESTAT}/looking-glass/data.json"
+    data, err = await _get_json(source_url, {"resource": prefix})
+    if data is None:
+        return {}, SourceHealth(status="degraded", message=err, source_url=source_url)
+
+    rrcs = data.get("rrcs", []) or []
+    peer_entries = 0
+    as_paths: list[str] = []
+    origin_asns: list[int] = []
+    collectors: list[dict[str, Any]] = []
+    for rrc in rrcs:
+        peers = rrc.get("peers", []) or []
+        peer_entries += len(peers)
+        for peer in peers:
+            path = str(peer.get("as_path") or "").strip()
+            if path and path not in as_paths:
+                as_paths.append(path)
+            if path:
+                try:
+                    asn = int(path.split()[-1])
+                except (ValueError, IndexError):
+                    continue
+                if asn not in origin_asns:
+                    origin_asns.append(asn)
+        collectors.append(
+            {
+                "rrc": rrc.get("rrc"),
+                "location": rrc.get("location"),
+                "peer_count": len(peers),
+            }
+        )
+
+    observed_at = _parse_query_time(data) or datetime.now(UTC)
+    result = {
+        "freshness": {
+            "class": DataFreshness.REALTIME.value,
+            "observed_at": observed_at.isoformat(),
+            "age_seconds": 0,
+            "stale": False,
+        },
+        "visible": peer_entries > 0,
+        "collector_count": len(rrcs),
+        "peer_entry_count": peer_entries,
+        "origin_asns": origin_asns,
+        "as_paths": as_paths[:64],
+        "collectors": collectors[:64],
+    }
+    return result, SourceHealth(
+        status="ok",
+        age_seconds=0,
+        checked_at=observed_at,
+        source_url=source_url,
+    )
 
 
 def _assertions(observed: list[int], assertions: BGPAssertions, rpki_status: str | None) -> dict[str, object]:
@@ -92,12 +211,14 @@ async def _prefix_lookup(req: BGPLookupRequest) -> BGPLookupResponse:
                 observed.append(asn)
         results["prefix_overview"] = overview
 
-    routing, err = await _get_json(f"{_RIPESTAT}/routing-status/data.json", {"resource": prefix})
+    routing_status_url = f"{_RIPESTAT}/routing-status/data.json"
+    routing, err = await _get_json(routing_status_url, {"resource": prefix})
     if routing is None:
         sources["ripestat_routing_status"] = SourceHealth(status="degraded", message=err)
         partial = True
     else:
-        sources["ripestat_routing_status"] = SourceHealth(status="ok")
+        health, freshness = _delayed_source_health(routing, routing_status_url)
+        sources["ripestat_routing_status"] = health
         routed = bool(routing.get("last_seen") or routing.get("origins"))
         best_prefix = routing.get("last_seen", {}).get("prefix") or prefix
         for origin in routing.get("origins", []) or []:
@@ -107,7 +228,46 @@ async def _prefix_lookup(req: BGPLookupRequest) -> BGPLookupResponse:
                 continue
             if asn not in observed:
                 observed.append(asn)
-        results["routing_status"] = routing
+        results["routing_status"] = {**routing, "freshness": freshness}
+
+    # Real-time propagation view. Opt-in so existing callers keep their current
+    # cost and latency profile, but it is the only dataset that can answer
+    # "is this announcement live?" — routing_status above cannot.
+    if BGPDataset.LIVE_LOOKING_GLASS in req.datasets:
+        lg, lg_health = await _looking_glass(prefix)
+        sources["ripestat_looking_glass"] = lg_health
+        if lg:
+            results["looking_glass"] = {**lg, "vantage": "external_ris"}
+            if lg.get("visible"):
+                routed = True
+                for asn in lg.get("origin_asns", []):
+                    if asn not in observed:
+                        observed.append(asn)
+        else:
+            partial = True
+
+    # Internal AS215932 vantage. Not wired up yet: this service has no path to
+    # the routers. Say so explicitly rather than returning silence — the caller
+    # is billed at the router-query rate for selecting this dataset, so a quiet
+    # no-op would be charging for data we never produced.
+    if BGPDataset.AS215932_ROUTER_TABLES in req.datasets:
+        sources["as215932_router_tables"] = SourceHealth(
+            status="not_configured",
+            message=(
+                "Internal AS215932 router vantage is not yet implemented. No router "
+                "RIB data is included in this response."
+            ),
+        )
+        results["as215932_router_tables"] = {
+            "vantage": "as215932_internal",
+            "status": "not_configured",
+            "note": (
+                "External vantages answer 'does the world see this prefix'. The "
+                "internal vantage answers 'which upstream do our own routers pick, "
+                "and where does return traffic land' — a different question."
+            ),
+        }
+        partial = True
 
     for asn in observed[:5]:
         rpki, err = await _get_json(

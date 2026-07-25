@@ -127,6 +127,7 @@ async def get_bgp_capabilities() -> ProductCapabilityResponse:
 async def get_bgp_pricing(request: Request) -> BGPPricingResponse:
     return BGPPricingResponse(
         public_latest_lookup_usd=str(payment_price(request, "price_bgp_lookup", "0.005")),
+        live_looking_glass_lookup_usd=str(payment_price(request, "price_bgp_looking_glass", "0.01")),
         router_table_lookup_usd=str(payment_price(request, "price_bgp_router_query", "0.01")),
         bgpstream_update_hour_usd=str(payment_price(request, "price_bgpstream_hour", "0.05")),
         bgpstream_rib_usd=str(payment_price(request, "price_bgpstream_rib", "0.10")),
@@ -134,10 +135,24 @@ async def get_bgp_pricing(request: Request) -> BGPPricingResponse:
     )
 
 
+def _lookup_price_attr(body: BGPLookupRequest | None) -> tuple[str, str]:
+    """Highest applicable price tier for the requested datasets.
+
+    Tiers are not additive — a request selecting several premium datasets is
+    charged once, at the dearest tier, so the quote a caller is shown always
+    matches what /lookup charges for the same body.
+    """
+    datasets = body.datasets if body is not None else []
+    if BGPDataset.AS215932_ROUTER_TABLES in datasets:
+        return "price_bgp_router_query", "0.01"
+    if BGPDataset.LIVE_LOOKING_GLASS in datasets:
+        return "price_bgp_looking_glass", "0.01"
+    return "price_bgp_lookup", "0.005"
+
+
 @router.post("/lookup/quote", response_model=PaidEndpointQuote)
 async def quote_bgp_lookup(request: Request, body: BGPLookupRequest) -> PaidEndpointQuote:
-    price_attr = "price_bgp_router_query" if BGPDataset.AS215932_ROUTER_TABLES in body.datasets else "price_bgp_lookup"
-    default = "0.01" if price_attr == "price_bgp_router_query" else "0.005"
+    price_attr, default = _lookup_price_attr(body)
     return quote(payment_price(request, price_attr, default), "bgp_lookup", "/v1/bgp/lookup")
 
 
@@ -173,9 +188,7 @@ async def list_bgp_router_snapshots(request: Request) -> BGPSnapshotListResponse
 
 
 async def _paid_lookup(request: Request, body: BGPLookupRequest | None = None) -> Response | None:
-    router_query = body is not None and BGPDataset.AS215932_ROUTER_TABLES in body.datasets
-    attr = "price_bgp_router_query" if router_query else "price_bgp_lookup"
-    default = "0.01" if router_query else "0.005"
+    attr, default = _lookup_price_attr(body)
     amount = payment_price(request, attr, default)
     result = await require_payment(request, amount, "Hyrule BGP/routing lookup")
     return result if isinstance(result, Response) else None
@@ -183,11 +196,8 @@ async def _paid_lookup(request: Request, body: BGPLookupRequest | None = None) -
 
 @router.post("/lookup", response_model=BGPLookupResponse)
 async def bgp_lookup(request: Request, body: BGPLookupRequest) -> BGPLookupResponse | Response:
-    amount = payment_price(
-        request,
-        "price_bgp_router_query" if BGPDataset.AS215932_ROUTER_TABLES in body.datasets else "price_bgp_lookup",
-        "0.01" if BGPDataset.AS215932_ROUTER_TABLES in body.datasets else "0.005",
-    )
+    attr, default = _lookup_price_attr(body)
+    amount = payment_price(request, attr, default)
     if payment := await _paid_lookup(request, body):
         return payment
     result = await lookup_bgp(body)

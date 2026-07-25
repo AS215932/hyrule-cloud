@@ -1079,9 +1079,28 @@ class BGPSubjectType(enum.StrEnum):
 
 class BGPDataset(enum.StrEnum):
     PUBLIC_ROUTING = "public_routing"
+    # Real-time RIS collector RIB (RIPEstat looking-glass). Use this — not
+    # PUBLIC_ROUTING — to answer "is this prefix propagating right now?".
+    # PUBLIC_ROUTING is a batch snapshot that can be many hours behind, which
+    # reads as "not announced" for anything deployed since the last batch run.
+    LIVE_LOOKING_GLASS = "live_looking_glass"
     RPKI = "rpki"
     PEERINGDB = "peeringdb"
     AS215932_ROUTER_TABLES = "as215932_router_tables"
+
+
+class DataFreshness(enum.StrEnum):
+    """How current a result is, stated explicitly rather than implied.
+
+    REALTIME  — observed from a live collector RIB at query time.
+    DELAYED   — a periodically-recomputed snapshot; carries an observed_at and
+                age_seconds so the caller can decide whether it is usable.
+    UNKNOWN   — the upstream returned no usable timestamp.
+    """
+
+    REALTIME = "realtime"
+    DELAYED = "delayed"
+    UNKNOWN = "unknown"
 
 
 class BGPView(enum.StrEnum):
@@ -1179,6 +1198,7 @@ class BGPSourcesResponse(BaseModel):
 
 class BGPPricingResponse(BaseModel):
     public_latest_lookup_usd: str
+    live_looking_glass_lookup_usd: str = "0.01"
     router_table_lookup_usd: str
     bgpstream_update_hour_usd: str
     bgpstream_rib_usd: str
