@@ -104,6 +104,17 @@ async def lifespan(app: FastAPI):
         health_ttl_seconds=config.network_proxy_health_ttl_seconds,
     )
 
+    # Prober sidecar client for x402-gated /v1/path/* active measurements.
+    # Registered as the process-wide active prober so the synchronous manifest
+    # gate (path_active_probe_enabled) sees the same configuration.
+    from hyrule_cloud.providers.prober_client import ProberProvider, set_active_prober
+    prober_provider = ProberProvider(
+        prober_url=config.prober_url,
+        token=config.prober_token,
+        health_ttl_seconds=config.prober_health_ttl_seconds,
+    )
+    set_active_prober(prober_provider)
+
     # Reverse-SSH tunnel daemon client + lifecycle service. x402 stays in Hyrule
     # Cloud; the daemon owns the public SSH intake and mints leases.
     from hyrule_cloud.providers.tunnel_client import TunnelProvider
@@ -159,6 +170,7 @@ async def lifespan(app: FastAPI):
         orchestrator=orchestrator,
         payment_gate=payment_gate,
         network_provider=network_provider,
+        prober_provider=prober_provider,
         tunnel_provider=tunnel_provider,
         tunnel_service=tunnel_service,
         native_crypto=native_crypto,
@@ -183,6 +195,8 @@ async def lifespan(app: FastAPI):
     await dns_filtering.close()
     await orchestrator.shutdown()
     await network_provider.close()
+    set_active_prober(None)
+    await prober_provider.close()
     await tunnel_provider.close()
     await native_crypto.close()
     await rate_provider.close()

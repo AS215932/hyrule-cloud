@@ -372,6 +372,16 @@ class HyruleConfig(BaseSettings):
     network_proxy_token: str = ""
     network_proxy_health_ttl_seconds: int = 15
 
+    # Internal prober sidecar (hyrule-prober) for x402-gated /v1/path/*
+    # active measurements. It runs real ping/traceroute from AS215932 vantage
+    # points; Hyrule Cloud verifies/settles x402 and delegates execution here.
+    # In production HYRULE_PROBER_URL points at noc's internal address. An empty
+    # token means the prober is NOT configured: path/ping and path/report stay
+    # 501 and are hidden from the manifest rather than charging for a stub.
+    prober_url: str = "http://127.0.0.1:8460"
+    prober_token: str = ""
+    prober_health_ttl_seconds: int = 30
+
     # Reverse-SSH tunnel daemon (hyrule-tunnel-proxy), co-located on netproxy.
     # Cloud verifies/settles x402 and mints leases via this internal control API.
     tunnel_proxy_url: str = "http://127.0.0.1:8452"
