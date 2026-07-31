@@ -131,8 +131,22 @@ revenue.)
 
 1. Deploy network-operations#371 to mon (prometheus.yml job + rules;
    `promtool check rules /etc/prometheus/rules.d/hyrule-payments.yml`).
-2. Import `configs/mon/grafana-dashboards/hyrule-payments.json` in Grafana
-   (map the Prometheus + Loki datasources).
+2. Provision the dashboard from network-operations — do **not** import it by
+   hand:
+   ```bash
+   cd ansible && ansible-playbook playbooks/monitoring.yml --tags apply \
+       -e '{"monitoring_apply":true}' --limit mon
+   ```
+   The monitoring role publishes every `configs/mon/grafana-dashboards/*.json`
+   to `/var/lib/grafana/dashboards` on mon and pins the Prometheus/Loki
+   datasource uids, so there is nothing to map. Grafana reloads a changed
+   dashboard within 30s; a datasource change restarts grafana-server.
+
+   This step used to read "import it in Grafana", and that is exactly why it
+   silently never happened: the dashboard JSON, its scrape job, and its alert
+   rules were all live from 2026-07-10, but Grafana held no dashboard at all
+   until network-operations#506 on 2026-07-31. A dashboard that only exists in
+   grafana.db is invisible to every repo and does not survive a mon rebuild.
 3. Gate: the Phase 1 canaries are visible — settlements panel shows 2 events,
    revenue shows ~$0.002, unique payers = 1, `up{job="hyrule-cloud"} == 1`.
 
