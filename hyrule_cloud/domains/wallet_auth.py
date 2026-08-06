@@ -30,7 +30,6 @@ from hyrule_cloud.middleware.auth import (
     derive_ip_prefix_hash,
     require_browser_session,
 )
-from hyrule_cloud.services.passwords import hash_password
 from hyrule_cloud.services.sessions import cookie_kwargs_for_set, create_session
 from hyrule_cloud.state import AppState, get_app_state
 
@@ -174,9 +173,11 @@ class WalletAuthService:
                 else:
                     owner = AccountRow(
                         account_id=generate_account_id(),
-                        password_hash=hash_password(secrets.token_urlsafe(48)),
+                        # Wallet-only: no password at all. A random hash
+                        # nobody holds would read as a real credential.
+                        password_hash=None,
                         recovery_code_hash=None,
-                        password_changed_at=_now(),
+                        password_changed_at=None,
                     )
                     session.add(owner)
                     await session.flush()
@@ -335,9 +336,11 @@ class WalletAuthService:
                 if wallet is None:
                     account_row = AccountRow(
                         account_id=generate_account_id(),
-                        password_hash=hash_password(secrets.token_urlsafe(48)),
+                        # Wallet-only: no password at all. A random hash
+                        # nobody holds would read as a real credential.
+                        password_hash=None,
                         recovery_code_hash=None,
-                        password_changed_at=_now(),
+                        password_changed_at=None,
                     )
                     session.add(account_row)
                     await session.flush()

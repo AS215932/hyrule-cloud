@@ -31,8 +31,15 @@ def hash_password(password: str) -> str:
     return _PH.hash(password)
 
 
-def verify_password(stored_hash: str, password: str) -> bool:
-    """Constant-time verify. Returns True iff the password matches."""
+def verify_password(stored_hash: str | None, password: str) -> bool:
+    """Constant-time verify. Returns True iff the password matches.
+
+    `stored_hash` is None for wallet-only accounts, which have no password at
+    all. Those never authenticate by password — they sign a wallet challenge —
+    so this returns False rather than raising.
+    """
+    if stored_hash is None:
+        return False
     try:
         return _PH.verify(stored_hash, password)
     except (VerifyMismatchError, InvalidHashError):

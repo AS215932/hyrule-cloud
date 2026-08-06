@@ -582,6 +582,7 @@ class Orchestrator:
         owner_wallet: str,
         payment_tx: str | None = None,
         *,
+        owner_account_id: str | None = None,
         start_provisioning: bool = True,
     ) -> VMRow | None:
         """Attach the settled payment to a reservation and start provisioning.
@@ -589,12 +590,19 @@ class Orchestrator:
         Pass start_provisioning=False to let the caller link a quote to the VM
         first: provisioning can fail immediately, and the refund path needs the
         locked quote amount, so the link must be committed before it starts.
+
+        owner_account_id attaches the VM to the account resolved from the
+        settled payer wallet. A reservation is made before payment, so an anon
+        buyer's row starts ownerless; this is where it gains an owner. An
+        existing owner is never overwritten.
         """
         async with self.db() as session:
             row = await session.get(VMRow, vm_id)
             if row is None:
                 return None
             row.owner_wallet = owner_wallet
+            if owner_account_id and row.owner_account_id is None:
+                row.owner_account_id = owner_account_id
             if payment_tx:
                 row.payment_tx = payment_tx
             await session.commit()
