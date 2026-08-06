@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
@@ -414,6 +415,34 @@ async def _probe_domains_discovery(app_state: Any) -> ServiceState | None:
         log.warning("status_domains_discovery_probe_failed", error_type=type(exc).__name__)
         return ServiceState.UNKNOWN
     return ServiceState.OPERATIONAL if ready else ServiceState.NOT_LAUNCHED
+
+
+@dataclass(frozen=True)
+class LiveReadiness:
+    """What the sell-side probes last proved about serving a customer.
+
+    ``vm_admission`` is ``None`` only when real provisioning is off, and
+    ``domains`` is ``UNKNOWN`` when its probe could not run — see each probe
+    for why those are deliberately not the same thing as "not ready".
+    """
+
+    vm_admission: bool | None
+    domains: ServiceState | None
+
+
+async def probe_live_readiness(app_state: Any) -> LiveReadiness:
+    """Run both sell-side probes concurrently.
+
+    Shared with the Prometheus exporter on purpose. An operator alert has to
+    fire on the same evidence the public status page shows, or the two drift
+    into separate notions of "can we sell" and the page can contradict the
+    page that pages you.
+    """
+    vm_admission, domains = await asyncio.gather(
+        _probe_vm_admission(app_state),
+        _probe_domains_discovery(app_state),
+    )
+    return LiveReadiness(vm_admission=vm_admission, domains=domains)
 
 
 async def _load_public_monitoring(
