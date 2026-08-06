@@ -55,9 +55,24 @@ class OpenproviderClient(Provider):
         self._token: str | None = None
         self._auth_lock = asyncio.Lock()
 
-    async def _authenticate(self, *, force: bool = False) -> None:
+    async def _authenticate(
+        self,
+        *,
+        force: bool = False,
+        rejected_token: str | None = None,
+    ) -> None:
         async with self._auth_lock:
             if self._token and not force:
+                return
+            if (
+                force
+                and rejected_token is not None
+                and self._token is not None
+                and self._token != rejected_token
+            ):
+                # A concurrent request already replaced the bearer that this
+                # caller had rejected. Reuse it instead of every in-flight
+                # request stampeding /auth/login with the same refresh.
                 return
             if not self.config.username or not self.config.password:
                 raise OpenproviderAuthError(
@@ -66,6 +81,10 @@ class OpenproviderClient(Provider):
                     retryable=False,
                     http_status=503,
                 )
+            # Drop the old bearer before asking for a new one so a refresh that
+            # fails cannot leave a token the provider has already rejected in
+            # place for the next caller to reuse.
+            self._token = None
             try:
                 response = await self._http.post(
                     "/auth/login",
@@ -88,7 +107,7 @@ class OpenproviderClient(Provider):
                 raise OpenproviderAuthError(
                     api_code if api_code is not None else response.status_code,
                     "OpenProvider authentication was rejected",
-                    retryable=response.status_code >= 500 and api_code != 196,
+                    retryable=response.status_code >= 500 and not _is_auth_rejection(api_code),
                     http_status=response.status_code,
                 )
             token = (body.get("data") or {}).get("token")
@@ -116,11 +135,12 @@ class OpenproviderClient(Provider):
         # Transport/5xx retries remain limited to explicitly safe operations.
         attempts = 2
         for attempt in range(attempts):
+            used_token = self._token
             try:
                 response = await self._http.request(
                     method,
                     path,
-                    headers={"Authorization": f"Bearer {self._token}"},
+                    headers={"Authorization": f"Bearer {used_token}"},
                     **kwargs,
                 )
             except httpx.RequestError as exc:
@@ -132,13 +152,36 @@ class OpenproviderClient(Provider):
                     retryable=True,
                 ) from exc
 
-            if response.status_code == 401 and attempt == 0:
-                self._token = None
-                await self._authenticate(force=True)
-                continue
-
             body = _json_body(response)
             api_code = body.get("code")
+
+            # OpenProvider reports an expired or revoked bearer as HTTP 500
+            # with API code 196 ("Authentication/Authorization Failed"), not as
+            # 401. Keying the refresh off 401 alone wedged this client on a
+            # dead token: every later call landed in the 5xx branch below and
+            # was reported as a transient provider outage that never cleared,
+            # so the catalog sync failed on every pass until the process was
+            # restarted. Always drop a bearer the provider rejected.
+            if response.status_code == 401 or (
+                response.status_code >= 400 and _is_auth_rejection(api_code)
+            ):
+                if attempt == 0:
+                    log.warning(
+                        "openprovider_token_rejected",
+                        http_status=response.status_code,
+                        api_code=api_code,
+                    )
+                await self._authenticate(force=True, rejected_token=used_token)
+                # A 401 is unambiguous: the request was rejected at the auth
+                # layer and never executed, so replaying it is safe even when
+                # it is not idempotent. Code 196 is OpenProvider overloading a
+                # 500, so it only earns an automatic replay for calls that
+                # already opted into retries; anything else refreshes the
+                # token and surfaces the failure for the caller's own durable
+                # retry rather than risk re-submitting a registration.
+                if attempt + 1 < attempts and (response.status_code == 401 or safe_retry):
+                    continue
+
             if response.status_code == 429 or response.status_code >= 500:
                 if safe_retry and attempt + 1 < attempts:
                     continue
@@ -382,6 +425,18 @@ def _safe_description(body: dict[str, Any]) -> str:
     description = str(body.get("desc") or "OpenProvider rejected the request")
     # Avoid reflecting provider payloads or contact data through public errors.
     return description[:300]
+
+
+#: OpenProvider answers a rejected bearer with this API code on an HTTP 500
+#: rather than a 401, so the status line alone cannot identify the failure.
+_AUTH_REJECTED_API_CODE = 196
+
+
+def _is_auth_rejection(code: object) -> bool:
+    try:
+        return int(str(code)) == _AUTH_REJECTED_API_CODE
+    except ValueError:
+        return False
 
 
 def _retryable_api_code(code: object) -> bool:

@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import APIRouter, Request, Response
 from sqlalchemy import func, select
 
+from hyrule_cloud.api.status import ServiceState, probe_live_readiness
 from hyrule_cloud.db import DomainRow, PaymentEventRow, VMRow
 from hyrule_cloud.models import VMStatus
 
@@ -149,6 +150,42 @@ def _render_dns_product_metrics(lines: list[str], state: Any | None) -> None:
                 f'hyrule_dns_filtering_profile_latency_ms_count{{profile_id="{_esc(profile_id)}"}} '
                 f"{samples.get(profile_id, 0)}"
             )
+
+
+async def _render_commerce_readiness(lines: list[str], state: Any | None) -> None:
+    """Export whether Hyrule could actually sell a VM or a domain right now.
+
+    The gap this closes: an expired XCPNG_XO_TOKEN took every VM sale down for
+    five days in 2026-08 while the only compute alert blackbox-probed /health,
+    which stayed 200 throughout. Nothing measured "can a customer buy".
+
+    A series is omitted, never guessed, when its probe could not run at all —
+    the same rule the public status page follows. A missing series does not
+    fire the `== 0` alerts, so an unmeasurable probe cannot page anyone with a
+    claim it has no evidence for.
+    """
+    if state is None:
+        return
+    readiness = await probe_live_readiness(state)
+
+    if readiness.vm_admission is not None:
+        _metric(
+            lines,
+            "hyrule_vm_admission_ready",
+            "Whether checkout could admit the smallest sellable VM at the last probe.",
+            "gauge",
+        )
+        lines.append(f"hyrule_vm_admission_ready {1 if readiness.vm_admission else 0}")
+
+    if readiness.domains in (ServiceState.OPERATIONAL, ServiceState.NOT_LAUNCHED):
+        _metric(
+            lines,
+            "hyrule_domains_discovery_ready",
+            "Whether the domains product could answer a customer at the last probe.",
+            "gauge",
+        )
+        ready = readiness.domains is ServiceState.OPERATIONAL
+        lines.append(f"hyrule_domains_discovery_ready {1 if ready else 0}")
 
 
 async def _render(session_factory: Any, state: Any | None = None) -> str:
@@ -286,6 +323,7 @@ async def _render(session_factory: Any, state: Any | None = None) -> str:
             lines.append(f'hyrule_domains_total{{status="{_esc(value)}"}} {count}')
 
     _render_dns_product_metrics(lines, state)
+    await _render_commerce_readiness(lines, state)
 
     return "\n".join(lines) + "\n"
 
