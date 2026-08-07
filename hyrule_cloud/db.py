@@ -1045,7 +1045,13 @@ class AccountRow(Base):
     )
     # argon2id. Plain sha256 is rejected even for high-entropy secrets — recovery
     # codes (see recovery_code_hash) get the same treatment.
-    password_hash: Mapped[str] = mapped_column(String(256))
+    #
+    # NULL for wallet-only accounts: one created from a settled x402 payment or
+    # a wallet login has no password at all and authenticates by signing a
+    # wallet challenge. Such an account may set a password later from a
+    # browser session. Never write a random placeholder here — a hash nobody
+    # holds is indistinguishable from a real credential to every reader.
+    password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     # One-time recovery code (argon2id-hashed). Issued at signup, single-use,
     # rotates on consumption. The cleartext is revealed ONCE; if the user

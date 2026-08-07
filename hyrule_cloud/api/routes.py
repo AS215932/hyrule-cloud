@@ -8,6 +8,7 @@ either a 402 Response or the payer's wallet address.
 from __future__ import annotations
 
 import asyncio
+import re
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from ipaddress import IPv6Network
@@ -254,6 +255,91 @@ def _vm_create_response(
             f"{base_url}/v1/vm/{row.vm_id}?token={management_token}" if management_token else None
         ),
     )
+
+
+_EVM_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
+def _settled_chain_id(request: Request, gate: Any) -> int | None:
+    """Chain id of the settled payment, restricted to configured networks.
+
+    `request.state.payment_network` is the CAIP-2 string the facilitator
+    matched. It is untrusted, so it is only resolved against our own enabled
+    networks — never parsed as `eip155:<n>` directly.
+    """
+    network = str(getattr(request.state, "payment_network", "") or "")
+    if not network:
+        return None
+    try:
+        configured_networks = gate.config.enabled_networks()
+    except Exception:
+        return None
+    for configured in configured_networks:
+        if configured.caip2 == network and configured.chain_id is not None:
+            return int(configured.chain_id)
+    return None
+
+
+async def _bind_payer_account(
+    request: Request,
+    gate: Any,
+    wallet: str,
+    account: Any,
+) -> tuple[str | None, bool]:
+    """Resolve a settled payer wallet to the account that owns the purchase.
+
+    Returns (owner_account_id, may_issue_session). A payer with no account
+    gets a wallet-only one, so a buyer who paid from a browser owns the VM
+    instead of holding only a management token.
+
+    This runs AFTER x402 settlement, so it must never raise: the customer has
+    already been charged and a paid create must never be dropped. Every
+    failure — service unavailable, a wallet already bound to a different
+    account, an unrecognised chain — falls back to the pre-existing behaviour
+    (session account, else anonymous + management token) and is logged. The
+    domains checkout resolves BEFORE settling and so can return 409; this
+    path cannot.
+    """
+    fallback = (account.account_id if account is not None else None, False)
+    if not _EVM_ADDRESS_RE.match(wallet or ""):
+        # Dev-bypass and admin waivers hand back sentinels, not addresses.
+        return fallback
+
+    app_state = await get_app_state(request)
+    wallet_auth = getattr(app_state, "wallet_auth", None)
+    if wallet_auth is None:
+        return fallback
+
+    chain_id = _settled_chain_id(request, gate)
+    if chain_id is None:
+        log.warning("payer_account_bind_skipped", reason="unknown_chain")
+        return fallback
+
+    is_api_key = bool(getattr(request.state, "is_api_key", False))
+    try:
+        owner, _bound, created = await wallet_auth.resolve_x402_owner(
+            address=wallet,
+            chain_id=chain_id,
+            account=account,
+            # An API key must never mutate account identity; it may only use a
+            # wallet already linked from a browser session.
+            allow_link=not is_api_key,
+        )
+    except DomainProblem as exc:
+        log.warning(
+            "payer_account_bind_conflict",
+            code=getattr(exc, "code", None),
+            detail=str(getattr(exc, "detail", exc)),
+        )
+        return fallback
+    except Exception:
+        log.warning("payer_account_bind_failed", exc_info=True)
+        return fallback
+
+    log.info("payer_account_bound", account_id=owner.account_id, created=created)
+    # Only browser callers get a session cookie; an API-key caller already has
+    # its own credential and must not be handed a browser session.
+    return owner.account_id, not is_api_key
 
 
 def _vm_row_profile_and_resources(row: Any) -> tuple[VMSize, VMResourceSpec]:
@@ -1000,6 +1086,13 @@ async def create_vm(
         return result
 
     wallet = result
+    # Bind the settled payer wallet to an account so the buyer owns this VM and
+    # lands logged in, instead of holding only a save-once management token.
+    # Falls back to the previous behaviour on any failure — see
+    # _bind_payer_account: the payment has already settled here.
+    owner_account_id, may_issue_session = await _bind_payer_account(
+        request, gate, wallet, account
+    )
     # Issue #14 / Sourcery (#16): claim the quote atomically BEFORE provisioning
     # so two concurrent paid creates for the same quote can't each provision a VM
     # — only the winner of the CREATED → CONSUMED flip proceeds.
@@ -1033,6 +1126,7 @@ async def create_vm(
             activated = await orch.activate_vm_reservation(
                 reservation_row.vm_id,
                 owner_wallet=wallet,
+                owner_account_id=owner_account_id,
                 payment_tx=getattr(request.state, "payment_tx", None),
                 start_provisioning=False,
             )
@@ -1046,7 +1140,7 @@ async def create_vm(
                 row, management_token = await orch.create_vm(
                     order,
                     owner_wallet=wallet,
-                    owner_account_id=account.account_id if account else None,
+                    owner_account_id=owner_account_id,
                     start_provisioning=False,
                     pricing_snapshot=pricing_snapshot,
                     legacy_billing=quote_row is not None and quote_row.pricing_snapshot is None,
@@ -1056,7 +1150,7 @@ async def create_vm(
             row, management_token = await orch.create_vm(
                 order,
                 owner_wallet=wallet,
-                owner_account_id=account.account_id if account else None,
+                owner_account_id=owner_account_id,
                 start_provisioning=False,
                 pricing_snapshot=pricing_snapshot,
                 legacy_billing=quote_row is not None and quote_row.pricing_snapshot is None,
@@ -1138,6 +1232,21 @@ async def create_vm(
     # The except above re-raises on any failure, so a fall-through here means the
     # VM row was created and provisioning was scheduled.
     assert row is not None
+
+    # Log the buyer into the account their wallet now owns, so a browser
+    # purchase lands on the dashboard instead of depending solely on the
+    # save-once token. Only after the VM exists, and never fatal: the VM is
+    # paid for and provisioning either way.
+    if may_issue_session and owner_account_id and account is None:
+        try:
+            app_state = await get_app_state(request)
+            wallet_auth = getattr(app_state, "wallet_auth", None)
+            if wallet_auth is not None:
+                await wallet_auth.issue_session(
+                    owner_account_id, request=request, response=response
+                )
+        except Exception:
+            log.warning("payer_session_issue_failed", account_id=owner_account_id, exc_info=True)
 
     # Block A0: status_url is the public sanitized view; management_url embeds
     # the one-time anon token. The UI must surface management_url prominently

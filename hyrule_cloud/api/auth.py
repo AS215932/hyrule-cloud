@@ -184,7 +184,10 @@ class WalletVerifyResponse(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
-    current_password: str = Field(min_length=1, max_length=256)
+    # Optional so a wallet-only account can set its FIRST password without
+    # inventing a current one. Accounts that have a password must still send
+    # it — an empty string simply fails verification.
+    current_password: str = Field(default="", max_length=256)
     new_password: str = Field(min_length=12, max_length=256)
 
 
@@ -390,7 +393,11 @@ async def login(
         # leaking existence through timing — verify_password handles the
         # "no hash" case by returning False quickly, but we burn some CPU
         # by computing a throwaway hash if the account doesn't exist.
-        if acct is None:
+        # A wallet-only account (password_hash IS NULL) is folded into the same
+        # branch: verify_password would return False without doing any argon2
+        # work, and that speed difference would tell an attacker which accounts
+        # are wallet-only. Burn the same CPU either way.
+        if acct is None or acct.password_hash is None:
             _ = hash_password(body.password)  # constant-time-ish defense
             raise HTTPException(401, "Invalid credentials")
         if not verify_password(acct.password_hash, body.password):
@@ -740,8 +747,13 @@ async def change_password(
     factory = _get_session_factory(app_state)
     if factory is None:
         raise HTTPException(503, "Database not available")
-    if not verify_password(account.password_hash, body.current_password):
-        raise HTTPException(401, "Current password is incorrect")
+    # A wallet-only account has no password to confirm; the browser session
+    # (which required a wallet signature to obtain) is the proof of control,
+    # so it may set an initial password. Accounts that DO have one must still
+    # present it.
+    if account.password_hash is not None:
+        if not verify_password(account.password_hash, body.current_password):
+            raise HTTPException(401, "Current password is incorrect")
 
     async with factory() as db:
         acct = await db.get(AccountRow, account.account_id)
