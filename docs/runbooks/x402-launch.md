@@ -282,7 +282,17 @@ the receiver wallet the same day. The Grafana provisioning panel and the
    `contact` target): add service list, manifest URL, golden-path curl,
    ClawHub links, pricing table.
 5. **llms.txt** on hyrule.host: network-intel + proxy golden paths and skill
-   links (hyrule-web change), deployed via its own promotion pin.
+   links (hyrule-web change), deployed via its own promotion pin. The registry
+   "announce" section ships dark behind `HYRULE_WEB_ENABLE_LLMS_ANNOUNCE`;
+   flip it on as the last step of this phase.
+6. **MCP registry**: publish `hyrule-cloud` to PyPI (`uv build` + upload),
+   add the `host.hyrule` DNS TXT record (`mcp-publisher login dns`), then
+   `mcp-publisher publish` with the repo-root `server.json`. Verify:
+   `curl "https://registry.modelcontextprotocol.io/v0/servers?search=hyrule"`
+   and a fresh-venv `uvx hyrule-cloud` listing tools against production.
+7. **Agent card**: after deploy, verify
+   `https://cloud.hyrule.host/.well-known/agent-card.json` (and the
+   hyrule.host mirror) lists exactly the enabled skill groups.
 
 ## Success criteria
 
