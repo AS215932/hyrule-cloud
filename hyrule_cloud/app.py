@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from x402.http import PAYMENT_RESPONSE_HEADER, X_PAYMENT_RESPONSE_HEADER
 
+from hyrule_cloud import __version__
 from hyrule_cloud.api.auth import router as auth_router
 from hyrule_cloud.api.bgp import router as bgp_router
 from hyrule_cloud.api.dns import router as dns_router
@@ -66,6 +67,31 @@ structlog.configure(
 )
 
 log = structlog.get_logger().bind(service="hyrule-cloud")
+
+# The official x402 SDK reports facilitator settle responses — including the
+# EXTENSION-RESPONSES header that confirms the Bazaar discovery extension was
+# processed (our x402 Bazaar indexing signal) — via stdlib
+# logging.getLogger("x402") at INFO. The structlog configuration above writes
+# straight to stdout and never touches stdlib logging, so those records would
+# otherwise be dropped. Bridge that one logger to stdout (journald) as JSON
+# lines matching the contract above; existing structlog output is unchanged.
+_x402_handler = logging.StreamHandler(sys.stdout)
+_x402_handler.setFormatter(
+    structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=[
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso", utc=True, key="ts"),
+        ],
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.processors.JSONRenderer(),
+        ],
+    )
+)
+_x402_logger = logging.getLogger("x402")
+_x402_logger.setLevel(logging.INFO)
+_x402_logger.addHandler(_x402_handler)
+_x402_logger.propagate = False
 
 
 from hyrule_cloud.state import AppState
@@ -220,7 +246,7 @@ app = FastAPI(
         "url": "https://github.com/AS215932",
         "email": "svag@servify.nl",
     },
-    version="0.1.0",
+    version=__version__,
     lifespan=lifespan,
 )
 
@@ -295,34 +321,36 @@ async def icon_192() -> FileResponse:
 @app.get("/llms.txt", include_in_schema=False)
 async def llms_txt(request: Request) -> PlainTextResponse:
     """Agent-facing plaintext guide, generated from the enabled catalog only."""
-    from hyrule_cloud.services.discovery import catalog_description, enabled_paid_operations
+    from hyrule_cloud.services.discovery import build_llms_txt
 
     state = getattr(request.app.state, "_typed_state", None)
     config = getattr(state, "config", None) or HyruleConfig()
-    base = config.public_base_url.rstrip("/")
-    lines = [
-        "# Hyrule Cloud — x402-payable network services for AI agents",
-        "",
-        catalog_description(config),
-        "",
-        f"Machine-readable catalog: {base}/.well-known/x402.json",
-        f"OpenAPI (payable surface only): {base}/openapi.json",
-        "Payment: HTTP 402 challenge (x402 v2), USDC; accepted networks at "
-        f"{base}/v1/payments/networks",
-        "",
-        "Golden path:",
-        f"  curl -s -X POST {base}/v1/dns/lookup \\",
-        "    -H 'Content-Type: application/json' -d '{\"name\":\"example.com\",\"type\":\"AAAA\"}'",
-        "  -> HTTP 402 with payment requirements; retry with an X-PAYMENT header to settle.",
-        "",
-        "Paid operations (method path — min USD — description):",
-    ]
-    for operation in enabled_paid_operations(config):
-        price = operation.price.minimum(config.payment)
-        lines.append(
-            f"  {operation.method} {operation.path} — ${price} — {operation.description}"
-        )
-    return PlainTextResponse("\n".join(lines) + "\n")
+    return PlainTextResponse(build_llms_txt(config))
+
+
+# The API host has no sitemap; hyrule.host carries the human/site surface.
+# Agent crawlers are explicitly welcome (mirrors hyrule-web's robots policy).
+_ROBOTS_TXT = """\
+User-agent: *
+Allow: /
+
+# Agent crawlers — explicitly welcome
+User-agent: ClaudeBot
+Allow: /
+User-agent: OAI-SearchBot
+Allow: /
+User-agent: GPTBot
+Allow: /
+User-agent: Google-Extended
+Allow: /
+User-agent: PerplexityBot
+Allow: /
+"""
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt() -> PlainTextResponse:
+    return PlainTextResponse(_ROBOTS_TXT)
 
 
 @app.middleware("http")
@@ -432,6 +460,19 @@ async def x402_manifest():
 
     config: HyruleConfig = app.state._typed_state.config
     return build_x402_manifest(config)
+
+
+@app.get("/.well-known/agent-card.json", include_in_schema=False)
+async def agent_card(request: Request):
+    """A2A agent card: capability/payment declaration from the enabled catalog.
+
+    Discovery-only — Hyrule Cloud speaks x402 REST + MCP, not A2A JSON-RPC.
+    """
+    from hyrule_cloud.services.discovery import build_agent_card
+
+    state = getattr(request.app.state, "_typed_state", None)
+    config = getattr(state, "config", None) or HyruleConfig()
+    return build_agent_card(config)
 
 
 def curated_openapi() -> dict:

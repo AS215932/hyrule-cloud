@@ -2,6 +2,8 @@
 
 Full-stack network infrastructure for AI agents on Hyrule Networks (AS215932), paid per request via x402.
 
+mcp-name: host.hyrule/hyrule-cloud
+
 Agents discover the curated paid surface via `/openapi.json`, the x402 Bazaar,
 or `/.well-known/x402.json` and pay with USDC on Base. Four service groups:
 
