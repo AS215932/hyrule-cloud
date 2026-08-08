@@ -1340,6 +1340,226 @@ def build_x402_manifest(config: HyruleConfig) -> dict[str, Any]:
     }
 
 
+# A2A skill groups for the agent card, matched by catalog path prefix. A group
+# with no enabled operation is omitted entirely, so gated-off products can
+# never be advertised as skills (Block G).
+@dataclass(frozen=True, slots=True)
+class _SkillGroup:
+    id: str
+    name: str
+    blurb: str
+    prefixes: tuple[str, ...]
+    tags: tuple[str, ...]
+
+
+_SKILL_GROUPS: tuple[_SkillGroup, ...] = (
+    _SkillGroup(
+        id="compute",
+        name="IPv6-native compute (VPS)",
+        blurb="Provision bare IPv6-native VMs with SSH access and automatic HTTPS subdomains.",
+        prefixes=("/v1/vm",),
+        tags=("compute", "vps", "ssh"),
+    ),
+    _SkillGroup(
+        id="domains-dns",
+        name="Domain registration & DNS",
+        blurb="Register domains owned by the paying x402 wallet, with managed DNS on AS215932.",
+        prefixes=("/v1/domains",),
+        tags=("domains", "dns", "registration"),
+    ),
+    _SkillGroup(
+        id="network-intelligence",
+        name="Network intelligence",
+        blurb=(
+            "BGP/routing, IP/ASN, DNS, RDAP/WHOIS, web/TLS, mail deliverability, "
+            "port/NAT reachability, threat, and VoIP diagnostics."
+        ),
+        prefixes=(
+            "/v1/bgp",
+            "/v1/ip",
+            "/v1/dns",
+            "/v1/rdap",
+            "/v1/whois",
+            "/v1/web",
+            "/v1/mx",
+            "/v1/path",
+            "/v1/ports",
+            "/v1/nat",
+            "/v1/threat",
+            "/v1/voip",
+        ),
+        tags=("network-intel", "bgp", "dns", "tls", "email"),
+    ),
+    _SkillGroup(
+        id="network-proxy",
+        name="Network proxy & tunnels",
+        blurb=(
+            "Outbound requests over Direct, Tor, I2P, or Yggdrasil, and reverse-SSH "
+            "tunnels exposing NATed hosts on a public port."
+        ),
+        prefixes=("/v1/network", "/v1/tunnel"),
+        tags=("proxy", "tor", "tunnel"),
+    ),
+)
+
+# a2a-x402 payments extension (A2A extension URI, not a fetchable document).
+_A2A_X402_EXTENSION_URI = "https://github.com/google-agentic-commerce/a2a-x402/v0.1"
+
+
+def _price_phrase(operation: PaidOperation, payment: PaymentConfig) -> str:
+    minimum = operation.price.minimum(payment)
+    if operation.price.mode == "fixed":
+        return f"${minimum}"
+    maximum = operation.price.maximum(payment)
+    if maximum is not None:
+        return f"${minimum}-${maximum}"
+    return f"from ${minimum}"
+
+
+def _summary(operation: PaidOperation) -> str:
+    """First sentence of the catalog description, for compact skill listings."""
+
+    return operation.description.split(". ")[0].rstrip(".")
+
+
+def build_agent_card(config: HyruleConfig) -> dict[str, Any]:
+    """A2A AgentCard built from the enabled catalog only.
+
+    This card is a capability/payment declaration for discovery: Hyrule Cloud
+    is an x402 REST API plus an MCP server, and does NOT expose an A2A
+    JSON-RPC transport. Skills mirror the live service groups; a readiness
+    gate that disables a group removes its skill entirely (Block G).
+    """
+
+    from hyrule_cloud import __version__
+
+    base = config.public_base_url.rstrip("/")
+    enabled = enabled_paid_operations(config)
+    skills: list[dict[str, Any]] = []
+    for group in _SKILL_GROUPS:
+        operations = [
+            operation
+            for operation in enabled
+            if any(
+                operation.path == prefix or operation.path.startswith(prefix + "/")
+                for prefix in group.prefixes
+            )
+        ]
+        if not operations:
+            continue
+        listing = "; ".join(
+            f"{operation.method} {operation.path} "
+            f"({_price_phrase(operation, config.payment)} USD) — {_summary(operation)}"
+            for operation in operations
+        )
+        skills.append(
+            {
+                "id": group.id,
+                "name": group.name,
+                "description": f"{group.blurb} Live x402-payable operations: {listing}.",
+                "tags": list(group.tags),
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"],
+            }
+        )
+    return {
+        "protocolVersion": "0.3.0",
+        "name": "Hyrule Cloud",
+        "description": (
+            "This agent card is a discovery and payment-capability declaration for "
+            f"Hyrule Cloud, an x402 (HTTP 402) REST API at {base} plus an MCP server "
+            "(pypi: hyrule-cloud). There is no A2A JSON-RPC transport; invoke skills "
+            f"via the REST operations in {base}/openapi.json and pay per request in "
+            f"USDC via x402. {catalog_description(config)}"
+        ),
+        "url": base,
+        "documentationUrl": "https://hyrule.host/agents",
+        "version": __version__,
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "stateTransitionHistory": False,
+            "extensions": [
+                {
+                    "uri": _A2A_X402_EXTENSION_URI,
+                    "description": (
+                        "Payable operations reply HTTP 402 with x402 v2 payment "
+                        "requirements; retry with a signed payment to settle in USDC."
+                    ),
+                    "required": False,
+                    "params": {
+                        "x402Version": 2,
+                        "networks": [
+                            network.caip2 for network in config.payment.enabled_networks()
+                        ],
+                    },
+                }
+            ],
+        },
+        "skills": skills,
+    }
+
+
+def build_llms_txt(config: HyruleConfig) -> str:
+    """Agent-facing plaintext guide, generated from the enabled catalog only.
+
+    Everything advertised here derives from ``enabled_paid_operations`` and
+    live payment config, so a gated-off operation can never appear (Block G).
+    """
+
+    base = config.public_base_url.rstrip("/")
+    networks = ", ".join(
+        f"{network.display_name} ({network.caip2})"
+        for network in config.payment.enabled_networks()
+    )
+    lines = [
+        "# Hyrule Cloud — x402-payable network services for AI agents",
+        "",
+        catalog_description(config),
+        "",
+        f"Machine-readable catalog: {base}/.well-known/x402.json",
+        f"OpenAPI (payable surface only): {base}/openapi.json",
+        f"A2A agent card (capability/payment declaration; no A2A JSON-RPC transport): {base}/.well-known/agent-card.json",
+        "Payment: HTTP 402 challenge (x402 v2), USDC; accepted networks at "
+        f"{base}/v1/payments/networks"
+        + (f" — currently {networks}" if networks else ""),
+        "",
+        "Golden path (402 challenge -> pay -> retry):",
+        f"  curl -s -X POST {base}/v1/dns/lookup \\",
+        "    -H 'Content-Type: application/json' -d '{\"name\":\"example.com\",\"type\":\"AAAA\"}'",
+        "  -> HTTP 402 with payment requirements (JSON body + Payment-Required header).",
+        "  Pay the challenge with an x402 client, then retry the same method, URL, and",
+        "  body with the X-PAYMENT header; the response settles and carries settlement headers.",
+        "",
+        "Paid operations (method path — min USD — description):",
+    ]
+    for operation in enabled_paid_operations(config):
+        price = operation.price.minimum(config.payment)
+        lines.append(
+            f"  {operation.method} {operation.path} — ${price} — {operation.description}"
+        )
+    lines += [
+        "",
+        "MCP server (pypi: hyrule-cloud) — client config:",
+        "  {",
+        '    "mcpServers": {',
+        '      "hyrule-cloud": {',
+        '        "command": "python",',
+        '        "args": ["-m", "hyrule_cloud.mcp_server"],',
+        f'        "env": {{"HYRULE_API_URL": "{base}"}}',
+        "      }",
+        "    }",
+        "  }",
+        "  Optional: set HYRULE_API_KEY (bootstrap one with the register_account tool)",
+        "  to authenticate subsequent calls.",
+        "",
+        "More Hyrule services: https://hyrule.host/llms.txt",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 _PAYMENT_REQUIRED_SCHEMA = {
     "type": "object",
     "required": ["x402Version", "accepts", "payment_required"],

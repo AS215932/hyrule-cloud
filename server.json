@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "host.hyrule/hyrule-cloud",
+  "description": "MCP tools for Hyrule Cloud: x402-paid VMs, domains/DNS, network intelligence, proxying.",
+  "repository": {
+    "url": "https://github.com/AS215932/hyrule-cloud",
+    "source": "github"
+  },
+  "version": "0.2.0",
+  "websiteUrl": "https://cloud.hyrule.host",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "hyrule-cloud",
+      "version": "0.2.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "HYRULE_API_URL",
+          "description": "Hyrule Cloud API base URL",
+          "default": "https://cloud.hyrule.host",
+          "isRequired": false
+        },
+        {
+          "name": "HYRULE_API_KEY",
+          "description": "Optional API key (bootstrap one with the register_account tool) for authenticated calls",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
