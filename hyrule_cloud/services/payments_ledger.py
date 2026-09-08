@@ -2,8 +2,8 @@
 
 PaymentGate records every payment-gate outcome here (402 issued, verify/settle
 failures, settlements, dev bypasses). The ledger is the revenue source of
-truth for /metrics and the operator dashboard; writes are best-effort and must
-never break the payment flow itself.
+truth for /metrics and the operator dashboard. Ordinary payment telemetry is
+best-effort; security-critical Admin waiver events explicitly fail closed.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def service_group_for_path(path: str) -> str:
 
 
 class PaymentLedger:
-    """Best-effort writer for payment_events rows."""
+    """Writer for payment events with optional fail-closed persistence."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -72,6 +72,8 @@ class PaymentLedger:
         facilitator_host: str | None = None,
         error: str | None = None,
         extra: dict[str, Any] | None = None,
+        actor_account_id: str | None = None,
+        required: bool = False,
     ) -> None:
         """Record a payment-gate outcome derived from an HTTP request."""
         await self.record_event(
@@ -86,6 +88,8 @@ class PaymentLedger:
             facilitator_host=facilitator_host,
             error=error,
             extra=extra,
+            actor_account_id=actor_account_id,
+            required=required,
         )
 
     async def record_event(
@@ -102,6 +106,8 @@ class PaymentLedger:
         facilitator_host: str | None = None,
         error: str | None = None,
         extra: dict[str, Any] | None = None,
+        actor_account_id: str | None = None,
+        required: bool = False,
     ) -> None:
         """Record an event from explicit fields (no HTTP request required).
 
@@ -123,12 +129,14 @@ class PaymentLedger:
                         facilitator_host=facilitator_host,
                         error=error,
                         extra=extra,
+                        actor_account_id=actor_account_id,
                     )
                 )
                 await session.commit()
         except Exception:
-            # The ledger must never take down the payment flow.
             log.warning("payment_ledger_write_failed", event_type=event_type, exc_info=True)
+            if required:
+                raise
 
     def build_event(
         self,
@@ -144,6 +152,7 @@ class PaymentLedger:
         facilitator_host: str | None = None,
         error: str | None = None,
         extra: dict[str, Any] | None = None,
+        actor_account_id: str | None = None,
     ) -> PaymentEventRow:
         """Build a PaymentEventRow without persisting it, so a caller can add it
         to its own session and commit it atomically with related writes (e.g. a
@@ -163,4 +172,5 @@ class PaymentLedger:
             facilitator_host=facilitator_host,
             error_reason=str(error)[:256] if error else None,
             extra=extra,
+            actor_account_id=actor_account_id,
         )

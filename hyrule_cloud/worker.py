@@ -10,6 +10,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import create_db_engine, create_session_factory, init_db
@@ -19,6 +20,7 @@ from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.providers.native_crypto import NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
 from hyrule_cloud.providers.tunnel_client import TunnelProvider
+from hyrule_cloud.services.admin_operations import process_admin_operations
 from hyrule_cloud.services.dns.blocklists import BlocklistService
 from hyrule_cloud.services.intents import scan_pending_intents
 from hyrule_cloud.services.tunnel.service import TunnelService
@@ -56,6 +58,23 @@ async def _refresh_dns_blocklists(service: BlocklistService) -> None:
         )
     except Exception:
         log.exception("dns_blocklist_refresh_failed")
+
+
+async def _run_admin_operations_loop(
+    stop: asyncio.Event,
+    sessions: async_sessionmaker[AsyncSession],
+    orchestrator: Orchestrator,
+) -> None:
+    """Process slow bulk account work without blocking the main scheduler."""
+    while not stop.is_set():
+        try:
+            await process_admin_operations(sessions, orchestrator, limit=10)
+        except Exception:
+            log.exception("admin_operations_failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=5.0)
+        except TimeoutError:
+            pass
 
 
 async def run_worker() -> None:
@@ -112,6 +131,10 @@ async def run_worker() -> None:
         "worker_started",
         worker_id=worker_id,
         recovered_bundle_vms=recovered_bundles,
+    )
+    admin_operations_task = asyncio.create_task(
+        _run_admin_operations_loop(stop, sessions, orchestrator),
+        name="admin-operations",
     )
     try:
         while not stop.is_set():
@@ -208,6 +231,8 @@ async def run_worker() -> None:
         if dns_blocklist_task is not None and not dns_blocklist_task.done():
             dns_blocklist_task.cancel()
             await asyncio.gather(dns_blocklist_task, return_exceptions=True)
+        stop.set()
+        await admin_operations_task
         await domains.close()
         await native.close()
         await rates.close()

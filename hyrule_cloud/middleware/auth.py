@@ -33,7 +33,10 @@ from hyrule_cloud.services.api_keys import (
     lookup_api_key,
 )
 from hyrule_cloud.services.sessions import (
+    CSRF_COOKIE_NAME,
     SESSION_COOKIE_NAME,
+    constant_time_eq,
+    hash_csrf_token,
     lookup_session,
     touch_session,
 )
@@ -118,6 +121,9 @@ async def current_account(
     request.state.is_api_key = False
     request.state.api_key_scopes = set()
     request.state.api_key_id = None
+    request.state.session_token_hash = None
+    request.state.session_csrf_token_hash = None
+    request.state.admin_elevated_at = None
 
     factory = _get_session_factory(app_state)
     if factory is None:
@@ -137,6 +143,8 @@ async def current_account(
             account = await db_session.get(AccountRow, key_row.account_id)
             if account is None:
                 raise HTTPException(401, "API key references missing account")
+            if account.disabled_at is not None:
+                raise HTTPException(403, "Account disabled")
             request.state.is_api_key = True
             request.state.api_key_scopes = set(key_row.scopes or [])
             request.state.api_key_id = key_row.key_id
@@ -153,6 +161,11 @@ async def current_account(
         account = await db_session.get(AccountRow, row.account_id)
         if account is None:
             return None
+        if account.disabled_at is not None:
+            raise HTTPException(403, "Account disabled")
+        request.state.session_token_hash = row.token_hash
+        request.state.session_csrf_token_hash = row.csrf_token_hash
+        request.state.admin_elevated_at = row.admin_elevated_at
         try:
             await touch_session(db_session, row)
         except Exception:
@@ -191,6 +204,58 @@ async def require_browser_session(
     return account
 
 
+def verify_session_csrf(request: Request) -> None:
+    """Require a header matching the CSRF digest on this exact session."""
+    expected = getattr(request.state, "session_csrf_token_hash", None)
+    supplied = request.headers.get("X-CSRF-Token")
+    cookie = request.cookies.get(CSRF_COOKIE_NAME)
+    if not expected or not supplied or not cookie:
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+    if not constant_time_eq(supplied, cookie) or not constant_time_eq(
+        hash_csrf_token(supplied), expected
+    ):
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+
+
+async def require_admin_session(
+    request: Request,
+    account: AccountRow = Depends(require_browser_session),
+) -> AccountRow:
+    """A live, enabled administrator browser session."""
+    if not account.is_admin:
+        raise HTTPException(status_code=403, detail="Administrator access required")
+    return account
+
+
+async def require_admin_csrf(
+    request: Request,
+    account: AccountRow = Depends(require_admin_session),
+) -> AccountRow:
+    verify_session_csrf(request)
+    return account
+
+
+def require_admin_step_up(max_age_seconds: int | None = None):
+    """Dependency factory for recent password-confirmed admin sessions."""
+
+    async def _dep(
+        request: Request,
+        account: AccountRow = Depends(require_admin_csrf),
+        app_state: AppState = Depends(get_app_state),
+    ) -> AccountRow:
+        from datetime import UTC, datetime
+
+        elevated_at = getattr(request.state, "admin_elevated_at", None)
+        ttl = max_age_seconds or app_state.config.admin_step_up_seconds
+        if elevated_at is not None and elevated_at.tzinfo is None:
+            elevated_at = elevated_at.replace(tzinfo=UTC)
+        if elevated_at is None or (datetime.now(UTC) - elevated_at).total_seconds() > ttl:
+            raise HTTPException(status_code=403, detail="admin_step_up_required")
+        return account
+
+    return _dep
+
+
 def require_scope(*needed: str):
     """Dependency factory: enforce that an API-key caller carries every
     `needed` scope. Cookie sessions bypass — a session = full account access.
@@ -203,6 +268,7 @@ def require_scope(*needed: str):
     any required scope. The exception detail names the missing scope so an
     agent can fix its key shape without guesswork.
     """
+
     async def _dep(
         request: Request,
         account: AccountRow = Depends(require_account),
