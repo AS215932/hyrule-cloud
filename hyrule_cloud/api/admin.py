@@ -1347,6 +1347,8 @@ async def transfer_vm(
         ).scalar_one_or_none()
         if vm is None:
             raise HTTPException(404, "VM not found")
+        if vm.deletion_started_at is not None or vm.status == VMStatus.DESTROYED:
+            raise HTTPException(409, "Deleting or destroyed VMs cannot be transferred")
         if str(vm.status) == VMStatus.PROVISIONING.value:
             raise HTTPException(409, "Provisioning VMs cannot be transferred")
         domain = (

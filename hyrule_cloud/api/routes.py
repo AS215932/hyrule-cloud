@@ -23,6 +23,7 @@ from sqlalchemy import update as _sql_update
 from hyrule_cloud.db import VMQuoteRow, VMRow
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.middleware.anon_token import (
+    VMManagementIdentity,
     anon_management_token,
     can_manage_vm,
 )
@@ -1392,7 +1393,10 @@ async def extend_vm(
     # create/quote/intent. Refuse before check_payment so no money moves.
     _require_vm_service_open(gate)
 
+    management_identity = VMManagementIdentity.capture(row)
     async with orch.locked_vm(vm_id) as (session, row):
+        if row is None or not management_identity.matches(row):
+            raise HTTPException(404, "VM not found")
         if not orch.vm_can_extend(row) or not await orch.vm_owner_enabled(session, row):
             raise HTTPException(409, "This VM can no longer be extended")
         total = current_daily_price_for_vm(row, cfg.payment) * body.days
@@ -1457,7 +1461,7 @@ async def reboot_vm(
     orch=Depends(get_orch),
 ) -> GenericActionResponse:
     # Block A0: management dep ensures caller has the token.
-    if not await orch.reboot_vm(vm_id):
+    if not await orch.reboot_vm(vm_id, management_identity=VMManagementIdentity.capture(row)):
         raise HTTPException(404, "VM not found or not running")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} is rebooting")
 
@@ -1469,7 +1473,7 @@ async def destroy_vm(
     orch=Depends(get_orch),
 ) -> GenericActionResponse:
     # Block A0: management dep ensures caller has the token.
-    if not await orch.destroy_vm(vm_id):
+    if not await orch.destroy_vm(vm_id, management_identity=VMManagementIdentity.capture(row)):
         raise HTTPException(404, "VM not found")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} destroyed")
 

@@ -38,7 +38,7 @@ from hyrule_cloud.db import (
     VMQuoteRow,
     VMRow,
 )
-from hyrule_cloud.middleware.anon_token import hash_anon_token
+from hyrule_cloud.middleware.anon_token import VMManagementIdentity, hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
     CryptoIntentStatus,
@@ -1913,19 +1913,23 @@ class Orchestrator:
                 "Purchased time committed; guest state requires reconciliation"
             ) from state_error
 
-    async def reboot_vm(self, vm_id: str) -> bool:
-        async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row or not row.xcpng_uuid:
+    async def reboot_vm(
+        self, vm_id: str, *, management_identity: VMManagementIdentity | None = None,
+    ) -> bool:
+        async with self.locked_vm(vm_id) as (_session, row):
+            if (row is None or not row.xcpng_uuid or row.deletion_started_at is not None
+                    or (management_identity is not None and not management_identity.matches(row))):
                 return False
-            xcpng_uuid = row.xcpng_uuid
+            # Ownership transfer cannot pass the row lock during the operation.
+            await self.xcpng.reboot_vm(row.xcpng_uuid)
+            return True
 
-        await self.xcpng.reboot_vm(xcpng_uuid)
-        return True
-
-    async def destroy_vm(self, vm_id: str, *, expired_before: datetime | None = None) -> bool:
+    async def destroy_vm(
+        self, vm_id: str, *, expired_before: datetime | None = None,
+        management_identity: VMManagementIdentity | None = None,
+    ) -> bool:
         async with self.locked_vm(vm_id) as (session, row):
-            if row is None:
+            if row is None or (management_identity is not None and not management_identity.matches(row)):
                 return False
             already_destroyed = row.status == VMStatus.DESTROYED
             if already_destroyed and row.ipv6_prefix_index is None and row.ipv6_prefix is None:
