@@ -237,6 +237,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        # Block concurrent disable writes until the downgrade transaction ends.
+        bind.execute(sa.text("LOCK TABLE accounts IN SHARE ROW EXCLUSIVE MODE"))
+    if bind.scalar(sa.text("SELECT count(*) FROM accounts WHERE disabled_at IS NOT NULL")):
+        raise RuntimeError("Cannot downgrade revision 023 while accounts remain disabled")
     op.drop_table("admin_bypass_usage")
     op.drop_table("refund_resolutions")
     op.drop_table("admin_operations")

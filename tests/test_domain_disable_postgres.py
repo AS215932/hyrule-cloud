@@ -29,6 +29,7 @@ from hyrule_cloud.domains.models import (
     NameserverUpdateRequest,
 )
 from hyrule_cloud.domains.service import DomainService
+from hyrule_cloud.middleware.anon_token import hash_anon_token
 
 
 @pytest.mark.asyncio
@@ -68,13 +69,14 @@ async def test_domain_mutations_serialize_with_account_disable():
         async with sessions.begin() as session:
             session.add(actor)
         for index, (action, mutation_first) in enumerate(
-                (action, first) for action in ('changeset', 'nameservers', 'dnssec') for first in (True, False)):
+                (action, first) for action in ('changeset', 'nameservers', 'dnssec', 'claim') for first in (True, False)):
             owner_id, fqdn = f'HOWNER0000{index}', f'fixture{index}.dev'
             async with sessions.begin() as session:
                 session.add(AccountRow(account_id=owner_id, password_hash='fixture'))
                 await session.flush()
                 session.add(DomainRow(name=f'fixture{index}', extension='dev', fqdn=fqdn,
-                    owner_wallet='fixture', owner_account_id=owner_id, status='active',
+                    owner_wallet='fixture', owner_account_id=None if action == 'claim' else owner_id, status='active',
+                    anon_management_token_hash=hash_anon_token('fixture-token') if action == 'claim' else None,
                     nameserver_mode='managed', nameservers=['ns1.servify.network', 'ns2.servify.network'],
                     dnssec_mode='managed', dnssec_status='active'))
             entered, release = asyncio.Event(), asyncio.Event()
@@ -96,6 +98,8 @@ async def test_domain_mutations_serialize_with_account_disable():
                 class_=AsyncSession if mutation_first else HeldCommitSession))
 
             async def mutate():
+                if action == 'claim':
+                    return await service.claim_legacy_domain(owner_id, fqdn, 'fixture-token')
                 if action == 'changeset':
                     return await service.apply_changeset(owner_id, fqdn, 1,
                         DNSChangesetRequest(changes=[DNSChange(action=DNSChangeAction.UPSERT,
@@ -129,8 +133,11 @@ async def test_domain_mutations_serialize_with_account_disable():
                 assert (await session.get(AccountRow, owner_id)).disabled_at is not None
                 domain = await session.scalar(select(DomainRow).where(DomainRow.fqdn == fqdn))
                 assert domain.zone_revision == 1 + int(mutation_first and action == 'changeset')
+                if action == 'claim':
+                    assert domain.owner_account_id == (owner_id if mutation_first else None)
+                    assert domain.anon_management_token_hash == (None if mutation_first else hash_anon_token('fixture-token'))
                 operations = list(await session.scalars(select(DomainOperationRow).where(DomainOperationRow.fqdn == fqdn)))
-                assert len(operations) == int(mutation_first and action != 'changeset')
+                assert len(operations) == int(mutation_first and action in ('nameservers', 'dnssec'))
     finally:
         for release in releases:
             release.set()

@@ -34,13 +34,17 @@ def test_admin_postgres_migration_roundtrip():
     def run(sql):
         return asyncio.run(query(sql))
 
-    def migrate(direction, revision):
+    def migrate(direction, revision, *, expected_error=None):
         result = subprocess.run(
             [sys.executable, "-m", "alembic", direction, revision], cwd=ROOT,
             env=dict(os.environ, HYRULE_DATABASE_URL=url), capture_output=True,
             text=True, timeout=120,
         )
-        assert result.returncode == 0, result.stderr
+        if expected_error is not None:
+            assert result.returncode != 0
+            assert expected_error in result.stderr
+        else:
+            assert result.returncode == 0, result.stderr
 
     assert run("SELECT count(*) FROM information_schema.tables WHERE table_schema='public'") == [(0,)]
     migrate("upgrade", "020")
@@ -59,6 +63,13 @@ def test_admin_postgres_migration_roundtrip():
     run("""INSERT INTO admin_audit(audit_id,actor_account_id,action)
         VALUES ('fixture-audit','HTEST000001','fixture.action')""")
     assert run("SELECT count(*) FROM admin_audit") == [(1,)]
+    run("UPDATE accounts SET disabled_at=now() WHERE account_id='HTEST000001'")
+    migrate("downgrade", "020", expected_error="while accounts remain disabled")
+    assert run("SELECT version_num FROM alembic_version") == [('023',)]
+    assert run("SELECT count(*) FROM accounts WHERE disabled_at IS NOT NULL") == [(1,)]
+    assert run("SELECT count(*) FROM admin_audit") == [(1,)]
+    # Explicitly resolve the fixture's restriction before the ordinary rollback.
+    run("UPDATE accounts SET disabled_at=NULL WHERE account_id='HTEST000001'")
     migrate("downgrade", "020")
     assert run("SELECT count(*) FROM vms") == [(2,)]
     assert run("SELECT count(*) FROM accounts") == [(1,)]
