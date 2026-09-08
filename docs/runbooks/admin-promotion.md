@@ -5,9 +5,10 @@ readiness gates, domain-registration settlement recovery and provisioning events
 alongside the admin PR's audited operations, session CSRF protection and explicit
 payment-waiver accounting. Payment waivers remain disabled by default.
 
-The admin migration is revision `023`, currently following `020`. Revision `017`
+The local migration chain is `020 → 021 → 023`; the admin migration `023`
+follows the integrated expiry deletion-claim migration `021`. Revision `017`
 is already the deployed provisioning-events migration and must not be reused.
-Before merging with pending expiry or guest-receipt migrations, reconcile the
+Before merging the pending guest-receipt migration `022`, reconcile the
 parent to produce a single ordered head and rerun the real PostgreSQL checks.
 Do not stamp over a conflicting migration history.
 

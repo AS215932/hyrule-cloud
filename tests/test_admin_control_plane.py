@@ -2105,7 +2105,7 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         assert expired_mailbox.suspension_reason == "expired"
         assert operation is not None and operation.status == "completed"
 
-    assert xcpng.suspended == ["uuid-active"]
+    assert xcpng.suspended == ["uuid-active", "uuid-failed-disabled"]
     assert xcpng.started == ["uuid-active"]
 
 
@@ -2350,3 +2350,34 @@ async def test_admin_expiry_extension_requires_step_up_and_atomic_audit(admin_fa
     finally:
         app.state._typed_state = previous
         await orch.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status,claimed', [('suspended', True), ('destroyed', False)])
+async def test_domain_transfer_rejects_attached_vm_deletion(admin_factory, status, claimed):
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory.begin() as session:
+        actor = await session.get(AccountRow, 'HAAAAAAAAAA')
+        session.add_all([AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture'),
+                         AccountRow(account_id='HCCCCCCCCCC', password_hash='fixture')])
+        session.add(VMRow(vm_id='vm_claimed_domain', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
+                          status=status, xcpng_uuid='fixture-guest', suspension_reason='account_disabled',
+                          deletion_started_at=datetime.now(UTC) if claimed else None,
+                          expires_at=datetime.now(UTC) + timedelta(days=1)))
+        session.add(DomainRow(name='claimed', extension='example', fqdn='claimed.example',
+                              vm_id='vm_claimed_domain', owner_wallet='fixture',
+                              owner_account_id='HBBBBBBBBBB', status='active'))
+    xcpng = _AdminXCPNG()
+    state = AppState(config=SimpleNamespace(), orchestrator=SimpleNamespace(xcpng=xcpng),
+                     payment_gate=None, network_provider=None, session_factory=admin_factory)
+    with pytest.raises(HTTPException) as exc:
+        await transfer_domain('claimed.example', OwnershipTransferRequest(
+            target_account_id='HCCCCCCCCCC', reason='Fixture transfer'),
+            _browser_request(credentials, path='/fixture'), actor, state)
+    assert exc.value.status_code == 409
+    assert xcpng.started == []
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, 'vm_claimed_domain')
+        domain = await session.scalar(select(DomainRow).where(DomainRow.fqdn == 'claimed.example'))
+        assert vm.owner_account_id == domain.owner_account_id == 'HBBBBBBBBBB'
+        assert list(await session.scalars(select(AdminAuditRow).where(AdminAuditRow.action == 'domain.transfer'))) == []
