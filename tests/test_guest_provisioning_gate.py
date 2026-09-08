@@ -20,10 +20,12 @@ from hyrule_cloud.orchestrator import Orchestrator
 async def test_paid_dispatch_survives_restart_while_waiting_for_provisioning_slots(tmp_path, monkeypatch):
     from hyrule_cloud.db import VMGuestResultRow
 
-    monkeypatch.setattr('hyrule_cloud.services.launch_proof.use_real_provisioning', lambda: False)
+    monkeypatch.setattr('hyrule_cloud.services.launch_proof.use_real_provisioning', lambda: True)
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'queued.db'}")
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    original, recovered = [Orchestrator(HyruleConfig(), factory) for _ in range(2)]
+    config = HyruleConfig()
+    config.xcpng.templates = {"debian-13": "fixture-template"}
+    original, recovered = [Orchestrator(config, factory) for _ in range(2)]
     entered = []
     four_active = asyncio.Event()
     release = asyncio.Event()
@@ -35,6 +37,13 @@ async def test_paid_dispatch_survives_restart_while_waiting_for_provisioning_slo
         await release.wait()
 
     original._provision_vm_owned = held_attempt
+    resumed = []
+
+    async def recovered_attempt(vm_id):
+        # This fixture verifies durable dispatch, not provider completion.
+        resumed.append(vm_id)
+
+    recovered._provision_vm_owned = recovered_attempt
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -61,7 +70,8 @@ async def test_paid_dispatch_survives_restart_while_waiting_for_provisioning_slo
         await asyncio.wait_for(asyncio.gather(*list(recovered._tasks)), 5)
         async with factory() as session:
             rows = list(await session.scalars(select(VMRow).where(VMRow.vm_id.like('vm_queued_%'))))
-            assert len(rows) == 8 and all(row.status == VMStatus.READY for row in rows)
+            assert len(rows) == 8 and all(row.status == VMStatus.PROVISIONING for row in rows)
+            assert sorted(resumed) == sorted(row.vm_id for row in rows)
             assert (await session.get(VMRow, unpaid.vm_id)).status == VMStatus.PROVISIONING
     finally:
         await original.shutdown()
@@ -399,4 +409,48 @@ async def test_guest_waiter_never_infers_success_from_missing_or_stale_report(tm
         async with factory() as session:
             assert (await session.get(VMRow, 'vm_wait')).status == VMStatus.PROVISIONING
     finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('existing_attempt', [False, True])
+async def test_simulation_does_not_create_or_erase_real_guest_receipts(tmp_path, monkeypatch, existing_attempt):
+    from hyrule_cloud.db import VMGuestResultRow
+    from hyrule_cloud.services.guest_result import prepare_guest_result
+
+    monkeypatch.setattr('hyrule_cloud.services.launch_proof.use_real_provisioning', lambda: False)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'simulation.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    orch = Orchestrator(HyruleConfig(), factory)
+    orch.dns.delete_aaaa = AsyncMock()
+    orch.xcpng.create_vm = AsyncMock(side_effect=AssertionError('simulation must not create guests'))
+    orch.xcpng.destroy_vm = AsyncMock(side_effect=AssertionError('unknown guest must be preserved'))
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        vm, _ = await orch.create_vm(
+            VMCreateRequest(ssh_pubkey='ssh-ed25519 fixture', duration_days=7),
+            owner_wallet='fixture', start_provisioning=False,
+        )
+        if existing_attempt:
+            async with factory() as session:
+                await prepare_guest_result(session, vm.vm_id, datetime.now(UTC) + timedelta(minutes=5))
+                await session.commit()
+        await orch.start_provisioning(vm.vm_id)
+        await asyncio.wait_for(asyncio.gather(*list(orch._tasks)), 5)
+        async with factory() as session:
+            row = await session.get(VMRow, vm.vm_id)
+            assert row.status == (VMStatus.PROVISIONING if existing_attempt else VMStatus.READY)
+            assert (await session.get(VMGuestResultRow, vm.vm_id) is not None) == existing_attempt
+        assert await orch.destroy_vm(vm.vm_id)
+        await orch.release_destroyed_prefix(vm.vm_id)
+        async with factory() as session:
+            row = await session.get(VMRow, vm.vm_id)
+            assert row.status == VMStatus.DESTROYED
+            assert (row.ipv6_prefix_index is not None) == existing_attempt
+            assert (await session.get(VMGuestResultRow, vm.vm_id) is not None) == existing_attempt
+        orch.xcpng.create_vm.assert_not_awaited()
+        orch.xcpng.destroy_vm.assert_not_awaited()
+    finally:
+        await orch.shutdown()
         await engine.dispose()

@@ -440,6 +440,8 @@ class Orchestrator:
             raise RuntimeError("planned VM id is already bound to another order")
 
     async def _spawn_provisioning(self, vm_id: str) -> None:
+        from hyrule_cloud.services.launch_proof import use_real_provisioning
+
         if vm_id in self._provisioning_vm_ids:
             return
         # Persist dispatch before creating an in-memory task, so semaphore and
@@ -450,7 +452,7 @@ class Orchestrator:
             if row is None or row.status != VMStatus.PROVISIONING or not row.owner_wallet:
                 return
             receipt = await session.get(VMGuestResultRow, vm_id)
-            if receipt is None and row.xcpng_uuid is None:
+            if use_real_provisioning() and receipt is None and row.xcpng_uuid is None:
                 await prepare_guest_result(
                     session, vm_id, _now() + timedelta(seconds=self.config.guest_report_timeout_seconds),
                 )
@@ -781,6 +783,14 @@ class Orchestrator:
             )
 
         if not use_real_provisioning():
+            # Switching off real provisioning cannot turn an interrupted real
+            # attempt into simulated success or discard its quarantine evidence.
+            async with self.db() as session:
+                receipt = await session.get(VMGuestResultRow, vm_id)
+                row = await session.get(VMRow, vm_id)
+                if receipt is not None or (row is not None and row.xcpng_uuid):
+                    log.warning("real_guest_recovery_paused_in_simulation", vm_id=vm_id)
+                    return
             await self._simulate_provisioning(vm_id)
             return
 

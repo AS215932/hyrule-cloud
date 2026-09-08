@@ -127,3 +127,5 @@ A QEMU guest with a verified official Debian image is useful for real cloud-init
 and observer execution. A local callback and mocked provider/network probes do
 not prove production XCP-NG, customer IPv6 or tenant-isolation behavior. Retain
 that distinction in the deployment record.
+
+Simulation dispatch does not create guest receipts. A simulation-mode process that finds an existing receipt or provider UUID leaves the real attempt pending for reconciliation; it never replaces that evidence with simulated success. Fresh simulated VMs can release their prefixes on deletion. Receipt-backed UUID-less real attempts remain quarantined, including after a mode change. The queued-dispatch restart fixture verifies re-dispatch of all eight paid attempts with provider execution stubbed; separate provisioning fixtures verify terminal guest completion.
