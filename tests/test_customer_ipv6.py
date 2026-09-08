@@ -31,7 +31,7 @@ async def _complete_test_guest(session_factory, kwargs):
                              if entry["path"] == "/var/lib/hyrule-guest-result/config.json"))
     async with session_factory() as session:
         await accept_guest_result(
-            session, kwargs["name_label"].removeprefix("hyrule-"),
+            session, report["url"].rsplit("/", 3)[1],
             report["url"].rsplit("/", 1)[1], report["token"],
             GuestResult(outcome="succeeded", stage="cloud_init", exit_code=0),
         )

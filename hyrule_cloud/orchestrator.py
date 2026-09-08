@@ -74,6 +74,7 @@ from hyrule_cloud.services.refunds import RefundService
 from hyrule_cloud.services.vm_events import (
     FAILURE_DNS,
     FAILURE_GUEST_INIT,
+    FAILURE_GUEST_RECOVERY,
     FAILURE_GUEST_REPORT,
     FAILURE_GUEST_SETUP,
     ProvisioningFailedError,
@@ -467,14 +468,14 @@ class Orchestrator:
         """Incrementally recover ordinary paid guests, including x402 orders.
 
         The worker calls this periodically, so an API crash is recovered even
-        when the worker itself never restarts. Exclude legacy/untracked guests;
-        never synthesize a credential for an existing guest.
+        when the worker itself never restarts. Include receipt-backed attempts
+        before UUID persistence; never replace a running guest's credential.
         """
         async with self.db() as session:
             vm_ids = list((await session.scalars(
                 select(VMRow.vm_id).join(VMGuestResultRow)
                 .where(VMRow.status == VMStatus.PROVISIONING,
-                       VMRow.xcpng_uuid.is_not(None), VMRow.vm_id > self._recovery_cursor)
+                       VMRow.vm_id > self._recovery_cursor)
                 .order_by(VMRow.vm_id).limit(4)
             )).all())
         self._recovery_cursor = vm_ids[-1] if vm_ids else ""
@@ -691,6 +692,42 @@ class Orchestrator:
                 if acquired:
                     await self._provision_vm_owned(vm_id)
 
+    async def _recover_pre_uuid_guest(self, vm_id: str) -> str | None:
+        """Caller owns the VM attempt and clone-capacity locks.
+
+        Generation-specific labels bind an orphan to its existing credential.
+        Running means the provider reached start after sizing/configuration.
+        Incomplete or ambiguous guests are retained for operator recovery rather
+        than deleted or blindly restarted. No matching guest can be retried:
+        vm.create uses bootAfterCreate=False, so a late old create stays halted.
+        """
+        async with self.db() as session:
+            receipt = await session.get(VMGuestResultRow, vm_id)
+            if receipt is None:
+                return None
+            generation, received = receipt.generation, receipt.received_at
+        candidates = await self.xcpng.find_vm_ids_by_name_label(f"hyrule-{vm_id}-{generation}")
+        if not candidates:
+            legacy = await self.xcpng.find_vm_ids_by_name_label(f"hyrule-{vm_id}")
+            if received is not None or legacy:
+                raise ProvisioningFailedError(FAILURE_GUEST_RECOVERY)
+            return None
+        if len(candidates) != 1 or await self.xcpng.get_vm_power_state(candidates[0]) != "Running":
+            raise ProvisioningFailedError(FAILURE_GUEST_RECOVERY)
+        recovered_uuid = candidates[0]
+        async with self.db() as session:
+            row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+            receipt = await session.scalar(
+                select(VMGuestResultRow).where(VMGuestResultRow.vm_id == vm_id).with_for_update()
+            )
+            if row is None or row.status != VMStatus.PROVISIONING or receipt is None or receipt.generation != generation:
+                raise GuestGenerationChangedError()
+            if row.xcpng_uuid is not None and row.xcpng_uuid != recovered_uuid:
+                raise GuestGenerationChangedError()
+            row.xcpng_uuid = recovered_uuid
+            await session.commit()
+        return recovered_uuid
+
     async def _provision_vm_owned(self, vm_id: str) -> None:
         """Background provisioning: create VM, wait for IPv6, configure DNS.
 
@@ -808,6 +845,8 @@ class Orchestrator:
                             return
                         xcpng_uuid = current.xcpng_uuid
                     if xcpng_uuid is None:
+                        xcpng_uuid = await self._recover_pre_uuid_guest(vm_id)
+                    if xcpng_uuid is None:
                         name_label = f"hyrule-{vm_id}"
                         # XO may contain a clone whose create call completed before the
                         # process could durably store its UUID. It is not safe to adopt
@@ -825,6 +864,7 @@ class Orchestrator:
                             deadline = _now() + timedelta(seconds=self.config.guest_report_timeout_seconds)
                             generation, guest_token = await prepare_guest_result(session, vm_id, deadline)
                             await session.commit()
+                        name_label = f"hyrule-{vm_id}-{generation}"
                         cloud_config = render_cloud_init(
                             os_name=os_name, hostname=self._generate_hostname(vm_id),
                             ssh_pubkey=ssh_pubkey, open_ports=open_ports, setup_script=setup_script,

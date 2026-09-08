@@ -112,7 +112,7 @@ def _real_orchestrator(session_factory, monkeypatch) -> Orchestrator:
             entry["content"] for entry in config_data["write_files"]
             if entry["path"] == "/var/lib/hyrule-guest-result/config.json"
         ))
-        vm_id = kwargs["name_label"].removeprefix("hyrule-")
+        vm_id = report["url"].rsplit("/", 3)[1]
         async with session_factory() as session:
             await accept_guest_result(
                 session, vm_id, report["url"].rsplit("/", 1)[1], report["token"],

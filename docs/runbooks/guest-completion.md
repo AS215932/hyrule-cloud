@@ -25,7 +25,7 @@ The server enforces that deadline. Guest retries use a bounded monotonic window
 (the configured report timeout, renewed on observer restart), so an incorrect
 guest wall clock cannot prevent submission or extend server acceptance.
 
-The worker scans tracked provisioning rows with report identities every 15 seconds,
+The worker scans provisioning rows with report identities every 15 seconds,
 four rows per page, continuing by VM ID so active earlier rows cannot starve later
 ones. This recovers ordinary x402 guests even if only the API restarts. Recovery
 rechecks network/DNS and consumes the existing receipt; it never recreates a tracked
@@ -36,6 +36,17 @@ joins tasks before closing providers. A connection heartbeat cancels work on det
 ownership loss; it cannot retract an external provider request already sent. SQLite
 only provides single-process development exclusion. Legacy guests without report
 identities remain subject to the deployment preflight below.
+
+Before UUID persistence, new guests use an exact label containing both the VM ID
+and report generation. A unique running guest with that label is recovered with
+the same receipt identity; provider sizing precedes its start. If no matching or
+legacy guest exists and no report has arrived, creation can be retried with a new
+generation. An old create request finishing after a crash stays halted because
+creation uses `bootAfterCreate=False`. Halted guests, multiple matches, legacy
+labels, or a completed report with no matching guest require operator recovery:
+the attempt becomes failed and enters refund-obligation handling; guests are
+preserved, not deleted or blindly started. This does not promise automatic repair
+of a partially created guest or automatic removal of a late halted orphan.
 
 Reports contain only a finite outcome, stage and numeric exit code. No guest
 logs or raw cloud-init error output are uploaded. HTTPS verification stays

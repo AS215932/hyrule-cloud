@@ -61,6 +61,10 @@ FAILURE_GUEST_REPORT = (
     "Guest initialization could not be verified before the deadline. "
     "The VM is retained for diagnosis. Contact support for recovery or refund status."
 )
+FAILURE_GUEST_RECOVERY = (
+    "Provisioning was interrupted and needs operator recovery. "
+    "Contact support for guest recovery or refund status."
+)
 
 FAILURE_TIMEOUT = (
     "Your VM did not come online within the provisioning window. "

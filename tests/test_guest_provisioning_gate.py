@@ -16,6 +16,89 @@ from hyrule_cloud.orchestrator import Orchestrator
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('crash_state', ['no_clone', 'running', 'halted', 'multiple', 'reported_missing', 'legacy'])
+async def test_receipt_backed_pre_uuid_attempts_are_reconciled(tmp_path, monkeypatch, crash_state):
+    import json
+
+    from hyrule_cloud.db import VMGuestResultRow
+    from hyrule_cloud.services.guest_result import (
+        GuestResult,
+        accept_guest_result,
+        prepare_guest_result,
+    )
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'pre-uuid.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    config = HyruleConfig()
+    config.xcpng.templates = {'debian-13': 'test-template'}
+    orch = Orchestrator(config, factory)
+    monkeypatch.setattr('hyrule_cloud.services.launch_proof.use_real_provisioning', lambda: True)
+    orch.dns.create_aaaa = AsyncMock()
+    orch.dns.verify_aaaa = AsyncMock(return_value=True)
+    orch._wait_for_ipv6 = AsyncMock(return_value='2a0c:b641:b51:5::2')
+    orch._probe_ssh = AsyncMock(return_value=True)
+    orch._probe_customer_dns_resolution = AsyncMock(return_value=DNSResolutionStatus.PASSED)
+    orch._record_vm_refund = AsyncMock()
+    orch.xcpng.destroy_vm = AsyncMock(side_effect=AssertionError('must preserve ambiguous guest data'))
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            session.add(VMRow(vm_id='vm_pre_uuid', owner_wallet='test',
+                              hostname='test.deploy.hyrule.host', ipv6_prefix='2a0c:b641:b51:5::/64',
+                              ipv6_prefix_index=5, expires_at=datetime.now(UTC) + timedelta(days=1)))
+        async with factory.begin() as session:
+            generation, token = await prepare_guest_result(session, 'vm_pre_uuid', datetime.now(UTC) + timedelta(minutes=5))
+        if crash_state in ('running', 'reported_missing'):
+            async with factory.begin() as session:
+                await accept_guest_result(session, 'vm_pre_uuid', generation, token,
+                                          GuestResult(outcome='succeeded', stage='cloud_init', exit_code=0))
+
+        async def find(label):
+            if crash_state == 'legacy' and label == 'hyrule-vm_pre_uuid':
+                return ['legacy-guest']
+            if label != f'hyrule-vm_pre_uuid-{generation}':
+                return []
+            return {'running': ['existing'], 'halted': ['existing'], 'multiple': ['first', 'second']}.get(crash_state, [])
+
+        async def create(**kwargs):
+            cloud = yaml.safe_load(kwargs['cloud_init_config'])
+            report = json.loads(next(entry['content'] for entry in cloud['write_files'] if entry['path'].endswith('/config.json')))
+            new_generation = report['url'].rsplit('/', 1)[1]
+            assert kwargs['name_label'] == f'hyrule-vm_pre_uuid-{new_generation}'
+            assert new_generation != generation
+            async with factory.begin() as session:
+                await accept_guest_result(session, 'vm_pre_uuid', new_generation, report['token'],
+                                          GuestResult(outcome='succeeded', stage='cloud_init', exit_code=0))
+            return 'new-guest'
+
+        orch.xcpng.find_vm_ids_by_name_label = AsyncMock(side_effect=find)
+        orch.xcpng.get_vm_power_state = AsyncMock(return_value='Halted' if crash_state == 'halted' else 'Running')
+        orch.xcpng.create_vm = AsyncMock(side_effect=create)
+        assert await orch.recover_tracked_provisioning() == 1  # No UUID is persisted.
+        await asyncio.wait_for(asyncio.gather(*list(orch._tasks)), 10)
+        async with factory() as session:
+            vm = await session.get(VMRow, 'vm_pre_uuid')
+            receipt = await session.get(VMGuestResultRow, 'vm_pre_uuid')
+            if crash_state in ('running', 'no_clone'):
+                assert vm.status == VMStatus.READY
+                assert vm.xcpng_uuid == ('existing' if crash_state == 'running' else 'new-guest')
+                orch._record_vm_refund.assert_not_awaited()
+            else:
+                assert vm.status == VMStatus.FAILED
+                assert vm.xcpng_uuid is None
+                assert 'interrupted' in vm.error
+                orch._record_vm_refund.assert_awaited_once()
+            if crash_state != 'no_clone':
+                assert receipt.generation == generation
+                orch.xcpng.create_vm.assert_not_awaited()
+        orch.xcpng.destroy_vm.assert_not_awaited()
+    finally:
+        await orch.shutdown()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_waiter_cancellation_joins_inflight_database_poll(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'cancel.db'}")
     orch = Orchestrator(HyruleConfig(), async_sessionmaker(engine, expire_on_commit=False))
