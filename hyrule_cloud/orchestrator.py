@@ -832,6 +832,27 @@ class Orchestrator:
             await session.commit()
         return recovered_uuid
 
+    async def _stop_restricted_provisioned_guest(self, vm_id: str, vm_uuid: str) -> bool:
+        """Stop a newly discovered guest before initialization waits when restricted.
+
+        Keep provisioning and its durable receipt retryable if the stop fails.
+        The owner/VM lock orders this check against account enable/disable.
+        """
+        async with self.locked_vm(vm_id) as (session, row):
+            if row is None or row.xcpng_uuid != vm_uuid:
+                return True
+            restricted = (row.suspension_reason in {"account_disabled", "manual_admin"}
+                          or not await self.vm_owner_enabled(session, row))
+            if not restricted:
+                return False
+            try:
+                await self.xcpng.suspend_vm(vm_uuid)
+            except Exception:
+                log.exception("restricted_provisioned_guest_stop_failed", vm_id=vm_id)
+            # Do not enter the generic FAILED/refund path: a stop failure needs
+            # another attempt even when the original disable job has completed.
+            return True
+
     async def _provision_vm_owned(self, vm_id: str) -> None:
         """Background provisioning: create VM, wait for IPv6, configure DNS.
 
@@ -959,6 +980,8 @@ class Orchestrator:
                     if xcpng_uuid is None:
                         xcpng_uuid = await self._recover_pre_uuid_guest(vm_id)
                         if xcpng_uuid is not None:
+                            if await self._stop_restricted_provisioned_guest(vm_id, xcpng_uuid):
+                                return
                             await self._emit(
                                 vm_id,
                                 VMEventKey.VM_CREATED,
@@ -1013,6 +1036,9 @@ class Orchestrator:
                                 row.xcpng_uuid = xcpng_uuid
                                 await session.commit()
 
+                        if await self._stop_restricted_provisioned_guest(vm_id, xcpng_uuid):
+                            return
+
                         # The hypervisor identity of the clone is internal; the
                         # customer only learns their machine exists and started.
                         await self._emit(
@@ -1025,6 +1051,9 @@ class Orchestrator:
                                 "disk_gb": resources.disk_gb,
                             },
                         )
+
+            if await self._stop_restricted_provisioned_guest(vm_id, xcpng_uuid):
+                return
 
             async with self.db() as session:
                 receipt = await session.get(VMGuestResultRow, vm_id)

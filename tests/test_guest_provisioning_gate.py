@@ -454,3 +454,66 @@ async def test_simulation_does_not_create_or_erase_real_guest_receipts(tmp_path,
     finally:
         await orch.shutdown()
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stop_fails', [False, True])
+async def test_disable_during_clone_stops_before_initialization_and_retries(tmp_path, monkeypatch, stop_fails):
+    from hyrule_cloud.db import AccountRow, VMGuestResultRow
+    from hyrule_cloud.services.guest_result import prepare_guest_result
+
+    monkeypatch.setattr('hyrule_cloud.services.launch_proof.use_real_provisioning', lambda: True)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'late-disabled.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    config = HyruleConfig()
+    config.xcpng.templates = {'debian-13': 'fixture-template'}
+    orch = Orchestrator(config, factory)
+    orch.xcpng.find_vm_ids_by_name_label = AsyncMock(return_value=[])
+    orch.xcpng.suspend_vm = AsyncMock(side_effect=RuntimeError('temporarily unavailable') if stop_fails else None)
+    orch._wait_for_ipv6 = AsyncMock(side_effect=AssertionError('disabled guest reached network wait'))
+    orch._wait_for_guest_result = AsyncMock(side_effect=AssertionError('disabled guest reached guest wait'))
+    orch._record_vm_refund = AsyncMock()
+    owner = 'HOWNER00001'
+    vm_id = 'vm_late_disabled'
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            session.add(AccountRow(account_id=owner))
+        async with factory.begin() as session:
+            session.add(VMRow(vm_id=vm_id, owner_wallet='fixture', owner_account_id=owner,
+                              ipv6_prefix='2a0c:b641:b51:5::/64', ipv6_prefix_index=5,
+                              expires_at=datetime.now(UTC) + timedelta(days=1)))
+        async with factory.begin() as session:
+            await prepare_guest_result(session, vm_id, datetime.now(UTC) + timedelta(minutes=5))
+
+        async def finish_clone_after_disable(**kwargs):
+            # Model the durable result of account-disable finishing while XO
+            # creates a UUID-less guest. Its old worker job will not run again.
+            async with factory.begin() as session:
+                account = await session.get(AccountRow, owner)
+                account.disabled_at = datetime.now(UTC)
+                row = await session.get(VMRow, vm_id)
+                row.suspension_reason = 'account_disabled'
+            return 'late-provider-guest'
+
+        orch.xcpng.create_vm = AsyncMock(side_effect=finish_clone_after_disable)
+        await orch._provision_vm_owned(vm_id)
+        orch.xcpng.suspend_vm.assert_awaited_once_with('late-provider-guest')
+        orch._wait_for_ipv6.assert_not_awaited()
+        orch._wait_for_guest_result.assert_not_awaited()
+        orch._record_vm_refund.assert_not_awaited()
+        async with factory() as session:
+            row = await session.get(VMRow, vm_id)
+            assert row.status == VMStatus.PROVISIONING
+            assert row.xcpng_uuid == 'late-provider-guest'
+            assert await session.get(VMGuestResultRow, vm_id) is not None
+        # Restarted dispatch keeps the known UUID and retries a failed stop.
+        orch.xcpng.suspend_vm.side_effect = None
+        await orch._provision_vm_owned(vm_id)
+        assert orch.xcpng.suspend_vm.await_count == 2
+        orch.xcpng.create_vm.assert_awaited_once()
+        orch._wait_for_ipv6.assert_not_awaited()
+    finally:
+        await orch.shutdown()
+        await engine.dispose()

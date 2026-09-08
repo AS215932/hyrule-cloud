@@ -338,6 +338,8 @@ async def _extend_failed_after_payment(
     the refund was durably 'recorded' — we always CRITICAL-log the obligation so
     an operator/reconciler can pick it up, and tell the customer a refund is owed
     and has been logged, not that it succeeded."""
+    if getattr(request.state, "payment_mode", None) in {"admin-bypass", "dev-bypass"}:
+        return HTTPException(status, "extend failed; no payment was collected")
     await _record_extend_refund(request, gate, tunnel_id, amount, payer)
     log.critical("tunnel_extend_refund_owed", tunnel_id=tunnel_id, amount=str(amount), payer=payer)
     return HTTPException(status, "extend failed after payment; a refund is owed and has been logged for manual processing")
