@@ -54,6 +54,7 @@ from hyrule_cloud.middleware.auth import (
     require_admin_step_up,
 )
 from hyrule_cloud.models import VMStatus
+from hyrule_cloud.services.account_deletion import lock_account_lifecycle
 from hyrule_cloud.services.admin_authorization import (
     validate_admin_dispatch as _validate_admin_dispatch,
 )
@@ -1349,6 +1350,7 @@ async def vm_action(
 
 
 async def _assert_transfer_target(session: AsyncSession, account_id: str) -> AccountRow:
+    await lock_account_lifecycle(session, account_id)
     target = (
         await session.execute(
             select(AccountRow)

@@ -51,6 +51,7 @@ from hyrule_cloud.models import (
     VMStatus,
     generate_anon_management_token,
 )
+from hyrule_cloud.services.account_deletion import account_deletion_guard
 from hyrule_cloud.services.api_keys import (
     DEFAULT_BOOTSTRAP_SCOPES,
     ApiKeyScope,
@@ -922,6 +923,20 @@ async def _account_deletion_snapshot(db: AsyncSession, account_id: str) -> tuple
 
 @router.delete("/me", response_model=AccountDeleteResponse)
 async def delete_me(
+    request: Request,
+    response: Response,
+    account: AccountRow = Depends(require_browser_session),
+    app_state: AppState = Depends(get_app_state),
+    session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE_NAME)] = None,
+) -> AccountDeleteResponse:
+    factory = _get_session_factory(app_state)
+    if factory is None:
+        raise HTTPException(503, "Database not available")
+    async with account_deletion_guard(factory, account.account_id):
+        return await _delete_account_resources(request, response, account, app_state, session_cookie)
+
+
+async def _delete_account_resources(
     request: Request,
     response: Response,
     account: AccountRow = Depends(require_browser_session),

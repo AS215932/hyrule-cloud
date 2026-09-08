@@ -3234,3 +3234,29 @@ async def test_domain_waiver_actor_fenced_at_acceptance(domain_service, worker_r
                 PaymentEventRow.event_type == 'refund_owed')))
         jobs = list(await session.scalars(select(DomainJobRow).where(DomainJobRow.resource_id == order.order_id)))
         assert len(jobs) == int(not revoked)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disabled", [False, True])
+async def test_legacy_domain_claim_rechecks_owner_before_consuming_token(domain_service, disabled):
+    from hyrule_cloud.middleware.anon_token import hash_anon_token
+
+    service, _provider, sessions = domain_service
+    token = "legacy-domain-fixture-token"
+    async with sessions.begin() as session:
+        session.add(DomainRow(name="legacy-claim", extension="dev", fqdn="legacy-claim.dev",
+            owner_wallet="fixture", owner_account_id=None, status="active",
+            nameserver_mode="managed", dnssec_mode="managed", dnssec_status="active",
+            anon_management_token_hash=hash_anon_token(token)))
+        if disabled:
+            (await session.get(AccountRow, "H1234567890")).disabled_at = datetime.now(UTC)
+    if disabled:
+        with pytest.raises(DomainProblem) as denied:
+            await service.claim_legacy_domain("H1234567890", "legacy-claim.dev", token)
+        assert denied.value.code == "account_disabled"
+    else:
+        assert await service.claim_legacy_domain("H1234567890", "legacy-claim.dev", token)
+    async with sessions() as session:
+        domain = await session.scalar(select(DomainRow).where(DomainRow.fqdn == "legacy-claim.dev"))
+        assert domain.owner_account_id == (None if disabled else "H1234567890")
+        assert domain.anon_management_token_hash == (hash_anon_token(token) if disabled else None)

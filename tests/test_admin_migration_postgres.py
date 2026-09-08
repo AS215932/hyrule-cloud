@@ -34,13 +34,17 @@ def test_admin_postgres_migration_roundtrip():
     def run(sql):
         return asyncio.run(query(sql))
 
-    def migrate(direction, revision):
+    def migrate(direction, revision, *, expected_error=None):
         result = subprocess.run(
             [sys.executable, "-m", "alembic", direction, revision], cwd=ROOT,
             env=dict(os.environ, HYRULE_DATABASE_URL=url), capture_output=True,
             text=True, timeout=120,
         )
-        assert result.returncode == 0, result.stderr
+        if expected_error is not None:
+            assert result.returncode != 0
+            assert expected_error in result.stderr
+        else:
+            assert result.returncode == 0, result.stderr
 
     assert run("SELECT count(*) FROM information_schema.tables WHERE table_schema='public'") == [(0,)]
     migrate("upgrade", "020")
@@ -49,7 +53,7 @@ def test_admin_postgres_migration_roundtrip():
         VALUES ('vm_paid','fixture','HTEST000001','{22}',2.50),
                ('vm_dev','0xDEV_TEST_WALLET','HTEST000001','{22}',1.25)""")
     migrate("upgrade", "head")
-    assert run("SELECT version_num FROM alembic_version") == [('024',)]
+    assert run("SELECT version_num FROM alembic_version") == [('025',)]
     rows = run("SELECT vm_id,billing_mode,cost_total,retail_cost_total FROM vms ORDER BY vm_id")
     assert [(r[0], r[1], str(r[2]), str(r[3])) for r in rows] == [
         ('vm_dev', 'dev_bypass', '0.000000', '1.250000'),
@@ -59,10 +63,17 @@ def test_admin_postgres_migration_roundtrip():
     run("""INSERT INTO admin_audit(audit_id,actor_account_id,action)
         VALUES ('fixture-audit','HTEST000001','fixture.action')""")
     assert run("SELECT count(*) FROM admin_audit") == [(1,)]
+    run("UPDATE accounts SET disabled_at=now() WHERE account_id='HTEST000001'")
+    migrate("downgrade", "020", expected_error="while accounts remain disabled")
+    assert run("SELECT version_num FROM alembic_version") == [('025',)]
+    assert run("SELECT count(*) FROM accounts WHERE disabled_at IS NOT NULL") == [(1,)]
+    assert run("SELECT count(*) FROM admin_audit") == [(1,)]
+    # Explicitly resolve the fixture's restriction before the ordinary rollback.
+    run("UPDATE accounts SET disabled_at=NULL WHERE account_id='HTEST000001'")
     migrate("downgrade", "020")
     assert run("SELECT count(*) FROM vms") == [(2,)]
     assert run("SELECT count(*) FROM accounts") == [(1,)]
     assert run("SELECT count(*) FROM information_schema.columns WHERE table_name='vms' AND column_name='suspension_reason'") == [(0,)]
     migrate("upgrade", "head")
-    assert run("SELECT version_num FROM alembic_version") == [('024',)]
+    assert run("SELECT version_num FROM alembic_version") == [('025',)]
     assert run("SELECT count(*) FROM vms") == [(2,)]

@@ -1915,6 +1915,7 @@ class DomainService:
     ) -> DomainDetailResponse:
         _, _, fqdn = normalize_registrable_domain(value)
         async with self.db() as session:
+            await self._lock_customer_owner(session, owner_account_id)
             row = (
                 await session.execute(
                     select(DomainRow).where(DomainRow.fqdn == fqdn).with_for_update()
