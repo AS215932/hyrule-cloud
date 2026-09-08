@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -12,6 +13,122 @@ from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import Base, VMRow
 from hyrule_cloud.models import DNSResolutionStatus, VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
+
+
+@pytest.mark.asyncio
+async def test_waiter_cancellation_joins_inflight_database_poll(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'cancel.db'}")
+    orch = Orchestrator(HyruleConfig(), async_sessionmaker(engine, expire_on_commit=False))
+    entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def poll(*args):
+        entered.set()
+        try:
+            await release.wait()
+            return None
+        finally:
+            closed.set()
+
+    orch._poll_guest_result = poll
+    waiter = asyncio.create_task(orch._wait_for_guest_result('vm_cancel', 'a' * 32))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        waiter.cancel()
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        assert not closed.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(waiter, 2)
+        assert closed.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(waiter, return_exceptions=True)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', ['succeeded', 'failed', 'timeout'])
+async def test_worker_recovers_tracked_guest_after_api_stops(tmp_path, monkeypatch, outcome):
+    from hyrule_cloud.db import VMGuestResultRow
+    from hyrule_cloud.services.guest_result import (
+        GuestResult,
+        accept_guest_result,
+        prepare_guest_result,
+    )
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'restart.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    config = HyruleConfig()
+    config.xcpng.templates = {'debian-13': 'test-template'}
+    monkeypatch.setattr('hyrule_cloud.services.launch_proof.use_real_provisioning', lambda: True)
+
+    def fresh_orchestrator():
+        orch = Orchestrator(config, factory)
+        orch.xcpng.create_vm = AsyncMock(side_effect=AssertionError('must retain existing guest'))
+        orch.xcpng.destroy_vm = AsyncMock(side_effect=AssertionError('must retain guest data'))
+        orch.dns.create_aaaa = AsyncMock()
+        orch.dns.verify_aaaa = AsyncMock(return_value=True)
+        orch._wait_for_ipv6 = AsyncMock(return_value='2a0c:b641:b51:5::2')
+        orch._probe_ssh = AsyncMock(return_value=True)
+        orch._probe_customer_dns_resolution = AsyncMock(return_value=DNSResolutionStatus.PASSED)
+        orch._record_vm_refund = AsyncMock()
+        return orch
+
+    original, recovered = fresh_orchestrator(), fresh_orchestrator()
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            session.add(VMRow(vm_id='vm_restart', owner_wallet='test',
+                              hostname='test.deploy.hyrule.host', ipv6_prefix='2a0c:b641:b51:5::/64',
+                              ipv6_prefix_index=5, expires_at=datetime.now(UTC) + timedelta(days=1)))
+        async with factory.begin() as session:
+            generation, token = await prepare_guest_result(session, 'vm_restart', datetime.now(UTC) + timedelta(minutes=5))
+            vm = await session.get(VMRow, 'vm_restart')
+            vm.xcpng_uuid = 'retained-guest'
+        waiting = asyncio.Event()
+        real_wait = original._wait_for_guest_result
+
+        async def observed_wait(*args):
+            waiting.set()
+            return await real_wait(*args)
+
+        original._wait_for_guest_result = observed_wait
+        original.start_provisioning('vm_restart')
+        await asyncio.wait_for(waiting.wait(), 10)
+        # A second process-equivalent orchestrator cannot duplicate an active attempt.
+        await asyncio.wait_for(recovered._provision_vm('vm_restart'), 2)
+        recovered._wait_for_ipv6.assert_not_awaited()
+        await original.shutdown()
+        # Match API/worker lifespan shutdown: close the old process's pool too.
+        # A cancelled aiosqlite cursor must not survive into the restarted fixture.
+        await engine.dispose()
+        async with factory.begin() as session:
+            if outcome == 'timeout':
+                receipt = await session.get(VMGuestResultRow, 'vm_restart')
+                receipt.deadline = datetime.now(UTC) - timedelta(seconds=1)
+            else:
+                await accept_guest_result(session, 'vm_restart', generation, token, GuestResult(
+                    outcome=outcome, stage='cloud_init' if outcome == 'succeeded' else 'setup_script',
+                    exit_code=0 if outcome == 'succeeded' else 7,
+                ))
+        assert await recovered.recover_tracked_provisioning() == 1
+        await asyncio.wait_for(asyncio.gather(*list(recovered._tasks)), 10)
+        async with factory() as session:
+            vm = await session.get(VMRow, 'vm_restart')
+            receipt = await session.get(VMGuestResultRow, 'vm_restart')
+            assert vm.status == (VMStatus.READY if outcome == 'succeeded' else VMStatus.FAILED)
+            assert vm.xcpng_uuid == 'retained-guest'
+            assert receipt.generation == generation
+        recovered.xcpng.create_vm.assert_not_awaited()
+        recovered.xcpng.destroy_vm.assert_not_awaited()
+        assert recovered._record_vm_refund.await_count == (0 if outcome == 'succeeded' else 1)
+        assert await recovered.recover_tracked_provisioning() == 0
+    finally:
+        await original.shutdown()
+        await recovered.shutdown()
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

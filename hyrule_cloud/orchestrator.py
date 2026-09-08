@@ -148,6 +148,8 @@ class Orchestrator:
         self._tasks: set[asyncio.Task] = set()
         self._provisioning_vm_ids: set[str] = set()
         self._vm_capacity_reservation_lock = asyncio.Lock()
+        self._provisioning_slots = asyncio.Semaphore(4)
+        self._recovery_cursor = ""
 
     async def startup(self) -> None:
         # Fail fast on malformed customer-network settings: an operator typo
@@ -164,6 +166,10 @@ class Orchestrator:
         log.info("orchestrator_started")
 
     async def shutdown(self) -> None:
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         try:
             await self.xcpng.close()
         except Exception:
@@ -442,6 +448,9 @@ class Orchestrator:
         def completed(done: asyncio.Task) -> None:
             self._tasks.discard(done)
             self._provisioning_vm_ids.discard(vm_id)
+            if not done.cancelled() and done.exception() is not None:
+                log.error("provisioning_task_interrupted", vm_id=vm_id,
+                          error_type=type(done.exception()).__name__)
 
         task.add_done_callback(completed)
 
@@ -453,6 +462,25 @@ class Orchestrator:
         failure path can always find the paying record.
         """
         self._spawn_provisioning(vm_id)
+
+    async def recover_tracked_provisioning(self) -> int:
+        """Incrementally recover ordinary paid guests, including x402 orders.
+
+        The worker calls this periodically, so an API crash is recovered even
+        when the worker itself never restarts. Exclude legacy/untracked guests;
+        never synthesize a credential for an existing guest.
+        """
+        async with self.db() as session:
+            vm_ids = list((await session.scalars(
+                select(VMRow.vm_id).join(VMGuestResultRow)
+                .where(VMRow.status == VMStatus.PROVISIONING,
+                       VMRow.xcpng_uuid.is_not(None), VMRow.vm_id > self._recovery_cursor)
+                .order_by(VMRow.vm_id).limit(4)
+            )).all())
+        self._recovery_cursor = vm_ids[-1] if vm_ids else ""
+        for vm_id in vm_ids:
+            self._spawn_provisioning(vm_id)
+        return len(vm_ids)
 
     async def create_vm(
         self,
@@ -653,6 +681,17 @@ class Orchestrator:
         await record_vm_event(self.db, vm_id, event, message=message, detail=detail)
 
     async def _provision_vm(self, vm_id: str) -> None:
+        from hyrule_cloud.services.provisioning_attempt import provisioning_attempt
+
+        async with self._provisioning_slots:
+            async with self.db() as session:
+                engine = session.bind
+            assert engine is not None
+            async with provisioning_attempt(engine, vm_id) as acquired:
+                if acquired:
+                    await self._provision_vm_owned(vm_id)
+
+    async def _provision_vm_owned(self, vm_id: str) -> None:
         """Background provisioning: create VM, wait for IPv6, configure DNS.
 
         Issue #28: controlled simulation by default. Real XCP-NG / DNS only
@@ -1066,22 +1105,42 @@ class Orchestrator:
     async def _wait_for_guest_result(self, vm_id: str, generation: str) -> str:
         """Wait without holding a connection; tracked guests keep their identity."""
         while True:
-            async with self.db() as session:
-                row = await session.get(VMGuestResultRow, vm_id)
-                if row is None:
-                    raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
-                if row.generation != generation:
-                    raise GuestGenerationChangedError()
-                if row.received_at is not None:
-                    if row.outcome == "succeeded":
-                        return generation
-                    raise ProvisioningFailedError(
-                        FAILURE_GUEST_SETUP if row.stage == "setup_script" else FAILURE_GUEST_INIT
-                    )
-                remaining = (utc(row.deadline) - _now()).total_seconds()
-                if remaining <= 0:
-                    raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+            # Driver cancellation may leave an unfinished cursor. Finish this
+            # read/session cleanup before allowing shutdown to release ownership.
+            poll = asyncio.create_task(self._poll_guest_result(vm_id, generation))
+            try:
+                remaining = await asyncio.shield(poll)
+            except asyncio.CancelledError:
+                await asyncio.gather(poll, return_exceptions=True)
+                raise
+            if remaining is None:
+                return generation
             await asyncio.sleep(min(2, remaining))
+
+    async def _poll_guest_result(self, vm_id: str, generation: str) -> float | None:
+        async with self.db() as session:
+            row = await session.get(VMGuestResultRow, vm_id)
+            if row is not None and row.received_at is None and utc(row.deadline) <= _now():
+                # A report accepted before the deadline may still be committing.
+                # Lock and refresh the identity-map row before declaring expiry.
+                row = await session.scalar(
+                    select(VMGuestResultRow).where(VMGuestResultRow.vm_id == vm_id)
+                    .with_for_update().execution_options(populate_existing=True)
+                )
+            if row is None:
+                raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+            if row.generation != generation:
+                raise GuestGenerationChangedError()
+            if row.received_at is not None:
+                if row.outcome == "succeeded":
+                    return None
+                raise ProvisioningFailedError(
+                    FAILURE_GUEST_SETUP if row.stage == "setup_script" else FAILURE_GUEST_INIT
+                )
+            remaining = (utc(row.deadline) - _now()).total_seconds()
+            if remaining <= 0:
+                raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+            return remaining
 
     async def _record_vm_refund(
         self,

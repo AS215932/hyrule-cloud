@@ -24,7 +24,58 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.asyncio
-async def test_postgres_concurrent_receipts_and_downgrade_guard():
+@pytest.mark.parametrize('interruption', ['cancel', 'connection_loss'])
+async def test_postgres_provisioning_ownership_releases_after_cancellation(interruption):
+    from hyrule_cloud.services.provisioning_attempt import provisioning_attempt
+
+    url = os.environ.get('HCP_GUEST_RESULT_TEST_DATABASE_URL')
+    if not url:
+        pytest.skip('requires disposable guest_result_test PostgreSQL')
+    parsed = make_url(url)
+    assert parsed.drivername == 'postgresql+asyncpg' and parsed.database == 'guest_result_test'
+    assert parsed.host in (None, 'localhost', '127.0.0.1', '::1')
+    engines = [create_async_engine(url, pool_size=1, max_overflow=0) for _ in range(2)]
+    active = asyncio.Event()
+
+    async def hold():
+        async with provisioning_attempt(engines[0], 'vm_lock_test') as acquired:
+            assert acquired
+            active.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(hold())
+    try:
+        await asyncio.wait_for(active.wait(), 10)
+        async with provisioning_attempt(engines[1], 'vm_lock_test') as acquired:
+            assert not acquired
+        # Even a one-connection application pool stays available during the wait.
+        async with engines[0].connect() as connection:
+            assert await asyncio.wait_for(connection.scalar(text('SELECT 1')), 2) == 1
+        async with provisioning_attempt(engines[1], 'vm_other_guest') as acquired:
+            assert acquired
+        if interruption == 'cancel':
+            task.cancel()
+        else:
+            # This disposable database has exactly one active advisory owner.
+            async with engines[1].connect() as connection:
+                owners = list((await connection.scalars(text(
+                    "SELECT DISTINCT pid FROM pg_locks WHERE locktype='advisory' AND granted"
+                ))).all())
+                assert len(owners) == 1
+                assert await connection.scalar(text('SELECT pg_terminate_backend(:pid)'), {'pid': owners[0]})
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 12)
+        assert task.done()
+        async with provisioning_attempt(engines[1], 'vm_lock_test') as acquired:
+            assert acquired
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for engine in engines:
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_postgres_concurrent_receipts_and_downgrade_guard(monkeypatch):
     url = os.environ.get('HCP_GUEST_RESULT_TEST_DATABASE_URL')
     if not url:
         pytest.skip('requires fresh disposable guest_result_test PostgreSQL')
@@ -86,6 +137,39 @@ async def test_postgres_concurrent_receipts_and_downgrade_guard():
         async with observer_factory() as session:
             receipt = await session.get(VMGuestResultRow, 'vm_pg_guest')
             assert (receipt.outcome, receipt.stage, receipt.exit_code) == ('failed', 'setup_script', 7)
+
+        # An on-time report holding the lock must win over a concurrent deadline
+        # poll, even though its terminal receipt is not visible until commit.
+        from hyrule_cloud.config import HyruleConfig
+        from hyrule_cloud.orchestrator import Orchestrator
+
+        deadline = datetime.now(UTC) + timedelta(minutes=1)
+        async with first_factory.begin() as session:
+            session.add(VMRow(vm_id='vm_pg_deadline', owner_wallet='test'))
+        async with first_factory.begin() as session:
+            race_generation, race_token = await prepare_guest_result(session, 'vm_pg_deadline', deadline)
+        async with second_factory() as session:
+            waiter_pid = await session.scalar(text('SELECT pg_backend_pid()'))
+        orch = Orchestrator(HyruleConfig(), second_factory)
+        async with first_factory() as owner:
+            owner_pid = await owner.scalar(text('SELECT pg_backend_pid()'))
+            await accept_guest_result(owner, 'vm_pg_deadline', race_generation, race_token,
+                                      GuestResult(outcome='succeeded', stage='cloud_init', exit_code=0))
+            with monkeypatch.context() as clock:
+                clock.setattr('hyrule_cloud.orchestrator._now', lambda: deadline + timedelta(seconds=1))
+                contender = asyncio.create_task(orch._wait_for_guest_result('vm_pg_deadline', race_generation))
+                blocked = False
+                for _ in range(100):
+                    async with observer_factory() as observer:
+                        blockers = await observer.scalar(text('SELECT pg_blocking_pids(:pid)'), {'pid': waiter_pid})
+                    if owner_pid in blockers:
+                        blocked = True
+                        break
+                    await asyncio.sleep(0.01)
+                assert blocked, 'deadline poll must wait for the accepted report transaction'
+                assert not contender.done()
+                await owner.commit()
+                assert await asyncio.wait_for(contender, 5) == race_generation
         # Parent is still provisioning until the orchestrator consumes the report.
         rejected = migrate('downgrade', '020', check=False)
         assert rejected.returncode != 0
@@ -96,6 +180,8 @@ async def test_postgres_concurrent_receipts_and_downgrade_guard():
         async with first_factory.begin() as session:
             vm = await session.get(VMRow, 'vm_pg_guest')
             vm.status = VMStatus.FAILED
+            race_vm = await session.get(VMRow, 'vm_pg_deadline')
+            race_vm.status = VMStatus.READY
         migrate('downgrade', '020')
         migrate('upgrade', 'head')
         async with observer_factory() as session:

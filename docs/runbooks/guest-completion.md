@@ -19,9 +19,23 @@ restarts; a fresh clone gets a new identity after existing orphan cleanup.
 The database receipt is independent of mutable VM metadata and serialized by a
 row lock. Identical retries are accepted, conflicting terminal reports rejected.
 A completed receipt can be acknowledged again after its original deadline.
+At expiry, the waiter locks and refreshes the receipt so an on-time report
+transaction that is still committing cannot be mistaken for a missing report.
 The server enforces that deadline. Guest retries use a bounded monotonic window
 (the configured report timeout, renewed on observer restart), so an incorrect
 guest wall clock cannot prevent submission or extend server acceptance.
+
+The worker scans tracked provisioning rows with report identities every 15 seconds,
+four rows per page, continuing by VM ID so active earlier rows cannot starve later
+ones. This recovers ordinary x402 guests even if only the API restarts. Recovery
+rechecks network/DNS and consumes the existing receipt; it never recreates a tracked
+guest or rotates its credential. Normal and recovered attempts share a PostgreSQL
+transaction advisory lock per VM. Four attempts per process may run concurrently;
+ownership connections are separate from the API/receipt pool. Shutdown cancels and
+joins tasks before closing providers. A connection heartbeat cancels work on detected
+ownership loss; it cannot retract an external provider request already sent. SQLite
+only provides single-process development exclusion. Legacy guests without report
+identities remain subject to the deployment preflight below.
 
 Reports contain only a finite outcome, stage and numeric exit code. No guest
 logs or raw cloud-init error output are uploaded. HTTPS verification stays
