@@ -80,6 +80,18 @@ execution against a guest owner who controls root.
 
 ## Rollback
 
+A receipt-backed attempt with no recorded hypervisor UUID keeps its customer
+prefix quarantined even after failure, repeated customer deletion, or deferred
+DNS cleanup. Retained ambiguous guests may still use that prefix. Operator
+reconciliation must account for every candidate and establish cleanup before
+releasing the address; DNS success alone is insufficient. The receipt identity
+must be preserved until reconciliation, even when no candidate is visible yet.
+
+Observer-local command/read errors are retried within the monotonic report
+window without persisting a failed result. If observation never succeeds, the
+controller's missing-report deadline determines failure. Explicit terminal
+cloud-init or setup-script failure still produces a durable failed receipt.
+
 Keep a compatible receiver available while outstanding guests can report.
 Do not remove the receipt table while provisioning is active; its downgrade
 explicitly refuses that state. A downgrade must not reintroduce a worker that

@@ -111,7 +111,10 @@ def main() -> int:
                 setup_exit = int(setup_path.read_text()) if setup_path.exists() else None
                 payload = classify(returncode, output, config['setup_required'], setup_exit)
             except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired):
-                payload = {'outcome': 'failed', 'stage': 'cloud_init', 'exit_code': 1}
+                # Failure to observe is not evidence of guest failure. Retry
+                # within the same bounded window; the controller handles a
+                # missing report at its authoritative deadline.
+                payload = None
             if payload is None:
                 time.sleep(5)
                 continue

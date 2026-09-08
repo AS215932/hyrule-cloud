@@ -113,6 +113,53 @@ def test_network_failure_retries_are_bounded_by_monotonic_time(tmp_path, monkeyp
     assert not (tmp_path / 'delivered').exists()
 
 
+@pytest.mark.parametrize('recovers', [True, False])
+def test_observer_local_errors_retry_without_persisting_false_failure(tmp_path, monkeypatch, recovers):
+    monkeypatch.setattr(guest_observer, 'STATE', tmp_path)
+    (tmp_path / 'config.json').write_text(json.dumps({
+        'url': 'https://cloud.example.test/result', 'token': 'test-only',
+        'retry_seconds': 60, 'setup_required': False,
+    }))
+    clock = [0.0]
+    reads = []
+    sent = []
+
+    def read():
+        reads.append(clock[0])
+        assert not (tmp_path / 'result.json').exists()
+        if not recovers or len(reads) <= 4:
+            errors = [TimeoutError(), OSError(), subprocess.TimeoutExpired('cloud-init', 30), ValueError()]
+            raise errors[(len(reads) - 1) % len(errors)]
+        return 0, json.dumps({'status': 'done', 'extended_status': 'done'}).encode()
+
+    class Reply:
+        status = 204
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    class Sender:
+        def open(self, request, timeout):
+            sent.append(json.loads(request.data))
+            return Reply()
+
+    monkeypatch.setattr(guest_observer, 'read_cloud_status', read)
+    monkeypatch.setattr(guest_observer, 'build_opener', lambda *args: Sender())
+    monkeypatch.setattr(guest_observer.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(guest_observer.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    assert guest_observer.main() == 0
+    if recovers:
+        assert len(reads) == 5
+        assert sent == [{'outcome': 'succeeded', 'stage': 'cloud_init', 'exit_code': 0}]
+        assert (tmp_path / 'delivered').exists()
+    else:
+        assert len(reads) == 12 and clock[0] == 60
+        assert not sent
+        assert not (tmp_path / 'result.json').exists()
+        assert (tmp_path / 'config.json').exists()
+
+
 @pytest.mark.parametrize('length', [32, 70000])
 def test_status_command_output_is_bounded(monkeypatch, length):
     import sys

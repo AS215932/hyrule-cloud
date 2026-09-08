@@ -6,11 +6,12 @@ import pytest
 import yaml
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.api.routes import get_orch, router
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import Base, VMRow
+from hyrule_cloud.db import Base, VMEventRow, VMRow
 from hyrule_cloud.models import DNSResolutionStatus, VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
 
@@ -84,6 +85,11 @@ async def test_receipt_backed_pre_uuid_attempts_are_reconciled(tmp_path, monkeyp
                 assert vm.status == VMStatus.READY
                 assert vm.xcpng_uuid == ('existing' if crash_state == 'running' else 'new-guest')
                 orch._record_vm_refund.assert_not_awaited()
+                events = list(await session.scalars(
+                    select(VMEventRow.event).where(VMEventRow.vm_id == vm.vm_id).order_by(VMEventRow.event_id)
+                ))
+                assert events.count('vm_created') == 1
+                assert events.index('vm_created') < events.index('network_ready')
             else:
                 assert vm.status == VMStatus.FAILED
                 assert vm.xcpng_uuid is None
@@ -93,6 +99,19 @@ async def test_receipt_backed_pre_uuid_attempts_are_reconciled(tmp_path, monkeyp
                 assert receipt.generation == generation
                 orch.xcpng.create_vm.assert_not_awaited()
         orch.xcpng.destroy_vm.assert_not_awaited()
+        if crash_state not in ('running', 'no_clone'):
+            orch.dns.delete_aaaa = AsyncMock()
+            # Customer rollback, repeated deletion and deferred DNS cleanup
+            # must all preserve quarantine while retained guests lack a UUID.
+            for _ in range(2):
+                assert await orch.destroy_vm('vm_pre_uuid')
+                await orch.release_destroyed_prefix('vm_pre_uuid')
+                async with factory() as session:
+                    vm = await session.get(VMRow, 'vm_pre_uuid')
+                    assert vm.status == VMStatus.DESTROYED
+                    assert vm.ipv6_prefix_index == 5
+                    assert vm.ipv6_prefix == '2a0c:b641:b51:5::/64'
+            orch.xcpng.destroy_vm.assert_not_awaited()
     finally:
         await orch.shutdown()
         await engine.dispose()

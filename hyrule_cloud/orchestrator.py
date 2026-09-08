@@ -846,6 +846,17 @@ class Orchestrator:
                         xcpng_uuid = current.xcpng_uuid
                     if xcpng_uuid is None:
                         xcpng_uuid = await self._recover_pre_uuid_guest(vm_id)
+                        if xcpng_uuid is not None:
+                            await self._emit(
+                                vm_id,
+                                VMEventKey.VM_CREATED,
+                                message="Virtual machine created and powered on.",
+                                detail={
+                                    "vcpu": resources.vcpu,
+                                    "ram_mb": resources.ram_mb,
+                                    "disk_gb": resources.disk_gb,
+                                },
+                            )
                     if xcpng_uuid is None:
                         name_label = f"hyrule-{vm_id}"
                         # XO may contain a clone whose create call completed before the
@@ -1820,6 +1831,10 @@ class Orchestrator:
             domain = row.domain
             owner_account_id = row.owner_account_id
 
+            # A durable attempt with no recorded UUID may still own retained
+            # generation-labeled guests, even after FAILED or DESTROYED.
+            unresolved_guest = xcpng_uuid is None and await session.get(VMGuestResultRow, vm_id) is not None
+
         # Track whether every user of the deterministic ::2 address is
         # verifiably gone; the /64 is only released when they are. A
         # quarantined prefix costs one pool slot; releasing early could hand
@@ -1828,7 +1843,7 @@ class Orchestrator:
 
         if xcpng_uuid:
             await self.xcpng.destroy_vm(xcpng_uuid)
-        elif status == str(VMStatus.PROVISIONING):
+        elif status == str(VMStatus.PROVISIONING) or unresolved_guest:
             # Mid-provision race: the clone may exist without xcpng_uuid
             # having been recorded yet — the guest could still come up on
             # this prefix after we look.
@@ -1903,6 +1918,11 @@ class Orchestrator:
                 )
             ).scalar_one_or_none()
             if row is not None and str(row.status) == VMStatus.DESTROYED.value:
+                if row.xcpng_uuid is None and await session.get(VMGuestResultRow, vm_id) is not None:
+                    # DNS convergence cannot prove retained guests are gone.
+                    # Operator reconciliation must establish guest identity and
+                    # cleanup before this prefix can be made reusable.
+                    return
                 row.ipv6_prefix_index = None
                 row.ipv6_prefix = None
                 await session.commit()
