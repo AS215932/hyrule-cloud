@@ -421,7 +421,7 @@ class PaymentGate:
     def _admin_operation_class(request: Request) -> str:
         """Classify costly side effects separately from diagnostics."""
         path = request.url.path.rstrip("/")
-        if path.startswith("/v1/vm/") and path.endswith("/extend"):
+        if path.startswith(("/v1/vm/", "/v1/tunnel/")) and path.endswith("/extend"):
             return "real_cost"
         if path == "/v1/domains/orders":
             return "real_cost"

@@ -1152,6 +1152,10 @@ async def vm_action(
                 raise HTTPException(404, "VM not found")
             if current.owner_account_id != owner_account_id:
                 raise HTTPException(409, "VM ownership changed; retry the action")
+            if current.deletion_started_at is not None:
+                raise HTTPException(409, "Deletion-claimed VMs cannot accept power actions")
+            if current.status == VMStatus.DESTROYED:
+                raise HTTPException(409, "Destroyed VMs cannot accept power actions")
             if action in {"start", "reboot"}:
                 status = str(current.status)
                 if status in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
@@ -1187,10 +1191,12 @@ async def vm_action(
                 await orch.xcpng.reboot_vm(current.xcpng_uuid)
             elif action == "shutdown":
                 await orch.xcpng.shutdown_vm(current.xcpng_uuid)
-                current.status = VMStatus.SUSPENDED
+                if current.status not in {VMStatus.FAILED, VMStatus.PROVISIONING}:
+                    current.status = VMStatus.SUSPENDED
             else:
                 await orch.xcpng.suspend_vm(current.xcpng_uuid)
-                current.status = VMStatus.SUSPENDED
+                if current.status not in {VMStatus.FAILED, VMStatus.PROVISIONING}:
+                    current.status = VMStatus.SUSPENDED
             if (
                 action in {"shutdown", "suspend"}
                 and current.suspension_reason != "account_disabled"

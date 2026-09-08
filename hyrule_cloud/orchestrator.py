@@ -2141,6 +2141,8 @@ class Orchestrator:
         async with lifecycle_lock as (session, row):
             if row is None or (management_identity is not None and not management_identity.matches(row)):
                 return False
+            if management_identity is not None and not await self.vm_owner_enabled(session, row):
+                return False
             already_destroyed = row.status == VMStatus.DESTROYED
             if already_destroyed and row.ipv6_prefix_index is None and row.ipv6_prefix is None:
                 return True

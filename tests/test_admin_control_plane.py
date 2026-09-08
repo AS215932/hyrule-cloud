@@ -231,7 +231,7 @@ async def test_deferred_admin_waiver_audits_before_delivery_and_restores_failed_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/v1/vm/create", "/v1/tunnel/create"])
+@pytest.mark.parametrize("path", ["/v1/vm/create", "/v1/tunnel/create", "/v1/tunnel/tun_fixture/extend"])
 async def test_real_cost_waiver_requires_recent_password_step_up(admin_factory, path) -> None:
     credentials = await _admin_credentials(admin_factory)
     gate = _admin_gate(admin_factory)
@@ -245,11 +245,12 @@ async def test_real_cost_waiver_requires_recent_password_step_up(admin_factory, 
 
 
 @pytest.mark.asyncio
-async def test_elevated_admin_can_waive_real_cost_without_settlement(admin_factory) -> None:
+@pytest.mark.parametrize("path", ["/v1/vm/create", "/v1/tunnel/tun_fixture/extend"])
+async def test_elevated_admin_can_waive_real_cost_without_settlement(admin_factory, path) -> None:
     credentials = await _admin_credentials(admin_factory, elevated=True)
     gate = _admin_gate(admin_factory)
     server = gate.server
-    request = _browser_request(credentials, path="/v1/vm/create")
+    request = _browser_request(credentials, path=path)
 
     payer = await gate.check_payment(request, Decimal("1.00"), "VM")
 
@@ -2614,3 +2615,70 @@ async def test_revoked_admin_cannot_transfer_attached_resources(admin_factory, r
         assert vm.anon_management_token_hash == 'keep-vm-token'
         assert domain.anon_management_token_hash == 'keep-domain-token'
         assert list(await session.scalars(select(AdminAuditRow))) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action', ['start', 'reboot', 'shutdown', 'suspend'])
+async def test_admin_power_rejects_committed_deletion_claim(admin_factory, action):
+    from unittest.mock import AsyncMock
+
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory.begin() as session:
+        actor = await session.get(AccountRow, 'HAAAAAAAAAA')
+        session.add(VMRow(vm_id='vm_power_claim', owner_wallet='fixture', status='suspended',
+                          xcpng_uuid='claim-guest', expires_at=datetime.now(UTC) + timedelta(days=1),
+                          deletion_started_at=datetime.now(UTC)))
+    provider = SimpleNamespace(**{name: AsyncMock() for name in ('start_vm', 'reboot_vm', 'shutdown_vm', 'suspend_vm')})
+    state = AppState(config=HyruleConfig(), orchestrator=SimpleNamespace(xcpng=provider), payment_gate=None,
+                     network_provider=None, session_factory=admin_factory)
+    with pytest.raises(HTTPException) as refused:
+        await vm_action('vm_power_claim', action, ReasonRequest(reason='fixture claimed guest'),
+                        _browser_request(credentials, path='/fixture'), actor, state)
+    assert refused.value.status_code == 409
+    for method in vars(provider).values():
+        method.assert_not_awaited()
+    async with admin_factory() as session:
+        assert list(await session.scalars(select(AdminAuditRow))) == []
+        assert (await session.get(VMRow, 'vm_power_claim')).status == 'suspended'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action', ['shutdown', 'suspend'])
+async def test_power_off_keeps_failed_guest_terminal_across_account_enable(admin_factory, action):
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory.begin() as session:
+        actor = await session.get(AccountRow, 'HAAAAAAAAAA')
+        session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture'))
+        session.add(VMRow(vm_id='vm_terminal_off', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
+                          status='failed', suspension_reason='account_disabled', xcpng_uuid='failed-guest',
+                          expires_at=datetime.now(UTC) + timedelta(days=1)))
+        session.add(AdminOperationRow(operation_id='enable-failed', kind='resume_account_resources',
+                                      account_id='HBBBBBBBBBB', status='running'))
+    provider = _AdminXCPNG()
+    orch = SimpleNamespace(xcpng=provider)
+    state = AppState(config=HyruleConfig(), orchestrator=orch, payment_gate=None,
+                     network_provider=None, session_factory=admin_factory)
+    await vm_action('vm_terminal_off', action, ReasonRequest(reason='stop failed guest'),
+                    _browser_request(credentials, path='/fixture'), actor, state)
+    await _apply_account_operation(admin_factory, orch, 'enable-failed')
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, 'vm_terminal_off')
+        assert vm.status == 'failed' and vm.suspension_reason == 'account_disabled'
+    assert provider.started == []
+    assert (provider.shut_down if action == 'shutdown' else provider.suspended) == ['failed-guest']
+
+
+@pytest.mark.asyncio
+async def test_account_disable_stops_provider_backed_provisioning_guest(admin_factory):
+    async with admin_factory.begin() as session:
+        session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture', disabled_at=datetime.now(UTC)))
+        session.add(VMRow(vm_id='vm_initializing_disable', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
+                          status='provisioning', xcpng_uuid='initializing-guest'))
+        session.add(AdminOperationRow(operation_id='disable-initializing', kind='suspend_account_resources',
+                                      account_id='HBBBBBBBBBB', status='running'))
+    provider = _AdminXCPNG()
+    await _apply_account_operation(admin_factory, SimpleNamespace(xcpng=provider), 'disable-initializing')
+    assert provider.suspended == ['initializing-guest']
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, 'vm_initializing_disable')
+        assert vm.status == 'provisioning' and vm.suspension_reason == 'account_disabled'
