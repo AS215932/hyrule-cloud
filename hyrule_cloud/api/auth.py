@@ -22,7 +22,8 @@ import structlog
 from cachetools import TTLCache
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from hyrule_cloud.db import (
     AccountRow,
@@ -30,10 +31,12 @@ from hyrule_cloud.db import (
     DomainRow,
     RecoveryAttemptRow,
     RecoveryChallengeRow,
+    SessionRow,
+    VMRetentionRow,
     VMRow,
     generate_account_id,
 )
-from hyrule_cloud.middleware.anon_token import hash_anon_token
+from hyrule_cloud.middleware.anon_token import VMManagementIdentity, hash_anon_token
 from hyrule_cloud.middleware.auth import (
     _client_ip,
     _get_session_factory,
@@ -873,6 +876,50 @@ async def list_my_vms(
     )
 
 
+async def _account_deletion_snapshot(db: AsyncSession, account_id: str) -> tuple[AccountRow, list[VMRow]]:
+    # Match expiry/recovery lock order and retain the account fence until commit.
+    # FOR UPDATE also prevents new account-owned FK rows during final deletion.
+    acct = await db.scalar(select(AccountRow).where(AccountRow.account_id == account_id)
+                           .with_for_update().execution_options(populate_existing=True))
+    if acct is None:
+        raise HTTPException(409, "Account deletion state changed")
+    if acct.is_admin:
+        raise HTTPException(409, "Administrator accounts must be demoted before account deletion.")
+    retained_domain_order = await db.scalar(
+        select(DomainOrderRow.order_id)
+        .where(DomainOrderRow.owner_account_id == account_id)
+        .limit(1)
+    )
+    owned_domain = await db.scalar(
+        select(DomainRow.id)
+        .where(DomainRow.owner_account_id == account_id)
+        .limit(1)
+    )
+    if retained_domain_order is not None or owned_domain is not None:
+        # Registrar and payment history must remain attributable for audit
+        # and support. A migrated/claimed DomainRow may have no retained
+        # order and no bearer token, so allowing its SET NULL owner key to
+        # fire would make the domain unmanageable. Refuse explicitly before
+        # touching VMs or sessions.
+        raise HTTPException(
+            409,
+            "Accounts with domains or domain order history require assisted deletion.",
+        )
+    result = await db.execute(
+        select(VMRow).where(VMRow.owner_account_id == account_id,
+                            VMRow.status != VMStatus.DESTROYED)
+        .order_by(VMRow.vm_id).with_for_update().execution_options(populate_existing=True)
+    )
+    owned_vms = list(result.scalars().all())
+    active_retention = await db.scalar(select(VMRetentionRow.vm_id).where(or_(
+        VMRetentionRow.owner_account_id == account_id,
+        VMRetentionRow.vm_id.in_([vm.vm_id for vm in owned_vms]),
+    )).limit(1))
+    if active_retention is not None:
+        raise HTTPException(409, "Accounts with retained VMs require assisted deletion.")
+    return acct, owned_vms
+
+
 @router.delete("/me", response_model=AccountDeleteResponse)
 async def delete_me(
     request: Request,
@@ -901,33 +948,7 @@ async def delete_me(
     detached: list[dict] = []
 
     async with factory() as db:
-        retained_domain_order = await db.scalar(
-            select(DomainOrderRow.order_id)
-            .where(DomainOrderRow.owner_account_id == account.account_id)
-            .limit(1)
-        )
-        owned_domain = await db.scalar(
-            select(DomainRow.id)
-            .where(DomainRow.owner_account_id == account.account_id)
-            .limit(1)
-        )
-        if retained_domain_order is not None or owned_domain is not None:
-            # Registrar and payment history must remain attributable for audit
-            # and support. A migrated/claimed DomainRow may have no retained
-            # order and no bearer token, so allowing its SET NULL owner key to
-            # fire would make the domain unmanageable. Refuse explicitly before
-            # touching VMs or sessions.
-            raise HTTPException(
-                409,
-                "Accounts with domains or domain order history require assisted deletion.",
-            )
-        result = await db.execute(
-            select(VMRow).where(
-                VMRow.owner_account_id == account.account_id,
-                VMRow.status != VMStatus.DESTROYED,
-            )
-        )
-        owned_vms = list(result.scalars().all())
+        acct, owned_vms = await _account_deletion_snapshot(db, account.account_id)
 
         if vm_policy == "detach":
             for vm in owned_vms:
@@ -943,22 +964,29 @@ async def delete_me(
                         ),
                     }
                 )
-            await db.commit()
         else:  # destroy
+            # Provider deletion takes its own account/VM locks. Release this
+            # snapshot, then reacquire and recheck before removing identity.
+            vm_targets = [(vm.vm_id, VMManagementIdentity.capture(vm)) for vm in owned_vms]
+            await db.rollback()
             orch = getattr(app_state, "orchestrator", None)
-            for vm in owned_vms:
-                if orch is not None:
-                    try:
-                        await orch.destroy_vm(vm.vm_id)
-                    except Exception:
-                        log.warning("vm_destroy_during_account_delete_failed", vm_id=vm.vm_id)
+            if vm_targets and orch is None:
+                raise HTTPException(503, "VM service unavailable; account was not deleted")
+            for vm_id, management_identity in vm_targets:
+                try:
+                    await orch.destroy_vm(vm_id, management_identity=management_identity)
+                except Exception as exc:
+                    log.warning("vm_destroy_during_account_delete_failed", vm_id=vm_id)
+                    raise HTTPException(503, "VM deletion incomplete; account was not deleted") from exc
+            acct, remaining_vms = await _account_deletion_snapshot(db, account.account_id)
+            if remaining_vms:
+                raise HTTPException(409, "VM deletion incomplete; account was not deleted")
 
-        # Revoke all sessions, then delete the account row.
-        await revoke_all_sessions_for(db, account.account_id)
-        acct = await db.get(AccountRow, account.account_id)
-        if acct is not None:
-            await db.delete(acct)
-            await db.commit()
+        # Detach, session revocation and account deletion are one transaction.
+        # The generic session-revocation helper commits, so do not use it here.
+        await db.execute(delete(SessionRow).where(SessionRow.account_id == account.account_id))
+        await db.delete(acct)
+        await db.commit()
 
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
     response.delete_cookie(CSRF_COOKIE_NAME, path="/")

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
 from hyrule_cloud.api.admin import RetainedRestoreRequest, restore_retained_vm
+from hyrule_cloud.api.auth import _account_deletion_snapshot
 from hyrule_cloud.db import AccountRow, AdminAuditRow, VMRestoreRow, VMRetentionRow, VMRow
 from hyrule_cloud.models import VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
@@ -175,6 +176,57 @@ async def test_recovery_serializes_with_expiry_and_account_disable():
                 assert sorted(audit.action for audit in audits) == ['vm.restore_completed', 'vm.restore_requested']
             worker.xcpng.destroy_vm.assert_not_awaited()
             api.xcpng.restore_retained_vm.assert_awaited_once_with(manifest)
+        # Account deletion and initial retention use the same account-first fence.
+        for index, retention_first in enumerate((True, False)):
+            owner_id, vm_id = f'HDELETE000{index}', f'vm_delete_race_{index}'
+            guest = str(uuid4())
+            manifest = VMProtectionManifest(guest, (str(uuid4()),), (), False, '', ())
+            async with sessions.begin() as session:
+                session.add(AccountRow(account_id=owner_id, password_hash='fixture'))
+                session.add(VMRow(vm_id=vm_id, owner_account_id=owner_id, owner_wallet='fixture',
+                                  status=VMStatus.SUSPENDED, xcpng_uuid=guest,
+                                  expires_at=datetime.now(UTC) - timedelta(days=3)))
+            api, worker = orchestrator(engines[0]), orchestrator(engines[1])
+
+            async def deletion_snapshot():
+                async with api.db() as session:
+                    return await _account_deletion_snapshot(session, owner_id)
+
+            async def claim_retention():
+                async with worker.locked_vm(vm_id) as (session, vm):
+                    await prepare_retention(session, vm_id, manifest, datetime.now(UTC) + timedelta(days=30))
+                    vm.deletion_started_at = datetime.now(UTC)
+                    await session.commit()
+
+            if retention_first:
+                async with worker.locked_vm(vm_id) as (session, vm):
+                    await prepare_retention(session, vm_id, manifest, datetime.now(UTC) + timedelta(days=30))
+                    vm.deletion_started_at = datetime.now(UTC)
+                    task = asyncio.create_task(deletion_snapshot())
+                    tasks.append(task)
+                    await blocked('retention-api-fixture')
+                    await session.commit()
+                with pytest.raises(HTTPException) as refused:
+                    await asyncio.wait_for(task, 5)
+                assert refused.value.status_code == 409
+                async with sessions() as session:
+                    assert (await session.get(VMRow, vm_id)).owner_account_id == owner_id
+                    assert (await session.get(VMRetentionRow, vm_id)).owner_account_id == owner_id
+            else:
+                async with api.db() as session:
+                    account, vms = await _account_deletion_snapshot(session, owner_id)
+                    task = asyncio.create_task(claim_retention())
+                    tasks.append(task)
+                    await blocked('retention-worker-fixture')
+                    vms[0].owner_account_id = None
+                    await session.delete(account)
+                    await session.commit()
+                with pytest.raises(RuntimeError, match='ownership changed'):
+                    await asyncio.wait_for(task, 5)
+                async with sessions() as session:
+                    assert await session.get(AccountRow, owner_id) is None
+                    assert (await session.get(VMRow, vm_id)).owner_account_id is None
+                    assert await session.get(VMRetentionRow, vm_id) is None
     finally:
         for release in releases:
             release.set()
