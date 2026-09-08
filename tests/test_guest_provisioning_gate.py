@@ -458,7 +458,8 @@ async def test_simulation_does_not_create_or_erase_real_guest_receipts(tmp_path,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('stop_fails', [False, True])
-async def test_disable_during_clone_stops_before_initialization_and_retries(tmp_path, monkeypatch, stop_fails):
+@pytest.mark.parametrize('restriction', ['disabled', 'deleted'])
+async def test_disable_during_clone_stops_before_initialization_and_retries(tmp_path, monkeypatch, stop_fails, restriction):
     from hyrule_cloud.db import AccountRow, VMGuestResultRow
     from hyrule_cloud.services.guest_result import prepare_guest_result
 
@@ -473,6 +474,7 @@ async def test_disable_during_clone_stops_before_initialization_and_retries(tmp_
     orch._wait_for_ipv6 = AsyncMock(side_effect=AssertionError('disabled guest reached network wait'))
     orch._wait_for_guest_result = AsyncMock(side_effect=AssertionError('disabled guest reached guest wait'))
     orch._record_vm_refund = AsyncMock()
+    orch.xcpng.destroy_vm = AsyncMock(side_effect=RuntimeError('temporarily unavailable') if stop_fails else None)
     owner = 'HOWNER00001'
     vm_id = 'vm_late_disabled'
     try:
@@ -490,28 +492,40 @@ async def test_disable_during_clone_stops_before_initialization_and_retries(tmp_
         async def finish_clone_after_disable(**kwargs):
             # Model the durable result of account-disable finishing while XO
             # creates a UUID-less guest. Its old worker job will not run again.
-            async with factory.begin() as session:
-                account = await session.get(AccountRow, owner)
-                account.disabled_at = datetime.now(UTC)
-                row = await session.get(VMRow, vm_id)
-                row.suspension_reason = 'account_disabled'
+            if restriction == 'deleted':
+                assert await orch.destroy_vm(vm_id)
+            else:
+                async with factory.begin() as session:
+                    account = await session.get(AccountRow, owner)
+                    account.disabled_at = datetime.now(UTC)
+                    row = await session.get(VMRow, vm_id)
+                    row.suspension_reason = 'account_disabled'
             return 'late-provider-guest'
 
         orch.xcpng.create_vm = AsyncMock(side_effect=finish_clone_after_disable)
         await orch._provision_vm_owned(vm_id)
-        orch.xcpng.suspend_vm.assert_awaited_once_with('late-provider-guest')
+        action = orch.xcpng.destroy_vm if restriction == 'deleted' else orch.xcpng.suspend_vm
+        action.assert_awaited_once_with('late-provider-guest')
         orch._wait_for_ipv6.assert_not_awaited()
         orch._wait_for_guest_result.assert_not_awaited()
         orch._record_vm_refund.assert_not_awaited()
         async with factory() as session:
             row = await session.get(VMRow, vm_id)
-            assert row.status == VMStatus.PROVISIONING
+            assert row.status == (VMStatus.DESTROYED if restriction == 'deleted' else VMStatus.PROVISIONING)
             assert row.xcpng_uuid == 'late-provider-guest'
             assert await session.get(VMGuestResultRow, vm_id) is not None
         # Restarted dispatch keeps the known UUID and retries a failed stop.
-        orch.xcpng.suspend_vm.side_effect = None
-        await orch._provision_vm_owned(vm_id)
-        assert orch.xcpng.suspend_vm.await_count == 2
+        action.side_effect = None
+        if restriction == 'deleted':
+            await orch.check_expiries()
+            assert action.await_count == (2 if stop_fails else 1)
+            async with factory() as session:
+                row = await session.get(VMRow, vm_id)
+                assert row.metadata_['provider_deleted_uuid'] == 'late-provider-guest'
+                assert row.ipv6_prefix_index is None
+        else:
+            await orch._provision_vm_owned(vm_id)
+            assert action.await_count == 2
         orch.xcpng.create_vm.assert_awaited_once()
         orch._wait_for_ipv6.assert_not_awaited()
     finally:

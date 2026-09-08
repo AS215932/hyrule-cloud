@@ -27,3 +27,9 @@ In this integration migration 021 follows 020 and admin migration 023 follows 02
 Do not downgrade while an unfinished deletion claim exists. The migration explicitly refuses to remove that fence. Do not clear a claim or manually change expiry as a workaround: first establish whether provider deletion happened and complete or explicitly reconcile the operation. A binary rollback to an older worker also loses claim awareness and requires a coordinated maintenance decision.
 
 This change addresses the renewal/expiry race. Issue 110 still requires owner notices, recoverable disk retention, production rollout of operator recovery tooling, grace-policy review and customer-visible expiry/deletion state. It does not make automatic expiry deletion recoverable. External payment settlement and the database are not one atomic transaction; reconciliation of ambiguous settlement outcomes remains a separate delivery requirement.
+
+### Late provider identity after deletion
+
+A deletion claim can commit while the provider is creating a guest whose UUID is not yet stored. The original attempt preserves the prefix quarantine. Once the provisioner persists that UUID, it checks the claim before network or guest-result waits and attempts cleanup. Failed cleanup remains discoverable by the expiry worker even when the database row already says DESTROYED.
+
+The server-owned VM metadata field `provider_deleted_uuid` records only the exact provider identity whose deletion was confirmed. A later or different UUID is not covered by that evidence. Completion reacquires the owner/VM lifecycle lock before recording evidence or releasing the prefix, and deferred DNS cleanup refuses to release a prefix with an unverified guest. Existing historical destroyed rows without this evidence use the provider's idempotent delete/absence check on retry. This does not discover an unrecorded UUID or authorize removal of ambiguous generation-labelled clones.
