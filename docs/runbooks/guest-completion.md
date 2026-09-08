@@ -68,8 +68,11 @@ execution against a guest owner who controls root.
   new worker cannot truthfully infer its initialization success. Existing
   delivered VMs are not retrospectively re-probed or recreated by this change.
 - Verify the configured `HYRULE_PUBLIC_BASE_URL` is HTTPS and reachable from
-  customer guests, with a normally trusted certificate chain. Keep existing
-  customer network isolation. The timeout is
+  customer guests, with a normally trusted certificate chain.
+  Configuration loading rejects non-HTTPS, malformed, credential-bearing,
+  query-bearing and fragment-bearing callback bases before API/worker startup.
+  This syntax check does not establish DNS, TLS trust or guest reachability.
+  Keep existing customer network isolation. The timeout is
   `HYRULE_GUEST_REPORT_TIMEOUT_SECONDS` (default 900, range 60–3600).
 - Verify the selected Linux template has Python 3, systemd and cloud-init with
   JSON terminal status. The observer configuration explicitly rejects OpenBSD;
@@ -102,6 +105,11 @@ controller's missing-report deadline determines failure. Explicit terminal
 cloud-init or setup-script failure still produces a durable failed receipt.
 
 Keep a compatible receiver available while outstanding guests can report.
+The receipt migration also refuses downgrade for any receipt-backed VM without
+a recorded hypervisor UUID, including failed or destroyed rows. Those receipts
+may be the only durable evidence keeping an ambiguous guest's prefix quarantined.
+Complete operator reconciliation before a downgrade; do not erase receipts to
+get past the guard.
 Do not remove the receipt table while provisioning is active; its downgrade
 explicitly refuses that state. A downgrade must not reintroduce a worker that
 marks unresolved guests ready from SSH reachability. Resolve or drain those

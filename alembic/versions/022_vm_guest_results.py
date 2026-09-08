@@ -30,8 +30,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     active = op.get_bind().execute(sa.text(
         "SELECT 1 FROM vm_guest_results AS r JOIN vms AS v ON v.vm_id = r.vm_id "
-        "WHERE v.status = 'provisioning' LIMIT 1"
+        "WHERE v.status = 'provisioning' OR v.xcpng_uuid IS NULL LIMIT 1"
     )).scalar()
     if active is not None:
-        raise RuntimeError("Refusing to remove guest receipts while provisioning is active")
+        raise RuntimeError("Refusing to remove guest receipts while provisioning or guest reconciliation is unresolved")
     op.drop_table("vm_guest_results")

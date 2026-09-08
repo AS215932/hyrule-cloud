@@ -173,7 +173,7 @@ async def test_postgres_concurrent_receipts_and_downgrade_guard(monkeypatch):
         # Parent is still provisioning until the orchestrator consumes the report.
         rejected = migrate('downgrade', '020', check=False)
         assert rejected.returncode != 0
-        assert 'Refusing to remove guest receipts while provisioning is active' in rejected.stderr
+        assert 'Refusing to remove guest receipts while provisioning or guest reconciliation is unresolved' in rejected.stderr
         async with observer_factory() as session:
             assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '022'
             assert await session.get(VMGuestResultRow, 'vm_pg_guest') is not None
@@ -182,6 +182,20 @@ async def test_postgres_concurrent_receipts_and_downgrade_guard(monkeypatch):
             vm.status = VMStatus.FAILED
             race_vm = await session.get(VMRow, 'vm_pg_deadline')
             race_vm.status = VMStatus.READY
+            race_vm.xcpng_uuid = 'fixture-known-deadline-guest'
+        for status in (VMStatus.FAILED, VMStatus.DESTROYED):
+            async with first_factory.begin() as session:
+                vm = await session.get(VMRow, 'vm_pg_guest')
+                vm.status = status
+            rejected = migrate('downgrade', '020', check=False)
+            assert rejected.returncode != 0
+            async with observer_factory() as session:
+                assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '022'
+                assert await session.get(VMGuestResultRow, 'vm_pg_guest') is not None
+        async with first_factory.begin() as session:
+            vm = await session.get(VMRow, 'vm_pg_guest')
+            vm.status = VMStatus.FAILED
+            vm.xcpng_uuid = 'fixture-reconciled-guest'
         migrate('downgrade', '020')
         migrate('upgrade', 'head')
         async with observer_factory() as session:
