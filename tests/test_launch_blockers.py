@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 import pytest_asyncio
-from fastapi import Response
+from fastapi import HTTPException, Response
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -95,6 +95,12 @@ class _Openprovider:
 
 
 class _Orch:
+    from hyrule_cloud.orchestrator import Orchestrator
+
+    locked_vm = Orchestrator.locked_vm
+    vm_can_extend = staticmethod(Orchestrator.vm_can_extend)
+    vm_owner_enabled = staticmethod(Orchestrator.vm_owner_enabled)
+
     def __init__(self, factory):
         self.db = factory
         self.openprovider = _Openprovider()
@@ -260,12 +266,13 @@ async def test_expiry_suspend_and_destroy_paths_are_exercised(launch_state):
             self.suspended.append(uuid)
 
     class _Fake:
+        locked_vm = Orchestrator.locked_vm
         config = launch_state.config
         db = launch_state.orchestrator.db
         xcpng = _XCPNG()
         destroyed: list[str] = []
 
-        async def destroy_vm(self, vm_id):
+        async def destroy_vm(self, vm_id, *, expired_before=None):
             self.destroyed.append(vm_id)
             async with self.db() as session:
                 row = await session.get(VMRow, vm_id)
@@ -405,6 +412,48 @@ async def test_signed_vm_create_returns_503_when_capacity_provider_is_unavailabl
 
 
 @pytest.mark.asyncio
+async def test_vm_create_releases_reservation_when_payment_check_raises(
+    launch_state,
+    monkeypatch,
+):
+    gate = _real_gate()
+    launch_state.payment_gate = gate
+    launch_state.config.xcpng = type(
+        "XCPNG",
+        (),
+        {"templates": {"debian-13": "template-debian-13"}},
+    )()
+    released: list[str] = []
+
+    async def reserve(*_args, **_kwargs):
+        return type("Reservation", (), {"vm_id": "vm_reserved"})(), "hyr_vm_token"
+
+    async def release(vm_id: str) -> None:
+        released.append(vm_id)
+
+    async def quota_rejected(*_args, **_kwargs):
+        raise HTTPException(429, "Admin real_cost waiver limit reached")
+
+    launch_state.orchestrator.reserve_vm_with_capacity = reserve
+    launch_state.orchestrator.release_vm_reservation = release
+    monkeypatch.setattr(gate, "check_payment", quota_rejected)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning",
+        lambda: True,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/vm/create",
+            json=_VM_ORDER,
+            headers={"X-PAYMENT": "signed-payment"},
+        )
+
+    assert response.status_code == 429
+    assert released == ["vm_reserved"]
+
+
+@pytest.mark.asyncio
 async def test_vm_quote_refused_while_simulated(launch_state):
     launch_state.payment_gate = _real_gate()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -514,6 +563,52 @@ async def test_extend_refused_while_simulated(launch_state):
         )
     assert res.status_code == 503
     assert "not yet generally available" in res.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_extend_refuses_admin_suspension_before_payment(launch_state, monkeypatch):
+    from hyrule_cloud.middleware.anon_token import hash_anon_token
+    from hyrule_cloud.models import generate_anon_management_token
+
+    gate = _real_gate()
+    launch_state.payment_gate = gate
+    token = generate_anon_management_token()
+    async with launch_state.orchestrator.db() as session:
+        session.add(
+            VMRow(
+                vm_id="vm_admin_suspended",
+                owner_wallet="0xwallet",
+                status=VMStatus.SUSPENDED,
+                suspension_reason="account_disabled",
+                size=VMSize.XS,
+                os="debian-13",
+                ssh_pubkey="ssh-ed25519 AAAA test",
+                open_ports=[22],
+                expires_at=_now() + timedelta(days=1),
+                cost_total=Decimal("0.05"),
+                anon_management_token_hash=hash_anon_token(token),
+            )
+        )
+        await session.commit()
+
+    async def payment_must_not_run(*_args, **_kwargs):
+        raise AssertionError("payment check ran for an Admin-suspended VM")
+
+    monkeypatch.setattr(gate, "check_payment", payment_must_not_run)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning",
+        lambda: True,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/vm/vm_admin_suspended/extend",
+            json={"days": 3},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "This VM can no longer be extended"
 
 
 def test_intent_awaiting_payment_truth_table():

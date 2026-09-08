@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hyrule_cloud.db import VMRetentionRow, VMRow
-from hyrule_cloud.providers.xcpng import VMRetentionManifest
+from hyrule_cloud.providers.xcpng import RetainedDisk, VMRetentionManifest
 
 
 async def prepare_retention(
@@ -41,3 +41,13 @@ async def prepare_retention(
     session.add(record)
     await session.flush()
     return record
+
+
+def stored_manifest(record: VMRetentionRow) -> VMRetentionManifest:
+    payload = record.manifest
+    if payload.get("version") != 1 or payload.get("vm_uuid") != record.source_vm_uuid:
+        raise ValueError("Unsupported or mismatched retention manifest")
+    disks = tuple(RetainedDisk(**disk) for disk in payload["disks"])
+    if not disks:
+        raise ValueError("Empty retention manifest")
+    return VMRetentionManifest(record.source_vm_uuid, disks)
