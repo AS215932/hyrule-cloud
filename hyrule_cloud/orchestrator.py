@@ -2160,9 +2160,11 @@ class Orchestrator:
     async def reboot_vm(
         self, vm_id: str, *, management_identity: VMManagementIdentity | None = None,
     ) -> bool:
-        async with self.locked_vm(vm_id) as (_session, row):
+        async with self.locked_vm(vm_id) as (session, row):
             if (row is None or not row.xcpng_uuid or row.deletion_started_at is not None
                     or (management_identity is not None and not management_identity.matches(row))):
+                return False
+            if management_identity is not None and not await self.vm_owner_enabled(session, row):
                 return False
             # Ownership transfer cannot pass the row lock during the operation.
             await self.xcpng.reboot_vm(row.xcpng_uuid)

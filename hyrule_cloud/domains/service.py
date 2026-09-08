@@ -1554,6 +1554,17 @@ class DomainService:
             dnssec_status=domain.dnssec_status,
         )
 
+    @staticmethod
+    async def _lock_customer_owner(session: AsyncSession, owner_account_id: str) -> None:
+        # Match account-disable ordering: account before domain. Keep the
+        # non-key lock through acceptance so disable cannot overtake this write.
+        owner = await session.scalar(
+            select(AccountRow).where(AccountRow.account_id == owner_account_id)
+            .with_for_update(key_share=True).execution_options(populate_existing=True)
+        )
+        if owner is None or owner.disabled_at is not None:
+            raise DomainProblem(403, "account_disabled", "Account access is disabled.")
+
     async def apply_changeset(
         self,
         owner_account_id: str,
@@ -1581,6 +1592,8 @@ class DomainService:
         async with self.db() as session:
             if dispatch_guard is not None:
                 await dispatch_guard(session)
+            else:
+                await self._lock_customer_owner(session, owner_account_id)
             existing_idempotency = (
                 await session.execute(
                     select(DomainIdempotencyRow).where(
@@ -3493,6 +3506,8 @@ class DomainService:
         async with self.db() as session:
             if dispatch_guard is not None:
                 await dispatch_guard(session)
+            else:
+                await self._lock_customer_owner(session, owner_account_id)
             existing_job = (
                 await session.execute(select(DomainJobRow).where(DomainJobRow.dedupe_key == dedupe))
             ).scalar_one_or_none()

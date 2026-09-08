@@ -3154,3 +3154,42 @@ async def test_wallet_login_rejects_disabled_account_without_consuming_challenge
         stored_challenge = await session.get(WalletChallengeRow, retry.nonce)
         assert stored_challenge is not None and stored_challenge.used_at is None
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["changeset", "nameservers", "dnssec"])
+async def test_customer_domain_mutation_rechecks_disabled_owner(domain_service, action):
+    service, _provider, sessions = domain_service
+    async with sessions.begin() as session:
+        session.add(DomainRow(name="disabled", extension="dev", fqdn="disabled.dev",
+                              owner_wallet="0x" + "1" * 40, owner_account_id="H1234567890",
+                              status="active", nameserver_mode="managed",
+                              nameservers=["ns1.servify.network", "ns2.servify.network"],
+                              dnssec_mode="managed", dnssec_status="active"))
+    # Model an already-authorized request whose account is disabled before its
+    # mutation transaction starts. Domain ownership remains unchanged.
+    await service._owned_domain("H1234567890", "disabled.dev")
+    async with sessions.begin() as session:
+        owner = await session.get(AccountRow, "H1234567890")
+        owner.disabled_at = datetime.now(UTC)
+    with pytest.raises(DomainProblem) as denied:
+        if action == "changeset":
+            await service.apply_changeset("H1234567890", "disabled.dev", 1,
+                DNSChangesetRequest(changes=[DNSChange(action=DNSChangeAction.UPSERT,
+                    rrset=DNSRRSet(name="www", type=ManagedRecordType.A,
+                                  ttl=300, values=["192.0.2.1"]))]),
+                idempotency_key="disabled-mutation")
+        elif action == "nameservers":
+            await service.enqueue_nameserver_update("H1234567890", "disabled.dev",
+                NameserverUpdateRequest(mode=NameserverMode.MANAGED), "disabled-mutation")
+        else:
+            await service.enqueue_dnssec_update("H1234567890", "disabled.dev",
+                DNSSECUpdateRequest(mode=DNSSECMode.MANAGED), "disabled-mutation")
+    assert denied.value.status == 403
+    assert denied.value.code == "account_disabled"
+    async with sessions() as session:
+        domain = await session.scalar(select(DomainRow).where(DomainRow.fqdn == "disabled.dev"))
+        assert domain.zone_revision == 1
+        assert list(await session.scalars(select(DomainDNSRecordRow))) == []
+        assert list(await session.scalars(select(DomainOperationRow))) == []
+        assert list(await session.scalars(select(DomainJobRow))) == []
