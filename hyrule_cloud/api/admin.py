@@ -803,6 +803,7 @@ async def _enabled_admin_count(session: AsyncSession, *, lock: bool = False) -> 
                 select(AccountRow.account_id)
                 .where(*predicate)
                 .order_by(AccountRow.account_id)
+                # key_share=True without read=True is FOR NO KEY UPDATE.
                 .with_for_update(key_share=True)
             )
         )
@@ -1771,7 +1772,12 @@ async def retry_admin_operation(
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
         await _validate_admin_dispatch(session, actor.account_id)
-        operation = await session.get(AdminOperationRow, operation_id)
+        operation = await session.scalar(
+            select(AdminOperationRow)
+            .where(AdminOperationRow.operation_id == operation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if operation is None:
             raise HTTPException(404, "Operation not found")
         if operation.status != "failed":

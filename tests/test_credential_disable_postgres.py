@@ -18,11 +18,13 @@ from hyrule_cloud.api.admin import ReasonRequest, disable_account
 from hyrule_cloud.api.auth import (
     ApiKeyCreateRequest,
     AuthLoginRequest,
+    RecoveryCodeRequest,
     create_api_key_endpoint,
     login,
+    recover_with_code,
 )
 from hyrule_cloud.db import AccountRow, ApiKeyRow, SessionRow
-from hyrule_cloud.services.passwords import hash_password
+from hyrule_cloud.services.passwords import hash_password, hash_recovery_code
 
 
 @pytest.mark.asyncio
@@ -76,10 +78,17 @@ async def test_credential_issuance_serializes_with_account_disable():
             session.add(actor)
 
         for index, (kind, issuance_first) in enumerate(
-            (kind, first) for kind in ("login", "api_key") for first in (True, False)
+            (kind, first)
+            for kind in ("login", "api_key", "recovery_code")
+            for first in (True, False)
         ):
             account_id = f"HCRED00000{index}"
-            account = AccountRow(account_id=account_id, password_hash=hash_password(password))
+            recovery_code = f"hyr-rec-fixture-{index}-credential-proof"
+            account = AccountRow(
+                account_id=account_id,
+                password_hash=hash_password(password),
+                recovery_code_hash=hash_recovery_code(recovery_code),
+            )
             async with observer.begin() as session:
                 session.add(account)
             entered = asyncio.Event()
@@ -120,6 +129,16 @@ async def test_credential_issuance_serializes_with_account_disable():
                         AuthLoginRequest(account_id=account_id, password=password),
                         request,
                         Response(),
+                        issuer_state,
+                    )
+                if kind == "recovery_code":
+                    return await recover_with_code(
+                        RecoveryCodeRequest(
+                            account_id=account_id,
+                            recovery_code=recovery_code,
+                            new_password="replacement credential password",
+                        ),
+                        request,
                         issuer_state,
                     )
                 return await create_api_key_endpoint(

@@ -1314,23 +1314,20 @@ class Orchestrator:
             customer_message = customer_failure_message(e)
             internal_reason = internal_failure_detail(e)
             owner_wallet, amount, payment_tx, settled = "", None, None, None
-            setup_failure = (
-                isinstance(e, ProvisioningFailedError)
-                and e.customer_message == FAILURE_GUEST_SETUP
-            )
             async with self.locked_vm(vm_id) as (session, row):
                 if row is not None:
                     if row.status != VMStatus.PROVISIONING:
                         return
-                    if setup_failure and row.xcpng_uuid:
-                        # Refund only after the customer-controlled failed
-                        # setup guest is actually stopped. A failed stop leaves
+                    if row.xcpng_uuid:
+                        # Refund only after the provider guest is actually
+                        # stopped. Receipt timeouts and explicit setup failures
+                        # are both customer-controllable; a failed stop leaves
                         # the durable receipt in PROVISIONING for a later retry.
                         try:
                             await self.xcpng.suspend_vm(row.xcpng_uuid)
                         except Exception:
                             log.warning(
-                                "failed_setup_guest_stop_failed",
+                                "failed_provision_guest_stop_failed",
                                 vm_id=vm_id,
                                 exc_info=True,
                             )

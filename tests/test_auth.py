@@ -293,6 +293,35 @@ async def test_recovery_code_cannot_be_reused(auth_state, client):
     assert again.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_recovery_code_cannot_replace_disabled_account_credentials(auth_state, client):
+    reg = await client.post(
+        "/v1/auth/register", json={"password": "disabled old password long enough"}
+    )
+    account_id = reg.json()["account_id"]
+    recovery_code = reg.json()["recovery_code"]
+    async with auth_state.orchestrator.db.begin() as session:
+        account = await session.get(AccountRow, account_id)
+        account.disabled_at = _now()
+        original_password_hash = account.password_hash
+        original_recovery_hash = account.recovery_code_hash
+
+    recover = await client.post(
+        "/v1/auth/recover/code",
+        json={
+            "account_id": account_id,
+            "recovery_code": recovery_code,
+            "new_password": "disabled replacement password long enough",
+        },
+    )
+    assert recover.status_code == 403
+    async with auth_state.orchestrator.db() as session:
+        account = await session.get(AccountRow, account_id)
+        assert account.password_hash == original_password_hash
+        assert account.recovery_code_hash == original_recovery_hash
+        assert account.recovery_code_used_at is None
+
+
 # --- Test: change password from inside session ---
 
 

@@ -331,7 +331,7 @@ async def test_worker_recovers_tracked_guest_after_api_stops(tmp_path, monkeypat
             assert vm.status == (VMStatus.READY if outcome == 'succeeded' else VMStatus.FAILED)
             assert vm.xcpng_uuid == 'retained-guest'
             assert receipt.generation == generation
-        if outcome == 'failed':
+        if outcome in {'failed', 'timeout'}:
             recovered.xcpng.suspend_vm.assert_awaited_once_with('retained-guest')
         else:
             recovered.xcpng.suspend_vm.assert_not_awaited()
@@ -428,6 +428,72 @@ async def test_guest_completion_controls_public_status_and_launch_proof(
                 vm = await session.get(VMRow, 'vm_guest')
                 assert vm.xcpng_uuid == 'test-guest-uuid'
                 assert vm.status == (VMStatus.FAILED if exit_code else VMStatus.READY)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_fails", [False, True])
+async def test_guest_report_timeout_stops_guest_before_refund(
+    tmp_path, monkeypatch, stop_fails,
+):
+    from hyrule_cloud.services.vm_events import FAILURE_GUEST_REPORT, ProvisioningFailedError
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'timeout-stop.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    config = HyruleConfig()
+    config.xcpng.templates = {"debian-13": "test-template"}
+    orch = Orchestrator(config, factory)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    orch.xcpng.find_vm_ids_by_name_label = AsyncMock(return_value=[])
+    orch.xcpng.create_vm = AsyncMock(return_value="timed-out-guest")
+    orch.xcpng.suspend_vm = AsyncMock(
+        side_effect=RuntimeError("provider stop unavailable") if stop_fails else None
+    )
+    orch.dns.create_aaaa = AsyncMock()
+    orch.dns.verify_aaaa = AsyncMock(return_value=True)
+    orch._wait_for_ipv6 = AsyncMock(return_value="2a0c:b641:b51:5::2")
+    orch._probe_ssh = AsyncMock(return_value=True)
+    orch._probe_customer_dns_resolution = AsyncMock(
+        return_value=DNSResolutionStatus.PASSED
+    )
+    orch._wait_for_guest_result = AsyncMock(
+        side_effect=ProvisioningFailedError(FAILURE_GUEST_REPORT)
+    )
+
+    async def record_refund(*args, **kwargs):
+        del args, kwargs
+        orch.xcpng.suspend_vm.assert_awaited_once_with("timed-out-guest")
+
+    orch._record_vm_refund = AsyncMock(side_effect=record_refund)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            session.add(
+                VMRow(
+                    vm_id="vm_guest_timeout",
+                    owner_wallet="test",
+                    hostname="timeout.deploy.hyrule.host",
+                    ipv6_prefix="2a0c:b641:b51:5::/64",
+                    ipv6_prefix_index=5,
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                )
+            )
+
+        await orch._provision_vm("vm_guest_timeout")
+        orch.xcpng.suspend_vm.assert_awaited_once_with("timed-out-guest")
+        async with factory() as session:
+            vm = await session.get(VMRow, "vm_guest_timeout")
+            assert vm.status == (
+                VMStatus.PROVISIONING if stop_fails else VMStatus.FAILED
+            )
+        if stop_fails:
+            orch._record_vm_refund.assert_not_awaited()
+        else:
+            orch._record_vm_refund.assert_awaited_once()
     finally:
         await engine.dispose()
 

@@ -7,8 +7,10 @@ from hyrule_cloud.db import AccountRow
 
 
 async def validate_admin_dispatch(session: AsyncSession, actor_id: str) -> AccountRow:
-    # Match role/disable ordering before any owner or resource locks. Non-key
-    # locks allow independent payment-quota FK checks while fencing demotion.
+    # Match role/disable ordering before any owner or resource locks.
+    # SQLAlchemy's key_share=True without read=True compiles to PostgreSQL
+    # FOR NO KEY UPDATE (not FOR KEY SHARE). It conflicts with role/disable
+    # updates while permitting independent payment-quota FK key-share checks.
     await session.scalars(select(AccountRow.account_id).where(
         AccountRow.is_admin.is_(True), AccountRow.disabled_at.is_(None))
         .order_by(AccountRow.account_id).with_for_update(key_share=True))

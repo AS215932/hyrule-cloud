@@ -488,28 +488,81 @@ async def recover_with_code(
             and verify_recovery_code(acct.recovery_code_hash, body.recovery_code)
         )
 
-        db.add(
-            RecoveryAttemptRow(
-                account_id=acct.account_id if acct else None,
-                method="code",
-                success=valid,
-                ip_prefix_hash=ip_hash,
-            )
-        )
-        await db.commit()
-
         if not valid or acct is None:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=acct.account_id if acct else None,
+                    method="code",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
             raise HTTPException(401, "Invalid recovery code")
 
-        # Rotate password + recovery code; revoke all sessions.
+        # Account disable revokes credentials under the account-row lock. Take
+        # the conflicting lock and revalidate the proof so recovery cannot
+        # replace credentials after disable wins.
+        acct = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == body.account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if acct is None:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=None,
+                    method="code",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise HTTPException(401, "Invalid recovery code")
+        if acct.disabled_at is not None:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=acct.account_id,
+                    method="code",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise HTTPException(403, "Account access is disabled")
+        if (
+            acct.recovery_code_hash is None
+            or acct.recovery_code_used_at is not None
+            or not verify_recovery_code(acct.recovery_code_hash, body.recovery_code)
+        ):
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=acct.account_id,
+                    method="code",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise HTTPException(401, "Invalid recovery code")
+
+        # Rotate password + recovery code and revoke sessions in the same
+        # transaction that still owns the account fence.
         acct.password_hash = hash_password(body.new_password)
         new_code = generate_recovery_code()
         acct.recovery_code_hash = hash_recovery_code(new_code)
         acct.recovery_code_issued_at = _now()
-        acct.recovery_code_used_at = _now()  # mark old code as consumed
+        acct.recovery_code_used_at = None
         acct.password_changed_at = _now()
-        await db.commit()
-
+        db.add(
+            RecoveryAttemptRow(
+                account_id=acct.account_id,
+                method="code",
+                success=True,
+                ip_prefix_hash=ip_hash,
+            )
+        )
         revoked = await revoke_all_sessions_for(db, acct.account_id)
 
     log.info("recovery_code_used", account_id=acct.account_id, sessions_revoked=revoked)
@@ -614,7 +667,11 @@ async def recover_wallet_verify(
     invalid = HTTPException(401, "Invalid or expired recovery challenge")
 
     async with factory() as db:
-        chal = await db.get(RecoveryChallengeRow, body.nonce)
+        chal = await db.scalar(
+            select(RecoveryChallengeRow)
+            .where(RecoveryChallengeRow.nonce == body.nonce)
+            .with_for_update()
+        )
 
         # Use the same "always log an attempt" pattern as code recovery so
         # the audit trail captures both real and probe traffic.
@@ -689,12 +746,14 @@ async def recover_wallet_verify(
             await db.commit()
             raise invalid
 
-        # Burn the challenge BEFORE doing anything else so a racing duplicate
-        # request can't double-spend the same signature.
-        chal.used_at = now
-        await db.commit()
-
-        acct = await db.get(AccountRow, chal.account_id)
+        # Account disable revokes credentials under the account-row lock. Lock
+        # and revalidate before burning the proof or changing the password.
+        acct = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == chal.account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if acct is None:
             # The wallet+account pair matched a VM row but the account row
             # itself is gone — treat as opaque failure.
@@ -708,16 +767,26 @@ async def recover_wallet_verify(
             )
             await db.commit()
             raise invalid
+        if acct.disabled_at is not None:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=acct.account_id,
+                    method="wallet",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise HTTPException(403, "Account access is disabled")
 
+        # Burn the challenge, change the password, revoke sessions and record
+        # success atomically while the account and challenge locks are held.
+        chal.used_at = now
         acct.password_hash = hash_password(body.new_password)
         acct.password_changed_at = now
         # Don't auto-rotate recovery_code on this path — the user can do that
         # explicitly from the dashboard. The code endpoint rotates because the
         # code is consumed in that flow; signatures aren't consumed analogously.
-        await db.commit()
-
-        revoked = await revoke_all_sessions_for(db, acct.account_id)
-
         db.add(
             RecoveryAttemptRow(
                 account_id=acct.account_id,
@@ -726,7 +795,7 @@ async def recover_wallet_verify(
                 ip_prefix_hash=ip_hash,
             )
         )
-        await db.commit()
+        revoked = await revoke_all_sessions_for(db, acct.account_id)
 
     log.info(
         "recovery_wallet_used",
