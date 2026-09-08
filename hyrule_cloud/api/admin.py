@@ -1153,6 +1153,12 @@ async def retained_vm_status(
             "retention": {
                 "state": retained.state,
                 "retain_until": _aware(retained.retain_until).isoformat(),
+                "verification": {
+                    "last_success_at": _aware(retained.last_verified_at).isoformat() if retained.last_verified_at else None,
+                    "last_attempt_at": _aware(retained.verification_attempted_at).isoformat() if retained.verification_attempted_at else None,
+                    "error": retained.verification_error,
+                    "next_due_at": _aware(retained.next_verification_at).isoformat() if retained.next_verification_at else None,
+                },
                 "retained_at": _aware(retained.retained_at).isoformat() if retained.retained_at else None,
             } if retained is not None else None,
             "active_recovery": _restore_status(active_recovery) if active_recovery is not None else None,

@@ -2220,6 +2220,11 @@ class Orchestrator:
                     await self.xcpng.protect_retained_vm(manifest)
                     retained.state = "retained"
                     retained.retained_at = retained.retained_at or _now()
+                    retained.last_verified_at = _now()
+                    retained.verification_attempted_at = retained.last_verified_at
+                    retained.verification_error = None
+                    retained.next_verification_at = retained.last_verified_at + timedelta(
+                        seconds=getattr(self.config, "vm_retention_verify_interval_seconds", 21600))
                     retained_vm.status = VMStatus.SUSPENDED
                     if retained_vm.suspension_reason not in {"manual_admin", "account_disabled"}:
                         retained_vm.suspension_reason = "expired"
@@ -2312,6 +2317,48 @@ class Orchestrator:
                 row.ipv6_prefix_index = None
                 row.ipv6_prefix = None
                 await session.commit()
+
+    async def verify_retained_vms(self) -> int:
+        """Check a bounded due batch without mutating guests or delaying expiry."""
+        now = _now()
+        async with self.db() as session:
+            due = list(await session.scalars(
+                select(VMRetentionRow.vm_id).where(
+                    VMRetentionRow.state == "retained",
+                    or_(VMRetentionRow.next_verification_at.is_(None), VMRetentionRow.next_verification_at <= now),
+                ).order_by(func.coalesce(VMRetentionRow.next_verification_at, VMRetentionRow.created_at),
+                           VMRetentionRow.vm_id)
+                .limit(self.config.vm_retention_verify_batch_size)
+            ))
+        checked = 0
+        for vm_id in due:
+            async with self.locked_vm(vm_id) as (session, vm):
+                retained = await session.get(VMRetentionRow, vm_id)
+                if retained is None or retained.state != "retained":
+                    continue
+                deadline = retained.next_verification_at
+                if deadline is not None and (deadline.replace(tzinfo=UTC) if deadline.tzinfo is None else deadline) > _now():
+                    continue
+                retained.verification_attempted_at = _now()
+                if (vm is None or vm.deletion_started_at is None or vm.status != VMStatus.SUSPENDED
+                        or vm.xcpng_uuid != retained.source_vm_uuid
+                        or vm.owner_account_id != retained.owner_account_id or vm.owner_wallet != retained.owner_wallet):
+                    retained.verification_error = "lifecycle_state_changed"
+                else:
+                    try:
+                        async with asyncio.timeout(30):
+                            await self.xcpng.verify_retained_vm(stored_manifest(retained))
+                    except Exception:
+                        retained.verification_error = "provider_verification_failed"
+                    else:
+                        retained.last_verified_at = _now()
+                        retained.verification_error = None
+                delay = (self.config.vm_retention_verify_retry_seconds if retained.verification_error
+                         else self.config.vm_retention_verify_interval_seconds)
+                retained.next_verification_at = _now() + timedelta(seconds=delay)
+                await session.commit()
+                checked += 1
+        return checked
 
     # --- Expiry Management ---
 

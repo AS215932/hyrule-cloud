@@ -735,6 +735,10 @@ disklabel "$disk"
             raise XOError("retain_vm", {"message": "Retained VM is unavailable"})
         if vm.get("power_state") != "Halted":
             await self._xo_call("vm.stop", id=manifest.vm_uuid, force=True)
+        await self.verify_retained_vm(manifest)
+
+    async def verify_retained_vm(self, manifest: VMProtectionManifest) -> None:
+        """Read-only evidence that the guest remains halted and protected."""
         protected = await self.capture_vm_protection(manifest.vm_uuid)
         vm = await self._retention_object(manifest.vm_uuid)
         if (vm is None or vm.get("power_state") != "Halted" or protected.auto_poweron

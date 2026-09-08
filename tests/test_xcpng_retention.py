@@ -159,3 +159,28 @@ async def test_incomplete_whole_vm_inventory_prevents_provider_mutation(damage):
     with pytest.raises(XOError):
         await provider.restore_retained_vm(manifest)
     provider._xo_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('drift', ['none', 'running', 'autostart', 'ha', 'unblocked', 'disk_missing'])
+async def test_periodic_verification_detects_drift_without_mutation(drift):
+    provider, objects = fixture_provider()
+    manifest = await provider.capture_vm_protection('vm')
+    vm = objects['vm']
+    vm['blockedOperations'] = {'start': 'retained', 'resume': 'retained', 'destroy': 'operator'}
+    if drift == 'running':
+        vm['power_state'] = 'Running'
+    elif drift == 'autostart':
+        vm['auto_poweron'] = True
+    elif drift == 'ha':
+        vm['high_availability'] = 'restart'
+    elif drift == 'unblocked':
+        vm['blockedOperations'].pop('start')
+    elif drift == 'disk_missing':
+        objects['disk']['missing'] = True
+    if drift == 'none':
+        await provider.verify_retained_vm(manifest)
+    else:
+        with pytest.raises(XOError):
+            await provider.verify_retained_vm(manifest)
+    provider._xo_call.assert_not_awaited()

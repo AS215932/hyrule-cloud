@@ -175,7 +175,7 @@ async def test_postgres_concurrent_receipts_and_downgrade_guard(monkeypatch):
         assert rejected.returncode != 0
         assert 'Refusing to remove guest receipts while provisioning or guest reconciliation is unresolved' in rejected.stderr
         async with observer_factory() as session:
-            assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '024'
+            assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '025'
             assert await session.get(VMGuestResultRow, 'vm_pg_guest') is not None
         async with first_factory.begin() as session:
             vm = await session.get(VMRow, 'vm_pg_guest')
@@ -190,7 +190,7 @@ async def test_postgres_concurrent_receipts_and_downgrade_guard(monkeypatch):
             rejected = migrate('downgrade', '020', check=False)
             assert rejected.returncode != 0
             async with observer_factory() as session:
-                assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '024'
+                assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '025'
                 assert await session.get(VMGuestResultRow, 'vm_pg_guest') is not None
         async with first_factory.begin() as session:
             vm = await session.get(VMRow, 'vm_pg_guest')

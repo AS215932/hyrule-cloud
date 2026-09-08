@@ -44,8 +44,9 @@ async def test_recovery_serializes_with_expiry_and_account_disable():
     def orchestrator(engine):
         obj = object.__new__(Orchestrator)
         obj.db = async_sessionmaker(engine, expire_on_commit=False)
-        obj.config = SimpleNamespace(vm_expiry_retention_enabled=False)
-        obj.xcpng = SimpleNamespace(protect_retained_vm=AsyncMock(), restore_retained_vm=AsyncMock(),
+        obj.config = SimpleNamespace(vm_expiry_retention_enabled=False, vm_retention_verify_batch_size=10,
+                                     vm_retention_verify_interval_seconds=21600, vm_retention_verify_retry_seconds=900)
+        obj.xcpng = SimpleNamespace(verify_retained_vm=AsyncMock(), protect_retained_vm=AsyncMock(), restore_retained_vm=AsyncMock(),
                                     destroy_vm=AsyncMock(side_effect=AssertionError('unexpected destruction')))
         return obj
 
@@ -74,7 +75,7 @@ async def test_recovery_serializes_with_expiry_and_account_disable():
         async with sessions.begin() as session:
             session.add(actor)
             session.add(AccountRow(account_id="HOWNER00001", password_hash="fixture"))
-        for index, ordering in enumerate(('restore_first', 'protect_first', 'stale_protect', 'disable_first')):
+        for index, ordering in enumerate(('restore_first', 'protect_first', 'stale_protect', 'disable_first', 'verify_first', 'stale_verify')):
             vm_id = f'vm_{ordering}'
             guest = str(uuid4())
             manifest = VMProtectionManifest(guest, (str(uuid4()),), (), True, 'restart', ())
@@ -106,7 +107,37 @@ async def test_recovery_serializes_with_expiry_and_account_disable():
                 entered.set()
                 await release.wait()
 
-            if ordering == 'disable_first':
+            if ordering == 'verify_first':
+                worker.xcpng.verify_retained_vm.side_effect = held_provider
+                verification = asyncio.create_task(worker.verify_retained_vms())
+                tasks.append(verification)
+                await asyncio.wait_for(entered.wait(), 5)
+                recovery = asyncio.create_task(recover())
+                tasks.append(recovery)
+                await blocked('retention-api-fixture')
+                release.set()
+                assert await asyncio.wait_for(verification, 5) == 1
+                assert (await asyncio.wait_for(recovery, 5))['state'] == 'completed'
+                worker.xcpng.verify_retained_vm.assert_awaited_once_with(manifest)
+            elif ordering == 'stale_verify':
+                real_locked_vm = worker.locked_vm
+
+                @asynccontextmanager
+                async def delayed_verification_lock(resource):
+                    entered.set()
+                    await release.wait()
+                    async with real_locked_vm(resource) as pair:
+                        yield pair
+
+                worker.locked_vm = delayed_verification_lock
+                verification = asyncio.create_task(worker.verify_retained_vms())
+                tasks.append(verification)
+                await asyncio.wait_for(entered.wait(), 5)
+                assert (await recover())['state'] == 'completed'
+                release.set()
+                assert await asyncio.wait_for(verification, 5) == 0
+                worker.xcpng.verify_retained_vm.assert_not_awaited()
+            elif ordering == 'disable_first':
                 async with sessions.begin() as session:
                     owner = await session.scalar(select(AccountRow).where(
                         AccountRow.account_id == 'HOWNER00001').with_for_update())

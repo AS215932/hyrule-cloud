@@ -49,12 +49,16 @@ async def test_retention_migration_refuses_to_erase_recovery_evidence():
             session.add(VMRow(vm_id='vm_retention_fixture', xcpng_uuid=uuid, owner_wallet='fixture-owner',
                               status=VMStatus.SUSPENDED, os='debian-13'))
         async with sessions.begin() as session:
-            await prepare_retention(session, 'vm_retention_fixture', manifest, deadline)
+            retained = await prepare_retention(session, 'vm_retention_fixture', manifest, deadline)
+            retained.last_verified_at = deadline - timedelta(days=30)
+            retained.verification_attempted_at = retained.last_verified_at + timedelta(minutes=1)
+            retained.verification_error = 'provider_verification_failed'
+            retained.next_verification_at = deadline - timedelta(days=29)
         result = migrate('downgrade', '020')
         assert result.returncode != 0
         assert 'Preserve and reconcile VM retention records before downgrade' in result.stderr
         async with sessions.begin() as session:
-            assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '024'
+            assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '025'
             saved = await session.get(VMRetentionRow, 'vm_retention_fixture')
             assert saved.retain_until == deadline
             assert saved.manifest['disk_ids'][0] == disk
@@ -66,6 +70,10 @@ async def test_retention_migration_refuses_to_erase_recovery_evidence():
             assert saved.owner_wallet == 'fixture-owner'
             assert saved.source_vm_uuid == uuid
             assert saved.restore_config['os'] == 'debian-13'
+            assert saved.last_verified_at == deadline - timedelta(days=30)
+            assert saved.verification_attempted_at == deadline - timedelta(days=30) + timedelta(minutes=1)
+            assert saved.verification_error == 'provider_verification_failed'
+            assert saved.next_verification_at == deadline - timedelta(days=29)
             assert await session.get(VMRow, 'vm_retention_fixture') is None
         # Completed recovery evidence must independently prevent schema removal,
         # including when neither the VM nor active retention row remains.
@@ -84,7 +92,7 @@ async def test_retention_migration_refuses_to_erase_recovery_evidence():
         assert 'Preserve and reconcile VM retention records before downgrade' in result.stderr
         await engine.dispose()
         async with sessions() as session:
-            assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '024'
+            assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '025'
             assert await session.get(VMRetentionRow, 'vm_retention_fixture') is None
             history = await session.get(VMRestoreRow, operation_id)
             assert history.retention_snapshot['manifest']['disk_ids'] == [disk]
