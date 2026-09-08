@@ -968,3 +968,35 @@ async def test_expiry_sweep_purges_abandoned_reservations(session_factory):
     async with session_factory() as session:
         assert await session.get(VMRow, "vm_stale_res") is None
         assert await session.get(VMRow, "vm_fresh_res") is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('account_state', ['disabled', 'missing', 'enabled'])
+async def test_anonymous_activation_validates_incoming_account(session_factory, account_state):
+    account_id = 'H1234567890'
+    async with session_factory.begin() as session:
+        if account_state != 'missing':
+            session.add(AccountRow(account_id=account_id, password_hash='fixture',
+                                   disabled_at=datetime.now(UTC) if account_state == 'disabled' else None))
+        session.add(VMRow(vm_id='vm_anon_binding', owner_wallet='', status=VMStatus.PROVISIONING))
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    try:
+        if account_state == 'enabled':
+            result = await orch.activate_vm_reservation(
+                'vm_anon_binding', 'fixture-payer', payment_tx='fixture-settlement',
+                owner_account_id=account_id, start_provisioning=False, retail_amount=Decimal('1.00'),
+            )
+            assert result.owner_account_id == account_id
+        else:
+            with pytest.raises(AccountDisabledError):
+                await orch.activate_vm_reservation(
+                    'vm_anon_binding', 'fixture-payer', payment_tx='fixture-settlement',
+                    owner_account_id=account_id, start_provisioning=False, retail_amount=Decimal('1.00'),
+                )
+        async with session_factory() as session:
+            row = await session.get(VMRow, 'vm_anon_binding')
+            assert row.owner_account_id == (account_id if account_state == 'enabled' else None)
+            assert row.owner_wallet == ('fixture-payer' if account_state == 'enabled' else '')
+            assert row.payment_tx == ('fixture-settlement' if account_state == 'enabled' else None)
+    finally:
+        await orch.shutdown()

@@ -158,11 +158,11 @@ class _OrchOK:
             return _row_with_hash(hash_anon_token(_TOKEN_OK))
         return None
 
-    async def reboot_vm(self, vm_id):
+    async def reboot_vm(self, vm_id, *, management_identity=None):
         self.rebooted.append(vm_id)
         return True
 
-    async def destroy_vm(self, vm_id):
+    async def destroy_vm(self, vm_id, *, management_identity=None):
         self.destroyed.append(vm_id)
         return True
 
@@ -175,7 +175,7 @@ class _OrchLegacy:
             return _row_with_hash(None)
         return None
 
-    async def reboot_vm(self, vm_id):
+    async def reboot_vm(self, vm_id, *, management_identity=None):
         return True
 
 

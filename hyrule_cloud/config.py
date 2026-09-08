@@ -426,8 +426,8 @@ class HyruleConfig(BaseSettings):
     # VM lifecycle
     guest_report_timeout_seconds: int = Field(default=900, ge=60, le=3600)
     vm_grace_period_hours: int = 48
-    vm_expiry_disk_retention_enabled: bool = False
-    vm_disk_retention_days: int = Field(default=30, ge=1, le=365)
+    vm_expiry_retention_enabled: bool = False
+    vm_retention_days: int = Field(default=30, ge=1, le=365)
     max_paid_active_vms: int = 0
     max_duration_days: int = 365
     max_ports: int = 10

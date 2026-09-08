@@ -34,6 +34,8 @@ from hyrule_cloud.db import (
     PaymentEventRow,
     RefundResolutionRow,
     SessionRow,
+    VMRestoreRow,
+    VMRetentionRow,
     VMRow,
 )
 from hyrule_cloud.domains.models import (
@@ -51,6 +53,7 @@ from hyrule_cloud.middleware.auth import (
 )
 from hyrule_cloud.models import VMStatus
 from hyrule_cloud.services.passwords import verify_password
+from hyrule_cloud.services.vm_retention import complete_restore, prepare_restore, stored_manifest
 from hyrule_cloud.state import AppState, get_app_state
 
 router = APIRouter(
@@ -192,6 +195,10 @@ class ReasonRequest(BaseModel):
 
 class ExpiryExtensionRequest(ReasonRequest):
     days: int = Field(gt=0, le=365, strict=True)
+
+
+class RetainedRestoreRequest(ExpiryExtensionRequest):
+    operation_id: uuid.UUID
 
 
 class RoleRequest(ReasonRequest):
@@ -1050,6 +1057,111 @@ async def extend_vm_expiry(
                 "power_changed": False}
 
 
+def _restore_status(operation: VMRestoreRow) -> dict[str, Any]:
+    return {
+        "operation_id": operation.operation_id, "state": operation.state,
+        "days": operation.days, "reason": operation.reason,
+        "new_expiry": _aware(operation.new_expiry).isoformat(),
+        "created_at": _aware(operation.created_at).isoformat(),
+        "completed_at": _aware(operation.completed_at).isoformat() if operation.completed_at else None,
+    }
+
+
+@router.get("/vms/{vm_id}/retention")
+async def retained_vm_status(
+    vm_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    actor: AccountRow = Depends(require_admin_session),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    """Expose actionable recovery state without provider manifests or credentials."""
+    async with _factory(state)() as session:
+        retained = await session.get(VMRetentionRow, vm_id)
+        history = list(await session.scalars(
+            select(VMRestoreRow).where(VMRestoreRow.vm_id == vm_id)
+            .order_by(VMRestoreRow.created_at.desc(), VMRestoreRow.operation_id.desc())
+            .offset(offset).limit(limit + 1)
+        ))
+        vm = await session.get(VMRow, vm_id)
+        if vm is None and retained is None and not history:
+            raise HTTPException(404, "VM recovery history not found")
+        active_recovery = None
+        if retained is not None and retained.restore_operation_id:
+            active_recovery = await session.get(VMRestoreRow, retained.restore_operation_id)
+        return {
+            "vm_id": vm_id, "vm_status": vm.status if vm is not None else None,
+            "retention": {
+                "state": retained.state,
+                "retain_until": _aware(retained.retain_until).isoformat(),
+                "retained_at": _aware(retained.retained_at).isoformat() if retained.retained_at else None,
+            } if retained is not None else None,
+            "active_recovery": _restore_status(active_recovery) if active_recovery is not None else None,
+            "history": [_restore_status(operation) for operation in history[:limit]],
+            "has_more_history": len(history) > limit,
+            "next_offset": offset + limit if len(history) > limit else None,
+        }
+
+
+@router.post("/vms/{vm_id}/actions/restore")
+async def restore_retained_vm(
+    vm_id: str,
+    body: RetainedRestoreRequest,
+    request: Request,
+    actor: AccountRow = Depends(require_admin_step_up()),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    """Resume an audited recovery request; never automatically power on a guest."""
+    orch = state.orchestrator
+    operation_id = str(body.operation_id)
+    async with orch.locked_vm(vm_id) as (session, vm):
+        if vm is None:
+            raise HTTPException(404, "VM not found")
+        previous = await session.get(VMRestoreRow, operation_id)
+        try:
+            operation = await prepare_restore(
+                session, vm, operation_id=operation_id, actor_account_id=actor.account_id,
+                days=body.days, reason=body.reason,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if previous is None:
+            _audit(session, request, actor, "vm.restore_requested", target_type="vm", target_id=vm_id,
+                   reason=body.reason, details={"operation_id": operation_id,
+                                               "new_expiry": _aware(operation.new_expiry).isoformat()})
+        await session.commit()
+
+    # Reacquire after the durable intent commit. Expiry workers use this fence
+    # and refuse restoring records, including after process or network failure.
+    async with orch.locked_vm(vm_id) as (session, vm):
+        recovered_operation = await session.get(VMRestoreRow, operation_id)
+        if recovered_operation is None:
+            raise HTTPException(409, "Restore request is unavailable")
+        operation = recovered_operation
+        if operation.state != "completed":
+            retained = await session.get(VMRetentionRow, vm_id)
+            if (vm is None or retained is None or retained.state != "restoring"
+                    or retained.restore_operation_id != operation_id
+                    or vm.deletion_started_at is None or vm.xcpng_uuid != retained.source_vm_uuid
+                    or vm.owner_account_id != retained.owner_account_id or vm.owner_wallet != retained.owner_wallet
+                    or vm.status != VMStatus.SUSPENDED):
+                raise HTTPException(409, "Retained recovery state changed")
+            owner = await session.get(AccountRow, vm.owner_account_id) if vm.owner_account_id else None
+            if ((vm.owner_account_id and (owner is None or owner.disabled_at is not None))
+                    or vm.suspension_reason == "account_disabled"):
+                raise HTTPException(409, "Enable the owner account before restoring this VM")
+            try:
+                await orch.xcpng.restore_retained_vm(stored_manifest(retained))
+            except Exception as exc:
+                raise HTTPException(503, "Recovery is pending; retry the same operation ID") from exc
+            await complete_restore(session, vm, operation)
+            _audit(session, request, actor, "vm.restore_completed", target_type="vm", target_id=vm_id,
+                   reason=body.reason, details={"operation_id": operation_id, "power_changed": False})
+            await session.commit()
+        return {"vm_id": vm_id, "operation_id": operation_id, "state": operation.state,
+                "new_expiry": _aware(operation.new_expiry).isoformat(), "power_changed": False}
+
+
 @router.post("/vms/{vm_id}/actions/{action}")
 async def vm_action(
     vm_id: str,
@@ -1090,6 +1202,7 @@ async def vm_action(
             current = (
                 await session.execute(
                     select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
             if current is None:
@@ -1097,6 +1210,8 @@ async def vm_action(
             if current.owner_account_id != owner_account_id:
                 raise HTTPException(409, "VM ownership changed; retry the action")
             if action in {"start", "reboot"}:
+                if current.deletion_started_at is not None:
+                    raise HTTPException(409, "Claimed VMs require completed retention recovery before power-on")
                 status = str(current.status)
                 if status in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
                     raise HTTPException(409, "Terminal VMs cannot be powered on")
@@ -1347,6 +1462,8 @@ async def transfer_vm(
         ).scalar_one_or_none()
         if vm is None:
             raise HTTPException(404, "VM not found")
+        if vm.deletion_started_at is not None or vm.status == VMStatus.DESTROYED:
+            raise HTTPException(409, "Deleting or destroyed VMs cannot be transferred")
         if str(vm.status) == VMStatus.PROVISIONING.value:
             raise HTTPException(409, "Provisioning VMs cannot be transferred")
         domain = (

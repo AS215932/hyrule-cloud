@@ -23,6 +23,7 @@ from sqlalchemy import update as _sql_update
 from hyrule_cloud.db import VMQuoteRow, VMRow
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.middleware.anon_token import (
+    VMManagementIdentity,
     anon_management_token,
     can_manage_vm,
 )
@@ -1428,7 +1429,10 @@ async def extend_vm(
     # create/quote/intent. Refuse before check_payment so no money moves.
     _require_vm_service_open(gate)
 
+    management_identity = VMManagementIdentity.capture(row)
     async with orch.locked_vm(vm_id) as (session, row):
+        if row is None or not management_identity.matches(row):
+            raise HTTPException(404, "VM not found")
         if not orch.vm_can_extend(row) or not await orch.vm_owner_enabled(session, row):
             raise HTTPException(409, "This VM can no longer be extended")
         total = current_daily_price_for_vm(row, cfg.payment) * body.days
@@ -1465,10 +1469,17 @@ async def extend_vm(
             await session.rollback()
             payment_tx = getattr(request.state, "payment_tx", None)
             waived = bool(payment_tx and payment_tx.startswith(("dev_bypass", "admin_bypass")))
-            await orch.record_extension_failure_refund(
-                vm_id=vm_id, owner_wallet=result, payment_tx=payment_tx,
-                charged_amount=total, reason="vm_extension_rejected_post_settlement",
-            )
+            try:
+                await orch.record_extension_failure_refund(
+                    vm_id=vm_id, owner_wallet=result, payment_tx=payment_tx,
+                    charged_amount=total, reason="vm_extension_rejected_post_settlement",
+                )
+            except Exception:
+                log.error("extension_refund_confirmation_failed", vm_id=vm_id, exc_info=True)
+                raise HTTPException(
+                    503, "The extension was not applied, but the refund could not be confirmed. "
+                    "Contact support before paying again."
+                ) from None
             raise HTTPException(409, "VM extension was rejected; no payment was taken" if waived
                                 else "VM extension was rejected; a refund has been recorded")
 
@@ -1486,7 +1497,7 @@ async def reboot_vm(
     orch=Depends(get_orch),
 ) -> GenericActionResponse:
     # Block A0: management dep ensures caller has the token.
-    if not await orch.reboot_vm(vm_id):
+    if not await orch.reboot_vm(vm_id, management_identity=VMManagementIdentity.capture(row)):
         raise HTTPException(404, "VM not found or not running")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} is rebooting")
 
@@ -1498,8 +1509,12 @@ async def destroy_vm(
     orch=Depends(get_orch),
 ) -> GenericActionResponse:
     # Block A0: management dep ensures caller has the token.
-    if not await orch.destroy_vm(vm_id):
+    if not await orch.destroy_vm(vm_id, management_identity=VMManagementIdentity.capture(row)):
         raise HTTPException(404, "VM not found")
+    current = await orch.get_vm(vm_id)
+    if (current is not None and current.status == VMStatus.SUSPENDED
+            and getattr(current, "deletion_started_at", None) is not None):
+        return GenericActionResponse(status="retained", message=f"VM {vm_id} is stopped and retained for recovery")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} destroyed")
 
 

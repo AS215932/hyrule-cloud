@@ -10,9 +10,9 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from hyrule_cloud.db import VMRetentionRow, VMRow
+from hyrule_cloud.db import VMRestoreRow, VMRetentionRow, VMRow
 from hyrule_cloud.models import VMStatus
-from hyrule_cloud.providers.xcpng import RetainedDisk, VMRetentionManifest
+from hyrule_cloud.providers.xcpng import VMProtectionManifest
 from hyrule_cloud.services.vm_retention import prepare_retention
 
 
@@ -43,7 +43,7 @@ async def test_retention_migration_refuses_to_erase_recovery_evidence():
             assert result.returncode == 0, result.stderr
         uuid = '00000000-0000-0000-0000-000000000001'
         disk = '00000000-0000-0000-0000-000000000002'
-        manifest = VMRetentionManifest(uuid, (RetainedDisk(disk, 'fixture-sr', 4096, '0', True, False),))
+        manifest = VMProtectionManifest(uuid, (disk,), (), True, "restart", ())
         deadline = datetime.now(UTC) + timedelta(days=30)
         async with sessions.begin() as session:
             session.add(VMRow(vm_id='vm_retention_fixture', xcpng_uuid=uuid, owner_wallet='fixture-owner',
@@ -57,7 +57,7 @@ async def test_retention_migration_refuses_to_erase_recovery_evidence():
             assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '024'
             saved = await session.get(VMRetentionRow, 'vm_retention_fixture')
             assert saved.retain_until == deadline
-            assert saved.manifest['disks'][0]['vdi_uuid'] == disk
+            assert saved.manifest['disk_ids'][0] == disk
             await session.delete(await session.get(VMRow, 'vm_retention_fixture'))
         # Reconnect and prove recovery evidence remains without a live VM row.
         await engine.dispose()
@@ -67,5 +67,27 @@ async def test_retention_migration_refuses_to_erase_recovery_evidence():
             assert saved.source_vm_uuid == uuid
             assert saved.restore_config['os'] == 'debian-13'
             assert await session.get(VMRow, 'vm_retention_fixture') is None
+        # Completed recovery evidence must independently prevent schema removal,
+        # including when neither the VM nor active retention row remains.
+        operation_id = '00000000-0000-0000-0000-000000000003'
+        async with sessions.begin() as session:
+            saved = await session.get(VMRetentionRow, 'vm_retention_fixture')
+            session.add(VMRestoreRow(
+                operation_id=operation_id, vm_id=saved.vm_id, actor_account_id='HAAAAAAAAAA',
+                days=7, reason='Fixture recovery history', state='completed',
+                retention_snapshot={'manifest': saved.manifest, 'owner_wallet': saved.owner_wallet},
+                new_expiry=deadline, completed_at=datetime.now(UTC),
+            ))
+            await session.delete(saved)
+        result = migrate('downgrade', '020')
+        assert result.returncode != 0
+        assert 'Preserve and reconcile VM retention records before downgrade' in result.stderr
+        await engine.dispose()
+        async with sessions() as session:
+            assert await session.scalar(text('SELECT version_num FROM alembic_version')) == '024'
+            assert await session.get(VMRetentionRow, 'vm_retention_fixture') is None
+            history = await session.get(VMRestoreRow, operation_id)
+            assert history.retention_snapshot['manifest']['disk_ids'] == [disk]
+            assert history.state == 'completed'
     finally:
         await engine.dispose()

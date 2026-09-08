@@ -1331,3 +1331,21 @@ class VMRetentionRow(Base):
     retain_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     retained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    restore_operation_id: Mapped[str | None] = mapped_column(String(36), unique=True)
+
+
+class VMRestoreRow(Base):
+    """Immutable recovery request and retention evidence, independent of owners."""
+
+    __tablename__ = "vm_restores"
+
+    operation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    vm_id: Mapped[str] = mapped_column(String(32), index=True)
+    actor_account_id: Mapped[str] = mapped_column(String(11))
+    days: Mapped[int] = mapped_column(Integer)
+    reason: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(24), default="pending", server_default="pending")
+    retention_snapshot: Mapped[dict] = mapped_column(_JSONB)
+    new_expiry: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -232,10 +232,11 @@ async def test_deferred_admin_waiver_audits_before_delivery_and_restores_failed_
 
 
 @pytest.mark.asyncio
-async def test_real_cost_waiver_requires_recent_password_step_up(admin_factory) -> None:
+@pytest.mark.parametrize("path", ["/v1/vm/create", "/v1/tunnel/create"])
+async def test_real_cost_waiver_requires_recent_password_step_up(admin_factory, path) -> None:
     credentials = await _admin_credentials(admin_factory)
     gate = _admin_gate(admin_factory)
-    request = _browser_request(credentials, path="/v1/vm/create")
+    request = _browser_request(credentials, path=path)
 
     with pytest.raises(HTTPException) as exc:
         await gate.check_payment(request, Decimal("1.00"), "VM")
@@ -1647,10 +1648,12 @@ async def test_admin_reboot_rejects_disabled_owner_before_worker_marker(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["failed", "destroyed", "provisioning"])
+@pytest.mark.parametrize("status", ["failed", "destroyed", "provisioning", "suspended"])
+@pytest.mark.parametrize("action", ["start", "reboot"])
 async def test_admin_start_rejects_non_startable_vm_states(
     admin_factory,
     status: str,
+    action: str,
 ) -> None:
     credentials = await _admin_credentials(admin_factory)
     async with admin_factory() as session:
@@ -1663,6 +1666,7 @@ async def test_admin_start_rejects_non_startable_vm_states(
                 owner_account_id="HAAAAAAAAAA",
                 xcpng_uuid=f"uuid-admin-start-{status}",
                 status=status,
+                deletion_started_at=datetime.now(UTC) if status == "suspended" else None,
                 expires_at=datetime.now(UTC) + timedelta(days=1),
             )
         )
@@ -1679,7 +1683,7 @@ async def test_admin_start_rejects_non_startable_vm_states(
     with pytest.raises(HTTPException) as exc:
         await vm_action(
             f"vm_admin_start_{status}",
-            "start",
+            action,
             ReasonRequest(reason="manual recovery"),
             _browser_request(
                 credentials,
@@ -1691,6 +1695,7 @@ async def test_admin_start_rejects_non_startable_vm_states(
 
     assert exc.value.status_code == 409
     assert xcpng.started == []
+    assert xcpng.rebooted == []
     async with admin_factory() as session:
         row = await session.get(VMRow, f"vm_admin_start_{status}")
         audits = list(await session.scalars(select(AdminAuditRow)))
@@ -2350,3 +2355,171 @@ async def test_admin_expiry_extension_requires_step_up_and_atomic_audit(admin_fa
     finally:
         app.state._typed_state = previous
         await orch.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['none', 'provider', 'request_audit', 'completion_audit',
+                                   'request_ack', 'completion_ack'])
+async def test_retained_restore_is_audited_replayable_and_keeps_cycle_history(admin_factory, monkeypatch, failure):
+    from uuid import uuid4
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from hyrule_cloud.db import VMRestoreRow, VMRetentionRow
+    from hyrule_cloud.providers.xcpng import VMProtectionManifest
+    from hyrule_cloud.services.vm_retention import prepare_retention
+
+    credentials = await _admin_credentials(admin_factory)
+    now = datetime.now(UTC)
+    manifest = VMProtectionManifest('guest-retained', ('disk',), (), True, 'restart', ())
+    async with admin_factory.begin() as session:
+        session.add(VMRow(vm_id='vm_retained_restore', owner_wallet='fixture',
+                          xcpng_uuid='guest-retained', status='suspended', suspension_reason='expired',
+                          expires_at=now - timedelta(days=3), deletion_started_at=now,
+                          ipv6_prefix_index=8, ipv6_prefix='2a0c:b641:b51:8::/64'))
+    async with admin_factory.begin() as session:
+        retained = await prepare_retention(session, 'vm_retained_restore', manifest, now + timedelta(days=30))
+        retained.state = 'retained'
+        retained.retained_at = now
+    orch = Orchestrator(HyruleConfig(), admin_factory)
+    seen = []
+
+    async def restore(received):
+        assert received == manifest
+        async with admin_factory() as session:
+            retained = await session.get(VMRetentionRow, 'vm_retained_restore')
+            operation = await session.get(VMRestoreRow, retained.restore_operation_id)
+            assert retained.state == 'restoring' and operation.state == 'pending'
+            assert await session.scalar(select(AdminAuditRow).where(
+                AdminAuditRow.action == 'vm.restore_requested')) is not None
+        seen.append(True)
+        if failure == 'provider' and len(seen) == 1:
+            raise ConnectionError('lost provider acknowledgement')
+
+    original_commit = AsyncSession.commit
+    injected = False
+
+    async def interrupted_commit(session):
+        nonlocal injected
+        target = 'vm.restore_requested' if failure.startswith('request_') else 'vm.restore_completed'
+        audits = [row for row in session.new if isinstance(row, AdminAuditRow) and row.action == target]
+        inject = failure not in {'none', 'provider'} and not injected and bool(audits)
+        if inject:
+            injected = True
+            if failure.endswith('_audit'):
+                audits[0].action = None  # Real NOT NULL failure rolls back the transaction.
+        await original_commit(session)
+        if inject and failure.endswith('_ack'):
+            raise ConnectionError('commit succeeded but acknowledgement was lost')
+
+    monkeypatch.setattr(AsyncSession, 'commit', interrupted_commit)
+    orch.xcpng.restore_retained_vm = AsyncMock(side_effect=restore)
+    orch.xcpng.start_vm = AsyncMock(side_effect=AssertionError('recovery must not start VM'))
+    state = AppState(config=HyruleConfig(), orchestrator=orch, payment_gate=_admin_gate(admin_factory),
+                     network_provider=None, session_factory=admin_factory)
+    previous = getattr(app.state, '_typed_state', None)
+    app.state._typed_state = state
+    path = '/v1/admin/vms/vm_retained_restore/actions/restore'
+    body = {'days': 7, 'reason': 'Recover retained customer data', 'operation_id': str(uuid4())}
+    headers = {'X-CSRF-Token': credentials.csrf_token}
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False), base_url='https://test') as client:
+            client.cookies.set('hyr_sess', credentials.token)
+            client.cookies.set('hyr_csrf', credentials.csrf_token)
+            response = await client.post(path, json=body, headers=headers)
+            assert response.status_code == 403
+            async with admin_factory.begin() as session:
+                login = await session.scalar(select(SessionRow).where(SessionRow.account_id == 'HAAAAAAAAAA'))
+                login.admin_elevated_at = now
+            response = await client.post(path, json=body, headers=headers)
+            if failure != 'none':
+                assert response.status_code == (503 if failure == 'provider' else 500)
+                async with admin_factory() as session:
+                    vm = await session.get(VMRow, 'vm_retained_restore')
+                    assert (vm.deletion_started_at is None) == (failure == 'completion_ack')
+                    operation = await session.get(VMRestoreRow, body['operation_id'])
+                    if failure == 'request_audit':
+                        assert operation is None and seen == []
+                    else:
+                        assert operation.state == ('completed' if failure == 'completion_ack' else 'pending')
+                    if failure == 'request_ack':
+                        assert seen == []
+                response = await client.post(path, json=body, headers=headers)
+            assert response.status_code == 200, response.text
+            replay = await client.post(path, json=body, headers=headers)
+            assert replay.status_code == 200 and replay.json() == response.json()
+            conflict = await client.post(path, json={**body, 'days': 8}, headers=headers)
+            assert conflict.status_code == 409
+        async with admin_factory.begin() as session:
+            vm = await session.get(VMRow, 'vm_retained_restore')
+            assert vm.status == 'suspended' and vm.ipv6_prefix_index == 8
+            assert vm.deletion_started_at is None
+            assert await session.get(VMRetentionRow, vm.vm_id) is None
+            operation = await session.get(VMRestoreRow, body['operation_id'])
+            assert operation.state == 'completed'
+            assert operation.retention_snapshot['manifest']['disk_ids'] == ['disk']
+            assert operation.retention_snapshot['previous_expiry'] == (now - timedelta(days=3)).isoformat()
+            audits = list(await session.scalars(select(AdminAuditRow).where(
+                AdminAuditRow.action.in_(['vm.restore_requested', 'vm.restore_completed']))))
+            assert len(audits) == 2
+            # A later retention cycle gets fresh evidence without overwriting recovery history.
+            next_manifest = VMProtectionManifest('guest-retained', ('disk',), (), False, '', ())
+            next_retained = await prepare_retention(session, vm.vm_id, next_manifest, now + timedelta(days=60))
+            assert next_retained.manifest['auto_poweron'] is False
+            assert operation.retention_snapshot['manifest']['auto_poweron'] is True
+        assert len(seen) == (2 if failure in {'provider', 'completion_audit'} else 1)
+        assert injected == (failure not in {'none', 'provider'})
+    finally:
+        app.state._typed_state = previous
+        await orch.xcpng.close()
+
+
+@pytest.mark.asyncio
+async def test_retention_status_exposes_pending_retry_without_sensitive_manifest(admin_factory):
+    from hyrule_cloud.db import VMRestoreRow, VMRetentionRow
+
+    credentials = await _admin_credentials(admin_factory)
+    now = datetime.now(UTC)
+    async with admin_factory.begin() as session:
+        session.add(VMRow(vm_id='vm_recovery_status', owner_wallet='fixture', status='suspended'))
+        session.add(VMRetentionRow(vm_id='vm_recovery_status', source_vm_uuid='private-provider-id',
+                                  owner_wallet='fixture', state='restoring',
+                                  manifest={'secret_fixture': 'must-not-return-manifest'},
+                                  restore_config={'ssh_pubkey': 'must-not-return-config'},
+                                  retain_until=now + timedelta(days=30), restore_operation_id='pending-old'))
+        for operation_id, age, status in [('pending-old', 3, 'pending'), ('newer', 1, 'completed')]:
+            session.add(VMRestoreRow(operation_id=operation_id, vm_id='vm_recovery_status',
+                                    actor_account_id='HAAAAAAAAAA', days=7, reason='Operator recovery',
+                                    state=status, retention_snapshot={'hidden': 'must-not-return-history'},
+                                    new_expiry=now + timedelta(days=7), created_at=now - timedelta(days=age)))
+    previous = getattr(app.state, '_typed_state', None)
+    app.state._typed_state = AppState(config=HyruleConfig(), orchestrator=SimpleNamespace(db=admin_factory), payment_gate=None,
+                                     network_provider=None, session_factory=admin_factory)
+    path = '/v1/admin/vms/vm_recovery_status/retention?limit=1'
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url='https://test') as client:
+            assert (await client.get(path)).status_code == 401
+            client.cookies.set('hyr_sess', credentials.token)
+            response = await client.get(path)
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload['active_recovery']['operation_id'] == 'pending-old'
+            assert payload['active_recovery']['days'] == 7
+            assert payload['active_recovery']['reason'] == 'Operator recovery'
+            assert payload['history'][0]['operation_id'] == 'newer'
+            assert payload['has_more_history'] is True
+            assert payload['next_offset'] == 1
+            older = (await client.get(path + '&offset=1')).json()
+            assert older['history'][0]['operation_id'] == 'pending-old'
+            assert older['next_offset'] is None
+            assert 'must-not-return' not in response.text and 'private-provider-id' not in response.text
+            assert (await client.get('/v1/admin/vms/missing/retention')).status_code == 404
+            # Historical evidence remains inspectable after resource removal.
+            async with admin_factory.begin() as session:
+                await session.delete(await session.get(VMRetentionRow, 'vm_recovery_status'))
+                await session.delete(await session.get(VMRow, 'vm_recovery_status'))
+            archived = (await client.get(path)).json()
+            assert archived['vm_status'] is None and archived['retention'] is None
+            assert archived['history'][0]['operation_id'] == 'newer'
+    finally:
+        app.state._typed_state = previous

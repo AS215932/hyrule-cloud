@@ -5,8 +5,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.db import Base, VMRetentionRow, VMRow
 from hyrule_cloud.models import VMStatus
-from hyrule_cloud.providers.xcpng import RetainedDisk, VMRetentionManifest
-from hyrule_cloud.services.vm_retention import prepare_retention
+from hyrule_cloud.providers.xcpng import VMProtectionManifest
+from hyrule_cloud.services.vm_retention import prepare_retention, stored_manifest
 
 
 @pytest.mark.asyncio
@@ -15,7 +15,7 @@ async def test_retention_is_transactional_and_survives_resource_deletion(rollbac
     engine = create_async_engine('sqlite+aiosqlite:///:memory:')
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     deadline = datetime.now(UTC) + timedelta(days=30)
-    manifest = VMRetentionManifest('guest', (RetainedDisk('disk', 'sr', 4096, '0', True, False),))
+    manifest = VMProtectionManifest('guest', ('disk',), (), True, "restart", ())
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -40,7 +40,7 @@ async def test_retention_is_transactional_and_survives_resource_deletion(rollbac
             retry = await prepare_retention(session, 'vm_retained', manifest, deadline + timedelta(days=7))
             assert retry.owner_wallet == 'original-owner'
             assert retry.retain_until.replace(tzinfo=UTC) == deadline
-            changed = VMRetentionManifest('guest', (RetainedDisk('different', 'sr', 4096, '0', True, False),))
+            changed = VMProtectionManifest('guest', ('different',), (), True, 'restart', ())
             with pytest.raises(ValueError, match='cannot be replaced'):
                 await prepare_retention(session, 'vm_retained', changed, deadline)
         async with sessions.begin() as session:
@@ -49,7 +49,9 @@ async def test_retention_is_transactional_and_survives_resource_deletion(rollbac
             saved = await session.get(VMRetentionRow, 'vm_retained')
             assert saved.source_vm_uuid == 'guest'
             assert saved.state == 'prepared'
-            assert saved.manifest['disks'][0]['vdi_uuid'] == 'disk'
+            assert saved.manifest['disk_ids'][0] == 'disk'
             assert saved.restore_config['os'] == 'debian-13'
+            assert stored_manifest(saved) == manifest
+            assert saved.manifest['mode'] == 'whole_vm'
     finally:
         await engine.dispose()

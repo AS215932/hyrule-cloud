@@ -23,11 +23,29 @@ def upgrade() -> None:
         sa.Column("retain_until", sa.DateTime(timezone=True), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("retained_at", sa.DateTime(timezone=True)),
+        sa.Column("restore_operation_id", sa.String(36), unique=True),
     )
     op.create_index("ix_vm_retention_retain_until", "vm_retention", ["retain_until"])
+    op.create_table(
+        "vm_restores",
+        sa.Column("operation_id", sa.String(36), primary_key=True),
+        sa.Column("vm_id", sa.String(32), nullable=False),
+        sa.Column("actor_account_id", sa.String(11), nullable=False),
+        sa.Column("days", sa.Integer(), nullable=False),
+        sa.Column("reason", sa.Text(), nullable=False),
+        sa.Column("state", sa.String(24), nullable=False, server_default="pending"),
+        sa.Column("retention_snapshot", postgresql.JSONB(), nullable=False),
+        sa.Column("new_expiry", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("completed_at", sa.DateTime(timezone=True)),
+    )
+    op.create_index("ix_vm_restores_vm_id", "vm_restores", ["vm_id"])
 
 
 def downgrade() -> None:
-    if op.get_bind().execute(sa.text("SELECT EXISTS (SELECT 1 FROM vm_retention)")).scalar_one():
+    if op.get_bind().execute(sa.text(
+        "SELECT EXISTS (SELECT 1 FROM vm_retention) OR EXISTS (SELECT 1 FROM vm_restores)"
+    )).scalar_one():
         raise RuntimeError("Preserve and reconcile VM retention records before downgrade")
+    op.drop_table("vm_restores")
     op.drop_table("vm_retention")

@@ -702,6 +702,7 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
             "visitor_conns": 0,
         },
         gate="tunnel",
+        admin_operation_class="real_cost",
     ),
     _body_operation(
         "/v1/bgp/lookup",

@@ -8,7 +8,13 @@ from hyrule_cloud.providers.xcpng import XCPNGProvider, XOError
 
 def fixture_provider():
     objects = {
-        'vm': {'type': 'VM', 'VBDs': ['vbd'], 'snapshots': []},
+        'vm': {'type': 'VM', '$VBDs': ['vbd'], 'snapshots': [],
+               'power_state': 'Halted', 'auto_poweron': False, 'high_availability': '', 'blockedOperations': {},
+               'CPUs': {'number': 2, 'max': 2},
+               'memory': {'dynamic': [1024, 2048], 'static': [0, 4096]},
+               'boot': {'firmware': 'bios', 'order': 'c'}, 'bios_strings': {},
+               'secureBoot': False, 'virtualizationMode': 'hvm', 'needsVtpm': False,
+               'VTPMs': [], 'VGPUs': [], 'nicType': 'e1000'},
         'vbd': {'type': 'VBD', 'VM': 'vm', 'VDI': 'disk', 'is_cd_drive': False,
                 'position': '0', 'bootable': True, 'read_only': False},
         'disk': {'type': 'VDI', '$SR': 'sr', 'size': 4096, 'missing': False},
@@ -22,84 +28,134 @@ def fixture_provider():
         return {key: deepcopy(row) for key, row in objects.items()
                 if all(row.get(field) == value for field, value in filters.items())}
 
-    async def delete(method, **kwargs):
-        assert method == 'vm.delete'
-        assert kwargs == {'id': 'vm', 'deleteDisks': False}
-        objects.pop('vm', None)
-        objects.pop('vbd', None)
-
     provider._xo_objects = AsyncMock(side_effect=inventory)
-    provider._xo_call = AsyncMock(side_effect=delete)
+    provider._xo_call = AsyncMock(side_effect=AssertionError("unexpected provider mutation"))
     return provider, objects
 
 
 @pytest.mark.asyncio
-async def test_preserved_disks_verified_on_delete_and_retry():
+@pytest.mark.parametrize('outcome', ['protected', 'running', 'autostart', 'missing'])
+async def test_whole_vm_retention_protects_guest_without_deleting_data(outcome):
     provider, objects = fixture_provider()
-    manifest = await provider.capture_retention_manifest('vm')
-    assert manifest.disks[0].vdi_uuid == 'disk'
-    assert manifest.disks[0].position == '0'
-    assert manifest.disks[0].bootable
-    await provider.delete_vm_retaining_disks(manifest)
-    await provider.delete_vm_retaining_disks(manifest)
-    provider._xo_call.assert_awaited_once_with('vm.delete', id='vm', deleteDisks=False)
-    assert objects['disk']['size'] == 4096
+    vm = objects['vm']
+    vm.update(power_state='Running', auto_poweron=True, high_availability='restart',
+              blockedOperations={'destroy': 'operator-existing-block'})
+    snapshots = ['existing-snapshot']
+    vm['snapshots'] = snapshots
+    objects['existing-snapshot'] = {'type': 'VM-snapshot'}
+    manifest = await provider.capture_vm_protection('vm')
+
+    async def mutate(method, **kwargs):
+        assert method in ('vm.set', 'vm.stop')
+        if method == 'vm.set':
+            vm['auto_poweron'] = kwargs['auto_poweron']
+            vm['high_availability'] = kwargs['high_availability']
+            vm['blockedOperations'] = kwargs['blockedOperations']
+        else:
+            vm['power_state'] = 'Halted'
+            if outcome == 'running':
+                vm['power_state'] = 'Running'
+            elif outcome == 'autostart':
+                vm['auto_poweron'] = True
+            elif outcome == 'missing':
+                objects.pop('vm')
+
+    provider._xo_call.side_effect = mutate
+    if outcome == 'protected':
+        await provider.protect_retained_vm(manifest)
+        assert vm['blockedOperations']['destroy'] == 'operator-existing-block'
+        assert vm['snapshots'] == snapshots
+        assert 'disk' in objects and 'vbd' in objects
+    else:
+        with pytest.raises(XOError):
+            await provider.protect_retained_vm(manifest)
+    assert all(call.args[0] != 'vm.delete' for call in provider._xo_call.await_args_list)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('damage', ['missing_vbd', 'missing_disk', 'unknown_missing', 'duplicate', 'size_change', 'snapshots', 'unknown_snapshots'])
-async def test_invalid_or_changed_manifest_prevents_delete(damage):
+@pytest.mark.parametrize('outcome', ['restored', 'lost_reply', 'ignored_patch', 'disk_missing', 'running'])
+async def test_restore_retained_vm_preserves_operator_blocks_and_reconciles_retry(outcome):
     provider, objects = fixture_provider()
-    manifest = await provider.capture_retention_manifest('vm')
-    if damage == 'missing_vbd':
-        objects.pop('vbd')
-    elif damage == 'missing_disk':
-        objects.pop('disk')
-    elif damage == 'unknown_missing':
-        objects['disk'].pop('missing')
-    elif damage == 'duplicate':
-        objects['vm']['VBDs'].append('second')
-        objects['second'] = dict(objects['vbd'], position='1')
-    elif damage == 'snapshots':
-        objects['vm']['snapshots'] = ['existing-recovery-point']
-    elif damage == 'unknown_snapshots':
-        objects['vm'].pop('snapshots')
+    vm = objects['vm']
+    vm.update(power_state='Halted', auto_poweron=True, high_availability='restart',
+              blockedOperations={'destroy': 'original-operator-block', 'resume': ''})
+    manifest = await provider.capture_vm_protection('vm')
+    vm.update(auto_poweron=False, high_availability='', blockedOperations={
+        'start': 'hyrule:retained', 'resume': 'hyrule:retained',
+        'destroy': 'new-operator-block', 'migrate': 'maintenance'})
+
+    async def mutate(method, **kwargs):
+        assert method == 'vm.set'  # Recovery must never start or destroy a guest.
+        vm['auto_poweron'] = kwargs['auto_poweron']
+        vm['high_availability'] = kwargs['high_availability']
+        assert kwargs['blockedOperations'] == {'start': None, 'resume': ''}
+        if outcome != 'ignored_patch':
+            for key, value in kwargs['blockedOperations'].items():
+                if value is None:
+                    vm['blockedOperations'].pop(key, None)
+                else:
+                    vm['blockedOperations'][key] = value
+        if outcome == 'lost_reply':
+            raise ConnectionError('reply lost after applying settings')
+        if outcome == 'disk_missing':
+            objects.pop('disk')
+        if outcome == 'running':
+            vm['power_state'] = 'Running'
+
+    provider._xo_call.side_effect = mutate
+    if outcome == 'restored':
+        await provider.restore_retained_vm(manifest)
     else:
-        objects['disk']['size'] = 8192
+        with pytest.raises((XOError, ConnectionError)):
+            await provider.restore_retained_vm(manifest)
+    if outcome in ('restored', 'lost_reply'):
+        await provider.restore_retained_vm(manifest)
+        assert provider._xo_call.await_count == 1
+        assert vm['power_state'] == 'Halted'
+        assert vm['blockedOperations'] == {
+            'resume': '', 'destroy': 'new-operator-block', 'migrate': 'maintenance'}
+        assert 'disk' in objects
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('change', ['running', 'storage'])
+async def test_restore_rejects_changed_guest_before_mutation(change):
+    provider, objects = fixture_provider()
+    vm = objects['vm']
+    vm.update(power_state='Halted', auto_poweron=False, high_availability='',
+              blockedOperations={'start': 'hyrule:retained'})
+    manifest = await provider.capture_vm_protection('vm')
+    if change == 'running':
+        vm['power_state'] = 'Running'
+    else:
+        objects['another-disk'] = objects.pop('disk')
+        objects['vbd']['VDI'] = 'another-disk'
     with pytest.raises(XOError):
-        await provider.delete_vm_retaining_disks(manifest)
+        await provider.restore_retained_vm(manifest)
     provider._xo_call.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('outcome', ['lost_ack', 'vm_still_present', 'disk_missing', 'inventory_unavailable'])
-async def test_delete_response_requires_complete_retention_proof(outcome):
+@pytest.mark.parametrize('damage', ['wrong_id', 'missing_vm', 'vbd_coverage', 'missing_disk',
+                                  'missing_snapshot', 'invalid_flags'])
+async def test_incomplete_whole_vm_inventory_prevents_provider_mutation(damage):
     provider, objects = fixture_provider()
-    manifest = await provider.capture_retention_manifest('vm')
-
-    async def deletion(*args, **kwargs):
-        if outcome != 'vm_still_present':
-            objects.pop('vm')
-        if outcome == 'disk_missing':
-            objects.pop('disk')
-        if outcome == 'inventory_unavailable':
-            provider._xo_objects.side_effect = ConnectionError('inventory unavailable')
-        raise ConnectionError('delete reply unavailable')
-
-    provider._xo_call.side_effect = deletion
-    if outcome == 'lost_ack':
-        await provider.delete_vm_retaining_disks(manifest)
+    manifest = await provider.capture_vm_protection('vm')
+    if damage == 'wrong_id':
+        provider._xo_objects.side_effect = None
+        provider._xo_objects.return_value = {'different-vm': {'type': 'VM'}}
+    elif damage == 'missing_vm':
+        objects.pop('vm')
+    elif damage == 'vbd_coverage':
+        objects['vm']['$VBDs'] = []
+    elif damage == 'missing_disk':
+        objects.pop('disk')
+    elif damage == 'missing_snapshot':
+        objects['vm']['snapshots'] = ['unavailable']
     else:
-        with pytest.raises((XOError, ConnectionError)):
-            await provider.delete_vm_retaining_disks(manifest)
-
-
-@pytest.mark.asyncio
-async def test_wrong_exact_object_response_is_not_absence():
-    provider, _ = fixture_provider()
-    manifest = await provider.capture_retention_manifest('vm')
-    provider._xo_objects.side_effect = None
-    provider._xo_objects.return_value = {'different-vm': {'type': 'VM'}}
+        objects['vm']['auto_poweron'] = 'false'
     with pytest.raises(XOError):
-        await provider.delete_vm_retaining_disks(manifest)
+        await provider.protect_retained_vm(manifest)
+    with pytest.raises(XOError):
+        await provider.restore_retained_vm(manifest)
     provider._xo_call.assert_not_awaited()

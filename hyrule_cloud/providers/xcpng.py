@@ -49,19 +49,13 @@ class XCPNGCapacity:
 
 
 @dataclass(frozen=True)
-class RetainedDisk:
-    vdi_uuid: str
-    sr_uuid: str
-    size_bytes: int
-    position: str
-    bootable: bool
-    read_only: bool
-
-
-@dataclass(frozen=True)
-class VMRetentionManifest:
+class VMProtectionManifest:
     vm_uuid: str
-    disks: tuple[RetainedDisk, ...]
+    disk_ids: tuple[str, ...]
+    snapshot_ids: tuple[str, ...]
+    auto_poweron: bool
+    high_availability: str
+    blocked_operations: tuple[tuple[str, str], ...]
 
 
 class XCPNGProvider(Provider):
@@ -689,66 +683,104 @@ disklabel "$disk"
             raise XOError("retention_inventory", {"message": "Invalid exact-object inventory"})
         return objects.get(object_uuid)
 
-    async def capture_retention_manifest(self, vm_uuid: str) -> VMRetentionManifest:
-        """Read all original data disks; callers must persist before deletion."""
+    async def capture_vm_protection(self, vm_uuid: str) -> VMProtectionManifest:
         vm = await self._retention_object(vm_uuid)
-        if not vm or vm.get("type") != "VM" or not isinstance(vm.get("VBDs"), list):
-            raise XOError("capture_retention", {"message": "VM inventory unavailable"})
-        # XO recursively deletes child snapshots even with deleteDisks=False.
-        # Preserve existing recovery points until a separate retention policy
-        # can account for them; unknown snapshot coverage is also rejected.
-        if vm.get("snapshots") != []:
-            raise XOError("capture_retention", {"message": "Snapshot retention requires reconciliation"})
-        vbds = await self._xo_objects(type="VBD", VM=vm_uuid)
-        if not isinstance(vbds, dict) or set(vbds) != set(vm["VBDs"]):
-            raise XOError("capture_retention", {"message": "Incomplete attachment inventory"})
+        if (vm is None or vm.get("type") != "VM" or not isinstance(vm.get("$VBDs"), list)
+                or not isinstance(vm.get("snapshots"), list)
+                or type(vm.get("auto_poweron")) is not bool
+                or vm.get("high_availability") not in {"", "restart", "best-effort"}
+                or not isinstance(vm.get("blockedOperations"), dict)):
+            raise XOError("retain_vm", {"message": "VM protection inventory incomplete"})
+        blocks = vm["blockedOperations"]
+        if any(not isinstance(key, str) or not isinstance(value, str) for key, value in blocks.items()):
+            raise XOError("retain_vm", {"message": "Invalid VM operation blocks"})
+        attachments = await self._xo_objects(type="VBD", VM=vm_uuid)
+        if not isinstance(attachments, dict) or set(attachments) != set(vm["$VBDs"]):
+            raise XOError("retain_vm", {"message": "Incomplete attachment inventory"})
         disks = []
-        for vbd in vbds.values():
-            if vbd.get("VM") != vm_uuid or type(vbd.get("is_cd_drive")) is not bool:
-                raise XOError("capture_retention", {"message": "Invalid attachment identity"})
-            if vbd["is_cd_drive"]:
+        for attachment in attachments.values():
+            if attachment.get("VM") != vm_uuid or type(attachment.get("is_cd_drive")) is not bool:
+                raise XOError("retain_vm", {"message": "Invalid attachment identity"})
+            if attachment["is_cd_drive"]:
                 continue
-            vdi_uuid = vbd.get("VDI")
-            vdi = await self._retention_object(vdi_uuid) if isinstance(vdi_uuid, str) else None
-            if (not vdi or vdi.get("type") != "VDI" or vdi.get("missing") is not False
-                    or not isinstance(vdi.get("$SR"), str)
-                    or type(vdi.get("size")) is not int or vdi["size"] <= 0
-                    or not isinstance(vbd.get("position"), str)
-                    or type(vbd.get("bootable")) is not bool
-                    or type(vbd.get("read_only")) is not bool):
-                raise XOError("capture_retention", {"message": "Incomplete disk metadata"})
-            disks.append(RetainedDisk(vdi_uuid, vdi["$SR"], vdi["size"],
-                                      vbd["position"], vbd["bootable"], vbd["read_only"]))
-        if not disks or len({disk.vdi_uuid for disk in disks}) != len(disks):
-            raise XOError("capture_retention", {"message": "Missing or duplicate data disks"})
-        return VMRetentionManifest(vm_uuid, tuple(sorted(disks, key=lambda disk: disk.position)))
+            disk_id = attachment.get("VDI")
+            disk = await self._retention_object(disk_id) if isinstance(disk_id, str) else None
+            if disk is None or disk.get("type") != "VDI" or disk.get("missing") is not False:
+                raise XOError("retain_vm", {"message": "Retained disk is unavailable"})
+            disks.append(disk_id)
+        if not disks or len(set(disks)) != len(disks):
+            raise XOError("retain_vm", {"message": "Missing or duplicate guest disks"})
+        for snapshot_id in vm["snapshots"]:
+            snapshot = await self._retention_object(snapshot_id) if isinstance(snapshot_id, str) else None
+            if snapshot is None or snapshot.get("type") != "VM-snapshot":
+                raise XOError("retain_vm", {"message": "Snapshot inventory incomplete"})
+        return VMProtectionManifest(vm_uuid, tuple(sorted(disks)), tuple(sorted(vm["snapshots"])),
+                                    vm["auto_poweron"], vm["high_availability"], tuple(sorted(blocks.items())))
 
-    async def delete_vm_retaining_disks(self, manifest: VMRetentionManifest) -> None:
-        """Delete only a manifest-matched VM; verify retained disks even on retry.
-
-        Does not persist the manifest, protect orphan disks, or prove restoration.
-        The retention state machine must provide those guarantees before use.
-        """
-        if not manifest.disks:
-            raise XOError("retain_delete", {"message": "Empty retention manifest"})
+    async def protect_retained_vm(self, manifest: VMProtectionManifest) -> None:
+        """Stop and protect the complete guest; keep disks and firmware in place."""
+        current = await self.capture_vm_protection(manifest.vm_uuid)
+        if current.disk_ids != manifest.disk_ids or current.snapshot_ids != manifest.snapshot_ids:
+            raise XOError("retain_vm", {"message": "Guest storage identity changed"})
+        blocks = dict(current.blocked_operations)
+        for operation in ("start", "resume", "destroy"):
+            if not blocks.get(operation):
+                blocks[operation] = "hyrule:retained"
+        if (current.auto_poweron or current.high_availability
+                or dict(current.blocked_operations) != blocks):
+            await self._xo_call("vm.set", id=manifest.vm_uuid, auto_poweron=False,
+                                high_availability="", blockedOperations=blocks)
         vm = await self._retention_object(manifest.vm_uuid)
-        if vm is not None:
-            current = await self.capture_retention_manifest(manifest.vm_uuid)
-            if current != manifest:
-                raise XOError("retain_delete", {"message": "Disk manifest changed"})
-            try:
-                await self._xo_call("vm.delete", id=manifest.vm_uuid, deleteDisks=False)
-            except Exception:
-                # Lost replies are reconciled only by complete successful reads.
-                if await self._retention_object(manifest.vm_uuid) is not None:
-                    raise
-        if await self._retention_object(manifest.vm_uuid) is not None:
-            raise XOError("retain_delete", {"message": "VM deletion unconfirmed"})
-        for disk in manifest.disks:
-            vdi = await self._retention_object(disk.vdi_uuid)
-            if (not vdi or vdi.get("type") != "VDI" or vdi.get("missing") is not False
-                    or vdi.get("$SR") != disk.sr_uuid or vdi.get("size") != disk.size_bytes):
-                raise XOError("retain_delete", {"message": "Retained disk verification failed"})
+        if vm is None:
+            raise XOError("retain_vm", {"message": "Retained VM is unavailable"})
+        if vm.get("power_state") != "Halted":
+            await self._xo_call("vm.stop", id=manifest.vm_uuid, force=True)
+        protected = await self.capture_vm_protection(manifest.vm_uuid)
+        vm = await self._retention_object(manifest.vm_uuid)
+        if (vm is None or vm.get("power_state") != "Halted" or protected.auto_poweron
+                or protected.high_availability or protected.disk_ids != manifest.disk_ids
+                or protected.snapshot_ids != manifest.snapshot_ids
+                or any(not dict(protected.blocked_operations).get(key) for key in ("start", "resume", "destroy"))):
+            raise XOError("retain_vm", {"message": "Retained VM protection could not be verified"})
+
+    async def restore_retained_vm(self, manifest: VMProtectionManifest) -> None:
+        """Restore recorded restart settings without starting the retained guest.
+
+        Caller must first persist audited restore intent and exclude expiry work.
+        Only retention-owned operation blocks are changed; XO applies a patch,
+        where null removes a block. A lost reply can be retried from inventory.
+        """
+        current = await self.capture_vm_protection(manifest.vm_uuid)
+        vm = await self._retention_object(manifest.vm_uuid)
+        if (vm is None or vm.get("power_state") != "Halted"
+                or current.disk_ids != manifest.disk_ids
+                or current.snapshot_ids != manifest.snapshot_ids):
+            raise XOError("restore_vm", {"message": "Retained guest identity or stopped state changed"})
+        original = dict(manifest.blocked_operations)
+        expected = dict(current.blocked_operations)
+        patch: dict[str, str | None] = {}
+        for operation in ("start", "resume", "destroy"):
+            if expected.get(operation) == "hyrule:retained":
+                patch[operation] = original.get(operation)
+                if operation in original:
+                    expected[operation] = original[operation]
+                else:
+                    expected.pop(operation)
+        if (patch or current.auto_poweron != manifest.auto_poweron
+                or current.high_availability != manifest.high_availability):
+            await self._xo_call("vm.set", id=manifest.vm_uuid,
+                                auto_poweron=manifest.auto_poweron,
+                                high_availability=manifest.high_availability,
+                                blockedOperations=patch)
+        restored = await self.capture_vm_protection(manifest.vm_uuid)
+        vm = await self._retention_object(manifest.vm_uuid)
+        if (vm is None or vm.get("power_state") != "Halted"
+                or restored.disk_ids != manifest.disk_ids
+                or restored.snapshot_ids != manifest.snapshot_ids
+                or restored.auto_poweron != manifest.auto_poweron
+                or restored.high_availability != manifest.high_availability
+                or dict(restored.blocked_operations) != expected):
+            raise XOError("restore_vm", {"message": "Retained guest restoration could not be verified"})
 
     async def destroy_vm(self, vm_uuid: str) -> None:
         """Destroy a VM and all associated VDIs."""

@@ -40,7 +40,7 @@ from hyrule_cloud.db import (
     VMRetentionRow,
     VMRow,
 )
-from hyrule_cloud.middleware.anon_token import hash_anon_token
+from hyrule_cloud.middleware.anon_token import VMManagementIdentity, hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
     CryptoIntentStatus,
@@ -711,11 +711,14 @@ class Orchestrator:
             if candidate is None:
                 return None
             expected_owner_account_id = candidate.owner_account_id
-            if expected_owner_account_id is not None:
+            # An anonymous reservation has no owner yet. Fence the account
+            # resolved from settlement as well, before attaching it.
+            account_ids = {value for value in (expected_owner_account_id, owner_account_id) if value}
+            for account_id in sorted(account_ids):
                 owner = (
                     await session.execute(
                         select(AccountRow)
-                        .where(AccountRow.account_id == expected_owner_account_id)
+                        .where(AccountRow.account_id == account_id)
                         .with_for_update()
                     )
                 ).scalar_one_or_none()
@@ -724,6 +727,7 @@ class Orchestrator:
             row = (
                 await session.execute(
                     select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                        .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
             if row is None:
@@ -1569,7 +1573,7 @@ class Orchestrator:
                         .limit(1)
                     )
                 ).scalar_one_or_none()
-        await self.refunds.record_owed(
+        obligation = self.refunds.build_owed_event(
             resource_path=f"/v1/vm/{vm_id}/extend",
             payer=(settled.payer_wallet if settled is not None else None)
             or owner_wallet
@@ -1581,6 +1585,12 @@ class Orchestrator:
             reason=reason,
             vm_id=vm_id,
         )
+        if obligation is None:
+            raise RuntimeError("Unable to construct the extension refund obligation")
+        async with self.db() as refund_session:
+            refund_session.add(obligation)
+            await refund_session.commit()
+
 
     async def _record_native_refund(self, vm_id: str, *, reason: str) -> bool:
         """Transition a failed native-intent VM's intent to REFUND_MANUAL and
@@ -1983,7 +1993,10 @@ class Orchestrator:
             snapshot = await session.get(VMRow, vm_id)
             owner_id = snapshot.owner_account_id if snapshot is not None else None
             if owner_id is not None:
-                await session.scalar(select(AccountRow).where(AccountRow.account_id == owner_id).with_for_update())
+                # Non-key account updates must serialize, while the payment
+                # quota transaction may take a FK key-share lock on this owner.
+                await session.scalar(select(AccountRow).where(AccountRow.account_id == owner_id)
+                                     .with_for_update(key_share=True))
             row = (await session.execute(
                 select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
                 .execution_options(populate_existing=True)
@@ -2096,19 +2109,23 @@ class Orchestrator:
                 "Purchased time committed; guest state requires reconciliation"
             ) from state_error
 
-    async def reboot_vm(self, vm_id: str) -> bool:
-        async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row or not row.xcpng_uuid:
+    async def reboot_vm(
+        self, vm_id: str, *, management_identity: VMManagementIdentity | None = None,
+    ) -> bool:
+        async with self.locked_vm(vm_id) as (_session, row):
+            if (row is None or not row.xcpng_uuid or row.deletion_started_at is not None
+                    or (management_identity is not None and not management_identity.matches(row))):
                 return False
-            xcpng_uuid = row.xcpng_uuid
+            # Ownership transfer cannot pass the row lock during the operation.
+            await self.xcpng.reboot_vm(row.xcpng_uuid)
+            return True
 
-        await self.xcpng.reboot_vm(xcpng_uuid)
-        return True
-
-    async def destroy_vm(self, vm_id: str, *, expired_before: datetime | None = None) -> bool:
+    async def destroy_vm(
+        self, vm_id: str, *, expired_before: datetime | None = None,
+        management_identity: VMManagementIdentity | None = None,
+    ) -> bool:
         async with self.locked_vm(vm_id) as (session, row):
-            if row is None:
+            if row is None or (management_identity is not None and not management_identity.matches(row)):
                 return False
             already_destroyed = row.status == VMStatus.DESTROYED
             if already_destroyed and row.ipv6_prefix_index is None and row.ipv6_prefix is None:
@@ -2122,14 +2139,16 @@ class Orchestrator:
                 if expiry >= expired_before:
                     return False
             retained = await session.get(VMRetentionRow, vm_id)
+            if retained is not None and retained.state == "restoring":
+                return False
             manifest = stored_manifest(retained) if retained is not None else None
             wants_retention = (expired_before is not None
-                               and getattr(self.config, "vm_expiry_disk_retention_enabled", False))
+                               and getattr(self.config, "vm_expiry_retention_enabled", False))
             if not already_destroyed and row.xcpng_uuid and manifest is None and wants_retention:
-                manifest = await self.xcpng.capture_retention_manifest(row.xcpng_uuid)
+                manifest = await self.xcpng.capture_vm_protection(row.xcpng_uuid)
                 await prepare_retention(
                     session, vm_id, manifest,
-                    _now() + timedelta(days=self.config.vm_disk_retention_days),
+                    _now() + timedelta(days=self.config.vm_retention_days),
                 )
             if manifest is not None and row.xcpng_uuid != manifest.vm_uuid:
                 raise RuntimeError("Retention manifest does not match the claimed guest")
@@ -2157,14 +2176,27 @@ class Orchestrator:
 
         if xcpng_uuid:
             if manifest is not None:
-                await self.xcpng.delete_vm_retaining_disks(manifest)
-                async with self.db() as retention_session:
+                # Reacquire the lifecycle fence after persisting intent. Recovery
+                # uses the same fence through provider mutation and finalization.
+                async with self.locked_vm(vm_id) as (retention_session, retained_vm):
+                    if (retained_vm is None or retained_vm.xcpng_uuid != manifest.vm_uuid
+                            or retained_vm.deletion_started_at is None):
+                        return False
                     retained = await retention_session.get(VMRetentionRow, vm_id)
                     if retained is None or stored_manifest(retained) != manifest:
                         raise RuntimeError("Retention evidence changed during provider deletion")
+                    if retained.state == "restoring":
+                        return False
+                    await self.xcpng.protect_retained_vm(manifest)
                     retained.state = "retained"
                     retained.retained_at = retained.retained_at or _now()
+                    retained_vm.status = VMStatus.SUSPENDED
+                    if retained_vm.suspension_reason not in {"manual_admin", "account_disabled"}:
+                        retained_vm.suspension_reason = "expired"
+                    # Keep DNS and the prefix: this guest still owns its disks,
+                    # firmware and network configuration throughout retention.
                     await retention_session.commit()
+                return True
             else:
                 await self.xcpng.destroy_vm(xcpng_uuid)
         elif status == str(VMStatus.PROVISIONING) or unresolved_guest:
