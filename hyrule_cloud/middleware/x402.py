@@ -22,6 +22,8 @@ import json
 import os
 import secrets
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -183,6 +185,22 @@ class VerifiedPayment:
 class AdminBypassContext:
     account_id: str
     operation_class: str
+
+
+def admin_waiver_dispatch_guard(request: Request) -> Callable[[AsyncSession], Awaitable[None]] | None:
+    """Carry the selected waiver actor into the accepting resource transaction."""
+    if getattr(request.state, "payment_mode", None) != "admin-bypass":
+        return None
+    context = getattr(request.state, "admin_bypass_context", None)
+    if not isinstance(context, AdminBypassContext):
+        raise HTTPException(403, "Administrator waiver authorization is missing")
+
+    async def guard(session: AsyncSession) -> None:
+        from hyrule_cloud.services.admin_authorization import validate_admin_dispatch
+
+        await validate_admin_dispatch(session, context.account_id)
+
+    return guard
 
 
 class PaymentGate:
@@ -791,6 +809,25 @@ class PaymentGate:
             await self._record("required_402", request, amount)
         return response
 
+    async def prospective_admin_dispatch_guard(
+        self, request: Request,
+    ) -> Callable[[AsyncSession], Awaitable[None]] | None:
+        """Select a possible waiver before a handler takes owner/resource locks."""
+        if self._payment_header(request):
+            return None
+        if self.config.dev_bypass_secret and request.headers.get("X-DEV-BYPASS") == self.config.dev_bypass_secret:
+            return None
+        context = await self._admin_context(request, force_refresh=True)
+        if context is None:
+            return None
+
+        async def guard(session: AsyncSession) -> None:
+            from hyrule_cloud.services.admin_authorization import validate_admin_dispatch
+
+            await validate_admin_dispatch(session, context.account_id)
+
+        return guard
+
     async def check_payment(
         self,
         request: Request,
@@ -1261,3 +1298,20 @@ class PaymentGate:
             return None
         except Exception:
             return None
+
+
+@asynccontextmanager
+async def external_admin_waiver_guard(request: Request, gate: Any) -> AsyncIterator[None]:
+    """Fence waiver-only external work whose service takes no account locks."""
+    if not isinstance(gate, PaymentGate):
+        yield
+        return
+    guard = await gate.prospective_admin_dispatch_guard(request)
+    if guard is None:
+        yield
+        return
+    if gate.session_factory is None:
+        raise HTTPException(403, "Administrator waiver authorization is unavailable")
+    async with gate.session_factory.begin() as session:
+        await guard(session)
+        yield

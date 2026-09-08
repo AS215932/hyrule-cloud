@@ -16,6 +16,7 @@ import dns.name
 import dns.rdatatype
 import structlog
 from cryptography.fernet import Fernet, InvalidToken
+from fastapi import HTTPException
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -1325,6 +1326,21 @@ class DomainService:
             snapshot = await session.get(DomainOrderRow, order_id)
             if snapshot is None:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            waiver_revoked = False
+            if billing_mode == "admin_waived" and snapshot.status == DomainOrderStatus.AWAITING_PAYMENT.value:
+                # The ledger recovery worker uses this same accepting transaction.
+                # Its server-recorded synthetic payer carries the waiver actor.
+                from hyrule_cloud.services.admin_authorization import validate_admin_dispatch
+
+                if not payer.startswith("admin:") or not payer.removeprefix("admin:"):
+                    waiver_revoked = True
+                else:
+                    try:
+                        await validate_admin_dispatch(session, payer.removeprefix("admin:"))
+                    except HTTPException as exc:
+                        if exc.status_code != 403:
+                            raise
+                        waiver_revoked = True
             owner = None
             if snapshot.owner_account_id is not None:
                 owner = (
@@ -1349,6 +1365,17 @@ class DomainService:
                     "order_owner_changed",
                     "The order owner changed while payment was settling.",
                 )
+            if waiver_revoked and order.status == DomainOrderStatus.AWAITING_PAYMENT.value:
+                order.status = DomainOrderStatus.FAILED.value
+                order.billing_mode = billing_mode
+                order.payer = payer[:128]
+                order.payment_tx = tx_hash
+                order.payment_network = payment_network
+                order.payment_asset = payment_asset
+                order.error_code = "admin_waiver_revoked"
+                order.error_detail = "Administrator waiver was revoked before acceptance; no payment was collected."
+                await session.commit()
+                return order
             if order.status == DomainOrderStatus.EXPIRED.value:
                 # The quote sweeper can win the race with an in-flight
                 # facilitator settlement. Funds that arrive after expiry must
