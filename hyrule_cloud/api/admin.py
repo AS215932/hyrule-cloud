@@ -1146,12 +1146,12 @@ async def vm_action(
                 raise HTTPException(409, "Deletion-claimed VMs cannot accept power actions")
             if current.status == VMStatus.DESTROYED:
                 raise HTTPException(409, "Destroyed VMs cannot accept power actions")
-            if action in {"start", "reboot", "shutdown", "suspend"}:
-                status = str(current.status)
+            status = str(current.status)
+            if action in {"start", "reboot"}:
                 if status in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
                     raise HTTPException(409, "Terminal VMs cannot be powered on")
-                if status == VMStatus.PROVISIONING.value:
-                    raise HTTPException(409, "Provisioning VMs cannot be powered manually")
+            if status == VMStatus.PROVISIONING.value:
+                raise HTTPException(409, "Provisioning VMs cannot be powered manually")
             if action == "start":
                 if current.expires_at is not None and _aware(current.expires_at) <= _now():
                     raise HTTPException(409, "Expired VMs cannot be started")
