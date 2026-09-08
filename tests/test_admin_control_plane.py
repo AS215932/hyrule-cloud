@@ -1196,6 +1196,7 @@ async def test_transfer_target_eligibility_check_locks_account() -> None:
             return target
 
     class Session:
+        bind = None  # This unit test checks the row lock; PostgreSQL covers the lifecycle guard.
         async def execute(self, statement):
             assert statement._for_update_arg is not None
             return Result()
