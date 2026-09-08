@@ -11,6 +11,35 @@ from tests.test_vm_expiry_renewal import _stored_vm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('initial_expiry_delete', [False, True])
+async def test_sweep_does_not_convert_existing_delete_claim_to_retention(initial_expiry_delete):
+    orch, engine = await _stored_vm(VMStatus.SUSPENDED)
+    orch.config.vm_expiry_retention_enabled = not initial_expiry_delete
+    orch.config.vm_retention_days = 30
+    orch.xcpng.capture_vm_protection = AsyncMock()
+    orch.xcpng.protect_retained_vm = AsyncMock()
+    orch.xcpng.destroy_vm.side_effect = [ConnectionError('interrupted delete'), None]
+    try:
+        kwargs = {'expired_before': datetime.now(UTC) - timedelta(days=2)} if initial_expiry_delete else {}
+        with pytest.raises(ConnectionError, match='interrupted delete'):
+            await orch.destroy_vm('vm_lifecycle', **kwargs)
+        async with orch.db() as session:
+            assert (await session.get(VMRow, 'vm_lifecycle')).deletion_started_at is not None
+            assert await session.get(VMRetentionRow, 'vm_lifecycle') is None
+        # Includes a legacy expiry claim made before the retention rollout.
+        orch.config.vm_expiry_retention_enabled = True
+        await orch.check_expiries()
+        async with orch.db() as session:
+            assert (await session.get(VMRow, 'vm_lifecycle')).status == VMStatus.DESTROYED
+            assert await session.get(VMRetentionRow, 'vm_lifecycle') is None
+        assert orch.xcpng.destroy_vm.await_count == 2
+        orch.xcpng.capture_vm_protection.assert_not_awaited()
+        orch.xcpng.protect_retained_vm.assert_not_awaited()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('interrupted', [False, True])
 async def test_expiry_commits_retention_before_delete_and_preserves_it_on_retry(interrupted):
     orch, engine = await _stored_vm(VMStatus.SUSPENDED)

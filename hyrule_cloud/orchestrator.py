@@ -2148,7 +2148,11 @@ class Orchestrator:
             if retained is not None and retained.state == "restoring":
                 return False
             manifest = stored_manifest(retained) if retained is not None else None
-            wants_retention = (expired_before is not None
+            # Retention evidence and the initial expiry claim are committed
+            # together. A pre-existing claim without evidence must finish its
+            # original deletion, even when retried by the expiry worker or
+            # after retention is enabled. Never reinterpret an explicit delete.
+            wants_retention = (row.deletion_started_at is None and expired_before is not None
                                and getattr(self.config, "vm_expiry_retention_enabled", False))
             if not already_destroyed and row.xcpng_uuid and manifest is None and wants_retention:
                 manifest = await self.xcpng.capture_vm_protection(row.xcpng_uuid)
