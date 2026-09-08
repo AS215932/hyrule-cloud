@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from starlette.requests import Request
 
 from hyrule_cloud.api.admin import ExpiryExtensionRequest, extend_vm_expiry
-from hyrule_cloud.db import AccountRow, AdminAuditRow, PaymentEventRow, VMRow
+from hyrule_cloud.db import AccountRow, AdminAuditRow, AdminBypassUsageRow, PaymentEventRow, VMRow
 from hyrule_cloud.models import VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
 
@@ -73,11 +73,20 @@ async def test_admin_extension_serializes_with_deletion_and_rolls_back_audit_fai
         async with worker.db.begin() as session:
             session.add(actor)
             for vm_id in ('vm_extend_first', 'vm_delete_first', 'vm_audit_rollback'):
-                session.add(VMRow(vm_id=vm_id, owner_wallet='fixture', status=VMStatus.SUSPENDED,
+                session.add(VMRow(vm_id=vm_id, owner_wallet='fixture', owner_account_id=actor.account_id, status=VMStatus.SUSPENDED,
                                   xcpng_uuid=vm_id, expires_at=old_expiry, suspension_reason='expired'))
         extension = asyncio.create_task(extend('vm_extend_first'))
         tasks.append(extension)
         await asyncio.wait_for(entered.wait(), 5)
+        # A same-owner waiver inserts an account FK in a separate transaction.
+        # It must complete while the outer lifecycle transaction still holds
+        # its account lock; account disable remains serialized by that lock.
+        async with worker.db.begin() as quota:
+            await quota.execute(text("SET LOCAL lock_timeout = '1s'"))
+            quota.add(AdminBypassUsageRow(actor_account_id=actor.account_id,
+                                         operation_class='real_cost',
+                                         window_started_at=datetime.now(UTC), count=1))
+            await quota.flush()
         sweep = asyncio.create_task(worker.destroy_vm('vm_extend_first', expired_before=datetime.now(UTC) - timedelta(days=2)))
         tasks.append(sweep)
         async with asyncio.timeout(5):

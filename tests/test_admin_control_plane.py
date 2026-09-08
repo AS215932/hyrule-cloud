@@ -231,10 +231,11 @@ async def test_deferred_admin_waiver_audits_before_delivery_and_restores_failed_
 
 
 @pytest.mark.asyncio
-async def test_real_cost_waiver_requires_recent_password_step_up(admin_factory) -> None:
+@pytest.mark.parametrize("path", ["/v1/vm/create", "/v1/tunnel/create"])
+async def test_real_cost_waiver_requires_recent_password_step_up(admin_factory, path) -> None:
     credentials = await _admin_credentials(admin_factory)
     gate = _admin_gate(admin_factory)
-    request = _browser_request(credentials, path="/v1/vm/create")
+    request = _browser_request(credentials, path=path)
 
     with pytest.raises(HTTPException) as exc:
         await gate.check_payment(request, Decimal("1.00"), "VM")

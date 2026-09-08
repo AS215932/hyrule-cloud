@@ -1787,7 +1787,10 @@ class Orchestrator:
             snapshot = await session.get(VMRow, vm_id)
             owner_id = snapshot.owner_account_id if snapshot is not None else None
             if owner_id is not None:
-                await session.scalar(select(AccountRow).where(AccountRow.account_id == owner_id).with_for_update())
+                # Non-key account updates must serialize, while the payment
+                # quota transaction may take a FK key-share lock on this owner.
+                await session.scalar(select(AccountRow).where(AccountRow.account_id == owner_id)
+                                     .with_for_update(key_share=True))
             row = (await session.execute(
                 select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
                 .execution_options(populate_existing=True)
