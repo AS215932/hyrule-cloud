@@ -1250,6 +1250,7 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
             current.suspension_reason = None
             current.suspended_by_account_id = None
             current.error = None
+            await orchestrator.prepare_provisioning_dispatch(session, current)
             restart_provisioning = True
         else:
             # A stale provenance marker on an already-live VM should not block
@@ -1263,7 +1264,7 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
         # state; AppState does not replace a live orchestrator at runtime.
         orchestrator = state.orchestrator
         assert orchestrator is not None
-        orchestrator.start_provisioning(vm_id)
+        await orchestrator.start_provisioning(vm_id)
 
 
 async def _pending_domain_work(

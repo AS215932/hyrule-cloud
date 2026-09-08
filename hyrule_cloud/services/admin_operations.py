@@ -322,11 +322,12 @@ async def _apply_locked_account_operation(
                     current.suspension_reason = None
                     current.suspended_by_account_id = None
                     current.error = None
+                    await orchestrator.prepare_provisioning_dispatch(session, current)
                     restart_provisioning = True
                 await session.commit()
                 vm_count += 1
             if restart_provisioning:
-                orchestrator.start_provisioning(vm.vm_id)
+                await orchestrator.start_provisioning(vm.vm_id)
         async with session_factory() as session:
             for mailbox in mailboxes:
                 mailbox_row = (

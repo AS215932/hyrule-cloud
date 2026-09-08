@@ -15,7 +15,7 @@ from alembic import op
 _JSONB = postgresql.JSONB(astext_type=sa.Text()).with_variant(sa.JSON(), "sqlite")
 
 revision: str = "023"
-down_revision: str | None = "021"
+down_revision: str | None = "022"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

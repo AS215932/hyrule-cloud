@@ -196,7 +196,7 @@ class _Orchestrator:
         self.refunds = RefundService(PaymentLedger(sessions))
         self.started_vms: list[str] = []
 
-    def start_provisioning(self, vm_id: str) -> None:
+    async def start_provisioning(self, vm_id: str) -> None:
         self.started_vms.append(vm_id)
 
 

@@ -2396,3 +2396,54 @@ async def test_marketplace_registration_uses_normal_payment_without_admin_waiver
         assert list(await session.scalars(select(AdminBypassUsageRow))) == []
         events = list(await session.scalars(select(PaymentEventRow)))
         assert all(event.event_type != 'admin_bypass' for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('source', ['account_enable', 'ownership_transfer'])
+async def test_legacy_restart_receipt_survives_commit_before_scheduling_crash(admin_factory, monkeypatch, source):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from hyrule_cloud.db import VMGuestResultRow
+
+    monkeypatch.setattr('hyrule_cloud.services.launch_proof._LAUNCH_PROOF_REAL', True)
+    config = HyruleConfig()
+    original = Orchestrator(config, admin_factory)
+    recovered = Orchestrator(config, admin_factory)
+    async with admin_factory.begin() as session:
+        session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture'))
+        session.add(VMRow(vm_id='vm_legacy_restart', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
+                          status='suspended', suspension_reason='account_disabled',
+                          expires_at=datetime.now(UTC) + timedelta(days=1)))
+        session.add(AdminOperationRow(operation_id='legacy-restart', kind='resume_account_resources',
+                                      account_id='HBBBBBBBBBB', status='running'))
+    generations = []
+
+    async def crash_after_commit(vm_id):
+        async with admin_factory() as session:
+            vm = await session.get(VMRow, vm_id)
+            receipt = await session.get(VMGuestResultRow, vm_id)
+            assert vm.status == 'provisioning' and vm.suspension_reason is None
+            assert receipt is not None
+            generations.append(receipt.generation)
+        raise asyncio.CancelledError('fixture process exit before in-memory scheduling')
+
+    original.start_provisioning = AsyncMock(side_effect=crash_after_commit)
+    recovered._provision_vm_owned = AsyncMock()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            if source == 'account_enable':
+                await _apply_account_operation(admin_factory, original, 'legacy-restart')
+            else:
+                state = AppState(config=config, orchestrator=original, payment_gate=None,
+                                 network_provider=None, session_factory=admin_factory)
+                await _resume_transferred_vm(state, 'vm_legacy_restart')
+        assert await recovered.recover_tracked_provisioning() == 1
+        await asyncio.gather(*list(recovered._tasks))
+        recovered._provision_vm_owned.assert_awaited_once_with('vm_legacy_restart')
+        async with admin_factory() as session:
+            receipt = await session.get(VMGuestResultRow, 'vm_legacy_restart')
+            assert receipt.generation == generations[0]
+    finally:
+        await original.shutdown()
+        await recovered.shutdown()

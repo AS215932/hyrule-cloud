@@ -778,7 +778,7 @@ async def _trigger_provisioning(
                 raise _NativeHandoffFencedError
             await db.commit()
         # The intent↔vm link is committed; now it is safe to provision.
-        orch.start_provisioning(vm_row.vm_id)
+        await orch.start_provisioning(vm_row.vm_id)
         log.info("intent_provisioned", intent_id=intent_id, vm_id=vm_row.vm_id)
     except _NativeHandoffFencedError:
         log.warning(
