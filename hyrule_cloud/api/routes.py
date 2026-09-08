@@ -1349,31 +1349,34 @@ async def extend_vm(
     # create/quote/intent. Refuse before check_payment so no money moves.
     _require_vm_service_open(gate)
 
-    total = current_daily_price_for_vm(row, cfg.payment) * body.days
+    async with orch.locked_vm(vm_id) as (session, row):
+        if not orch.vm_can_extend(row):
+            raise HTTPException(409, "This VM can no longer be extended")
+        total = current_daily_price_for_vm(row, cfg.payment) * body.days
 
-    result = await gate.check_payment(
-        request,
-        amount=total,
-        description=f"Extend VM {vm_id} by {body.days} days",
-        extra_body={
+        result = await gate.check_payment(
+            request,
+            amount=total,
+            description=f"Extend VM {vm_id} by {body.days} days",
+            extra_body={
+                "vm_id": vm_id,
+                "current_expiry": row.expires_at.isoformat() if row.expires_at else None,
+                "extension_days": body.days,
+            },
+        )
+
+        if isinstance(result, Response):
+            return result
+
+        updated = await orch.extend_vm(vm_id, body.days, session=session)
+        if not updated:
+            raise HTTPException(500, "Failed to extend VM")
+
+        return {
             "vm_id": vm_id,
-            "current_expiry": row.expires_at.isoformat() if row.expires_at else None,
-            "extension_days": body.days,
-        },
-    )
-
-    if isinstance(result, Response):
-        return result
-
-    updated = await orch.extend_vm(vm_id, body.days)
-    if not updated:
-        raise HTTPException(500, "Failed to extend VM")
-
-    return {
-        "vm_id": vm_id,
-        "new_expiry": updated.expires_at.isoformat() if updated.expires_at else None,
-        "status": updated.status,
-    }
+            "new_expiry": updated.expires_at.isoformat() if updated.expires_at else None,
+            "status": updated.status,
+        }
 
 
 @router.post("/vm/{vm_id}/reboot", response_model=GenericActionResponse)

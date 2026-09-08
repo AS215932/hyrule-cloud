@@ -136,6 +136,8 @@ class VMRow(Base):
     provisioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     destroyed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Durable fence: renewal cannot race a provider deletion after commit/crash.
+    deletion_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Error tracking
     error: Mapped[str | None] = mapped_column(Text)

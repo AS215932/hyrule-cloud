@@ -22,8 +22,8 @@ import dns.query
 import dns.rcode
 import dns.rdatatype
 import structlog
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -1598,39 +1598,55 @@ class Orchestrator:
             result = await session.execute(select(VMQuoteRow).where(VMQuoteRow.vm_id == vm_id))
             return result.scalar_one_or_none()
 
-    async def extend_vm(self, vm_id: str, days: int) -> VMRow | None:
+    @asynccontextmanager
+    async def locked_vm(self, vm_id: str) -> AsyncIterator[tuple[AsyncSession, VMRow | None]]:
+        """One PostgreSQL row lock shared by renewal/payment and expiry decisions."""
         async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row or not row.expires_at:
-                return None
+            row = (await session.execute(
+                select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+            )).scalar_one_or_none()
+            yield session, row
 
-            now = _now()
-            base = max(row.expires_at, now)
-            row.expires_at = base + timedelta(days=days)
+    @staticmethod
+    def vm_can_extend(row: VMRow | None) -> bool:
+        return bool(row is not None and row.expires_at is not None
+                    and row.deletion_started_at is None
+                    and row.status not in (VMStatus.DESTROYED, VMStatus.FAILED))
 
-            suspend_status = row.status == VMStatus.SUSPENDED
-            xcpng_uuid = row.xcpng_uuid
-
+    async def extend_vm(
+        self, vm_id: str, days: int, *, session: AsyncSession | None = None,
+    ) -> VMRow | None:
+        if days <= 0:
+            raise ValueError("Extension days must be positive")
+        if session is None:
+            async with self.locked_vm(vm_id) as (locked_session, _row):
+                return await self.extend_vm(vm_id, days, session=locked_session)
+        row = await session.get(VMRow, vm_id)
+        if not self.vm_can_extend(row):
+            return None
+        assert row is not None and row.expires_at is not None
+        now = _now()
+        expiry = row.expires_at
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        row.expires_at = max(expiry, now) + timedelta(days=days)
+        suspended = row.status == VMStatus.SUSPENDED
+        xcpng_uuid = row.xcpng_uuid
+        # Paid time survives a later provider power-operation failure.
+        await session.commit()
+        if suspended and xcpng_uuid:
+            row = (await session.execute(
+                select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                .execution_options(populate_existing=True)
+            )).scalar_one()
+            if row.deletion_started_at is None and row.status == VMStatus.SUSPENDED:
+                power = await self.xcpng.get_vm_power_state(xcpng_uuid)
+                if power == "Halted":
+                    await self.xcpng.start_vm(xcpng_uuid)
+                row.status = VMStatus.RUNNING
             await session.commit()
-            await session.refresh(row)
-
-        if suspend_status and xcpng_uuid:
-            power = await self.xcpng.get_vm_power_state(xcpng_uuid)
-            if power == "Halted":
-                await self.xcpng.start_vm(xcpng_uuid)
-
-            async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
-                if row:
-                    row.status = VMStatus.RUNNING
-                    await session.commit()
-                    await session.refresh(row)
-
-        log.info(
-            "vm_extended",
-            vm_id=vm_id,
-            new_expiry=row.expires_at.isoformat() if row.expires_at else "none",
-        )
+        await session.refresh(row)
+        log.info("vm_extended", vm_id=vm_id, new_expiry=row.expires_at.isoformat())
         return row
 
     async def reboot_vm(self, vm_id: str) -> bool:
@@ -1643,12 +1659,27 @@ class Orchestrator:
         await self.xcpng.reboot_vm(xcpng_uuid)
         return True
 
-    async def destroy_vm(self, vm_id: str) -> bool:
-        async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row:
+    async def destroy_vm(self, vm_id: str, *, expired_before: datetime | None = None) -> bool:
+        async with self.locked_vm(vm_id) as (session, row):
+            if row is None:
                 return False
-            xcpng_uuid = row.xcpng_uuid
+            already_destroyed = row.status == VMStatus.DESTROYED
+            if already_destroyed and row.ipv6_prefix_index is None and row.ipv6_prefix is None:
+                return True
+            if row.deletion_started_at is None and expired_before is not None and not already_destroyed:
+                expiry = row.expires_at
+                if expiry is None or row.status == VMStatus.FAILED:
+                    return False
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=UTC)
+                if expiry >= expired_before:
+                    return False
+            if row.deletion_started_at is None:
+                row.deletion_started_at = _now()
+            # Persist before the irreversible provider call. A failed call or
+            # worker crash retains the claim and prevents a paid renewal.
+            await session.commit()
+            xcpng_uuid = None if already_destroyed else row.xcpng_uuid
             hostname = row.hostname
             status = str(row.status)
             domain_mode = row.domain_mode
@@ -1757,6 +1788,7 @@ class Orchestrator:
                 await session.scalars(
                     select(VMRow.vm_id).where(
                         VMRow.owner_wallet == "",
+                        VMRow.deletion_started_at.is_(None),
                         VMRow.status == VMStatus.PROVISIONING,
                         VMRow.created_at < now - timedelta(minutes=15),
                     )
@@ -1775,6 +1807,7 @@ class Orchestrator:
                     sql_delete(VMRow).where(
                         VMRow.vm_id.in_(stale_reservations),
                         VMRow.owner_wallet == "",
+                        VMRow.deletion_started_at.is_(None),
                         VMRow.status == VMStatus.PROVISIONING,
                     )
                 )
@@ -1783,9 +1816,11 @@ class Orchestrator:
         async with self.db() as session:
             result = await session.execute(
                 select(VMRow).where(
-                    VMRow.status.notin_([VMStatus.DESTROYED, VMStatus.FAILED]),
-                    VMRow.expires_at.isnot(None),
-                    VMRow.expires_at < now,
+                    VMRow.status != VMStatus.DESTROYED,
+                    or_(
+                        VMRow.deletion_started_at.isnot(None),
+                        and_(VMRow.status != VMStatus.FAILED, VMRow.expires_at < now),
+                    ),
                 )
             )
             expired_vms = []
@@ -1800,26 +1835,36 @@ class Orchestrator:
                 )
 
         for vm in expired_vms:
-            if not vm["expires_at"]:
-                continue
-            expires_at = vm["expires_at"]
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=UTC)
-
-            if now > expires_at + grace:
-                log.info("vm_expiry_destroy", vm_id=vm["vm_id"])
-                await self.destroy_vm(vm["vm_id"])
-            elif vm["status"] != VMStatus.SUSPENDED:
-                log.info("vm_expiry_suspend", vm_id=vm["vm_id"])
-                if vm["xcpng_uuid"]:
-                    try:
-                        await self.xcpng.suspend_vm(vm["xcpng_uuid"])
-                    except Exception:
-                        log.warning("suspend_failed", vm_id=vm["vm_id"], exc_info=True)
-                async with self.db() as session:
-                    await session.execute(
-                        update(VMRow)
-                        .where(VMRow.vm_id == vm["vm_id"])
-                        .values(status=VMStatus.SUSPENDED)
-                    )
+            async with self.locked_vm(vm["vm_id"]) as (session, current):
+                if current is None or current.status == VMStatus.DESTROYED:
+                    continue
+                claimed = current.deletion_started_at is not None
+                expiry = current.expires_at
+                if not claimed and (expiry is None or current.status == VMStatus.FAILED):
+                    continue
+                if expiry is not None and expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=UTC)
+                action_now = _now()
+                delete_due = claimed or (expiry is not None and action_now > expiry + grace)
+                if not delete_due:
+                    assert expiry is not None
+                    if expiry >= action_now or current.status == VMStatus.SUSPENDED:
+                        continue
+                    log.info("vm_expiry_suspend", vm_id=current.vm_id)
+                    if current.xcpng_uuid:
+                        # Failure must not be committed as a successful suspend,
+                        # nor prevent later candidates from being processed.
+                        try:
+                            await self.xcpng.suspend_vm(current.xcpng_uuid)
+                        except Exception:
+                            log.warning("suspend_failed", vm_id=current.vm_id, exc_info=True)
+                            continue
+                    current.status = VMStatus.SUSPENDED
                     await session.commit()
+                    continue
+            # Reacquire/recheck in destroy_vm: renewal may commit after the
+            # lock above is released but before the deletion claim is written.
+            try:
+                await self.destroy_vm(vm["vm_id"], expired_before=action_now - grace)
+            except Exception:
+                log.warning("vm_expiry_destroy_failed", vm_id=vm["vm_id"], exc_info=True)
