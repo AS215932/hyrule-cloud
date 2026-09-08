@@ -1229,7 +1229,7 @@ async def create_vm(
                 )
         # Always start provisioning so a paid create is never left in
         # PROVISIONING with no background task and no refund path.
-        orch.start_provisioning(row.vm_id)
+        await orch.start_provisioning(row.vm_id)
     except HTTPException:
         raise
     except Exception as exc:

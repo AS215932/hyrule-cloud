@@ -80,6 +80,15 @@ execution against a guest owner who controls root.
 
 ## Rollback
 
+Provisioning dispatch is asynchronous and must be awaited after the caller
+links its paid quote or intent. Dispatch commits an initial receipt identity
+before creating any in-memory task, including work waiting on the four-task
+limit or clone capacity lock. Unpaid reservations cannot be dispatched. New
+clones receive a fresh credential and deadline at clone time; waiting in the
+queue does not consume their eventual guest-report window. This preserves the
+existing link-before-dispatch ordering; it does not make the preceding payment
+and quote/intent handoff transactions atomic.
+
 A receipt-backed attempt with no recorded hypervisor UUID keeps its customer
 prefix quarantined even after failure, repeated customer deletion, or deferred
 DNS cleanup. Retained ambiguous guests may still use that prefix. Operator

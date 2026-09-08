@@ -74,7 +74,7 @@ class _StubOrchestrator:
             total=f"${total:.2f}",
         )
 
-    def start_provisioning(self, vm_id: str) -> None:
+    async def start_provisioning(self, vm_id: str) -> None:
         self.provisioning_started.append(vm_id)
 
     async def create_vm(

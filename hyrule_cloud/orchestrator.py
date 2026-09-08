@@ -439,7 +439,22 @@ class Orchestrator:
         ):
             raise RuntimeError("planned VM id is already bound to another order")
 
-    def _spawn_provisioning(self, vm_id: str) -> None:
+    async def _spawn_provisioning(self, vm_id: str) -> None:
+        if vm_id in self._provisioning_vm_ids:
+            return
+        # Persist dispatch before creating an in-memory task, so semaphore and
+        # capacity-lock waiters remain discoverable after API shutdown. Callers
+        # await this only after linking the paid quote/intent for refund safety.
+        async with self.db() as session:
+            row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+            if row is None or row.status != VMStatus.PROVISIONING or not row.owner_wallet:
+                return
+            receipt = await session.get(VMGuestResultRow, vm_id)
+            if receipt is None and row.xcpng_uuid is None:
+                await prepare_guest_result(
+                    session, vm_id, _now() + timedelta(seconds=self.config.guest_report_timeout_seconds),
+                )
+            await session.commit()
         if vm_id in self._provisioning_vm_ids:
             return
         self._provisioning_vm_ids.add(vm_id)
@@ -455,14 +470,14 @@ class Orchestrator:
 
         task.add_done_callback(completed)
 
-    def start_provisioning(self, vm_id: str) -> None:
+    async def start_provisioning(self, vm_id: str) -> None:
         """Kick off background provisioning for an already-created VM row.
 
         Used by callers that need to establish a link to the row (e.g. a native
         crypto intent setting its vm_id) BEFORE provisioning can fail, so the
         failure path can always find the paying record.
         """
-        self._spawn_provisioning(vm_id)
+        await self._spawn_provisioning(vm_id)
 
     async def recover_tracked_provisioning(self) -> int:
         """Incrementally recover ordinary paid guests, including x402 orders.
@@ -480,7 +495,7 @@ class Orchestrator:
             )).all())
         self._recovery_cursor = vm_ids[-1] if vm_ids else ""
         for vm_id in vm_ids:
-            self._spawn_provisioning(vm_id)
+            await self._spawn_provisioning(vm_id)
         return len(vm_ids)
 
     async def create_vm(
@@ -519,7 +534,7 @@ class Orchestrator:
             legacy_billing=legacy_billing,
         )
         if start_provisioning:
-            self._spawn_provisioning(row.vm_id)
+            await self._spawn_provisioning(row.vm_id)
         return row, anon_token
 
     async def reserve_vm(
@@ -646,7 +661,7 @@ class Orchestrator:
             await session.commit()
             await session.refresh(row)
         if start_provisioning:
-            self._spawn_provisioning(vm_id)
+            await self._spawn_provisioning(vm_id)
         return row
 
     async def release_vm_reservation(self, vm_id: str) -> None:

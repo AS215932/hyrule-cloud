@@ -385,7 +385,7 @@ class _OrchForCreate:
             vm_cost="$1.00", domain_cost="$0.00", total="$1.00",
         )
 
-    def start_provisioning(self, vm_id):
+    async def start_provisioning(self, vm_id):
         self.provisioning_started = getattr(self, "provisioning_started", [])
         self.provisioning_started.append(vm_id)
 

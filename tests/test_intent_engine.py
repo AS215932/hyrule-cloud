@@ -118,7 +118,7 @@ class _StubOrchestrator:
         # 0.05/day * 1 day = 0.05 for xs
         return Decimal("0.05") * request.duration_days, None
 
-    def start_provisioning(self, vm_id: str) -> None:
+    async def start_provisioning(self, vm_id: str) -> None:
         self.provisioning_started.append(vm_id)
 
     async def mark_vm_failed(self, vm_id: str, error: str) -> None:
@@ -249,7 +249,7 @@ class _StubOrchestrator:
             await db.refresh(row)
         self.created_vms.append((vm_id, row.owner_account_id))
         if start_provisioning:
-            self.start_provisioning(vm_id)
+            await self.start_provisioning(vm_id)
         return row
 
     async def release_vm_reservation(self, vm_id: str) -> None:

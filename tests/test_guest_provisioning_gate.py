@@ -12,8 +12,61 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from hyrule_cloud.api.routes import get_orch, router
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import Base, VMEventRow, VMRow
-from hyrule_cloud.models import DNSResolutionStatus, VMStatus
+from hyrule_cloud.models import DNSResolutionStatus, VMCreateRequest, VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
+
+
+@pytest.mark.asyncio
+async def test_paid_dispatch_survives_restart_while_waiting_for_provisioning_slots(tmp_path, monkeypatch):
+    from hyrule_cloud.db import VMGuestResultRow
+
+    monkeypatch.setattr('hyrule_cloud.services.launch_proof.use_real_provisioning', lambda: False)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'queued.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    original, recovered = [Orchestrator(HyruleConfig(), factory) for _ in range(2)]
+    entered = []
+    four_active = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held_attempt(vm_id):
+        entered.append(vm_id)
+        if len(entered) == 4:
+            four_active.set()
+        await release.wait()
+
+    original._provision_vm_owned = held_attempt
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        request = VMCreateRequest(ssh_pubkey='ssh-ed25519 fixture', duration_days=7)
+        for i in range(8):
+            vm, _ = await original.create_vm(request, owner_wallet='paid-fixture',
+                                             vm_id=f'vm_queued_{i}', start_provisioning=False)
+            async with factory() as session:
+                assert await session.get(VMGuestResultRow, vm.vm_id) is None
+            # Models dispatch after the caller has linked its paid quote/intent.
+            await original.start_provisioning(vm.vm_id)
+        unpaid, _ = await original.reserve_vm(request, vm_id='vm_unpaid')
+        await original.start_provisioning(unpaid.vm_id)
+        await asyncio.wait_for(four_active.wait(), 5)
+        assert len(entered) == 4
+        assert len(original._tasks) == 8
+        async with factory() as session:
+            assert len(list(await session.scalars(select(VMGuestResultRow.vm_id)))) == 8
+            assert await session.get(VMGuestResultRow, unpaid.vm_id) is None
+        await original.shutdown()
+        await engine.dispose()
+        assert await recovered.recover_tracked_provisioning() == 4
+        assert await recovered.recover_tracked_provisioning() == 4
+        await asyncio.wait_for(asyncio.gather(*list(recovered._tasks)), 5)
+        async with factory() as session:
+            rows = list(await session.scalars(select(VMRow).where(VMRow.vm_id.like('vm_queued_%'))))
+            assert len(rows) == 8 and all(row.status == VMStatus.READY for row in rows)
+            assert (await session.get(VMRow, unpaid.vm_id)).status == VMStatus.PROVISIONING
+    finally:
+        await original.shutdown()
+        await recovered.shutdown()
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -197,7 +250,7 @@ async def test_worker_recovers_tracked_guest_after_api_stops(tmp_path, monkeypat
             return await real_wait(*args)
 
         original._wait_for_guest_result = observed_wait
-        original.start_provisioning('vm_restart')
+        await original.start_provisioning('vm_restart')
         await asyncio.wait_for(waiting.wait(), 10)
         # A second process-equivalent orchestrator cannot duplicate an active attempt.
         await asyncio.wait_for(recovered._provision_vm('vm_restart'), 2)

@@ -41,8 +41,11 @@ def utc(value: datetime) -> datetime:
 
 
 async def prepare_guest_result(session: AsyncSession, vm_id: str, deadline: datetime) -> tuple[str, str]:
-    """Call under the clone capacity lock, after old untracked guests are removed.
+    """Create initial dispatch identity, or replace it under the clone capacity lock.
 
+    Dispatch commits an initial identity before queueing an in-memory task; its
+    token is discarded. A new clone gets a fresh identity and deadline under the
+    capacity lock after retained candidates are reconciled.
     Commit before injecting the returned token into a NEW guest. Never call for
     an already tracked guest: its existing receipt identity must survive retry.
     """
