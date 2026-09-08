@@ -49,6 +49,7 @@ async def test_admin_extension_serializes_with_deletion_and_rolls_back_audit_fai
     def orchestrator(engine, session_class=AsyncSession):
         obj = object.__new__(Orchestrator)
         obj.db = async_sessionmaker(engine, class_=session_class, expire_on_commit=False)
+        obj.config = SimpleNamespace(vm_expiry_disk_retention_enabled=False)
         obj.xcpng = SimpleNamespace(destroy_vm=AsyncMock(), start_vm=AsyncMock())
         return obj
 

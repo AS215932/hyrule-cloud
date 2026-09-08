@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -841,7 +842,7 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
         config=SimpleNamespace(),
         orchestrator=SimpleNamespace(
             xcpng=xcpng,
-            start_provisioning=lambda _vm_id: None,
+            start_provisioning=AsyncMock(),
         ),
         payment_gate=None,
         network_provider=None,
@@ -948,7 +949,7 @@ async def test_transferred_vm_revalidates_disabled_recipient_before_resume(
         config=SimpleNamespace(),
         orchestrator=SimpleNamespace(
             xcpng=xcpng,
-            start_provisioning=lambda _vm_id: None,
+            start_provisioning=AsyncMock(),
         ),
         payment_gate=None,
         network_provider=None,

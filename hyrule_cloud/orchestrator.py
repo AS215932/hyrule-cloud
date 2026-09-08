@@ -35,6 +35,7 @@ from hyrule_cloud.db import (
     DomainOrderRow,
     DomainRow,
     PaymentEventRow,
+    VMGuestResultRow,
     VMQuoteRow,
     VMRetentionRow,
     VMRow,
@@ -70,10 +71,15 @@ from hyrule_cloud.providers.network_config import (
 )
 from hyrule_cloud.providers.openprovider import OpenproviderClient
 from hyrule_cloud.providers.xcpng import XCPNGProvider
+from hyrule_cloud.services.guest_result import prepare_guest_result, utc
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
 from hyrule_cloud.services.vm_events import (
     FAILURE_DNS,
+    FAILURE_GUEST_INIT,
+    FAILURE_GUEST_RECOVERY,
+    FAILURE_GUEST_REPORT,
+    FAILURE_GUEST_SETUP,
     ProvisioningFailedError,
     customer_failure_message,
     internal_failure_detail,
@@ -135,6 +141,10 @@ def _looks_like_evm_wallet(value: str | None) -> bool:
     return True
 
 
+class GuestGenerationChangedError(RuntimeError):
+    """A stale provisioning attempt must not change its replacement's state."""
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -155,6 +165,8 @@ class Orchestrator:
         self._tasks: set[asyncio.Task] = set()
         self._provisioning_vm_ids: set[str] = set()
         self._vm_capacity_reservation_lock = asyncio.Lock()
+        self._provisioning_slots = asyncio.Semaphore(4)
+        self._recovery_cursor = ""
 
     async def startup(self) -> None:
         # Fail fast on malformed customer-network settings: an operator typo
@@ -171,6 +183,10 @@ class Orchestrator:
         log.info("orchestrator_started")
 
     async def shutdown(self) -> None:
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         try:
             await self.xcpng.close()
         except Exception:
@@ -466,7 +482,24 @@ class Orchestrator:
         ):
             raise RuntimeError("planned VM id is already bound to another order")
 
-    def _spawn_provisioning(self, vm_id: str) -> None:
+    async def _spawn_provisioning(self, vm_id: str) -> None:
+        from hyrule_cloud.services.launch_proof import use_real_provisioning
+
+        if vm_id in self._provisioning_vm_ids:
+            return
+        # Persist dispatch before creating an in-memory task, so semaphore and
+        # capacity-lock waiters remain discoverable after API shutdown. Callers
+        # await this only after linking the paid quote/intent for refund safety.
+        async with self.db() as session:
+            row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+            if row is None or row.status != VMStatus.PROVISIONING or not row.owner_wallet:
+                return
+            receipt = await session.get(VMGuestResultRow, vm_id)
+            if use_real_provisioning() and receipt is None and row.xcpng_uuid is None:
+                await prepare_guest_result(
+                    session, vm_id, _now() + timedelta(seconds=self.config.guest_report_timeout_seconds),
+                )
+            await session.commit()
         if vm_id in self._provisioning_vm_ids:
             return
         self._provisioning_vm_ids.add(vm_id)
@@ -476,17 +509,39 @@ class Orchestrator:
         def completed(done: asyncio.Task) -> None:
             self._tasks.discard(done)
             self._provisioning_vm_ids.discard(vm_id)
+            if not done.cancelled() and done.exception() is not None:
+                log.error("provisioning_task_interrupted", vm_id=vm_id,
+                          error_type=type(done.exception()).__name__)
 
         task.add_done_callback(completed)
 
-    def start_provisioning(self, vm_id: str) -> None:
+    async def start_provisioning(self, vm_id: str) -> None:
         """Kick off background provisioning for an already-created VM row.
 
         Used by callers that need to establish a link to the row (e.g. a native
         crypto intent setting its vm_id) BEFORE provisioning can fail, so the
         failure path can always find the paying record.
         """
-        self._spawn_provisioning(vm_id)
+        await self._spawn_provisioning(vm_id)
+
+    async def recover_tracked_provisioning(self) -> int:
+        """Incrementally recover ordinary paid guests, including x402 orders.
+
+        The worker calls this periodically, so an API crash is recovered even
+        when the worker itself never restarts. Include receipt-backed attempts
+        before UUID persistence; never replace a running guest's credential.
+        """
+        async with self.db() as session:
+            vm_ids = list((await session.scalars(
+                select(VMRow.vm_id).join(VMGuestResultRow)
+                .where(VMRow.status == VMStatus.PROVISIONING,
+                       VMRow.vm_id > self._recovery_cursor)
+                .order_by(VMRow.vm_id).limit(4)
+            )).all())
+        self._recovery_cursor = vm_ids[-1] if vm_ids else ""
+        for vm_id in vm_ids:
+            await self._spawn_provisioning(vm_id)
+        return len(vm_ids)
 
     async def create_vm(
         self,
@@ -530,7 +585,7 @@ class Orchestrator:
             admin_waived=admin_waived,
         )
         if start_provisioning:
-            self._spawn_provisioning(row.vm_id)
+            await self._spawn_provisioning(row.vm_id)
         return row, anon_token
 
     async def reserve_vm(
@@ -687,7 +742,7 @@ class Orchestrator:
             await session.commit()
             await session.refresh(row)
         if start_provisioning:
-            self._spawn_provisioning(vm_id)
+            await self._spawn_provisioning(vm_id)
         return row
 
     async def release_vm_reservation(self, vm_id: str) -> None:
@@ -723,6 +778,53 @@ class Orchestrator:
         await record_vm_event(self.db, vm_id, event, message=message, detail=detail)
 
     async def _provision_vm(self, vm_id: str) -> None:
+        from hyrule_cloud.services.provisioning_attempt import provisioning_attempt
+
+        async with self._provisioning_slots:
+            async with self.db() as session:
+                engine = session.bind
+            assert engine is not None
+            async with provisioning_attempt(engine, vm_id) as acquired:
+                if acquired:
+                    await self._provision_vm_owned(vm_id)
+
+    async def _recover_pre_uuid_guest(self, vm_id: str) -> str | None:
+        """Caller owns the VM attempt and clone-capacity locks.
+
+        Generation-specific labels bind an orphan to its existing credential.
+        Running means the provider reached start after sizing/configuration.
+        Incomplete or ambiguous guests are retained for operator recovery rather
+        than deleted or blindly restarted. No matching guest can be retried:
+        vm.create uses bootAfterCreate=False, so a late old create stays halted.
+        """
+        async with self.db() as session:
+            receipt = await session.get(VMGuestResultRow, vm_id)
+            if receipt is None:
+                return None
+            generation, received = receipt.generation, receipt.received_at
+        candidates = await self.xcpng.find_vm_ids_by_name_label(f"hyrule-{vm_id}-{generation}")
+        if not candidates:
+            legacy = await self.xcpng.find_vm_ids_by_name_label(f"hyrule-{vm_id}")
+            if received is not None or legacy:
+                raise ProvisioningFailedError(FAILURE_GUEST_RECOVERY)
+            return None
+        if len(candidates) != 1 or await self.xcpng.get_vm_power_state(candidates[0]) != "Running":
+            raise ProvisioningFailedError(FAILURE_GUEST_RECOVERY)
+        recovered_uuid = candidates[0]
+        async with self.db() as session:
+            row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+            receipt = await session.scalar(
+                select(VMGuestResultRow).where(VMGuestResultRow.vm_id == vm_id).with_for_update()
+            )
+            if row is None or row.status != VMStatus.PROVISIONING or receipt is None or receipt.generation != generation:
+                raise GuestGenerationChangedError()
+            if row.xcpng_uuid is not None and row.xcpng_uuid != recovered_uuid:
+                raise GuestGenerationChangedError()
+            row.xcpng_uuid = recovered_uuid
+            await session.commit()
+        return recovered_uuid
+
+    async def _provision_vm_owned(self, vm_id: str) -> None:
         """Background provisioning: create VM, wait for IPv6, configure DNS.
 
         Issue #28: controlled simulation by default. Real XCP-NG / DNS only
@@ -732,11 +834,9 @@ class Orchestrator:
         event (see `VMEventKey`) that `GET /v1/vm/{vm_id}/logs` returns. Event
         writes are best-effort by construction: they can never fail a paid VM.
 
-        Limit worth knowing: a supplied `setup_script` is only observable up to
-        the point it is injected into cloud-init user-data. The platform has no
-        channel into the guest, so whether the script actually ran, succeeded,
-        or failed is NOT reported here — the customer reads
-        /var/log/hyrule-setup.log inside their own VM for that.
+        READY requires an authenticated terminal guest completion report.
+        Missing and failed reports preserve the guest for diagnosis and follow
+        the existing failed-provisioning refund path.
         """
         from hyrule_cloud.services.launch_proof import use_real_provisioning
 
@@ -762,6 +862,14 @@ class Orchestrator:
             )
 
         if not use_real_provisioning():
+            # Switching off real provisioning cannot turn an interrupted real
+            # attempt into simulated success or discard its quarantine evidence.
+            async with self.db() as session:
+                receipt = await session.get(VMGuestResultRow, vm_id)
+                row = await session.get(VMRow, vm_id)
+                if receipt is not None or (row is not None and row.xcpng_uuid):
+                    log.warning("real_guest_recovery_paused_in_simulation", vm_id=vm_id)
+                    return
             await self._simulate_provisioning(vm_id)
             return
 
@@ -823,9 +931,9 @@ class Orchestrator:
                     VMEventKey.SETUP_SCRIPT_INJECTED,
                     message=(
                         "Your setup script was injected into first-boot user-data and "
-                        "will run as root once the VM boots. Its exit status is not "
-                        "visible to the platform — read /var/log/hyrule-setup.log on "
-                        "the VM to see what it did."
+                        "will run as root once the VM boots. Completion must be "
+                        "verified before the VM is ready; detailed output remains "
+                        "in /var/log/hyrule-setup.log inside your VM."
                     ),
                 )
 
@@ -841,6 +949,19 @@ class Orchestrator:
                             return
                         xcpng_uuid = current.xcpng_uuid
                     if xcpng_uuid is None:
+                        xcpng_uuid = await self._recover_pre_uuid_guest(vm_id)
+                        if xcpng_uuid is not None:
+                            await self._emit(
+                                vm_id,
+                                VMEventKey.VM_CREATED,
+                                message="Virtual machine created and powered on.",
+                                detail={
+                                    "vcpu": resources.vcpu,
+                                    "ram_mb": resources.ram_mb,
+                                    "disk_gb": resources.disk_gb,
+                                },
+                            )
+                    if xcpng_uuid is None:
                         name_label = f"hyrule-{vm_id}"
                         # XO may contain a clone whose create call completed before the
                         # process could durably store its UUID. It is not safe to adopt
@@ -854,6 +975,20 @@ class Orchestrator:
                                 xcpng_uuid=stale_uuid,
                             )
                             await self.xcpng.destroy_vm(stale_uuid)
+                        async with self.db() as session:
+                            deadline = _now() + timedelta(seconds=self.config.guest_report_timeout_seconds)
+                            generation, guest_token = await prepare_guest_result(session, vm_id, deadline)
+                            await session.commit()
+                        name_label = f"hyrule-{vm_id}-{generation}"
+                        cloud_config = render_cloud_init(
+                            os_name=os_name, hostname=self._generate_hostname(vm_id),
+                            ssh_pubkey=ssh_pubkey, open_ports=open_ports, setup_script=setup_script,
+                            guest_report={
+                                "url": f"{self.config.public_base_url.rstrip('/')}/v1/vm/{vm_id}/guest-result/{generation}",
+                                "token": guest_token, "deadline": deadline.timestamp(),
+                                "retry_seconds": self.config.guest_report_timeout_seconds,
+                            },
+                        )
                         xcpng_uuid = await self.xcpng.create_vm(
                             template_uuid=template_uuid,
                             name_label=name_label,
@@ -882,6 +1017,12 @@ class Orchestrator:
                                 "disk_gb": resources.disk_gb,
                             },
                         )
+
+            async with self.db() as session:
+                receipt = await session.get(VMGuestResultRow, vm_id)
+                if receipt is None:
+                    raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+                generation = receipt.generation
 
             # Wait for IPv6 (outside DB session to avoid long-held connections)
             ipv6 = await self._wait_for_ipv6(
@@ -937,8 +1078,8 @@ class Orchestrator:
                     VMEventKey.SSH_UNREACHABLE,
                     message=(
                         "SSH was not reachable on port 22 within the check window. "
-                        "The VM is still delivered — first boot may simply not have "
-                        "finished; retry the connection shortly."
+                        "Delivery is pending guest initialization verification; "
+                        "first boot may still be in progress."
                     ),
                 )
             if dns_resolution is DNSResolutionStatus.FAILED:
@@ -950,25 +1091,28 @@ class Orchestrator:
                     probe_hostname=self.config.customer_dns_probe_hostname,
                 )
 
+            # Inbound connectivity cannot establish guest initialization success.
+            generation = await self._wait_for_guest_result(vm_id, generation)
+
             # Update DB with final state
             custom_domain: str | None = None
             custom_account_id: str | None = None
-            async with self.db() as session:
-                row = (
-                    await session.execute(
-                        select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
-                    )
-                ).scalar_one_or_none()
-                if row is None:
+            async with self.locked_vm(vm_id) as (session, row):
+                if row is None or row.deletion_started_at is not None:
                     return
-                admin_suspended = row.suspension_reason in {
-                    "account_disabled",
-                    "manual_admin",
-                }
+                admin_suspended = row.suspension_reason in {"account_disabled", "manual_admin"}
+                if row.status != VMStatus.PROVISIONING and not (
+                    admin_suspended and row.status == VMStatus.SUSPENDED
+                ):
+                    return
+                receipt = await session.scalar(
+                    select(VMGuestResultRow).where(VMGuestResultRow.vm_id == vm_id).with_for_update()
+                )
+                if row.xcpng_uuid != xcpng_uuid or receipt is None or receipt.generation != generation:
+                    raise GuestGenerationChangedError()
+                if receipt.outcome != "succeeded":
+                    raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
                 if admin_suspended:
-                    # Serialize with account re-enablement while the row lock is
-                    # held: a disabled account must never observe a newly built
-                    # provider VM transition through READY.
                     await self.xcpng.suspend_vm(xcpng_uuid)
                 row.ipv6 = ipv6
                 row.status = VMStatus.SUSPENDED if admin_suspended else VMStatus.READY
@@ -1060,6 +1204,9 @@ class Orchestrator:
 
             log.info("provision_complete", vm_id=vm_id, ipv6=ipv6)
 
+        except GuestGenerationChangedError:
+            log.info("provision_attempt_superseded", vm_id=vm_id)
+            return
         except Exception as e:
             log.error("provision_failed", vm_id=vm_id, error=str(e), exc_info=True)
             # The customer sees a fixed, safe message; the operator keeps the
@@ -1068,13 +1215,20 @@ class Orchestrator:
             internal_reason = internal_failure_detail(e)
             owner_wallet, amount, payment_tx, settled = "", None, None, None
             async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
+                row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
                 if row is not None:
+                    if row.status != VMStatus.PROVISIONING:
+                        return
                     row.status = VMStatus.FAILED
                     # row.error is customer-visible (management status view and
                     # the public launch proof's operator_message), so it stores
                     # the sanitized message — never provider text.
                     row.error = customer_message
+                    meta = dict(row.metadata_ or {})
+                    proof = dict(meta.get("launch_proof", {}))
+                    proof["customer_message"] = customer_message
+                    meta["launch_proof"] = proof
+                    row.metadata_ = meta
                     owner_wallet = row.owner_wallet
                     amount = row.cost_total
                     payment_tx = row.payment_tx
@@ -1108,6 +1262,46 @@ class Orchestrator:
             await self._record_vm_refund(
                 vm_id, owner_wallet, amount, payment_tx, settled, reason=internal_reason
             )
+
+    async def _wait_for_guest_result(self, vm_id: str, generation: str) -> str:
+        """Wait without holding a connection; tracked guests keep their identity."""
+        while True:
+            # Driver cancellation may leave an unfinished cursor. Finish this
+            # read/session cleanup before allowing shutdown to release ownership.
+            poll = asyncio.create_task(self._poll_guest_result(vm_id, generation))
+            try:
+                remaining = await asyncio.shield(poll)
+            except asyncio.CancelledError:
+                await asyncio.gather(poll, return_exceptions=True)
+                raise
+            if remaining is None:
+                return generation
+            await asyncio.sleep(min(2, remaining))
+
+    async def _poll_guest_result(self, vm_id: str, generation: str) -> float | None:
+        async with self.db() as session:
+            row = await session.get(VMGuestResultRow, vm_id)
+            if row is not None and row.received_at is None and utc(row.deadline) <= _now():
+                # A report accepted before the deadline may still be committing.
+                # Lock and refresh the identity-map row before declaring expiry.
+                row = await session.scalar(
+                    select(VMGuestResultRow).where(VMGuestResultRow.vm_id == vm_id)
+                    .with_for_update().execution_options(populate_existing=True)
+                )
+            if row is None:
+                raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+            if row.generation != generation:
+                raise GuestGenerationChangedError()
+            if row.received_at is not None:
+                if row.outcome == "succeeded":
+                    return None
+                raise ProvisioningFailedError(
+                    FAILURE_GUEST_SETUP if row.stage == "setup_script" else FAILURE_GUEST_INIT
+                )
+            remaining = (utc(row.deadline) - _now()).total_seconds()
+            if remaining <= 0:
+                raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+            return remaining
 
     async def _record_vm_refund(
         self,
@@ -1951,6 +2145,10 @@ class Orchestrator:
             domain = row.domain
             owner_account_id = row.owner_account_id
 
+            # A durable attempt with no recorded UUID may still own retained
+            # generation-labeled guests, even after FAILED or DESTROYED.
+            unresolved_guest = xcpng_uuid is None and await session.get(VMGuestResultRow, vm_id) is not None
+
         # Track whether every user of the deterministic ::2 address is
         # verifiably gone; the /64 is only released when they are. A
         # quarantined prefix costs one pool slot; releasing early could hand
@@ -1969,7 +2167,7 @@ class Orchestrator:
                     await retention_session.commit()
             else:
                 await self.xcpng.destroy_vm(xcpng_uuid)
-        elif status == str(VMStatus.PROVISIONING):
+        elif status == str(VMStatus.PROVISIONING) or unresolved_guest:
             # Mid-provision race: the clone may exist without xcpng_uuid
             # having been recorded yet — the guest could still come up on
             # this prefix after we look.
@@ -2044,6 +2242,11 @@ class Orchestrator:
                 )
             ).scalar_one_or_none()
             if row is not None and str(row.status) == VMStatus.DESTROYED.value:
+                if row.xcpng_uuid is None and await session.get(VMGuestResultRow, vm_id) is not None:
+                    # DNS convergence cannot prove retained guests are gone.
+                    # Operator reconciliation must establish guest identity and
+                    # cleanup before this prefix can be made reusable.
+                    return
                 row.ipv6_prefix_index = None
                 row.ipv6_prefix = None
                 await session.commit()

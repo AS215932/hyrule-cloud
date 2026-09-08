@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from ipaddress import IPv6Network
@@ -21,6 +22,21 @@ from hyrule_cloud.providers.network_config import (
     validate_customer_network_settings,
     vm_address_for_prefix,
 )
+
+
+async def _complete_test_guest(session_factory, kwargs):
+    from hyrule_cloud.services.guest_result import GuestResult, accept_guest_result
+
+    cloud = yaml.safe_load(kwargs["cloud_init_config"])
+    report = json.loads(next(entry["content"] for entry in cloud["write_files"]
+                             if entry["path"] == "/var/lib/hyrule-guest-result/config.json"))
+    async with session_factory() as session:
+        await accept_guest_result(
+            session, report["url"].rsplit("/", 3)[1],
+            report["url"].rsplit("/", 1)[1], report["token"],
+            GuestResult(outcome="succeeded", stage="cloud_init", exit_code=0),
+        )
+        await session.commit()
 
 
 @pytest_asyncio.fixture
@@ -181,6 +197,7 @@ async def test_restarted_provisioner_replaces_untracked_exact_label_clone(
 
         async def create_vm(self, **kwargs) -> str:
             self.created.append(kwargs)
+            await _complete_test_guest(session_factory, kwargs)
             return "fresh-clone"
 
         async def get_vm_ipv6(self, vm_uuid: str) -> str | None:
@@ -239,10 +256,14 @@ async def test_restarted_provisioner_replaces_untracked_exact_label_clone(
 
 
 class _ProvisionStubXCPNG:
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
     async def find_vm_ids_by_name_label(self, name_label: str) -> list[str]:
         return []
 
     async def create_vm(self, **kwargs) -> str:
+        await _complete_test_guest(self.session_factory, kwargs)
         return "clone-uuid"
 
     async def get_vm_ipv6(self, vm_uuid: str) -> str | None:
@@ -264,7 +285,7 @@ async def _run_provision(session_factory, monkeypatch, vm_id: str) -> Orchestrat
     cfg = HyruleConfig()
     cfg.xcpng.templates["debian-13"] = "template"
     orch = Orchestrator(cfg, session_factory)
-    orch.xcpng = _ProvisionStubXCPNG()
+    orch.xcpng = _ProvisionStubXCPNG(session_factory)
     orch.dns = _ProvisionStubDNS()
 
     async def probe_ssh(ipv6: str) -> bool:

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import AnyHttpUrl, Field, TypeAdapter, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -351,6 +351,17 @@ class HyruleConfig(BaseSettings):
     # is the wrong canonical resource identity for Bazaar/x402scan indexing.
     public_base_url: str = "https://cloud.hyrule.host"
 
+    @field_validator("public_base_url")
+    @classmethod
+    def validate_public_callback_base(cls, value: str) -> str:
+        if any(char.isspace() or ord(char) < 32 for char in value):
+            raise ValueError("Public callback base must be a valid HTTPS URL")
+        url = TypeAdapter(AnyHttpUrl).validate_python(value)
+        if (url.scheme != "https" or url.username is not None or url.password is not None
+                or url.query is not None or url.fragment is not None):
+            raise ValueError("Public callback base requires HTTPS without credentials, query or fragment")
+        return str(url).rstrip("/")
+
     # Launch guard: when true, the app refuses to start unless real XCP-NG
     # provisioning is enabled (HCP_LAUNCH_PROOF_REAL_XCPNG=1) and the payment
     # dev bypass is disabled. Set in production so a config regression can
@@ -413,6 +424,7 @@ class HyruleConfig(BaseSettings):
     dns_tsig_algo: str = "hmac-sha256"
 
     # VM lifecycle
+    guest_report_timeout_seconds: int = Field(default=900, ge=60, le=3600)
     vm_grace_period_hours: int = 48
     vm_expiry_disk_retention_enabled: bool = False
     vm_disk_retention_days: int = Field(default=30, ge=1, le=365)

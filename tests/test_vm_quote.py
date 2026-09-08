@@ -79,7 +79,7 @@ class _StubOrchestrator:
         if self.capacity_error is not None:
             raise self.capacity_error
 
-    def start_provisioning(self, vm_id: str) -> None:
+    async def start_provisioning(self, vm_id: str) -> None:
         self.provisioning_started.append(vm_id)
 
     async def create_vm(

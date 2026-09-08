@@ -1263,7 +1263,7 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
         # state; AppState does not replace a live orchestrator at runtime.
         orchestrator = state.orchestrator
         assert orchestrator is not None
-        orchestrator.start_provisioning(vm_id)
+        await orchestrator.start_provisioning(vm_id)
 
 
 async def _pending_domain_work(

@@ -71,6 +71,11 @@ from hyrule_cloud.providers.network_config import (
     customer_prefix_count,
     supports_static_network_config,
 )
+from hyrule_cloud.services.guest_result import (
+    GuestResult,
+    GuestResultRejectedError,
+    accept_guest_result,
+)
 from hyrule_cloud.services.launch_proof import build_launch_proof
 from hyrule_cloud.services.quotes import (
     QuoteConflictError,
@@ -817,6 +822,38 @@ async def _vm_for_management(
 # because the legacy `/vm/{id}` URL is still in their templates and now
 # returns 404 unless the caller has a token. Status pages should switch
 # to `/status`.
+@router.post("/vm/{vm_id}/guest-result/{generation}", status_code=204, include_in_schema=False)
+async def receive_guest_result(
+    vm_id: str, generation: str, request: Request, orch=Depends(get_orch),
+) -> Response:
+    """Only the scoped guest credential can submit a finite completion receipt."""
+    authorization = request.headers.get("authorization", "")
+    if not authorization.startswith("Bearer ") or len(authorization) > 135:
+        raise HTTPException(404, "Guest completion report rejected")
+    token = authorization.removeprefix("Bearer ")
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        raise HTTPException(415, "Expected application/json")
+    try:
+        async with asyncio.timeout(10):
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > 1024:
+                    raise HTTPException(413, "Completion report too large")
+                body.extend(chunk)
+            try:
+                result = GuestResult.model_validate_json(bytes(body))
+            except ValueError:
+                raise HTTPException(400, "Invalid completion report") from None
+            async with orch.db() as session:
+                await accept_guest_result(session, vm_id, generation, token, result)
+                await session.commit()
+    except GuestResultRejectedError as exc:
+        raise HTTPException(exc.status_code, "Guest completion report rejected") from None
+    except TimeoutError:
+        raise HTTPException(503, "Completion report temporarily unavailable") from None
+    return Response(status_code=204)
+
+
 @router.get("/vm/{vm_id}/status", response_model=VMPublicStatusResponse)
 async def get_vm_public_status(
     vm_id: str,
@@ -891,10 +928,9 @@ async def get_vm_logs(
     DNS published, SSH reachability, ready/failed. They are NOT logs from inside
     the guest.
 
-    A supplied `setup_script` is observable only up to `setup_script_injected`:
-    the platform has no channel into the guest, so whether the script ran,
-    succeeded, or failed is not reported here. Read /var/log/hyrule-setup.log on
-    the VM over SSH for that.
+    Injection is not completion. New guests must report successful cloud-init
+    before the ready event. A failed setup script produces a fixed failure
+    message; detailed output remains in /var/log/hyrule-setup.log inside the VM.
 
     VMs created before provisioning events existed return the single legacy
     `provisioning_started` entry derived from their creation time.
@@ -1216,7 +1252,7 @@ async def create_vm(
                 )
         # Always start provisioning so a paid create is never left in
         # PROVISIONING with no background task and no refund path.
-        orch.start_provisioning(row.vm_id)
+        await orch.start_provisioning(row.vm_id)
     except HTTPException:
         raise
     except AccountDisabledError as exc:

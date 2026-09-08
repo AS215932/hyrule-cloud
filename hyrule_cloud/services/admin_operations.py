@@ -325,7 +325,7 @@ async def _apply_locked_account_operation(
                 await session.commit()
                 vm_count += 1
             if restart_provisioning:
-                orchestrator.start_provisioning(vm.vm_id)
+                await orchestrator.start_provisioning(vm.vm_id)
         async with session_factory() as session:
             for mailbox in mailboxes:
                 mailbox_row = (
