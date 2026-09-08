@@ -260,12 +260,13 @@ async def test_expiry_suspend_and_destroy_paths_are_exercised(launch_state):
             self.suspended.append(uuid)
 
     class _Fake:
+        locked_vm = Orchestrator.locked_vm
         config = launch_state.config
         db = launch_state.orchestrator.db
         xcpng = _XCPNG()
         destroyed: list[str] = []
 
-        async def destroy_vm(self, vm_id):
+        async def destroy_vm(self, vm_id, *, expired_before=None):
             self.destroyed.append(vm_id)
             async with self.db() as session:
                 row = await session.get(VMRow, vm_id)
