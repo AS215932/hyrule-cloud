@@ -2129,6 +2129,7 @@ class Orchestrator:
     async def destroy_vm(
         self, vm_id: str, *, expired_before: datetime | None = None,
         management_identity: VMManagementIdentity | None = None,
+        reconcile_retention: bool = False,
     ) -> bool:
         async with self.locked_vm(vm_id) as (session, row):
             if row is None or (management_identity is not None and not management_identity.matches(row)):
@@ -2145,8 +2146,16 @@ class Orchestrator:
                 if expiry >= expired_before:
                     return False
             retained = await session.get(VMRetentionRow, vm_id)
+            if reconcile_retention and retained is None:
+                # Reconciliation selected before a completed recovery must not
+                # become a fresh customer deletion after its evidence is gone.
+                return False
             if retained is not None and retained.state == "restoring":
                 return False
+            if retained is not None and retained.state == "retained" and expired_before is not None:
+                # A completed retention is not pending expiry work. Explicit
+                # calls without an expiry cutoff still reconcile protection.
+                return True
             manifest = stored_manifest(retained) if retained is not None else None
             # Retention evidence and the initial expiry claim are committed
             # together. A pre-existing claim without evidence must finish its
@@ -2197,6 +2206,8 @@ class Orchestrator:
                         raise RuntimeError("Retention evidence changed during provider deletion")
                     if retained.state == "restoring":
                         return False
+                    if retained.state == "retained" and expired_before is not None:
+                        return True
                     await self.xcpng.protect_retained_vm(manifest)
                     retained.state = "retained"
                     retained.retained_at = retained.retained_at or _now()
@@ -2337,6 +2348,10 @@ class Orchestrator:
             result = await session.execute(
                 select(VMRow).where(
                     VMRow.status != VMStatus.DESTROYED,
+                    ~select(VMRetentionRow.vm_id).where(
+                        VMRetentionRow.vm_id == VMRow.vm_id,
+                        VMRetentionRow.state.in_(("retained", "restoring")),
+                    ).exists(),
                     or_(
                         VMRow.deletion_started_at.isnot(None),
                         and_(VMRow.status != VMStatus.FAILED, VMRow.expires_at < now),

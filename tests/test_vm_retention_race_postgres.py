@@ -96,7 +96,9 @@ async def test_recovery_serializes_with_expiry_and_account_disable():
                 return await restore_retained_vm(vm_id, body, request, actor, SimpleNamespace(orchestrator=api))
 
             async def sweep():
-                return await worker.destroy_vm(vm_id, expired_before=now - timedelta(days=2))
+                # Completed retention is excluded from automatic expiry sweeps;
+                # explicit reconciliation must still serialize with recovery.
+                return await worker.destroy_vm(vm_id, reconcile_retention=True)
 
             async def held_provider(received):
                 assert received == manifest

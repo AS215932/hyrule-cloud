@@ -99,3 +99,41 @@ async def test_expiry_commits_retention_before_delete_and_preserves_it_on_retry(
         orch.xcpng.protect_retained_vm.assert_not_awaited()
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_expiry_skips_completed_retention_but_retries_prepared_and_allows_reconciliation():
+    orch, engine = await _stored_vm(VMStatus.SUSPENDED)
+    orch.config.vm_expiry_retention_enabled = True
+    orch.config.vm_retention_days = 30
+    manifest = VMProtectionManifest('test-guest', ('disk',), (), False, '', ())
+    orch.xcpng.capture_vm_protection = AsyncMock(return_value=manifest)
+    orch.xcpng.protect_retained_vm = AsyncMock(side_effect=[ConnectionError('verification interrupted'), None, None])
+    cutoff = datetime.now(UTC) - timedelta(days=2)
+    try:
+        with pytest.raises(ConnectionError):
+            await orch.destroy_vm('vm_lifecycle', expired_before=cutoff)
+        # Prepared evidence remains automatic retry work, even if rollout is off.
+        orch.config.vm_expiry_retention_enabled = False
+        await orch.check_expiries()
+        assert orch.xcpng.protect_retained_vm.await_count == 2
+        async with orch.db() as session:
+            retained_at = (await session.get(VMRetentionRow, 'vm_lifecycle')).retained_at
+        original_destroy = orch.destroy_vm
+        orch.destroy_vm = AsyncMock(wraps=original_destroy)
+        await orch.check_expiries()
+        await orch.check_expiries()
+        orch.destroy_vm.assert_not_awaited()  # Excluded by candidate query, not just the handler.
+        assert orch.xcpng.protect_retained_vm.await_count == 2
+        # Already selected expiry work also stops before provider inventory calls.
+        assert await original_destroy('vm_lifecycle', expired_before=cutoff)
+        assert orch.xcpng.protect_retained_vm.await_count == 2
+        # An explicit reconciliation still verifies protection without recapture.
+        assert await original_destroy('vm_lifecycle', reconcile_retention=True)
+        assert orch.xcpng.protect_retained_vm.await_count == 3
+        orch.xcpng.capture_vm_protection.assert_awaited_once()
+        orch.xcpng.destroy_vm.assert_not_awaited()
+        async with orch.db() as session:
+            assert (await session.get(VMRetentionRow, 'vm_lifecycle')).retained_at == retained_at
+    finally:
+        await engine.dispose()
