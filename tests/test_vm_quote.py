@@ -129,6 +129,24 @@ class _StubOrchestrator:
                 row.cost_total = amount
                 await session.commit()
 
+    async def persist_payment_billing(
+        self,
+        vm_id: str,
+        retail_amount: Decimal,
+        *,
+        admin_waived: bool,
+        payment_tx: str | None = None,
+    ) -> None:
+        self.charged_amounts[vm_id] = Decimal("0") if admin_waived else retail_amount
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.retail_cost_total = retail_amount
+                row.cost_total = Decimal("0") if admin_waived else retail_amount
+                row.billing_mode = "admin_waived" if admin_waived else "charged"
+                row.payment_tx = payment_tx
+                await session.commit()
+
     async def record_create_failure_refund(
         self, *, owner_wallet, payment_tx, charged_amount, reason, vm_id=None
     ) -> None:

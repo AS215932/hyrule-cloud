@@ -217,6 +217,13 @@ class _StubOrchestrator:
         vm_id: str | None = None,
         **kwargs,
     ):
+        if owner_account_id is not None:
+            async with self.db() as db:
+                owner = await db.get(AccountRow, owner_account_id)
+            if owner is not None and owner.disabled_at is not None:
+                from hyrule_cloud.orchestrator import AccountDisabledError
+
+                raise AccountDisabledError("VM owner account is disabled")
         capacity_error = getattr(self, "capacity_error", None)
         if capacity_error is not None:
             raise capacity_error
@@ -237,14 +244,22 @@ class _StubOrchestrator:
         self,
         vm_id: str,
         owner_wallet: str,
+        payment_tx: str | None = None,
         *,
         start_provisioning: bool = True,
+        retail_amount: Decimal | None = None,
+        admin_waived: bool = False,
     ):
         async with self.db() as db:
             row = await db.get(VMRow, vm_id)
             if row is None:
                 return None
             row.owner_wallet = owner_wallet
+            row.payment_tx = payment_tx
+            if retail_amount is not None:
+                row.retail_cost_total = retail_amount
+                row.cost_total = Decimal("0") if admin_waived else retail_amount
+                row.billing_mode = "admin_waived" if admin_waived else "charged"
             await db.commit()
             await db.refresh(row)
         self.created_vms.append((vm_id, row.owner_account_id))
@@ -452,6 +467,7 @@ async def _seed_intent(
     amount_crypto: Decimal | None = None,
     amount_usd: Decimal | None = None,
     rate_valid_until: datetime | None = None,
+    owner_account_id: str | None = None,
 ):
     intent_state_provider = state.native_crypto
     if asset == "BTC":
@@ -466,7 +482,7 @@ async def _seed_intent(
         order_payload=_vm_create_request(),
         amount_usd=amount_usd or Decimal("0.05"),
         client_order_id=None,
-        owner_account_id=None,
+        owner_account_id=owner_account_id,
     )
     if rate_valid_until is not None:
         async with state.orchestrator.db() as db:
@@ -747,17 +763,14 @@ async def test_provisioning_fires_exactly_once_even_with_concurrent_polls(intent
     # The critical invariant: exactly ONE VM is created, regardless of how
     # the two concurrent pollers interleave.
     assert len(intent_state.orchestrator.created_vms) == 1
-    # The winner drives the intent SETTLED → PROVISIONING → PROVISIONED and is
-    # guaranteed to return PROVISIONED. The loser lost the atomic UPDATE...
-    # RETURNING race, so _trigger_provisioning was a no-op for it; the status it
-    # returns is whatever its post-trigger re-fetch (intents.py) happened to
-    # observe of the winner's in-flight transition — SETTLED (winner not yet at
-    # PROVISIONING), PROVISIONING (winner mid-create_vm), or PROVISIONED (winner
-    # done). All three are benign: the invariants that matter (exactly one VM,
-    # winner reached PROVISIONED) already hold above. Pinning the loser to a
-    # single state made this test flaky under CI scheduling.
+    # Return objects can be snapshots from either side of the handoff. The
+    # durable row is the invariant: concurrent scans must not write a stale
+    # SETTLED status over the winner's completed PROVISIONED transition.
+    async with intent_state.orchestrator.db() as db:
+        durable = await db.get(CryptoIntentRow, row.intent_id)
+    assert durable is not None
+    assert durable.status == CryptoIntentStatus.PROVISIONED
     terminal_states = {r1.status, r2.status}
-    assert CryptoIntentStatus.PROVISIONED in terminal_states
     assert terminal_states.issubset(
         {
             CryptoIntentStatus.PROVISIONED,
@@ -1757,6 +1770,49 @@ async def test_native_intent_refunds_when_atomic_capacity_reservation_fails(
     async with intent_state.orchestrator.db() as db:
         intent = await db.get(CryptoIntentRow, row.intent_id)
         assert intent.status == CryptoIntentStatus.REFUND_MANUAL
+
+
+@pytest.mark.asyncio
+async def test_paid_native_intent_refunds_when_owner_was_disabled(intent_state):
+    account_id = "HDDDDDDDDDD"
+    async with intent_state.orchestrator.db() as db:
+        db.add(
+            AccountRow(
+                account_id=account_id,
+                password_hash="not-used-in-intent-test",
+            )
+        )
+        await db.commit()
+    row = await _seed_intent(
+        intent_state,
+        asset="BTC",
+        owner_account_id=account_id,
+    )
+    async with intent_state.orchestrator.db() as db:
+        owner = await db.get(AccountRow, account_id)
+        assert owner is not None
+        owner.disabled_at = _now()
+        await db.commit()
+    intent_state.native_crypto.scan_results[row.address] = AddressScanResult(
+        address=row.address,
+        received_total=row.amount_crypto * Decimal("1.20"),
+        confirmations=2,
+    )
+
+    await poll_one_intent(
+        intent_id=row.intent_id,
+        session_factory=intent_state.orchestrator.db,
+        provider=intent_state.native_crypto,
+        rates=intent_state.rate_provider,
+        orch=intent_state.orchestrator,
+    )
+
+    assert intent_state.orchestrator.native_refunds == [row.intent_id]
+    assert (
+        intent_state.orchestrator.native_refund_reasons[row.intent_id]
+        == "account_disabled_at_settlement"
+    )
+    assert intent_state.orchestrator.created_vms == []
 
 
 @pytest.mark.asyncio
