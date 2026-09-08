@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, cast, overload
@@ -1561,6 +1562,7 @@ class DomainService:
         body: DNSChangesetRequest,
         *,
         idempotency_key: str,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> DNSZoneResponse:
         _, _, fqdn = normalize_registrable_domain(value)
         if len(body.changes) > self.domain_config.max_dns_changes:
@@ -1577,6 +1579,8 @@ class DomainService:
         ).encode()
         request_hash = hashlib.sha256(canonical).hexdigest()
         async with self.db() as session:
+            if dispatch_guard is not None:
+                await dispatch_guard(session)
             existing_idempotency = (
                 await session.execute(
                     select(DomainIdempotencyRow).where(
@@ -1741,6 +1745,8 @@ class DomainService:
         value: str,
         body: NameserverUpdateRequest,
         idempotency_key: str,
+        *,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> DomainOperationResponse:
         nameservers = (
             self.domain_config.managed_nameservers
@@ -1753,6 +1759,7 @@ class DomainService:
             "nameservers",
             {"mode": body.mode.value, "nameservers": nameservers},
             idempotency_key,
+            dispatch_guard=dispatch_guard,
             reject_vm_attachment=body.mode is NameserverMode.EXTERNAL,
         )
 
@@ -1762,6 +1769,8 @@ class DomainService:
         value: str,
         body: DNSSECUpdateRequest,
         idempotency_key: str,
+        *,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> DomainOperationResponse:
         return await self._enqueue_domain_operation(
             owner_account_id,
@@ -1769,6 +1778,7 @@ class DomainService:
             "dnssec",
             body.model_dump(mode="json"),
             idempotency_key,
+            dispatch_guard=dispatch_guard,
         )
 
     async def enqueue_transfer_out(
@@ -3471,6 +3481,7 @@ class DomainService:
         idempotency_key: str,
         *,
         reject_vm_attachment: bool = False,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> DomainOperationResponse:
         if not idempotency_key or len(idempotency_key) > 128:
             raise DomainProblem(
@@ -3480,6 +3491,8 @@ class DomainService:
         await self._owned_domain(owner_account_id, fqdn)
         dedupe = self._operation_dedupe(owner_account_id, kind, idempotency_key)
         async with self.db() as session:
+            if dispatch_guard is not None:
+                await dispatch_guard(session)
             existing_job = (
                 await session.execute(select(DomainJobRow).where(DomainJobRow.dedupe_key == dedupe))
             ).scalar_one_or_none()

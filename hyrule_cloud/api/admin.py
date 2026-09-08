@@ -8,6 +8,8 @@ payloads never enter a response model.
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal, cast
@@ -180,6 +182,19 @@ async def _audit_before_dispatch(
         audit_id = row.audit_id
         await session.commit()
     return audit_id
+
+
+def _admin_dispatch_guard(
+    state: AppState, request: Request, actor: AccountRow, action: str, *,
+    target_type: str, target_id: str, reason: str, details: dict[str, Any] | None = None,
+) -> Callable[[AsyncSession], Awaitable[None]]:
+    async def guard(session: AsyncSession) -> None:
+        await _validate_admin_dispatch(session, actor.account_id)
+        # Keep the actor fence in the caller transaction while independently
+        # committing the request audit before an external side effect.
+        await _audit_before_dispatch(state, request, actor, action, target_type=target_type,
+                                     target_id=target_id, reason=reason, details=details)
+    return guard
 
 
 class StepUpRequest(BaseModel):
@@ -784,7 +799,7 @@ async def _enabled_admin_count(session: AsyncSession, *, lock: bool = False) -> 
                 select(AccountRow.account_id)
                 .where(*predicate)
                 .order_by(AccountRow.account_id)
-                .with_for_update()
+                .with_for_update(key_share=True)
             )
         )
         return len(rows)
@@ -798,9 +813,44 @@ async def _locked_account(session: AsyncSession, account_id: str) -> AccountRow 
         await session.execute(
             select(AccountRow)
             .where(AccountRow.account_id == account_id)
-            .with_for_update()
+            .with_for_update(key_share=True)
         )
     ).scalar_one_or_none()
+
+
+async def _validate_admin_dispatch(session: AsyncSession, actor_id: str) -> AccountRow:
+    # Role/disable mutations already lock the enabled-admin set in this order.
+    # Take that set before owner/target/resource locks, rather than first locking
+    # only the actor and deadlocking two administrators acting on each other.
+    # NO KEY UPDATE still fences role/disable changes but permits FK key-share
+    # checks from the independent payment-quota transaction.
+    await _enabled_admin_count(session, lock=True)
+    actor = await session.scalar(
+        select(AccountRow).where(AccountRow.account_id == actor_id)
+        .with_for_update(key_share=True).execution_options(populate_existing=True)
+    )
+    if actor is None or not actor.is_admin or actor.disabled_at is not None:
+        raise HTTPException(403, "Administrator access was revoked")
+    return actor
+
+
+@asynccontextmanager
+async def _locked_admin_vm(
+    state: AppState, actor_id: str, vm_id: str,
+) -> AsyncIterator[tuple[AsyncSession, VMRow | None]]:
+    async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor_id)
+        snapshot = await session.get(VMRow, vm_id)
+        owner_id = snapshot.owner_account_id if snapshot is not None else None
+        if owner_id is not None:
+            await _locked_account(session, owner_id)
+        row = await session.scalar(
+            select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if row is not None and row.owner_account_id != owner_id:
+            raise HTTPException(409, "VM ownership changed; retry the action")
+        yield session, row
 
 
 @router.post("/accounts/{account_id}/disable")
@@ -814,6 +864,7 @@ async def disable_account(
     if account_id == actor.account_id:
         raise HTTPException(409, "You cannot disable your current Admin account")
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         # Always acquire the common enabled-Admin lock set before the target
         # row. Concurrent requests disabling different Admins must share one
         # lock order or each can hold its target while waiting on the other.
@@ -887,6 +938,7 @@ async def enable_account(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         target = await _locked_account(session, account_id)
         if target is None:
             raise HTTPException(404, "Account not found")
@@ -927,6 +979,7 @@ async def set_account_role(
     if account_id == actor.account_id and not body.is_admin:
         raise HTTPException(409, "You cannot demote your current Admin account")
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         # Demotions use the same enabled-Admin lock set and ordering as account
         # disable. Promotions only increase the invariant and need the target.
         enabled_admin_count = (
@@ -966,6 +1019,7 @@ async def revoke_account_sessions(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         if await session.get(AccountRow, account_id) is None:
             raise HTTPException(404, "Account not found")
         result = cast(
@@ -995,6 +1049,7 @@ async def revoke_account_keys(
 ) -> dict[str, Any]:
     now = _now()
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         if await session.get(AccountRow, account_id) is None:
             raise HTTPException(404, "Account not found")
         result = cast(
@@ -1030,7 +1085,7 @@ async def extend_vm_expiry(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     """Grant recovery time atomically with its audit; preserve suspension state."""
-    async with state.orchestrator.locked_vm(vm_id) as (session, row):
+    async with _locked_admin_vm(state, actor.account_id, vm_id) as (session, row):
         if row is None:
             raise HTTPException(404, "VM not found")
         if (row.deletion_started_at is not None or row.expires_at is None
@@ -1067,6 +1122,7 @@ async def vm_action(
         # so start/reboot/shutdown/suspend cannot cross and leave provider/database
         # state describing different outcomes.
         async with _factory(state)() as session:
+            await _validate_admin_dispatch(session, actor.account_id)
             snapshot = await session.get(VMRow, vm_id)
             if snapshot is None:
                 raise HTTPException(404, "VM not found")
@@ -1144,21 +1200,10 @@ async def vm_action(
             await session.commit()
         return {"vm_id": vm_id, "action": action, "status": "accepted"}
 
-    async with _factory(state)() as session:
-        row = await session.get(VMRow, vm_id)
-        if row is None:
-            raise HTTPException(404, "VM not found")
-    await _audit_before_dispatch(
-        state,
-        request,
-        actor,
-        f"vm.{action}",
-        target_type="vm",
-        target_id=vm_id,
-        reason=body.reason,
-    )
     if action == "destroy":
-        if not await orch.destroy_vm(vm_id):
+        guard = _admin_dispatch_guard(state, request, actor, "vm.destroy", target_type="vm",
+                                      target_id=vm_id, reason=body.reason)
+        if not await orch.destroy_vm(vm_id, dispatch_guard=guard):
             raise HTTPException(409, "VM cannot be destroyed")
     return {"vm_id": vm_id, "action": action, "status": "accepted"}
 
@@ -1341,6 +1386,7 @@ async def transfer_vm(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         await _assert_transfer_target(session, body.target_account_id)
         new_owner_wallet = await _transfer_wallet_identity(session, body.target_account_id)
         vm = (
@@ -1401,6 +1447,7 @@ async def transfer_domain(
     fqdn = fqdn.lower().rstrip(".")
     attached_vm_id: str | None = None
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         await _assert_transfer_target(session, body.target_account_id)
         new_owner_wallet = await _transfer_wallet_identity(session, body.target_account_id)
         domain, vm = await _lock_domain_transfer_bundle(session, fqdn)
@@ -1464,7 +1511,7 @@ async def admin_nameservers(
         raise HTTPException(503, "Domain service unavailable")
     owner = await _domain_owner(state, fqdn)
     idempotency_key = str(uuid.uuid4())
-    await _audit_before_dispatch(
+    guard = _admin_dispatch_guard(
         state,
         request,
         actor,
@@ -1475,7 +1522,7 @@ async def admin_nameservers(
         details={"idempotency_key": idempotency_key},
     )
     result = await state.domains.enqueue_nameserver_update(
-        owner, fqdn, body.request, idempotency_key
+        owner, fqdn, body.request, idempotency_key, dispatch_guard=guard
     )
     return result
 
@@ -1492,7 +1539,7 @@ async def admin_dns(
         raise HTTPException(503, "Domain service unavailable")
     owner = await _domain_owner(state, fqdn)
     idempotency_key = str(uuid.uuid4())
-    await _audit_before_dispatch(
+    guard = _admin_dispatch_guard(
         state,
         request,
         actor,
@@ -1510,7 +1557,7 @@ async def admin_dns(
         fqdn,
         body.expected_revision,
         body.request,
-        idempotency_key=idempotency_key,
+        idempotency_key=idempotency_key, dispatch_guard=guard,
     )
     return result
 
@@ -1527,7 +1574,7 @@ async def admin_dnssec(
         raise HTTPException(503, "Domain service unavailable")
     owner = await _domain_owner(state, fqdn)
     idempotency_key = str(uuid.uuid4())
-    await _audit_before_dispatch(
+    guard = _admin_dispatch_guard(
         state,
         request,
         actor,
@@ -1542,6 +1589,7 @@ async def admin_dnssec(
         fqdn,
         body.request,
         idempotency_key,
+        dispatch_guard=guard,
     )
     return result
 
@@ -1556,6 +1604,7 @@ async def reconcile_domain(
 ) -> dict[str, Any]:
     fqdn = fqdn.lower().rstrip(".")
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         if await session.scalar(select(DomainRow.id).where(DomainRow.fqdn == fqdn)) is None:
             raise HTTPException(404, "Domain not found")
         job = DomainJobRow(
@@ -1588,6 +1637,7 @@ async def retry_job(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         job = (
             await session.execute(
                 select(DomainJobRow)
@@ -1658,6 +1708,7 @@ async def retry_admin_operation(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         operation = await session.get(AdminOperationRow, operation_id)
         if operation is None:
             raise HTTPException(404, "Operation not found")
@@ -1696,6 +1747,7 @@ async def resolve_refund(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         event = (
             await session.execute(
                 select(PaymentEventRow)
