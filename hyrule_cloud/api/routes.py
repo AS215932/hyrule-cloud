@@ -77,6 +77,7 @@ from hyrule_cloud.services.quotes import (
     link_quote_vm,
 )
 from hyrule_cloud.services.vm_events import vm_log_events
+from hyrule_cloud.services.vm_expiry import build_vm_expiry
 from hyrule_cloud.services.vm_pricing import (
     VMResourceValidationError,
     current_daily_price_for_vm,
@@ -816,6 +817,7 @@ async def _vm_for_management(
 async def get_vm_public_status(
     vm_id: str,
     orch=Depends(get_orch),
+    cfg=Depends(get_cfg),
 ) -> VMPublicStatusResponse:
     row = await orch.get_vm(vm_id)
     if not row:
@@ -824,6 +826,12 @@ async def get_vm_public_status(
     if hasattr(orch, "get_quote_for_vm"):
         quote = await orch.get_quote_for_vm(vm_id)
     lp = build_launch_proof(row, quote_row=quote)
+    expiry = build_vm_expiry(VMStatus(row.status), row.expires_at, cfg.vm_grace_period_hours,
+                             deletion_started_at=getattr(row, "deletion_started_at", None))
+    if row.status == VMStatus.SUSPENDED:
+        lp["customer_message"] = f"The VM is suspended. {expiry.message}"
+    elif expiry.state in ("expired", "deletion_eligible", "deleting", "destroyed"):
+        lp["customer_message"] = expiry.message
     profile, resources = _vm_row_profile_and_resources(row)
     return VMPublicStatusResponse(
         vm_id=row.vm_id,
@@ -842,6 +850,7 @@ async def get_vm_public_status(
         rollback_available=lp["rollback_available"],
         operator_message=lp["operator_message"],
         customer_message=lp["customer_message"],
+        expiry=expiry,
     )
 
 
@@ -851,6 +860,7 @@ async def get_vm_public_status(
 @router.get("/vm/{vm_id}", response_model=VMStatusResponse)
 async def get_vm_status(
     row=Depends(_vm_for_management),
+    cfg=Depends(get_cfg),
 ) -> VMStatusResponse:
     firewall = None
     if row.open_ports:
@@ -871,6 +881,8 @@ async def get_vm_status(
         resources=resources,
         firewall=firewall,
         error=row.error,
+        expiry=build_vm_expiry(VMStatus(row.status), row.expires_at, cfg.vm_grace_period_hours,
+                              deletion_started_at=getattr(row, "deletion_started_at", None)),
     )
 
 

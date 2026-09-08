@@ -58,6 +58,7 @@ class _MockXCPNG:
 
 
 class _MockConfig:
+    vm_grace_period_hours = 48
     payment = _MockPaymentConfig()
     xcpng = _MockXCPNG()
     deploy_domain = "deploy.hyrule.host"
