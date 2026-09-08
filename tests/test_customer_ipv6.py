@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from ipaddress import IPv6Network
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -827,7 +828,7 @@ async def test_reservation_lifecycle(session_factory, monkeypatch):
     cfg = HyruleConfig()
     orch = Orchestrator(cfg, session_factory)
     spawned: list[str] = []
-    monkeypatch.setattr(orch, "_spawn_provisioning", spawned.append)
+    monkeypatch.setattr(orch, "_spawn_provisioning", AsyncMock(side_effect=spawned.append))
 
     order = VMCreateRequest(duration_days=1, os="debian-13", ssh_pubkey="ssh-ed25519 AAAA t")
 

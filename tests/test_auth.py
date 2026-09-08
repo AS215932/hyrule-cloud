@@ -80,17 +80,17 @@ class _StubOrchestrator:
         async with self.db() as session:
             return await session.get(VMRow, vm_id)
 
-    async def reboot_vm(self, vm_id: str) -> bool:
+    async def reboot_vm(self, vm_id: str, *, management_identity=None) -> bool:
         self.reboot_called.append(vm_id)
         async with self.db() as session:
             vm = await session.get(VMRow, vm_id)
-        return vm is not None
+        return vm is not None and (management_identity is None or management_identity.matches(vm))
 
-    async def destroy_vm(self, vm_id: str) -> bool:
+    async def destroy_vm(self, vm_id: str, *, management_identity=None) -> bool:
         self.destroy_called.append(vm_id)
         async with self.db() as session:
             vm = await session.get(VMRow, vm_id)
-            if vm is None:
+            if vm is None or (management_identity is not None and not management_identity.matches(vm)):
                 return False
             vm.status = VMStatus.DESTROYED
             vm.destroyed_at = _now()

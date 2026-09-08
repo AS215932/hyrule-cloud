@@ -1365,6 +1365,7 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
             current.suspension_reason = None
             current.suspended_by_account_id = None
             current.error = None
+            await orchestrator.prepare_provisioning_dispatch(session, current)
             restart_provisioning = True
         else:
             # A stale provenance marker on an already-live VM should not block
@@ -1522,6 +1523,8 @@ async def transfer_domain(
             raise HTTPException(409, "Domain has a pending operation")
         if domain.vm_id:
             attached_vm_id = domain.vm_id
+            if vm is not None and (vm.deletion_started_at is not None or vm.status == VMStatus.DESTROYED):
+                raise HTTPException(409, "Deletion-claimed or destroyed VMs cannot be transferred")
             if vm is not None and str(vm.status) == VMStatus.PROVISIONING.value:
                 raise HTTPException(409, "Provisioning VMs cannot be transferred")
         previous_account_id = domain.owner_account_id

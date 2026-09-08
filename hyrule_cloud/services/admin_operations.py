@@ -241,16 +241,17 @@ async def _apply_locked_account_operation(
                     continue
                 if str(current.status) in {
                     VMStatus.DESTROYED.value,
-                    VMStatus.FAILED.value,
                     VMStatus.SUSPENDED.value,
                 }:
+                    continue
+                if str(current.status) == VMStatus.FAILED.value and not current.xcpng_uuid:
                     continue
                 if str(current.status) != VMStatus.PROVISIONING.value and current.xcpng_uuid:
                     await orchestrator.xcpng.suspend_vm(current.xcpng_uuid)
                 # A provisioner owns the PROVISIONING transition. Mark the
                 # desired terminal state without making its initial guard exit;
                 # finalization will suspend the new provider VM under the row lock.
-                if str(current.status) != VMStatus.PROVISIONING.value:
+                if str(current.status) not in {VMStatus.PROVISIONING.value, VMStatus.FAILED.value}:
                     current.status = VMStatus.SUSPENDED
                 current.suspension_reason = "account_disabled"
                 current.suspended_by_account_id = actor_id
@@ -321,6 +322,7 @@ async def _apply_locked_account_operation(
                     current.suspension_reason = None
                     current.suspended_by_account_id = None
                     current.error = None
+                    await orchestrator.prepare_provisioning_dispatch(session, current)
                     restart_provisioning = True
                 await session.commit()
                 vm_count += 1

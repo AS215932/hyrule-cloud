@@ -5,7 +5,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "024"
-down_revision = "023"  # Reconcile pending guest migration 022 before combined promotion.
+down_revision = "023"
 branch_labels = None
 depends_on = None
 

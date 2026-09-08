@@ -2110,7 +2110,7 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         assert expired_mailbox.suspension_reason == "expired"
         assert operation is not None and operation.status == "completed"
 
-    assert xcpng.suspended == ["uuid-active"]
+    assert xcpng.suspended == ["uuid-active", "uuid-failed-disabled"]
     assert xcpng.started == ["uuid-active"]
 
 
@@ -2523,3 +2523,100 @@ async def test_retention_status_exposes_pending_retry_without_sensitive_manifest
             assert archived['history'][0]['operation_id'] == 'newer'
     finally:
         app.state._typed_state = previous
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status,claimed', [('suspended', True), ('destroyed', False)])
+async def test_domain_transfer_rejects_attached_vm_deletion(admin_factory, status, claimed):
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory.begin() as session:
+        actor = await session.get(AccountRow, 'HAAAAAAAAAA')
+        session.add_all([AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture'),
+                         AccountRow(account_id='HCCCCCCCCCC', password_hash='fixture')])
+        session.add(VMRow(vm_id='vm_claimed_domain', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
+                          status=status, xcpng_uuid='fixture-guest', suspension_reason='account_disabled',
+                          deletion_started_at=datetime.now(UTC) if claimed else None,
+                          expires_at=datetime.now(UTC) + timedelta(days=1)))
+        session.add(DomainRow(name='claimed', extension='example', fqdn='claimed.example',
+                              vm_id='vm_claimed_domain', owner_wallet='fixture',
+                              owner_account_id='HBBBBBBBBBB', status='active'))
+    xcpng = _AdminXCPNG()
+    state = AppState(config=SimpleNamespace(), orchestrator=SimpleNamespace(xcpng=xcpng),
+                     payment_gate=None, network_provider=None, session_factory=admin_factory)
+    with pytest.raises(HTTPException) as exc:
+        await transfer_domain('claimed.example', OwnershipTransferRequest(
+            target_account_id='HCCCCCCCCCC', reason='Fixture transfer'),
+            _browser_request(credentials, path='/fixture'), actor, state)
+    assert exc.value.status_code == 409
+    assert xcpng.started == []
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, 'vm_claimed_domain')
+        domain = await session.scalar(select(DomainRow).where(DomainRow.fqdn == 'claimed.example'))
+        assert vm.owner_account_id == domain.owner_account_id == 'HBBBBBBBBBB'
+        assert list(await session.scalars(select(AdminAuditRow).where(AdminAuditRow.action == 'domain.transfer'))) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method', ['check_payment', 'verify_only'])
+async def test_marketplace_registration_uses_normal_payment_without_admin_waiver(admin_factory, method):
+    credentials = await _admin_credentials(admin_factory, elevated=True)
+    gate = _admin_gate(admin_factory)
+    request = _browser_request(credentials, path='/v1/domains/registrations')
+    result = await getattr(gate, method)(request, Decimal('12.00'), 'Domain registration')
+    assert isinstance(result, Response) and result.status_code == 402
+    assert getattr(request.state, 'payment_mode', None) != 'admin-bypass'
+    async with admin_factory() as session:
+        assert list(await session.scalars(select(AdminBypassUsageRow))) == []
+        events = list(await session.scalars(select(PaymentEventRow)))
+        assert all(event.event_type != 'admin_bypass' for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('source', ['account_enable', 'ownership_transfer'])
+async def test_legacy_restart_receipt_survives_commit_before_scheduling_crash(admin_factory, monkeypatch, source):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from hyrule_cloud.db import VMGuestResultRow
+
+    monkeypatch.setattr('hyrule_cloud.services.launch_proof._LAUNCH_PROOF_REAL', True)
+    config = HyruleConfig()
+    original = Orchestrator(config, admin_factory)
+    recovered = Orchestrator(config, admin_factory)
+    async with admin_factory.begin() as session:
+        session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture'))
+        session.add(VMRow(vm_id='vm_legacy_restart', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
+                          status='suspended', suspension_reason='account_disabled',
+                          expires_at=datetime.now(UTC) + timedelta(days=1)))
+        session.add(AdminOperationRow(operation_id='legacy-restart', kind='resume_account_resources',
+                                      account_id='HBBBBBBBBBB', status='running'))
+    generations = []
+
+    async def crash_after_commit(vm_id):
+        async with admin_factory() as session:
+            vm = await session.get(VMRow, vm_id)
+            receipt = await session.get(VMGuestResultRow, vm_id)
+            assert vm.status == 'provisioning' and vm.suspension_reason is None
+            assert receipt is not None
+            generations.append(receipt.generation)
+        raise asyncio.CancelledError('fixture process exit before in-memory scheduling')
+
+    original.start_provisioning = AsyncMock(side_effect=crash_after_commit)
+    recovered._provision_vm_owned = AsyncMock()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            if source == 'account_enable':
+                await _apply_account_operation(admin_factory, original, 'legacy-restart')
+            else:
+                state = AppState(config=config, orchestrator=original, payment_gate=None,
+                                 network_provider=None, session_factory=admin_factory)
+                await _resume_transferred_vm(state, 'vm_legacy_restart')
+        assert await recovered.recover_tracked_provisioning() == 1
+        await asyncio.gather(*list(recovered._tasks))
+        recovered._provision_vm_owned.assert_awaited_once_with('vm_legacy_restart')
+        async with admin_factory() as session:
+            receipt = await session.get(VMGuestResultRow, 'vm_legacy_restart')
+            assert receipt.generation == generations[0]
+    finally:
+        await original.shutdown()
+        await recovered.shutdown()

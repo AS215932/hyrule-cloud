@@ -482,9 +482,19 @@ class Orchestrator:
         ):
             raise RuntimeError("planned VM id is already bound to another order")
 
-    async def _spawn_provisioning(self, vm_id: str) -> None:
+    async def prepare_provisioning_dispatch(self, session: AsyncSession, row: VMRow) -> None:
+        """Stage real-guest restart evidence in the caller's locked transaction."""
         from hyrule_cloud.services.launch_proof import use_real_provisioning
 
+        if row.status != VMStatus.PROVISIONING or not row.owner_wallet:
+            raise ValueError("Provisioning dispatch requires an owned provisioning VM")
+        receipt = await session.get(VMGuestResultRow, row.vm_id)
+        if use_real_provisioning() and receipt is None and row.xcpng_uuid is None:
+            await prepare_guest_result(
+                session, row.vm_id, _now() + timedelta(seconds=self.config.guest_report_timeout_seconds),
+            )
+
+    async def _spawn_provisioning(self, vm_id: str) -> None:
         if vm_id in self._provisioning_vm_ids:
             return
         # Persist dispatch before creating an in-memory task, so semaphore and
@@ -494,11 +504,7 @@ class Orchestrator:
             row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
             if row is None or row.status != VMStatus.PROVISIONING or not row.owner_wallet:
                 return
-            receipt = await session.get(VMGuestResultRow, vm_id)
-            if use_real_provisioning() and receipt is None and row.xcpng_uuid is None:
-                await prepare_guest_result(
-                    session, vm_id, _now() + timedelta(seconds=self.config.guest_report_timeout_seconds),
-                )
+            await self.prepare_provisioning_dispatch(session, row)
             await session.commit()
         if vm_id in self._provisioning_vm_ids:
             return
