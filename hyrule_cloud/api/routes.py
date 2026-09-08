@@ -830,7 +830,7 @@ async def get_vm_public_status(
                              deletion_started_at=getattr(row, "deletion_started_at", None))
     if row.status == VMStatus.SUSPENDED:
         lp["customer_message"] = f"The VM is suspended. {expiry.message}"
-    elif expiry.state in ("expired", "deletion_eligible", "deleting"):
+    elif expiry.state in ("expired", "deletion_eligible", "deleting", "destroyed"):
         lp["customer_message"] = expiry.message
     profile, resources = _vm_row_profile_and_resources(row)
     return VMPublicStatusResponse(

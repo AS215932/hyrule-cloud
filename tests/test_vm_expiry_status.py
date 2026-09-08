@@ -12,6 +12,22 @@ from tests.test_api import _TEST_TOKEN, override_state  # noqa: F401
 EXPIRY = datetime(2026, 9, 8, tzinfo=UTC)
 
 
+@pytest.mark.asyncio
+async def test_destroyed_vm_overrides_persisted_readiness_message(override_state):
+    row = await override_state.orchestrator.get_vm('vm_test123')
+    row.status = VMStatus.DESTROYED
+    row.metadata_ = {'launch_proof': {'customer_message': 'Your VM is ready.'}}
+    override_state.orchestrator.get_vm = AsyncMock(return_value=row)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
+        response = await client.get('/v1/vm/vm_test123/status')
+        assert response.status_code == 200
+        body = response.json()
+        assert body['status'] == body['expiry']['state'] == 'destroyed'
+        assert body['customer_message'] == 'The VM is destroyed.'
+        assert body['expiry']['grace_ends_at'] is None
+        assert row.metadata_['launch_proof']['customer_message'] == 'Your VM is ready.'
+
+
 @pytest.mark.parametrize(('seconds', 'state', 'eligible'), [
     (-1, VMExpiryState.ACTIVE, False),
     (0, VMExpiryState.ACTIVE, False),
