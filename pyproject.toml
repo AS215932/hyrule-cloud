@@ -125,3 +125,9 @@ module = [
     "hyrule_cloud.state",
 ]
 ignore_errors = true
+
+[tool.uv]
+# coincurve 20 uses cmake.verbose in its Hatch hook; scikit-build-core 0.10+
+# rejects that option. Keep source builds (including Python 3.13) on its
+# compatible build backend without changing the runtime cryptography pins.
+build-constraint-dependencies = ["scikit-build-core>=0.9,<0.10"]
