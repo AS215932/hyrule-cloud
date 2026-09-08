@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+import yaml
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -30,6 +31,7 @@ from hyrule_cloud.models import VMEventKey, VMSize, VMStatus
 from hyrule_cloud.orchestrator import Orchestrator, VMCapacityError
 from hyrule_cloud.providers.network_config import prefix_for_index, vm_address_for_prefix
 from hyrule_cloud.providers.xcpng import XOError
+from hyrule_cloud.services.guest_result import GuestResult, accept_guest_result
 from hyrule_cloud.services.vm_events import (
     FAILURE_CAPACITY,
     FAILURE_DNS,
@@ -104,7 +106,22 @@ def _real_orchestrator(session_factory, monkeypatch) -> Orchestrator:
     config.xcpng.templates = {"debian-13": TEMPLATE_UUID}
     orch = Orchestrator(config, session_factory)
     orch.xcpng.find_vm_ids_by_name_label = AsyncMock(return_value=[])
-    orch.xcpng.create_vm = AsyncMock(return_value=XO_VM_UUID)
+    async def create_with_guest_completion(**kwargs):
+        config_data = yaml.safe_load(kwargs["cloud_init_config"])
+        report = json.loads(next(
+            entry["content"] for entry in config_data["write_files"]
+            if entry["path"] == "/var/lib/hyrule-guest-result/config.json"
+        ))
+        vm_id = kwargs["name_label"].removeprefix("hyrule-")
+        async with session_factory() as session:
+            await accept_guest_result(
+                session, vm_id, report["url"].rsplit("/", 1)[1], report["token"],
+                GuestResult(outcome="succeeded", stage="cloud_init", exit_code=0),
+            )
+            await session.commit()
+        return XO_VM_UUID
+
+    orch.xcpng.create_vm = AsyncMock(side_effect=create_with_guest_completion)
     orch.dns.create_aaaa = AsyncMock(return_value=None)
     orch.dns.verify_aaaa = AsyncMock(return_value=True)
     orch._wait_for_ipv6 = AsyncMock(return_value=CUSTOMER_IPV6)
@@ -207,7 +224,7 @@ async def test_ssh_unreachable_is_reported_without_failing_the_vm(
 
 
 @pytest.mark.asyncio
-async def test_setup_script_injection_is_observable_but_not_its_outcome(
+async def test_setup_script_injection_requires_verified_completion(
     session_factory, monkeypatch
 ) -> None:
     orch = _real_orchestrator(session_factory, monkeypatch)
@@ -219,11 +236,10 @@ async def test_setup_script_injection_is_observable_but_not_its_outcome(
 
     events = {e.event: e for e in await _events(session_factory, "vm_script")}
     injected = events[VMEventKey.SETUP_SCRIPT_INJECTED]
-    # The message must state the limit rather than implying the platform knows
-    # the script succeeded.
-    assert "not visible to the platform" in injected.message
+    # Injection does not claim success; READY follows the separate receipt.
+    assert "Completion must be verified" in injected.message
     assert "/var/log/hyrule-setup.log" in injected.message
-    # No event claims completion — the platform genuinely cannot see it.
+    # Detailed script output remains inside the guest, not a new public event.
     assert not any("setup_script_completed" in key for key in events)
     # The script body is the customer's, but there is no reason to echo it back.
     assert "nginx" not in json.dumps([e.message for e in await _events(session_factory, "vm_script")])
@@ -355,6 +371,7 @@ async def test_no_internal_identifiers_leak_into_customer_visible_output(
     session_factory, monkeypatch
 ) -> None:
     orch = _real_orchestrator(session_factory, monkeypatch)
+    successful_create = orch.xcpng.create_vm
     orch.xcpng.create_vm = AsyncMock(
         side_effect=XOError(
             "VM.create",
@@ -372,7 +389,7 @@ async def test_no_internal_identifiers_leak_into_customer_visible_output(
 
     await orch._provision_vm("vm_leak")
     # And a successful one, so the audit covers the happy path too.
-    orch.xcpng.create_vm = AsyncMock(return_value=XO_VM_UUID)
+    orch.xcpng.create_vm = successful_create
     async with session_factory() as session:
         session.add(_vm("vm_leak_ok", setup_script="echo hi", prefix_index=6))
         await session.commit()

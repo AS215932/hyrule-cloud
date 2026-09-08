@@ -33,6 +33,7 @@ from hyrule_cloud.db import (
     DomainOrderRow,
     DomainRow,
     PaymentEventRow,
+    VMGuestResultRow,
     VMQuoteRow,
     VMRow,
 )
@@ -67,10 +68,14 @@ from hyrule_cloud.providers.network_config import (
 )
 from hyrule_cloud.providers.openprovider import OpenproviderClient
 from hyrule_cloud.providers.xcpng import XCPNGProvider
+from hyrule_cloud.services.guest_result import prepare_guest_result, utc
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
 from hyrule_cloud.services.vm_events import (
     FAILURE_DNS,
+    FAILURE_GUEST_INIT,
+    FAILURE_GUEST_REPORT,
+    FAILURE_GUEST_SETUP,
     ProvisioningFailedError,
     customer_failure_message,
     internal_failure_detail,
@@ -117,6 +122,10 @@ def _looks_like_evm_wallet(value: str | None) -> bool:
     except ValueError:
         return False
     return True
+
+
+class GuestGenerationChangedError(RuntimeError):
+    """A stale provisioning attempt must not change its replacement's state."""
 
 
 class Orchestrator:
@@ -653,11 +662,9 @@ class Orchestrator:
         event (see `VMEventKey`) that `GET /v1/vm/{vm_id}/logs` returns. Event
         writes are best-effort by construction: they can never fail a paid VM.
 
-        Limit worth knowing: a supplied `setup_script` is only observable up to
-        the point it is injected into cloud-init user-data. The platform has no
-        channel into the guest, so whether the script actually ran, succeeded,
-        or failed is NOT reported here — the customer reads
-        /var/log/hyrule-setup.log inside their own VM for that.
+        READY requires an authenticated terminal guest completion report.
+        Missing and failed reports preserve the guest for diagnosis and follow
+        the existing failed-provisioning refund path.
         """
         from hyrule_cloud.services.launch_proof import use_real_provisioning
 
@@ -744,9 +751,9 @@ class Orchestrator:
                     VMEventKey.SETUP_SCRIPT_INJECTED,
                     message=(
                         "Your setup script was injected into first-boot user-data and "
-                        "will run as root once the VM boots. Its exit status is not "
-                        "visible to the platform — read /var/log/hyrule-setup.log on "
-                        "the VM to see what it did."
+                        "will run as root once the VM boots. Completion must be "
+                        "verified before the VM is ready; detailed output remains "
+                        "in /var/log/hyrule-setup.log inside your VM."
                     ),
                 )
 
@@ -775,6 +782,18 @@ class Orchestrator:
                                 xcpng_uuid=stale_uuid,
                             )
                             await self.xcpng.destroy_vm(stale_uuid)
+                        async with self.db() as session:
+                            deadline = _now() + timedelta(seconds=self.config.guest_report_timeout_seconds)
+                            generation, guest_token = await prepare_guest_result(session, vm_id, deadline)
+                            await session.commit()
+                        cloud_config = render_cloud_init(
+                            os_name=os_name, hostname=self._generate_hostname(vm_id),
+                            ssh_pubkey=ssh_pubkey, open_ports=open_ports, setup_script=setup_script,
+                            guest_report={
+                                "url": f"{self.config.public_base_url.rstrip('/')}/v1/vm/{vm_id}/guest-result/{generation}",
+                                "token": guest_token, "deadline": deadline.timestamp(),
+                            },
+                        )
                         xcpng_uuid = await self.xcpng.create_vm(
                             template_uuid=template_uuid,
                             name_label=name_label,
@@ -803,6 +822,12 @@ class Orchestrator:
                                 "disk_gb": resources.disk_gb,
                             },
                         )
+
+            async with self.db() as session:
+                receipt = await session.get(VMGuestResultRow, vm_id)
+                if receipt is None:
+                    raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+                generation = receipt.generation
 
             # Wait for IPv6 (outside DB session to avoid long-held connections)
             ipv6 = await self._wait_for_ipv6(
@@ -871,13 +896,23 @@ class Orchestrator:
                     probe_hostname=self.config.customer_dns_probe_hostname,
                 )
 
+            # Inbound connectivity cannot establish guest initialization success.
+            generation = await self._wait_for_guest_result(vm_id, generation)
+
             # Update DB with final state
             custom_domain: str | None = None
             custom_account_id: str | None = None
             async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
-                if not row:
+                row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+                if row is None or row.status != VMStatus.PROVISIONING:
                     return
+                receipt = await session.scalar(
+                    select(VMGuestResultRow).where(VMGuestResultRow.vm_id == vm_id).with_for_update()
+                )
+                if row.xcpng_uuid != xcpng_uuid or receipt is None or receipt.generation != generation:
+                    raise GuestGenerationChangedError()
+                if receipt.outcome != "succeeded":
+                    raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
                 row.ipv6 = ipv6
                 row.status = VMStatus.READY
                 # Block B (Wave 2): timestamp the READY transition so
@@ -968,6 +1003,9 @@ class Orchestrator:
 
             log.info("provision_complete", vm_id=vm_id, ipv6=ipv6)
 
+        except GuestGenerationChangedError:
+            log.info("provision_attempt_superseded", vm_id=vm_id)
+            return
         except Exception as e:
             log.error("provision_failed", vm_id=vm_id, error=str(e), exc_info=True)
             # The customer sees a fixed, safe message; the operator keeps the
@@ -976,13 +1014,20 @@ class Orchestrator:
             internal_reason = internal_failure_detail(e)
             owner_wallet, amount, payment_tx, settled = "", None, None, None
             async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
+                row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
                 if row is not None:
+                    if row.status != VMStatus.PROVISIONING:
+                        return
                     row.status = VMStatus.FAILED
                     # row.error is customer-visible (management status view and
                     # the public launch proof's operator_message), so it stores
                     # the sanitized message — never provider text.
                     row.error = customer_message
+                    meta = dict(row.metadata_ or {})
+                    proof = dict(meta.get("launch_proof", {}))
+                    proof["customer_message"] = customer_message
+                    meta["launch_proof"] = proof
+                    row.metadata_ = meta
                     owner_wallet = row.owner_wallet
                     amount = row.cost_total
                     payment_tx = row.payment_tx
@@ -1016,6 +1061,26 @@ class Orchestrator:
             await self._record_vm_refund(
                 vm_id, owner_wallet, amount, payment_tx, settled, reason=internal_reason
             )
+
+    async def _wait_for_guest_result(self, vm_id: str, generation: str) -> str:
+        """Wait without holding a connection; tracked guests keep their identity."""
+        while True:
+            async with self.db() as session:
+                row = await session.get(VMGuestResultRow, vm_id)
+                if row is None:
+                    raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+                if row.generation != generation:
+                    raise GuestGenerationChangedError()
+                if row.received_at is not None:
+                    if row.outcome == "succeeded":
+                        return generation
+                    raise ProvisioningFailedError(
+                        FAILURE_GUEST_SETUP if row.stage == "setup_script" else FAILURE_GUEST_INIT
+                    )
+                remaining = (utc(row.deadline) - _now()).total_seconds()
+                if remaining <= 0:
+                    raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+            await asyncio.sleep(min(2, remaining))
 
     async def _record_vm_refund(
         self,

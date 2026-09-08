@@ -406,6 +406,7 @@ class HyruleConfig(BaseSettings):
     dns_tsig_algo: str = "hmac-sha256"
 
     # VM lifecycle
+    guest_report_timeout_seconds: int = Field(default=900, ge=60, le=3600)
     vm_grace_period_hours: int = 48
     max_paid_active_vms: int = 0
     max_duration_days: int = 365
