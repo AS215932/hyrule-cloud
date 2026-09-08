@@ -28,7 +28,11 @@ from hyrule_cloud.middleware.anon_token import (
     can_manage_vm,
 )
 from hyrule_cloud.middleware.auth import current_account
-from hyrule_cloud.middleware.x402 import PaymentGate
+from hyrule_cloud.middleware.x402 import (
+    PaymentGate,
+    admin_waiver_dispatch_guard,
+    external_admin_waiver_guard,
+)
 from hyrule_cloud.models import (
     VM_PROFILE_LABELS,
     VM_SPECS,
@@ -1169,6 +1173,8 @@ async def create_vm(
         request, gate, wallet, account
     )
     admin_waived = getattr(request.state, "payment_mode", None) == "admin-bypass"
+    waiver_guard = admin_waiver_dispatch_guard(request)
+    acceptance_guard = {"dispatch_guard": waiver_guard} if waiver_guard is not None else {}
     # Issue #14 / Sourcery (#16): claim the quote atomically BEFORE provisioning
     # so two concurrent paid creates for the same quote can't each provision a VM
     # — only the winner of the CREATED → CONSUMED flip proceeds.
@@ -1209,6 +1215,7 @@ async def create_vm(
                 start_provisioning=False,
                 retail_amount=retail_amount,
                 admin_waived=admin_waived,
+                **acceptance_guard,
             )
             if activated is not None:
                 row, management_token = activated, reservation_token
@@ -1227,6 +1234,7 @@ async def create_vm(
                     payment_tx=payment_tx,
                     retail_amount=retail_amount,
                     admin_waived=admin_waived,
+                    **acceptance_guard,
                 )
         else:
             row, management_token = await orch.create_vm(
@@ -1239,6 +1247,7 @@ async def create_vm(
                 payment_tx=payment_tx,
                 retail_amount=retail_amount,
                 admin_waived=admin_waived,
+                **acceptance_guard,
             )
         if quote_row is not None:
             # Persist the locked charged amount first so a later refund is
@@ -1455,7 +1464,11 @@ async def extend_vm(
     _require_vm_service_open(gate)
 
     management_identity = VMManagementIdentity.capture(row)
-    async with orch.locked_vm(vm_id) as (session, row):
+    waiver_guard = (await gate.prospective_admin_dispatch_guard(request)
+                    if isinstance(gate, PaymentGate) else None)
+    lifecycle_lock = (orch.locked_vm(vm_id, dispatch_guard=waiver_guard)
+                      if waiver_guard is not None else orch.locked_vm(vm_id))
+    async with lifecycle_lock as (session, row):
         if row is None or not management_identity.matches(row):
             raise HTTPException(404, "VM not found")
         if not orch.vm_can_extend(row) or not await orch.vm_owner_enabled(session, row):
@@ -1572,7 +1585,7 @@ async def proxy_network_request(
 
     # The guard stops a second concurrent request from reusing the same
     # authorization to drive a duplicate fetch before this one settles.
-    async with _proxy_authorization_guard(request):
+    async with _proxy_authorization_guard(request), external_admin_waiver_guard(request, gate):
         if not is_idempotent:
             # Non-idempotent (POST): forwarding it mutates remote state, so the
             # payment must be FINAL before we send it — never execute an

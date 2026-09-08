@@ -476,6 +476,8 @@ async def create_order(
                 "payment_handoff_pending",
                 "Payment settled, but the order handoff is pending recovery.",
             ) from handoff_error
+        if order.error_code == "admin_waiver_revoked":
+            raise DomainProblem(403, "admin_waiver_revoked", order.error_detail or "Administrator waiver was revoked.")
         response.status_code = 202
     else:
         response.status_code = 200

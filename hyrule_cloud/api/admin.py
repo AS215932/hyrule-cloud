@@ -54,6 +54,9 @@ from hyrule_cloud.middleware.auth import (
     require_admin_step_up,
 )
 from hyrule_cloud.models import VMStatus
+from hyrule_cloud.services.admin_authorization import (
+    validate_admin_dispatch as _validate_admin_dispatch,
+)
 from hyrule_cloud.services.passwords import verify_password
 from hyrule_cloud.services.vm_retention import (
     authorize_restore,
@@ -830,20 +833,6 @@ async def _locked_account(session: AsyncSession, account_id: str) -> AccountRow 
     ).scalar_one_or_none()
 
 
-async def _validate_admin_dispatch(session: AsyncSession, actor_id: str) -> AccountRow:
-    # Role/disable mutations already lock the enabled-admin set in this order.
-    # Take that set before owner/target/resource locks, rather than first locking
-    # only the actor and deadlocking two administrators acting on each other.
-    # NO KEY UPDATE still fences role/disable changes but permits FK key-share
-    # checks from the independent payment-quota transaction.
-    await _enabled_admin_count(session, lock=True)
-    actor = await session.scalar(
-        select(AccountRow).where(AccountRow.account_id == actor_id)
-        .with_for_update(key_share=True).execution_options(populate_existing=True)
-    )
-    if actor is None or not actor.is_admin or actor.disabled_at is not None:
-        raise HTTPException(403, "Administrator access was revoked")
-    return actor
 
 
 @asynccontextmanager

@@ -2867,6 +2867,8 @@ async def test_admin_waived_bundle_failure_creates_no_refund_obligation(
     domain_service,
 ):
     service, _provider, sessions = domain_service
+    async with sessions.begin() as session:
+        (await session.get(AccountRow, "H1234567890")).is_admin = True
     fqdn = "waived-bundle-failure.dev"
     quote = await service.create_quote(fqdn, DomainAction.REGISTER, "H1234567890")
     vm_quote_id = "vmq_waived_bundle_failure"
@@ -3193,3 +3195,42 @@ async def test_customer_domain_mutation_rechecks_disabled_owner(domain_service, 
         assert list(await session.scalars(select(DomainDNSRecordRow))) == []
         assert list(await session.scalars(select(DomainOperationRow))) == []
         assert list(await session.scalars(select(DomainJobRow))) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('worker_recovery', [False, True])
+@pytest.mark.parametrize('revoked', [False, True])
+async def test_domain_waiver_actor_fenced_at_acceptance(domain_service, worker_recovery, revoked):
+    service, _provider, sessions = domain_service
+    async with sessions.begin() as session:
+        (await session.get(AccountRow, 'H1234567890')).is_admin = True
+    quote = await service.create_quote('waiver-fence.dev', DomainAction.REGISTER, 'H1234567890')
+    order, _ = await service.create_order(DomainOrderRequest(quote_id=quote.quote_id,
+        payment_method=DomainPaymentMethod.USDC, terms_version=service.domain_config.terms_version),
+        owner_account_id='H1234567890', idempotency_key='waiver-fence')
+    if revoked:
+        async with sessions.begin() as session:
+            (await session.get(AccountRow, 'H1234567890')).is_admin = False
+    if worker_recovery:
+        event = PaymentLedger(sessions).build_event(event_type='admin_bypass',
+            resource_path='/v1/domains/orders', method='POST', amount=Decimal('13'),
+            network='admin-bypass', payer='admin:H1234567890', tx_hash='admin_bypass_fixture',
+            actor_account_id='H1234567890', extra={'order_id': order.order_id})
+        async with sessions.begin() as session:
+            session.add(event)
+        assert await service.recover_x402_handoffs() == 1
+        assert await service.recover_x402_handoffs() == 0
+    else:
+        async def accept():
+            return await service.mark_x402_paid(order.order_id, payer='admin:H1234567890',
+                tx_hash='admin_bypass_fixture', payment_network='admin-bypass', billing_mode='admin_waived')
+        await accept()
+    async with sessions() as session:
+        current = await session.get(DomainOrderRow, order.order_id)
+        assert current.status == ('failed' if revoked else 'queued')
+        if revoked:
+            assert current.error_code == 'admin_waiver_revoked'
+            assert not list(await session.scalars(select(PaymentEventRow).where(
+                PaymentEventRow.event_type == 'refund_owed')))
+        jobs = list(await session.scalars(select(DomainJobRow).where(DomainJobRow.resource_id == order.order_id)))
+        assert len(jobs) == int(not revoked)

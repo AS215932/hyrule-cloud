@@ -308,6 +308,7 @@ class Orchestrator:
         payment_tx: str | None = None,
         retail_amount: Decimal | None = None,
         admin_waived: bool = False,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> tuple[VMRow, str]:
         """Persist a VM row and atomically claim a customer /64 (unique index).
 
@@ -382,6 +383,8 @@ class Orchestrator:
             hostname = f"{hostname_prefix}.{self.config.deploy_domain}"
 
             async with self.db() as session:
+                if dispatch_guard is not None:
+                    await dispatch_guard(session)
                 if owner_account_id is not None:
                     owner = (
                         await session.execute(
@@ -561,6 +564,7 @@ class Orchestrator:
         payment_tx: str | None = None,
         retail_amount: Decimal | None = None,
         admin_waived: bool = False,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> tuple[VMRow, str]:
         """Create a VM record in DB and start background provisioning.
 
@@ -589,6 +593,7 @@ class Orchestrator:
             payment_tx=payment_tx,
             retail_amount=retail_amount,
             admin_waived=admin_waived,
+            dispatch_guard=dispatch_guard,
         )
         if start_provisioning:
             await self._spawn_provisioning(row.vm_id)
@@ -696,6 +701,7 @@ class Orchestrator:
         start_provisioning: bool = True,
         retail_amount: Decimal | None = None,
         admin_waived: bool = False,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> VMRow | None:
         """Attach the settled payment to a reservation and start provisioning.
 
@@ -709,6 +715,8 @@ class Orchestrator:
         existing owner is never overwritten.
         """
         async with self.db() as session:
+            if dispatch_guard is not None:
+                await dispatch_guard(session)
             # Account disable takes the account lock before touching owned VMs.
             # Read the reservation only to discover its owner, then acquire the
             # same locks in that order so settlement cannot deadlock with (or
