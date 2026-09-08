@@ -118,6 +118,10 @@ async def complete_restore(session: AsyncSession, vm: VMRow, operation: VMRestor
         raise ValueError("Recovery identity or state changed")
     vm.expires_at = operation.new_expiry
     vm.deletion_started_at = None
+    # Recovery is deliberately stopped. A delayed account-enable job must not
+    # interpret old disable provenance as permission to start this guest.
+    vm.suspension_reason = "manual_admin"
+    vm.suspended_by_account_id = operation.actor_account_id
     operation.state = "completed"
     operation.completed_at = datetime.now(UTC)
     await session.delete(retained)

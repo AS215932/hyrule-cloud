@@ -2627,3 +2627,67 @@ async def test_legacy_restart_receipt_survives_commit_before_scheduling_crash(ad
     finally:
         await original.shutdown()
         await recovered.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_restore_after_account_enable_stays_stopped_when_queued_enable_runs(admin_factory):
+    from uuid import uuid4
+
+    from hyrule_cloud.db import VMRetentionRow
+    from hyrule_cloud.providers.xcpng import VMProtectionManifest
+    from hyrule_cloud.services.vm_retention import prepare_retention
+
+    credentials = await _admin_credentials(admin_factory, elevated=True)
+    now = datetime.now(UTC)
+    async with admin_factory.begin() as session:
+        session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture', disabled_at=now))
+        session.add(VMRow(vm_id='vm_disabled_retained', owner_account_id='HBBBBBBBBBB',
+                          owner_wallet='fixture', xcpng_uuid='disabled-retained-guest',
+                          status='suspended', suspension_reason='account_disabled',
+                          expires_at=now - timedelta(days=3), deletion_started_at=now))
+    async with admin_factory.begin() as session:
+        retained = await prepare_retention(
+            session, 'vm_disabled_retained',
+            VMProtectionManifest('disabled-retained-guest', ('disk',), (), False, '', ()),
+            now + timedelta(days=30),
+        )
+        retained.state = 'retained'
+        retained.retained_at = now
+    orch = Orchestrator(HyruleConfig(), admin_factory)
+    orch.xcpng.restore_retained_vm = AsyncMock()
+    orch.xcpng.start_vm = AsyncMock(side_effect=AssertionError('recovery must remain stopped'))
+    previous = getattr(app.state, '_typed_state', None)
+    app.state._typed_state = AppState(config=HyruleConfig(), orchestrator=orch,
+                                     payment_gate=_admin_gate(admin_factory),
+                                     network_provider=None, session_factory=admin_factory)
+    body = {'operation_id': str(uuid4()), 'days': 7, 'reason': 'Recover retained data after enabling owner'}
+    path = '/v1/admin/vms/vm_disabled_retained/actions/restore'
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url='https://test') as client:
+            client.cookies.set('hyr_sess', credentials.token)
+            client.cookies.set('hyr_csrf', credentials.csrf_token)
+            headers = {'X-CSRF-Token': credentials.csrf_token}
+            assert (await client.post(path, json=body, headers=headers)).status_code == 409
+            orch.xcpng.restore_retained_vm.assert_not_awaited()
+            async with admin_factory.begin() as session:
+                owner = await session.get(AccountRow, 'HBBBBBBBBBB')
+                owner.disabled_at = None
+                session.add(AdminOperationRow(operation_id='delayed-enable', kind='resume_account_resources',
+                                              account_id=owner.account_id, status='running'))
+            response = await client.post(path, json=body, headers=headers)
+            assert response.status_code == 200, response.text
+            assert response.json()['power_changed'] is False
+        # Run the real queued operation after recovery has committed its new term.
+        await _apply_account_operation(admin_factory, orch, 'delayed-enable')
+        async with admin_factory() as session:
+            vm = await session.get(VMRow, 'vm_disabled_retained')
+            assert vm.status == 'suspended' and vm.deletion_started_at is None
+            assert vm.suspension_reason == 'manual_admin'
+            assert vm.suspended_by_account_id == 'HAAAAAAAAAA'
+            assert vm.expires_at.replace(tzinfo=UTC) > now
+            assert await session.get(VMRetentionRow, vm.vm_id) is None
+        orch.xcpng.restore_retained_vm.assert_awaited_once()
+        orch.xcpng.start_vm.assert_not_awaited()
+    finally:
+        app.state._typed_state = previous
+        await orch.xcpng.close()

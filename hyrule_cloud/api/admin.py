@@ -1152,7 +1152,7 @@ async def restore_retained_vm(
                 raise HTTPException(409, "Retained recovery state changed")
             owner = await session.get(AccountRow, vm.owner_account_id) if vm.owner_account_id else None
             if ((vm.owner_account_id and (owner is None or owner.disabled_at is not None))
-                    or vm.suspension_reason == "account_disabled"):
+                    or (not vm.owner_account_id and vm.suspension_reason == "account_disabled")):
                 raise HTTPException(409, "Enable the owner account before restoring this VM")
             try:
                 await orch.xcpng.restore_retained_vm(stored_manifest(retained))
