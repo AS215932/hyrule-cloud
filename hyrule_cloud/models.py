@@ -334,6 +334,25 @@ class VMQuoteResponse(BaseModel):
     expires_at: datetime
 
 
+class VMExpiryState(enum.StrEnum):
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    DELETION_ELIGIBLE = "deletion_eligible"
+    DELETING = "deleting"
+    NOT_SET = "not_set"
+    NOT_APPLICABLE = "not_applicable"
+    DESTROYED = "destroyed"
+
+
+class VMExpiryInfo(BaseModel):
+    """Expiry policy assessment, independent of reported runtime status."""
+    state: VMExpiryState
+    observed_at: datetime
+    grace_ends_at: datetime | None = None
+    deletion_eligible: bool = False
+    message: str
+
+
 class VMStatusResponse(BaseModel):
     vm_id: str
     status: VMStatus
@@ -347,6 +366,7 @@ class VMStatusResponse(BaseModel):
     firewall: FirewallState | None = None
     error: str | None = None
     cost_breakdown: CostBreakdown | None = None
+    expiry: VMExpiryInfo | None = None
 
 
 class VMPublicStatusResponse(BaseModel):
@@ -379,6 +399,7 @@ class VMPublicStatusResponse(BaseModel):
     rollback_available: bool = False
     operator_message: str | None = None
     customer_message: str | None = None
+    expiry: VMExpiryInfo | None = None
 
 
 class FirewallState(BaseModel):
