@@ -98,6 +98,7 @@ async def run_worker() -> None:
     now = datetime.now(UTC)
     next_intents = now
     next_payment_handoffs = now
+    next_provisioning_recovery = now
     next_jobs = now
     next_expiry = now
     next_quotes = now
@@ -116,6 +117,12 @@ async def run_worker() -> None:
     try:
         while not stop.is_set():
             now = datetime.now(UTC)
+            if now >= next_provisioning_recovery:
+                try:
+                    await orchestrator.recover_tracked_provisioning()
+                except Exception:
+                    log.exception("tracked_provisioning_recovery_failed")
+                next_provisioning_recovery = now + timedelta(seconds=15)
             if now >= next_intents:
                 try:
                     await scan_pending_intents(

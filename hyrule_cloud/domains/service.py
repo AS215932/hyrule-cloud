@@ -1855,7 +1855,7 @@ class DomainService:
                 )
             )
         for vm_id in vm_ids:
-            self.orchestrator.start_provisioning(vm_id)
+            await self.orchestrator.start_provisioning(vm_id)
         return len(vm_ids)
 
     async def recover_x402_handoffs(self, *, limit: int = 200) -> int:
@@ -2896,7 +2896,7 @@ class DomainService:
         if str(vm.status) == "failed":
             raise RuntimeError("the planned bundle VM is failed")
         if str(vm.status) == "provisioning":
-            self.orchestrator.start_provisioning(vm.vm_id)
+            await self.orchestrator.start_provisioning(vm.vm_id)
 
     async def _fail_paid_order(self, order_id: str, code: str, detail: str) -> None:
         async with self.db() as session:

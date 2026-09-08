@@ -155,6 +155,20 @@ class VMRow(Base):
     )
 
 
+class VMGuestResultRow(Base):
+    """Scoped first-boot receipt, separate from concurrently edited VM metadata."""
+
+    __tablename__ = "vm_guest_results"
+    vm_id: Mapped[str] = mapped_column(String(32), ForeignKey("vms.vm_id", ondelete="CASCADE"), primary_key=True)
+    generation: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    outcome: Mapped[str | None] = mapped_column(String(16))
+    stage: Mapped[str | None] = mapped_column(String(16))
+    exit_code: Mapped[int | None] = mapped_column(Integer)
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class VMEventRow(Base):
     """Append-only provisioning lifecycle log for one VM.
 

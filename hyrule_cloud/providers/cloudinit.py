@@ -11,6 +11,9 @@ xe-guest-utilities and cloud-init are pre-installed in the VM template.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import yaml
 
 
@@ -21,9 +24,12 @@ def render_cloud_init(
     ssh_pubkey: str,
     open_ports: list[int],
     setup_script: str | None = None,
+    guest_report: dict | None = None,
 ) -> str:
     """Render a cloud-init user-data document."""
     if os_name.startswith("openbsd"):
+        if guest_report is not None:
+            raise ValueError("Guest completion reporting requires a supported Linux template")
         return _render_openbsd_cloud_init(
             hostname=hostname,
             ssh_pubkey=ssh_pubkey,
@@ -32,6 +38,7 @@ def render_cloud_init(
         )
 
     return _render_debian_cloud_init(
+        guest_report=guest_report,
         hostname=hostname,
         ssh_pubkey=ssh_pubkey,
         open_ports=open_ports,
@@ -40,6 +47,7 @@ def render_cloud_init(
 
 
 def _render_debian_cloud_init(
+    guest_report: dict | None,
     *,
     hostname: str,
     ssh_pubkey: str,
@@ -64,15 +72,7 @@ def _render_debian_cloud_init(
     ]
 
     if setup_script:
-        runcmd.extend([
-            (
-                "cat > /root/setup.sh << 'HYRULE_SETUP_EOF'\n"
-                f"{setup_script}\n"
-                "HYRULE_SETUP_EOF"
-            ),
-            "chmod +x /root/setup.sh",
-            "/root/setup.sh > /var/log/hyrule-setup.log 2>&1 || true",
-        ])
+        runcmd.append("/root/setup.sh > /var/log/hyrule-setup.log 2>&1")
 
     cloud_config: dict = {
         "hostname": hostname,
@@ -90,6 +90,40 @@ def _render_debian_cloud_init(
         "runcmd": runcmd,
         "final_message": "Hyrule Cloud init complete",
     }
+
+    if setup_script:
+        cloud_config.setdefault("write_files", []).append({
+            "path": "/root/setup.sh",
+            "owner": "root:root",
+            "permissions": "0700",
+            "content": setup_script,
+        })
+
+    if guest_report is not None:
+        state_dir = "/var/lib/hyrule-guest-result"
+        report_config = {**guest_report, "setup_required": bool(setup_script)}
+        cloud_config.setdefault("write_files", []).extend([
+            {"path": f"{state_dir}/config.json", "owner": "root:root", "permissions": "0600",
+             "content": json.dumps(report_config)},
+            {"path": "/usr/local/libexec/hyrule-guest-result.py", "owner": "root:root", "permissions": "0700",
+             "content": Path(__file__).with_name("guest_observer.py").read_text()},
+            {"path": "/etc/systemd/system/hyrule-guest-result.service", "owner": "root:root", "permissions": "0644",
+             "content": "[Unit]\nDescription=Hyrule first-boot completion report\nAfter=cloud-final.service network-online.target\n"
+                        "[Service]\nType=oneshot\nExecStart=/usr/bin/python3 /usr/local/libexec/hyrule-guest-result.py\n"
+                        "Restart=on-failure\nRestartSec=10\nUMask=0077\n"
+                        "[Install]\nWantedBy=multi-user.target\n"},
+        ])
+        # Queue the observer without waiting for cloud-final (this very task)
+        # to finish. It runs after final even when cloud-final has failed.
+        runcmd[0:0] = [
+            f"chmod 0700 {state_dir}", "systemctl daemon-reload",
+            "systemctl enable --now --no-block hyrule-guest-result.service",
+        ]
+        if setup_script:
+            runcmd[-1] = (
+                "/root/setup.sh > /var/log/hyrule-setup.log 2>&1; "
+                f"rc=$?; printf '%s\\n' \"$rc\" > {state_dir}/setup-exit; exit \"$rc\""
+            )
 
     config_yaml = yaml.dump(
         cloud_config,
@@ -132,15 +166,7 @@ pass in quick proto tcp from any to any port {port_expr} flags S/SA keep state
     ]
 
     if setup_script:
-        runcmd.extend([
-            (
-                "cat > /root/setup.sh << 'HYRULE_SETUP_EOF'\n"
-                f"{setup_script}\n"
-                "HYRULE_SETUP_EOF"
-            ),
-            "chmod +x /root/setup.sh",
-            "sh /root/setup.sh > /var/log/hyrule-setup.log 2>&1 || true",
-        ])
+        runcmd.append("sh /root/setup.sh > /var/log/hyrule-setup.log 2>&1")
 
     cloud_config: dict = {
         "hostname": hostname,
@@ -166,6 +192,14 @@ pass in quick proto tcp from any to any port {port_expr} flags S/SA keep state
         "runcmd": runcmd,
         "final_message": "Hyrule Cloud OpenBSD init complete",
     }
+
+    if setup_script:
+        cloud_config.setdefault("write_files", []).append({
+            "path": "/root/setup.sh",
+            "owner": "root:wheel",
+            "permissions": "0700",
+            "content": setup_script,
+        })
 
     config_yaml = yaml.dump(
         cloud_config,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -386,13 +387,13 @@ async def test_create_vm_can_defer_provisioning(session_factory, monkeypatch) ->
     )
     orch = Orchestrator(HyruleConfig(), session_factory)
     spawned: list[str] = []
-    monkeypatch.setattr(orch, "_spawn_provisioning", lambda vm_id: spawned.append(vm_id))
+    monkeypatch.setattr(orch, "_spawn_provisioning", AsyncMock(side_effect=lambda vm_id: spawned.append(vm_id)))
     order = VMCreateRequest(duration_days=1, size=VMSize.XS, os="debian-13", ssh_pubkey="ssh-ed25519 AAAA test")
 
     row, _ = await orch.create_vm(order, owner_wallet=EVM_WALLET, start_provisioning=False)
     assert spawned == []  # deferred — nothing provisioning yet
 
-    orch.start_provisioning(row.vm_id)
+    await orch.start_provisioning(row.vm_id)
     assert spawned == [row.vm_id]  # explicit start works
 
 
@@ -528,7 +529,7 @@ async def test_activate_reservation_can_defer_provisioning(session_factory, monk
     start_provisioning=False and only spawn on the explicit start."""
     orch = Orchestrator(HyruleConfig(), session_factory)
     spawned: list[str] = []
-    monkeypatch.setattr(orch, "_spawn_provisioning", lambda vm_id: spawned.append(vm_id))
+    monkeypatch.setattr(orch, "_spawn_provisioning", AsyncMock(side_effect=lambda vm_id: spawned.append(vm_id)))
     async with session_factory() as session:
         session.add(_paid_provisioning_vm("vm_res", wallet="", tx=None, cost="0.05"))
         await session.commit()
@@ -539,7 +540,7 @@ async def test_activate_reservation_can_defer_provisioning(session_factory, monk
     assert row is not None
     assert spawned == []  # deferred until the quote is linked
 
-    orch.start_provisioning("vm_res")
+    await orch.start_provisioning("vm_res")
     assert spawned == ["vm_res"]
 
 
