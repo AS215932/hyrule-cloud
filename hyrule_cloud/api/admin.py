@@ -190,6 +190,10 @@ class ReasonRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
 
 
+class ExpiryExtensionRequest(ReasonRequest):
+    days: int = Field(gt=0, le=365, strict=True)
+
+
 class RoleRequest(ReasonRequest):
     is_admin: bool
 
@@ -1015,6 +1019,35 @@ async def revoke_account_keys(
         )
         await session.commit()
     return {"revoked": int(result.rowcount or 0)}
+
+
+@router.post("/vms/{vm_id}/actions/extend")
+async def extend_vm_expiry(
+    vm_id: str,
+    body: ExpiryExtensionRequest,
+    request: Request,
+    actor: AccountRow = Depends(require_admin_step_up()),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    """Grant recovery time atomically with its audit; preserve suspension state."""
+    async with state.orchestrator.locked_vm(vm_id) as (session, row):
+        if row is None:
+            raise HTTPException(404, "VM not found")
+        if (row.deletion_started_at is not None or row.expires_at is None
+                or row.status in {VMStatus.PROVISIONING, VMStatus.FAILED, VMStatus.DESTROYED}):
+            raise HTTPException(409, "This VM can no longer be extended")
+        previous = _aware(row.expires_at)
+        expiry = max(previous, _now()) + timedelta(days=body.days)
+        row.expires_at = expiry
+        _audit(
+            session, request, actor, "vm.extend", target_type="vm", target_id=vm_id,
+            reason=body.reason,
+            details={"days": body.days, "previous_expiry": previous.isoformat(),
+                     "new_expiry": expiry.isoformat(), "payment_taken": False},
+        )
+        await session.commit()
+        return {"vm_id": vm_id, "new_expiry": expiry.isoformat(), "status": row.status,
+                "power_changed": False}
 
 
 @router.post("/vms/{vm_id}/actions/{action}")

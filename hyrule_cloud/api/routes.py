@@ -59,7 +59,12 @@ from hyrule_cloud.models import (
     VMStatus,
     VMStatusResponse,
 )
-from hyrule_cloud.orchestrator import AccountDisabledError, VMCapacityError
+from hyrule_cloud.orchestrator import (
+    AccountDisabledError,
+    ExtensionAppliedStateUnavailableError,
+    ExtensionOutcomeUnknownError,
+    VMCapacityError,
+)
 from hyrule_cloud.providers.base import ProviderError
 from hyrule_cloud.providers.network_config import (
     RESERVED_PREFIX_INDEXES,
@@ -1387,66 +1392,55 @@ async def extend_vm(
     # create/quote/intent. Refuse before check_payment so no money moves.
     _require_vm_service_open(gate)
 
-    if row.suspension_reason in {"account_disabled", "manual_admin"}:
-        raise HTTPException(409, "Admin-suspended VMs cannot be extended")
+    async with orch.locked_vm(vm_id) as (session, row):
+        if not orch.vm_can_extend(row) or not await orch.vm_owner_enabled(session, row):
+            raise HTTPException(409, "This VM can no longer be extended")
+        total = current_daily_price_for_vm(row, cfg.payment) * body.days
 
-    total = current_daily_price_for_vm(row, cfg.payment) * body.days
+        result = await gate.check_payment(
+            request,
+            amount=total,
+            description=f"Extend VM {vm_id} by {body.days} days",
+            extra_body={
+                "vm_id": vm_id,
+                "current_expiry": row.expires_at.isoformat() if row.expires_at else None,
+                "extension_days": body.days,
+            },
+        )
 
-    result = await gate.check_payment(
-        request,
-        amount=total,
-        description=f"Extend VM {vm_id} by {body.days} days",
-        extra_body={
+        if isinstance(result, Response):
+            return result
+
+        try:
+            updated = await orch.extend_vm(
+                vm_id, body.days, session=session,
+                payment_tx=getattr(request.state, "payment_tx", None), payer_wallet=result,
+            )
+        except ExtensionAppliedStateUnavailableError:
+            raise HTTPException(
+                503, "Your extension was applied, but the VM state is unavailable. "
+                "Do not pay again for this extension; contact support."
+            ) from None
+        except ExtensionOutcomeUnknownError:
+            raise HTTPException(
+                503, "Payment outcome needs reconciliation. Contact support before paying again."
+            ) from None
+        if not updated:
+            await session.rollback()
+            payment_tx = getattr(request.state, "payment_tx", None)
+            waived = bool(payment_tx and payment_tx.startswith(("dev_bypass", "admin_bypass")))
+            await orch.record_extension_failure_refund(
+                vm_id=vm_id, owner_wallet=result, payment_tx=payment_tx,
+                charged_amount=total, reason="vm_extension_rejected_post_settlement",
+            )
+            raise HTTPException(409, "VM extension was rejected; no payment was taken" if waived
+                                else "VM extension was rejected; a refund has been recorded")
+
+        return {
             "vm_id": vm_id,
-            "current_expiry": row.expires_at.isoformat() if row.expires_at else None,
-            "extension_days": body.days,
-        },
-    )
-
-    if isinstance(result, Response):
-        return result
-
-    payment_tx = getattr(request.state, "payment_tx", None)
-    payment_waived = bool(
-        payment_tx
-        and payment_tx.startswith(("dev_bypass", "admin_bypass"))
-    )
-    try:
-        updated = await orch.extend_vm(vm_id, body.days)
-    except Exception as exc:
-        await orch.record_extension_failure_refund(
-            vm_id=vm_id,
-            owner_wallet=result,
-            payment_tx=payment_tx,
-            charged_amount=total,
-            reason=f"vm_extension_failed: {exc}",
-        )
-        detail = (
-            "Failed to extend VM; no payment was taken"
-            if payment_waived
-            else "Failed to extend VM; a refund has been recorded"
-        )
-        raise HTTPException(500, detail) from exc
-    if not updated:
-        await orch.record_extension_failure_refund(
-            vm_id=vm_id,
-            owner_wallet=result,
-            payment_tx=payment_tx,
-            charged_amount=total,
-            reason="vm_extension_rejected_post_settlement",
-        )
-        detail = (
-            "VM extension was rejected; no payment was taken"
-            if payment_waived
-            else "VM extension was rejected; a refund has been recorded"
-        )
-        raise HTTPException(409, detail)
-
-    return {
-        "vm_id": vm_id,
-        "new_expiry": updated.expires_at.isoformat() if updated.expires_at else None,
-        "status": updated.status,
-    }
+            "new_expiry": updated.expires_at.isoformat() if updated.expires_at else None,
+            "status": updated.status,
+        }
 
 
 @router.post("/vm/{vm_id}/reboot", response_model=GenericActionResponse)

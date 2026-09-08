@@ -1,7 +1,7 @@
 """Administrator console, payment waivers, and audit trail.
 
 Revision ID: 023
-Revises: 020
+Revises: 021
 Create Date: 2026-07-19
 """
 
@@ -15,7 +15,7 @@ from alembic import op
 _JSONB = postgresql.JSONB(astext_type=sa.Text()).with_variant(sa.JSON(), "sqlite")
 
 revision: str = "023"
-down_revision: str | None = "020"
+down_revision: str | None = "021"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

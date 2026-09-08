@@ -134,4 +134,4 @@ def test_migration_023_backfills_legacy_dev_bypass_resources() -> None:
     assert vm_rows["vm-paid"].billing_mode == "charged"
     assert vm_rows["vm-paid"].cost_total == Decimal("2.500000")
     assert module.revision == "023"
-    assert module.down_revision == "020"
+    assert module.down_revision == "021"

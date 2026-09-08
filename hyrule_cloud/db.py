@@ -136,6 +136,8 @@ class VMRow(Base):
     provisioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     destroyed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Durable fence: renewal cannot race a provider deletion after commit/crash.
+    deletion_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Error tracking
     error: Mapped[str | None] = mapped_column(Text)
@@ -688,7 +690,7 @@ class PaymentEventRow(Base):
         DateTime(timezone=True), server_default=func.now(), index=True
     )
     # required_402 | verify_failed | settle_failed | settled | dev_bypass |
-    # admin_bypass | refund_owed
+    # admin_bypass | refund_owed | extend_applied
     event_type: Mapped[str] = mapped_column(String(16), index=True)
     resource_path: Mapped[str] = mapped_column(String(256))
     method: Mapped[str] = mapped_column(String(8))

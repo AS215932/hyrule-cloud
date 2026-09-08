@@ -2148,11 +2148,11 @@ async def test_admin_suspension_blocks_orchestrator_extension(admin_factory) -> 
         )
         await session.commit()
 
-    result = await Orchestrator.extend_vm(
-        SimpleNamespace(db=admin_factory),
-        "vm_admin_suspended",
-        7,
-    )
+    orchestrator = Orchestrator(HyruleConfig(), admin_factory)
+    try:
+        result = await orchestrator.extend_vm("vm_admin_suspended", 7)
+    finally:
+        await orchestrator.shutdown()
 
     assert result is None
     async with admin_factory() as session:
@@ -2184,11 +2184,11 @@ async def test_disabled_owner_blocks_extension_without_vm_marker(admin_factory) 
         )
         await session.commit()
 
-    result = await Orchestrator.extend_vm(
-        SimpleNamespace(db=admin_factory),
-        "vm_disabled_owner_extension",
-        7,
-    )
+    orchestrator = Orchestrator(HyruleConfig(), admin_factory)
+    try:
+        result = await orchestrator.extend_vm("vm_disabled_owner_extension", 7)
+    finally:
+        await orchestrator.shutdown()
 
     assert result is None
     async with admin_factory() as session:
@@ -2277,3 +2277,75 @@ async def test_admin_resource_operations_wait_for_same_account_operation(
     async with admin_factory() as session:
         queued = await session.get(AdminOperationRow, "operation-queued")
         assert queued is not None and queued.status == "queued"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['expired', 'running', 'claimed', 'failed', 'destroyed', 'provisioning', 'no_expiry', 'audit_failure'])
+async def test_admin_expiry_extension_requires_step_up_and_atomic_audit(admin_factory, monkeypatch, case):
+    from unittest.mock import AsyncMock
+
+    now = datetime.now(UTC)
+    monkeypatch.setattr('hyrule_cloud.api.admin._now', lambda: now)
+    credentials = await _admin_credentials(admin_factory)
+    status = 'suspended' if case in ('expired', 'claimed', 'no_expiry', 'audit_failure') else case
+    expiry = now - timedelta(days=1) if case != 'running' else now + timedelta(days=2)
+    async with admin_factory.begin() as session:
+        session.add(VMRow(vm_id='vm_admin_expiry', owner_wallet='fixture', status=status,
+                          expires_at=None if case == 'no_expiry' else expiry,
+                          suspension_reason='expired' if status == 'suspended' else None,
+                          deletion_started_at=now if case == 'claimed' else None))
+    orch = Orchestrator(HyruleConfig(), admin_factory)
+    orch.xcpng.start_vm = AsyncMock(side_effect=AssertionError('expiry grant must not change power'))
+    state = AppState(config=HyruleConfig(), orchestrator=orch, payment_gate=_admin_gate(admin_factory),
+                     network_provider=None, session_factory=admin_factory)
+    previous = getattr(app.state, '_typed_state', None)
+    app.state._typed_state = state
+    path = '/v1/admin/vms/vm_admin_expiry/actions/extend'
+    body = {'days': 7, 'reason': 'Operator recovery window'}
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False), base_url='http://localhost') as client:
+            assert (await client.post(path, json=body)).status_code == 401
+            client.cookies.set('hyr_sess', credentials.token)
+            client.cookies.set('hyr_csrf', credentials.csrf_token)
+            assert (await client.post(path, json=body)).status_code == 403
+            headers = {'X-CSRF-Token': credentials.csrf_token}
+            assert (await client.post(path, json=body, headers=headers)).status_code == 403
+            async with admin_factory.begin() as session:
+                login = await session.scalar(select(SessionRow).where(SessionRow.account_id == 'HAAAAAAAAAA'))
+                login.admin_elevated_at = now
+            for days in (0, 366, True):
+                response = await client.post(path, json={**body, 'days': days}, headers=headers)
+                assert response.status_code == 422
+            if case == 'audit_failure':
+                from hyrule_cloud.api import admin
+                real_audit = admin._audit
+
+                def invalid_audit(*args, **kwargs):
+                    audit = real_audit(*args, **kwargs)
+                    audit.action = None  # Force a real NOT NULL failure at commit.
+                    return audit
+
+                monkeypatch.setattr(admin, '_audit', invalid_audit)
+            response = await client.post(path, json=body, headers=headers)
+            expected_status = 200 if case in ('expired', 'running') else 500 if case == 'audit_failure' else 409
+            assert response.status_code == expected_status
+            async with admin_factory() as session:
+                vm = await session.get(VMRow, 'vm_admin_expiry')
+                audits = list(await session.scalars(select(AdminAuditRow).where(AdminAuditRow.action == 'vm.extend')))
+                if response.status_code == 200:
+                    expected = max(expiry, now) + timedelta(days=7)
+                    assert vm.expires_at.replace(tzinfo=UTC) == expected
+                    assert response.json()['power_changed'] is False
+                    assert len(audits) == 1 and audits[0].actor_account_id == 'HAAAAAAAAAA'
+                    assert audits[0].reason == body['reason']
+                    assert audits[0].details['previous_expiry'] == expiry.isoformat()
+                    assert audits[0].details['new_expiry'] == expected.isoformat()
+                else:
+                    assert not audits
+                    assert vm.expires_at is None if case == 'no_expiry' else vm.expires_at.replace(tzinfo=UTC) == expiry
+                assert str(vm.status) == status
+                assert vm.suspension_reason == ('expired' if status == 'suspended' else None)
+            orch.xcpng.start_vm.assert_not_awaited()
+    finally:
+        app.state._typed_state = previous
+        await orch.shutdown()

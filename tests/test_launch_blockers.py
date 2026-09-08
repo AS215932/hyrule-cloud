@@ -95,6 +95,12 @@ class _Openprovider:
 
 
 class _Orch:
+    from hyrule_cloud.orchestrator import Orchestrator
+
+    locked_vm = Orchestrator.locked_vm
+    vm_can_extend = staticmethod(Orchestrator.vm_can_extend)
+    vm_owner_enabled = staticmethod(Orchestrator.vm_owner_enabled)
+
     def __init__(self, factory):
         self.db = factory
         self.openprovider = _Openprovider()
@@ -260,12 +266,13 @@ async def test_expiry_suspend_and_destroy_paths_are_exercised(launch_state):
             self.suspended.append(uuid)
 
     class _Fake:
+        locked_vm = Orchestrator.locked_vm
         config = launch_state.config
         db = launch_state.orchestrator.db
         xcpng = _XCPNG()
         destroyed: list[str] = []
 
-        async def destroy_vm(self, vm_id):
+        async def destroy_vm(self, vm_id, *, expired_before=None):
             self.destroyed.append(vm_id)
             async with self.db() as session:
                 row = await session.get(VMRow, vm_id)
@@ -601,7 +608,7 @@ async def test_extend_refuses_admin_suspension_before_payment(launch_state, monk
         )
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "Admin-suspended VMs cannot be extended"
+    assert response.json()["detail"] == "This VM can no longer be extended"
 
 
 def test_intent_awaiting_payment_truth_table():

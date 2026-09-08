@@ -15,6 +15,7 @@ from decimal import Decimal
 from functools import partial
 from ipaddress import IPv6Address, IPv6Network
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import dns.exception
 import dns.message
@@ -22,8 +23,8 @@ import dns.query
 import dns.rcode
 import dns.rdatatype
 import structlog
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -94,6 +95,14 @@ _VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable cross-worker PostgreSQL lock k
 # inside it for IPv4-only names, which is how an IPv6-only customer VM reaches
 # the IPv4 internet.
 _NAT64_PREFIX = IPv6Network("64:ff9b::/96")
+
+
+class ExtensionAppliedStateUnavailableError(RuntimeError):
+    """Purchased time committed, but the current guest state is unavailable."""
+
+
+class ExtensionOutcomeUnknownError(RuntimeError):
+    """Paid extension requires reconciliation before retry or refund."""
 
 
 class VMCapacityError(RuntimeError):
@@ -1771,119 +1780,125 @@ class Orchestrator:
             result = await session.execute(select(VMQuoteRow).where(VMQuoteRow.vm_id == vm_id))
             return result.scalar_one_or_none()
 
-    async def extend_vm(self, vm_id: str, days: int) -> VMRow | None:
-        original_expiry: datetime | None = None
-        extended_expiry: datetime | None = None
-        original_status: VMStatus | None = None
-        original_suspension_reason: str | None = None
-        original_suspended_by_account_id: str | None = None
-        restart_uuid: str | None = None
-        restart_attempted = False
+    @asynccontextmanager
+    async def locked_vm(self, vm_id: str) -> AsyncIterator[tuple[AsyncSession, VMRow | None]]:
+        """One PostgreSQL row lock shared by renewal/payment and expiry decisions."""
+        async with self.db() as session:
+            snapshot = await session.get(VMRow, vm_id)
+            owner_id = snapshot.owner_account_id if snapshot is not None else None
+            if owner_id is not None:
+                await session.scalar(select(AccountRow).where(AccountRow.account_id == owner_id).with_for_update())
+            row = (await session.execute(
+                select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                .execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if row is not None and row.owner_account_id != owner_id:
+                raise RuntimeError("VM ownership changed; retry the lifecycle action")
+            yield session, row
+
+    @staticmethod
+    async def vm_owner_enabled(session: AsyncSession, row: VMRow | None) -> bool:
+        if row is None:
+            return False
+        if row.owner_account_id is None:
+            return True
+        owner = await session.get(AccountRow, row.owner_account_id)
+        return owner is not None and owner.disabled_at is None
+
+    @staticmethod
+    def vm_can_extend(row: VMRow | None) -> bool:
+        return bool(row is not None and row.expires_at is not None
+                    and row.deletion_started_at is None
+                    and row.status not in (VMStatus.DESTROYED, VMStatus.FAILED, VMStatus.PROVISIONING)
+                    and row.suspension_reason not in ("account_disabled", "manual_admin"))
+
+    async def extend_vm(
+        self, vm_id: str, days: int, *, session: AsyncSession | None = None,
+        payment_tx: str | None = None, payer_wallet: str | None = None,
+    ) -> VMRow | None:
+        if days <= 0:
+            raise ValueError("Extension days must be positive")
+        if session is None:
+            async with self.locked_vm(vm_id) as (locked_session, _row):
+                return await self.extend_vm(vm_id, days, session=locked_session,
+                                            payment_tx=payment_tx, payer_wallet=payer_wallet)
+        row = await session.get(VMRow, vm_id)
+        if not self.vm_can_extend(row) or not await self.vm_owner_enabled(session, row):
+            return None
+        assert row is not None and row.expires_at is not None
+        now = _now()
+        expiry = row.expires_at
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        row.expires_at = max(expiry, now) + timedelta(days=days)
+        suspended = row.status == VMStatus.SUSPENDED
+        xcpng_uuid = row.xcpng_uuid
+        original_owner = (row.owner_account_id, row.owner_wallet)
+        # This receipt and purchased time commit together. It is an application
+        # record, not revenue or a second payment settlement.
+        receipt_id = str(uuid4())
+        session.add(PaymentEventRow(
+            event_id=receipt_id, event_type="extend_applied",
+            resource_path=f"/v1/vm/{vm_id}/extend", method="POST",
+            service_group="vm", amount_usd=Decimal(0),
+            payer_wallet=payer_wallet or row.owner_wallet, tx_hash=payment_tx,
+            extra={"vm_id": vm_id, "days": days,
+                   "previous_expiry": expiry.isoformat(),
+                   "new_expiry": row.expires_at.isoformat()},
+        ))
         try:
-            async with self.db() as session:
-                snapshot = await session.get(VMRow, vm_id)
-                if snapshot is None:
-                    return None
-                owner_account_id = snapshot.owner_account_id
-                owner = None
-                if owner_account_id is not None:
-                    owner = (
-                        await session.execute(
-                            select(AccountRow)
-                            .where(AccountRow.account_id == owner_account_id)
-                            .with_for_update()
-                        )
-                    ).scalar_one_or_none()
-                row = (
-                    await session.execute(
-                        select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
-                    )
-                ).scalar_one_or_none()
-                if row is None or row.owner_account_id != owner_account_id:
-                    return None
-                if owner_account_id is not None and (
-                    owner is None or owner.disabled_at is not None
-                ):
-                    return None
-                if (
-                    row.expires_at is None
-                    or row.suspension_reason in {"account_disabled", "manual_admin"}
-                    or str(row.status)
-                    in {
-                        VMStatus.PROVISIONING.value,
-                        VMStatus.FAILED.value,
-                        VMStatus.DESTROYED.value,
-                    }
-                ):
-                    return None
-
-                original_expiry = row.expires_at
-                original_status = row.status
-                original_suspension_reason = row.suspension_reason
-                original_suspended_by_account_id = row.suspended_by_account_id
-                now = _now()
-                if row.expires_at.tzinfo is None:
-                    now = now.replace(tzinfo=None)
-                extended_expiry = max(row.expires_at, now) + timedelta(days=days)
-
-                if row.status == VMStatus.SUSPENDED:
-                    if not row.xcpng_uuid:
+            await session.commit()
+        except Exception as commit_error:
+            try:
+                await session.rollback()
+                # A fresh connection and lifecycle lock wait for the original
+                # transaction to resolve before absence is treated as failure.
+                async with self.locked_vm(vm_id) as (check_session, current):
+                    receipt = await check_session.get(PaymentEventRow, receipt_id)
+                    if current is None:
+                        raise ExtensionOutcomeUnknownError("VM missing during reconciliation")
+                    if receipt is None:
                         return None
-                    restart_uuid = row.xcpng_uuid
-                    power = await self.xcpng.get_vm_power_state(restart_uuid)
-                    if power == "Halted":
-                        restart_attempted = True
-                        await self.xcpng.start_vm(restart_uuid)
-                    row.status = VMStatus.RUNNING
-                    row.suspension_reason = None
-                    row.suspended_by_account_id = None
-                row.expires_at = extended_expiry
-                await session.commit()
-        except Exception:
-            if restart_attempted and restart_uuid is not None:
-                try:
-                    await self.xcpng.suspend_vm(restart_uuid)
-                except Exception:
-                    log.exception(
-                        "vm_extension_restart_compensation_failed",
-                        vm_id=vm_id,
-                        vm_uuid=restart_uuid,
-                    )
-            # A commit can fail ambiguously after the server accepted it. Undo
-            # only the exact expiry written by this attempt so the caller never
-            # records a refund while the purchased days remain durable.
-            if (
-                original_expiry is not None
-                and extended_expiry is not None
-                and original_status is not None
-            ):
-                try:
-                    async with self.db() as session:
-                        current = (
-                            await session.execute(
-                                select(VMRow)
-                                .where(VMRow.vm_id == vm_id)
-                                .with_for_update()
-                            )
-                        ).scalar_one_or_none()
-                        if current is not None and current.expires_at == extended_expiry:
-                            current.expires_at = original_expiry
-                            current.status = original_status
-                            current.suspension_reason = original_suspension_reason
-                            current.suspended_by_account_id = (
-                                original_suspended_by_account_id
-                            )
-                            await session.commit()
-                except Exception:
-                    log.exception("vm_extension_database_compensation_failed", vm_id=vm_id)
-            raise
-
-        log.info(
-            "vm_extended",
-            vm_id=vm_id,
-            new_expiry=row.expires_at.isoformat() if row.expires_at else "none",
-        )
-        return row
+            except Exception as reconcile_error:
+                log.error("vm_extension_outcome_unknown", vm_id=vm_id,
+                          receipt_id=receipt_id, exc_info=True)
+                raise ExtensionOutcomeUnknownError(
+                    "Unable to establish whether purchased time committed"
+                ) from reconcile_error
+            log.warning("vm_extension_commit_ack_recovered", vm_id=vm_id,
+                        receipt_id=receipt_id, error_type=type(commit_error).__name__)
+        try:
+            if suspended and xcpng_uuid:
+                # Reacquire account then VM after committing purchased time. An
+                # account suspension, ownership change or deletion may have won.
+                async with self.locked_vm(vm_id) as (resume_session, current):
+                    if (self.vm_can_extend(current) and await self.vm_owner_enabled(resume_session, current)
+                            and current is not None and current.status == VMStatus.SUSPENDED
+                            and current.xcpng_uuid == xcpng_uuid
+                            and (current.owner_account_id, current.owner_wallet) == original_owner):
+                        try:
+                            power = await self.xcpng.get_vm_power_state(xcpng_uuid)
+                            if power == "Halted":
+                                await self.xcpng.start_vm(xcpng_uuid)
+                        except Exception:
+                            log.warning("vm_extension_resume_failed", vm_id=vm_id, exc_info=True)
+                        else:
+                            if power in ("Halted", "Running"):
+                                current.status = VMStatus.RUNNING
+                                current.suspension_reason = None
+                                current.suspended_by_account_id = None
+                                await resume_session.commit()
+            current = await self.get_vm(vm_id)
+            if current is None:
+                raise ExtensionAppliedStateUnavailableError("Applied extension VM is unavailable")
+            log.info("vm_extended", vm_id=vm_id, receipt_id=receipt_id)
+            return current
+        except Exception as state_error:
+            log.error("vm_extension_applied_state_unavailable", vm_id=vm_id,
+                      receipt_id=receipt_id, exc_info=True)
+            raise ExtensionAppliedStateUnavailableError(
+                "Purchased time committed; guest state requires reconciliation"
+            ) from state_error
 
     async def reboot_vm(self, vm_id: str) -> bool:
         async with self.db() as session:
@@ -1895,12 +1910,27 @@ class Orchestrator:
         await self.xcpng.reboot_vm(xcpng_uuid)
         return True
 
-    async def destroy_vm(self, vm_id: str) -> bool:
-        async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row:
+    async def destroy_vm(self, vm_id: str, *, expired_before: datetime | None = None) -> bool:
+        async with self.locked_vm(vm_id) as (session, row):
+            if row is None:
                 return False
-            xcpng_uuid = row.xcpng_uuid
+            already_destroyed = row.status == VMStatus.DESTROYED
+            if already_destroyed and row.ipv6_prefix_index is None and row.ipv6_prefix is None:
+                return True
+            if row.deletion_started_at is None and expired_before is not None and not already_destroyed:
+                expiry = row.expires_at
+                if expiry is None or row.status == VMStatus.FAILED:
+                    return False
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=UTC)
+                if expiry >= expired_before:
+                    return False
+            if row.deletion_started_at is None:
+                row.deletion_started_at = _now()
+            # Persist before the irreversible provider call. A failed call or
+            # worker crash retains the claim and prevents a paid renewal.
+            await session.commit()
+            xcpng_uuid = None if already_destroyed else row.xcpng_uuid
             hostname = row.hostname
             status = str(row.status)
             domain_mode = row.domain_mode
@@ -2009,6 +2039,7 @@ class Orchestrator:
                 await session.scalars(
                     select(VMRow.vm_id).where(
                         VMRow.owner_wallet == "",
+                        VMRow.deletion_started_at.is_(None),
                         VMRow.status == VMStatus.PROVISIONING,
                         VMRow.created_at < now - timedelta(minutes=15),
                     )
@@ -2027,6 +2058,7 @@ class Orchestrator:
                     sql_delete(VMRow).where(
                         VMRow.vm_id.in_(stale_reservations),
                         VMRow.owner_wallet == "",
+                        VMRow.deletion_started_at.is_(None),
                         VMRow.status == VMStatus.PROVISIONING,
                     )
                 )
@@ -2035,9 +2067,11 @@ class Orchestrator:
         async with self.db() as session:
             result = await session.execute(
                 select(VMRow).where(
-                    VMRow.status.notin_([VMStatus.DESTROYED, VMStatus.FAILED]),
-                    VMRow.expires_at.isnot(None),
-                    VMRow.expires_at < now,
+                    VMRow.status != VMStatus.DESTROYED,
+                    or_(
+                        VMRow.deletion_started_at.isnot(None),
+                        and_(VMRow.status != VMStatus.FAILED, VMRow.expires_at < now),
+                    ),
                 )
             )
             expired_vms = []
@@ -2052,30 +2086,39 @@ class Orchestrator:
                 )
 
         for vm in expired_vms:
-            if not vm["expires_at"]:
-                continue
-            expires_at = vm["expires_at"]
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=UTC)
-
-            if now > expires_at + grace:
-                log.info("vm_expiry_destroy", vm_id=vm["vm_id"])
-                await self.destroy_vm(vm["vm_id"])
-            elif vm["status"] != VMStatus.SUSPENDED:
-                log.info("vm_expiry_suspend", vm_id=vm["vm_id"])
-                if vm["xcpng_uuid"]:
-                    try:
-                        await self.xcpng.suspend_vm(vm["xcpng_uuid"])
-                    except Exception:
-                        log.warning("suspend_failed", vm_id=vm["vm_id"], exc_info=True)
-                async with self.db() as session:
-                    await session.execute(
-                        update(VMRow)
-                        .where(VMRow.vm_id == vm["vm_id"])
-                        .values(
-                            status=VMStatus.SUSPENDED,
-                            suspension_reason="expired",
-                            suspended_by_account_id=None,
-                        )
-                    )
+            async with self.locked_vm(vm["vm_id"]) as (session, current):
+                if current is None or current.status == VMStatus.DESTROYED:
+                    continue
+                claimed = current.deletion_started_at is not None
+                expiry = current.expires_at
+                if not claimed and (expiry is None or current.status == VMStatus.FAILED):
+                    continue
+                if expiry is not None and expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=UTC)
+                action_now = _now()
+                delete_due = claimed or (expiry is not None and action_now > expiry + grace)
+                if not delete_due:
+                    assert expiry is not None
+                    if expiry >= action_now or current.status == VMStatus.SUSPENDED:
+                        continue
+                    log.info("vm_expiry_suspend", vm_id=current.vm_id)
+                    if current.xcpng_uuid:
+                        # Failure must not be committed as a successful suspend,
+                        # nor prevent later candidates from being processed.
+                        try:
+                            await self.xcpng.suspend_vm(current.xcpng_uuid)
+                        except Exception:
+                            log.warning("suspend_failed", vm_id=current.vm_id, exc_info=True)
+                            continue
+                    current.status = VMStatus.SUSPENDED
+                    if current.suspension_reason not in {"account_disabled", "manual_admin"}:
+                        current.suspension_reason = "expired"
+                        current.suspended_by_account_id = None
                     await session.commit()
+                    continue
+            # Reacquire/recheck in destroy_vm: renewal may commit after the
+            # lock above is released but before the deletion claim is written.
+            try:
+                await self.destroy_vm(vm["vm_id"], expired_before=action_now - grace)
+            except Exception:
+                log.warning("vm_expiry_destroy_failed", vm_id=vm["vm_id"], exc_info=True)
