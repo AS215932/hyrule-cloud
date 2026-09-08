@@ -2521,6 +2521,13 @@ async def test_retention_status_exposes_pending_retry_without_sensitive_manifest
             archived = (await client.get(path)).json()
             assert archived['vm_status'] is None and archived['retention'] is None
             assert archived['history'][0]['operation_id'] == 'newer'
+            for offset in (2, 100):
+                empty_page = await client.get(path + f'&offset={offset}')
+                assert empty_page.status_code == 200
+                assert empty_page.json()['history'] == []
+                assert empty_page.json()['has_more_history'] is False
+                assert empty_page.json()['next_offset'] is None
+            assert (await client.get('/v1/admin/vms/missing/retention?offset=100')).status_code == 404
     finally:
         app.state._typed_state = previous
 

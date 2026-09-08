@@ -1085,7 +1085,11 @@ async def retained_vm_status(
         ))
         vm = await session.get(VMRow, vm_id)
         if vm is None and retained is None and not history:
-            raise HTTPException(404, "VM recovery history not found")
+            has_history = await session.scalar(
+                select(exists().where(VMRestoreRow.vm_id == vm_id))
+            )
+            if not has_history:
+                raise HTTPException(404, "VM recovery history not found")
         active_recovery = None
         if retained is not None and retained.restore_operation_id:
             active_recovery = await session.get(VMRestoreRow, retained.restore_operation_id)
