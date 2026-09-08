@@ -19,6 +19,9 @@ restarts; a fresh clone gets a new identity after existing orphan cleanup.
 The database receipt is independent of mutable VM metadata and serialized by a
 row lock. Identical retries are accepted, conflicting terminal reports rejected.
 A completed receipt can be acknowledged again after its original deadline.
+The server enforces that deadline. Guest retries use a bounded monotonic window
+(the configured report timeout, renewed on observer restart), so an incorrect
+guest wall clock cannot prevent submission or extend server acceptance.
 
 Reports contain only a finite outcome, stage and numeric exit code. No guest
 logs or raw cloud-init error output are uploaded. HTTPS verification stays

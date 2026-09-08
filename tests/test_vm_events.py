@@ -215,6 +215,12 @@ async def test_ssh_unreachable_is_reported_without_failing_the_vm(
 
     keys = await _keys(session_factory, "vm_nossh")
     assert VMEventKey.SSH_UNREACHABLE in keys
+    from hyrule_cloud.services.vm_events import list_vm_events
+
+    rows = await list_vm_events(session_factory, "vm_nossh")
+    warning = next(row for row in rows if row.event == VMEventKey.SSH_UNREACHABLE)
+    assert "Delivery is pending guest initialization verification" in warning.message
+    assert "still delivered" not in warning.message
     assert keys[-1] == VMEventKey.READY
     async with session_factory() as session:
         assert (await session.get(VMRow, "vm_nossh")).status == VMStatus.READY

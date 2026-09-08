@@ -51,8 +51,10 @@ def test_report_render_records_setup_failure_without_blocking_cloud_final(tmp_pa
     assert int((tmp_path / 'setup-exit').read_text()) == 7
 
 
-def test_retry_uses_persisted_result_and_removes_token_after_ack(tmp_path, monkeypatch):
+@pytest.mark.parametrize('guest_wall_time', [0, 99999999999])
+def test_retry_uses_persisted_result_and_removes_token_after_ack(tmp_path, monkeypatch, guest_wall_time):
     monkeypatch.setattr(guest_observer, 'STATE', tmp_path)
+    monkeypatch.setattr(guest_observer.time, 'time', lambda: guest_wall_time)
     (tmp_path / 'config.json').write_text(json.dumps({
         'url': 'https://cloud.example.test/result', 'token': 'test-only',
         'deadline': 9999999999, 'setup_required': True,
@@ -81,6 +83,34 @@ def test_retry_uses_persisted_result_and_removes_token_after_ack(tmp_path, monke
     assert not (tmp_path / 'config.json').exists()
     assert guest_observer.main() == 0  # Restart after ack never sends again.
     assert sent == [original]
+
+
+def test_network_failure_retries_are_bounded_by_monotonic_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(guest_observer, 'STATE', tmp_path)
+    (tmp_path / 'config.json').write_text(json.dumps({
+        'url': 'https://cloud.example.test/result', 'token': 'test-only',
+        'deadline': 1, 'retry_seconds': 60, 'setup_required': False,
+    }))
+    guest_observer.save_receipt(tmp_path / 'result.json', {
+        'outcome': 'succeeded', 'stage': 'cloud_init', 'exit_code': 0,
+    })
+    clock = [100.0]
+    calls = []
+
+    class Sender:
+        def open(self, request, timeout):
+            calls.append(clock[0])
+            raise OSError('test network unavailable')
+
+    monkeypatch.setattr(guest_observer, 'build_opener', lambda *args: Sender())
+    monkeypatch.setattr(guest_observer.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(guest_observer.time, 'time', lambda: pytest.fail('guest wall clock is not authoritative'))
+    monkeypatch.setattr(guest_observer.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    assert guest_observer.main() == 0
+    assert len(calls) == 12
+    assert clock[0] == 160
+    assert (tmp_path / 'config.json').exists()
+    assert not (tmp_path / 'delivered').exists()
 
 
 @pytest.mark.parametrize('length', [32, 70000])

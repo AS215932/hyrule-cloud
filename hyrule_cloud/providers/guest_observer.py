@@ -98,7 +98,10 @@ def main() -> int:
         return 1
     opener = build_opener(ProxyHandler({}), NoRedirect())
     receipt = STATE / 'result.json'
-    while time.time() < config['deadline']:
+    # The controller enforces the absolute receipt deadline. Guest RTC/NTP can
+    # be wrong at boot, so only use a bounded monotonic window for local retries.
+    retry_until = time.monotonic() + min(3600, max(60, int(config.get('retry_seconds', 900))))
+    while time.monotonic() < retry_until:
         if receipt.exists():
             payload = json.loads(receipt.read_text())
         else:

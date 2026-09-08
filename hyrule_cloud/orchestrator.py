@@ -792,6 +792,7 @@ class Orchestrator:
                             guest_report={
                                 "url": f"{self.config.public_base_url.rstrip('/')}/v1/vm/{vm_id}/guest-result/{generation}",
                                 "token": guest_token, "deadline": deadline.timestamp(),
+                                "retry_seconds": self.config.guest_report_timeout_seconds,
                             },
                         )
                         xcpng_uuid = await self.xcpng.create_vm(
@@ -883,8 +884,8 @@ class Orchestrator:
                     VMEventKey.SSH_UNREACHABLE,
                     message=(
                         "SSH was not reachable on port 22 within the check window. "
-                        "The VM is still delivered — first boot may simply not have "
-                        "finished; retry the connection shortly."
+                        "Delivery is pending guest initialization verification; "
+                        "first boot may still be in progress."
                     ),
                 )
             if dns_resolution is DNSResolutionStatus.FAILED:
