@@ -220,6 +220,13 @@ class WalletAuthService:
         """Create the management session only after checkout settlement."""
 
         async with self.db() as session:
+            account = await session.scalar(
+                select(AccountRow)
+                .where(AccountRow.account_id == account_id)
+                .with_for_update()
+            )
+            if account is None or account.disabled_at is not None:
+                raise DomainProblem(403, "account_disabled", "This account is disabled.")
             credentials = await create_session(
                 session,
                 account_id,
@@ -359,14 +366,17 @@ class WalletAuthService:
                     session.add(wallet)
                     created = True
                 else:
-                    loaded_account = await session.get(AccountRow, wallet.account_id)
+                    loaded_account = await session.scalar(
+                        select(AccountRow)
+                        .where(AccountRow.account_id == wallet.account_id)
+                        .with_for_update()
+                    )
                     if loaded_account is None:
                         raise DomainProblem(401, "invalid_wallet_account", "The wallet account is unavailable.")
                     if loaded_account.disabled_at is not None:
                         raise DomainProblem(403, "account_disabled", "This account is disabled.")
                     account_row = loaded_account
                 challenge.used_at = _now()
-                await session.commit()
                 credentials = await create_session(
                     session,
                     account_row.account_id,

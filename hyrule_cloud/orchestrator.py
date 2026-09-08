@@ -503,6 +503,29 @@ class Orchestrator:
                 session, row.vm_id, _now() + timedelta(seconds=self.config.guest_report_timeout_seconds),
             )
 
+    async def renew_provisioning_report_deadline(
+        self,
+        session: AsyncSession,
+        row: VMRow,
+    ) -> None:
+        """Give a deliberately resumed guest a fresh reporting window.
+
+        The credential and generation are already embedded in the retained
+        guest, so resumption must extend that receipt instead of replacing it.
+        Locking the receipt also orders this update against deadline recovery.
+        """
+        if row.status != VMStatus.PROVISIONING or row.xcpng_uuid is None:
+            raise ValueError("Only provider-backed provisioning guests can be resumed")
+        receipt = await session.scalar(
+            select(VMGuestResultRow)
+            .where(VMGuestResultRow.vm_id == row.vm_id)
+            .with_for_update()
+        )
+        if receipt is not None and receipt.received_at is None:
+            receipt.deadline = _now() + timedelta(
+                seconds=self.config.guest_report_timeout_seconds
+            )
+
     async def _spawn_provisioning(self, vm_id: str) -> None:
         if vm_id in self._provisioning_vm_ids:
             return
@@ -548,8 +571,18 @@ class Orchestrator:
         """
         async with self.db() as session:
             vm_ids = list((await session.scalars(
-                select(VMRow.vm_id).join(VMGuestResultRow)
+                select(VMRow.vm_id)
+                .join(VMGuestResultRow)
+                .outerjoin(
+                    CryptoIntentRow,
+                    and_(
+                        CryptoIntentRow.vm_id == VMRow.vm_id,
+                        CryptoIntentRow.resource_type == "vm",
+                        CryptoIntentRow.status == CryptoIntentStatus.PROVISIONING,
+                    ),
+                )
                 .where(VMRow.status == VMStatus.PROVISIONING,
+                       CryptoIntentRow.intent_id.is_(None),
                        VMRow.vm_id > self._recovery_cursor)
                 .order_by(VMRow.vm_id).limit(4)
             )).all())

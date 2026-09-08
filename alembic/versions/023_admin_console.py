@@ -239,10 +239,30 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
-        # Block concurrent disable writes until the downgrade transaction ends.
-        bind.execute(sa.text("LOCK TABLE accounts IN SHARE ROW EXCLUSIVE MODE"))
+        # Freeze every state used by the rollback guards until the downgrade
+        # transaction ends. Otherwise a resumption or waived order could enter
+        # an unsafe state after its check but before its provenance is dropped.
+        bind.execute(sa.text(
+            "LOCK TABLE accounts, admin_operations, vms, mail_accounts, "
+            "domain_orders IN SHARE ROW EXCLUSIVE MODE"
+        ))
     if bind.scalar(sa.text("SELECT count(*) FROM accounts WHERE disabled_at IS NOT NULL")):
         raise RuntimeError("Cannot downgrade revision 023 while accounts remain disabled")
+    if bind.scalar(sa.text(
+        "SELECT count(*) FROM admin_operations WHERE status <> 'completed'"
+    )):
+        raise RuntimeError("Cannot downgrade revision 023 while account operations remain unresolved")
+    if bind.scalar(sa.text(
+        "SELECT (SELECT count(*) FROM vms WHERE suspension_reason = 'account_disabled') + "
+        "(SELECT count(*) FROM mail_accounts WHERE suspension_reason = 'account_disabled')"
+    )):
+        raise RuntimeError("Cannot downgrade revision 023 while account resumptions remain pending")
+    if bind.scalar(sa.text(
+        "SELECT count(*) FROM domain_orders "
+        "WHERE billing_mode = 'admin_waived' "
+        "AND status NOT IN ('active', 'refunded', 'cancelled', 'expired')"
+    )):
+        raise RuntimeError("Cannot downgrade revision 023 while waived domain orders remain actionable")
     op.drop_table("admin_bypass_usage")
     op.drop_table("refund_resolutions")
     op.drop_table("admin_operations")

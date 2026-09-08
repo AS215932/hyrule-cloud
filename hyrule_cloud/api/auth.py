@@ -411,14 +411,28 @@ async def login(
         if acct is None or acct.password_hash is None:
             _ = hash_password(body.password)  # constant-time-ish defense
             raise HTTPException(401, "Invalid credentials")
-        if not verify_password(acct.password_hash, body.password):
+        verified_password_hash = acct.password_hash
+        if not verify_password(verified_password_hash, body.password):
+            raise HTTPException(401, "Invalid credentials")
+        # Password verification is intentionally outside the row lock. Re-lock
+        # and revalidate the credential at issuance so account disable either
+        # revokes this new session or wins first and prevents its creation.
+        acct = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == body.account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if (
+            acct is None
+            or acct.password_hash is None
+            or acct.password_hash != verified_password_hash
+        ):
             raise HTTPException(401, "Invalid credentials")
         if acct.disabled_at is not None:
             raise HTTPException(403, "Account disabled")
 
         acct.last_login_at = _now()
-        await db.commit()
-
         credentials = await create_session(
             db,
             acct.account_id,
@@ -1200,6 +1214,13 @@ async def create_api_key_endpoint(
         expires_at = _now() + timedelta(days=body.expires_in_days)
 
     async with factory() as db:
+        current_account = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == account.account_id)
+            .with_for_update()
+        )
+        if current_account is None or current_account.disabled_at is not None:
+            raise HTTPException(403, "Account disabled")
         try:
             cleartext, row = await svc_create_api_key(
                 db,

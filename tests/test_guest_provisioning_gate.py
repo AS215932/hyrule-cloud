@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,9 +12,45 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.api.routes import get_orch, router
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import Base, VMEventRow, VMRow
-from hyrule_cloud.models import DNSResolutionStatus, VMCreateRequest, VMStatus
+from hyrule_cloud.db import Base, CryptoIntentRow, VMEventRow, VMGuestResultRow, VMRow
+from hyrule_cloud.models import CryptoIntentStatus, DNSResolutionStatus, VMCreateRequest, VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
+
+
+@pytest.mark.asyncio
+async def test_guest_recovery_waits_for_native_intent_handoff(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'native-handoff.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    orch = Orchestrator(HyruleConfig(), factory)
+    orch._spawn_provisioning = AsyncMock()
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            session.add(VMRow(
+                vm_id='vm_native_handoff', owner_wallet='fixture',
+                status=VMStatus.PROVISIONING,
+            ))
+            session.add(VMGuestResultRow(
+                vm_id='vm_native_handoff', generation='a' * 32,
+                token_hash='b' * 64,
+                deadline=datetime.now(UTC) + timedelta(minutes=5),
+            ))
+            session.add(CryptoIntentRow(
+                intent_id='native-handoff', asset='BTC', amount_crypto=Decimal('0.1'),
+                address='fixture', status=CryptoIntentStatus.PROVISIONING,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                resource_type='vm', vm_id='vm_native_handoff',
+            ))
+        assert await orch.recover_tracked_provisioning() == 0
+        orch._spawn_provisioning.assert_not_awaited()
+        async with factory.begin() as session:
+            intent = await session.get(CryptoIntentRow, 'native-handoff')
+            intent.status = CryptoIntentStatus.PROVISIONED
+        assert await orch.recover_tracked_provisioning() == 1
+        orch._spawn_provisioning.assert_awaited_once_with('vm_native_handoff')
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

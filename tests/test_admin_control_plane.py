@@ -46,6 +46,7 @@ from hyrule_cloud.db import (
     PaymentEventRow,
     RefundResolutionRow,
     SessionRow,
+    VMGuestResultRow,
     VMRow,
 )
 from hyrule_cloud.domains.models import DomainOperationStatus
@@ -2002,7 +2003,9 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
     admin_factory,
 ) -> None:
     xcpng = _AdminXCPNG()
-    orchestrator = SimpleNamespace(xcpng=xcpng)
+    orchestrator = Orchestrator(HyruleConfig(), admin_factory)
+    orchestrator.xcpng = xcpng
+    old_report_deadline = datetime.now(UTC) - timedelta(minutes=1)
     async with admin_factory() as session:
         session.add_all(
             [
@@ -2074,6 +2077,12 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
                     actor_account_id="HAAAAAAAAAA",
                     reason="abuse response",
                 ),
+                VMGuestResultRow(
+                    vm_id="vm_provisioning",
+                    generation="a" * 32,
+                    token_hash="b" * 64,
+                    deadline=old_report_deadline,
+                ),
             ]
         )
         await session.commit()
@@ -2128,6 +2137,7 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         mailbox = await session.get(MailAccountRow, "mailbox-1")
         expired_mailbox = await session.get(MailAccountRow, "mailbox-expired")
         operation = await session.get(AdminOperationRow, "operation-resume")
+        receipt = await session.get(VMGuestResultRow, "vm_provisioning")
         assert active is not None and str(active.status) == "running"
         assert active.suspension_reason is None
         assert manual is not None and manual.suspension_reason == "manual_admin"
@@ -2139,6 +2149,13 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         assert expired_mailbox is not None and expired_mailbox.status == "suspended"
         assert expired_mailbox.suspension_reason == "expired"
         assert operation is not None and operation.status == "completed"
+        assert receipt is not None
+        receipt_deadline = (
+            receipt.deadline.replace(tzinfo=UTC)
+            if receipt.deadline.tzinfo is None
+            else receipt.deadline
+        )
+        assert receipt_deadline > old_report_deadline
 
     assert xcpng.suspended == ["uuid-active", "uuid-provisioning", "uuid-failed-disabled"]
     assert xcpng.started == ["uuid-active", "uuid-provisioning"]
@@ -2674,6 +2691,45 @@ async def test_admin_power_rejects_committed_deletion_claim(admin_factory, actio
     async with admin_factory() as session:
         assert list(await session.scalars(select(AdminAuditRow))) == []
         assert (await session.get(VMRow, 'vm_power_claim')).status == 'suspended'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action', ['shutdown', 'suspend'])
+async def test_admin_power_off_rejects_provisioning_guest(admin_factory, action):
+    from unittest.mock import AsyncMock
+
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory.begin() as session:
+        actor = await session.get(AccountRow, 'HAAAAAAAAAA')
+        session.add(VMRow(
+            vm_id='vm_power_provisioning', owner_wallet='fixture',
+            status='provisioning', xcpng_uuid='provisioning-guest',
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+        ))
+    provider = SimpleNamespace(**{
+        name: AsyncMock()
+        for name in ('start_vm', 'reboot_vm', 'shutdown_vm', 'suspend_vm')
+    })
+    state = AppState(
+        config=HyruleConfig(),
+        orchestrator=SimpleNamespace(xcpng=provider),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    with pytest.raises(HTTPException) as refused:
+        await vm_action(
+            'vm_power_provisioning', action,
+            ReasonRequest(reason='fixture power off'),
+            _browser_request(credentials, path='/fixture'), actor, state,
+        )
+    assert refused.value.status_code == 409
+    provider.shutdown_vm.assert_not_awaited()
+    provider.suspend_vm.assert_not_awaited()
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, 'vm_power_provisioning')
+        assert vm.status == 'provisioning' and vm.suspension_reason is None
+        assert list(await session.scalars(select(AdminAuditRow))) == []
 
 
 @pytest.mark.asyncio

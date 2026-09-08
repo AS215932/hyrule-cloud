@@ -70,6 +70,28 @@ def test_admin_postgres_migration_roundtrip():
     assert run("SELECT count(*) FROM admin_audit") == [(1,)]
     # Explicitly resolve the fixture's restriction before the ordinary rollback.
     run("UPDATE accounts SET disabled_at=NULL WHERE account_id='HTEST000001'")
+    run("""INSERT INTO admin_operations(operation_id,kind,account_id,status)
+        VALUES ('fixture-resume','resume_account_resources','HTEST000001','failed')""")
+    migrate("downgrade", "020", expected_error="while account operations remain unresolved")
+    run("UPDATE admin_operations SET status='completed' WHERE operation_id='fixture-resume'")
+    run("UPDATE vms SET suspension_reason='account_disabled' WHERE vm_id='vm_paid'")
+    migrate("downgrade", "020", expected_error="while account resumptions remain pending")
+    run("UPDATE vms SET suspension_reason='manual_admin' WHERE vm_id='vm_paid'")
+    run("""INSERT INTO domain_quotes(
+        quote_id,fqdn,action,status,provider_cost,provider_currency,fx_rate,
+        provider_cost_usd,hyrule_fee_usd,tax_usd,total_usd,available,premium,
+        terms_version,expires_at)
+        VALUES ('quote-waived','fixture.dev','register','consumed',1,'USD',1,1,0,0,1,
+                true,false,'fixture',now()+interval '1 hour')""")
+    run("""INSERT INTO domain_orders(
+        order_id,quote_id,fqdn,action,owner_account_id,idempotency_key,status,
+        amount_usd,domain_amount_usd,vm_amount_usd,payment_method,billing_mode,
+        on_domain_failure,terms_version,terms_accepted_at)
+        VALUES ('order-waived','quote-waived','fixture.dev','register','HTEST000001',
+                'fixture-waived','failed',1,1,0,'x402','admin_waived','keep_vm',
+                'fixture',now())""")
+    migrate("downgrade", "020", expected_error="while waived domain orders remain actionable")
+    run("UPDATE domain_orders SET status='active' WHERE order_id='order-waived'")
     migrate("downgrade", "020")
     assert run("SELECT count(*) FROM vms") == [(2,)]
     assert run("SELECT count(*) FROM accounts") == [(1,)]

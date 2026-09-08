@@ -1146,7 +1146,7 @@ async def vm_action(
                 raise HTTPException(409, "Deletion-claimed VMs cannot accept power actions")
             if current.status == VMStatus.DESTROYED:
                 raise HTTPException(409, "Destroyed VMs cannot accept power actions")
-            if action in {"start", "reboot"}:
+            if action in {"start", "reboot", "shutdown", "suspend"}:
                 status = str(current.status)
                 if status in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
                     raise HTTPException(409, "Terminal VMs cannot be powered on")
@@ -1291,6 +1291,12 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
         if status == VMStatus.PROVISIONING.value:
             # The in-flight provisioner will observe the cleared marker and
             # complete normally for the enabled recipient.
+            if current.xcpng_uuid:
+                orchestrator = state.orchestrator
+                if orchestrator is None:
+                    raise HTTPException(503, "VM service unavailable")
+                await orchestrator.xcpng.start_vm(current.xcpng_uuid)
+                await orchestrator.renew_provisioning_report_deadline(session, current)
             current.suspension_reason = None
             current.suspended_by_account_id = None
         elif status == VMStatus.SUSPENDED.value and current.xcpng_uuid:
