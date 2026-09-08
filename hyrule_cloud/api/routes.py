@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy import update as _sql_update
 
-from hyrule_cloud.db import VMQuoteRow, VMRow
+from hyrule_cloud.db import VMQuoteRow, VMRetentionRow, VMRow
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.middleware.anon_token import (
     VMManagementIdentity,
@@ -88,6 +88,7 @@ from hyrule_cloud.services.quotes import (
     link_quote_vm,
 )
 from hyrule_cloud.services.vm_events import vm_log_events
+from hyrule_cloud.services.vm_expiry import build_vm_expiry
 from hyrule_cloud.services.vm_pricing import (
     VMResourceValidationError,
     current_daily_price_for_vm,
@@ -855,10 +856,25 @@ async def receive_guest_result(
     return Response(status_code=204)
 
 
+async def _vm_expiry_info(row, cfg, orch):
+    claim = getattr(row, "deletion_started_at", None)
+    retained = None
+    if claim is not None:
+        async with orch.db() as session:
+            retained = await session.get(VMRetentionRow, row.vm_id)
+    return build_vm_expiry(
+        VMStatus(row.status), row.expires_at, cfg.vm_grace_period_hours,
+        deletion_started_at=claim,
+        retention_state=retained.state if retained is not None else None,
+        retained_until=retained.retain_until if retained is not None else None,
+    )
+
+
 @router.get("/vm/{vm_id}/status", response_model=VMPublicStatusResponse)
 async def get_vm_public_status(
     vm_id: str,
     orch=Depends(get_orch),
+    cfg=Depends(get_cfg),
 ) -> VMPublicStatusResponse:
     row = await orch.get_vm(vm_id)
     if not row:
@@ -867,6 +883,11 @@ async def get_vm_public_status(
     if hasattr(orch, "get_quote_for_vm"):
         quote = await orch.get_quote_for_vm(vm_id)
     lp = build_launch_proof(row, quote_row=quote)
+    expiry = await _vm_expiry_info(row, cfg, orch)
+    if row.status == VMStatus.SUSPENDED:
+        lp["customer_message"] = f"The VM is suspended. {expiry.message}"
+    elif expiry.state in ("expired", "deletion_eligible", "deleting", "destroyed", "retaining", "retained", "restoring"):
+        lp["customer_message"] = expiry.message
     profile, resources = _vm_row_profile_and_resources(row)
     return VMPublicStatusResponse(
         vm_id=row.vm_id,
@@ -885,6 +906,7 @@ async def get_vm_public_status(
         rollback_available=lp["rollback_available"],
         operator_message=lp["operator_message"],
         customer_message=lp["customer_message"],
+        expiry=expiry,
     )
 
 
@@ -894,6 +916,8 @@ async def get_vm_public_status(
 @router.get("/vm/{vm_id}", response_model=VMStatusResponse)
 async def get_vm_status(
     row=Depends(_vm_for_management),
+    cfg=Depends(get_cfg),
+    orch=Depends(get_orch),
 ) -> VMStatusResponse:
     firewall = None
     if row.open_ports:
@@ -914,6 +938,7 @@ async def get_vm_status(
         resources=resources,
         firewall=firewall,
         error=row.error,
+        expiry=await _vm_expiry_info(row, cfg, orch),
     )
 
 
