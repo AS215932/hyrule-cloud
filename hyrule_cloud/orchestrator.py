@@ -654,11 +654,14 @@ class Orchestrator:
             if candidate is None:
                 return None
             expected_owner_account_id = candidate.owner_account_id
-            if expected_owner_account_id is not None:
+            # An anonymous reservation has no owner yet. Fence the account
+            # resolved from settlement as well, before attaching it.
+            account_ids = {value for value in (expected_owner_account_id, owner_account_id) if value}
+            for account_id in sorted(account_ids):
                 owner = (
                     await session.execute(
                         select(AccountRow)
-                        .where(AccountRow.account_id == expected_owner_account_id)
+                        .where(AccountRow.account_id == account_id)
                         .with_for_update()
                     )
                 ).scalar_one_or_none()
@@ -667,6 +670,7 @@ class Orchestrator:
             row = (
                 await session.execute(
                     select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                        .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
             if row is None:
@@ -1373,7 +1377,7 @@ class Orchestrator:
                         .limit(1)
                     )
                 ).scalar_one_or_none()
-        await self.refunds.record_owed(
+        obligation = self.refunds.build_owed_event(
             resource_path=f"/v1/vm/{vm_id}/extend",
             payer=(settled.payer_wallet if settled is not None else None)
             or owner_wallet
@@ -1385,6 +1389,12 @@ class Orchestrator:
             reason=reason,
             vm_id=vm_id,
         )
+        if obligation is None:
+            raise RuntimeError("Unable to construct the extension refund obligation")
+        async with self.db() as refund_session:
+            refund_session.add(obligation)
+            await refund_session.commit()
+
 
     async def _record_native_refund(self, vm_id: str, *, reason: str) -> bool:
         """Transition a failed native-intent VM's intent to REFUND_MANUAL and

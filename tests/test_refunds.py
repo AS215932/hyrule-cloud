@@ -1097,7 +1097,7 @@ async def test_native_refund_is_atomic_no_partial_flip_on_ledger_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["unapplied", "applied", "unknown"])
+@pytest.mark.parametrize("outcome", ["unapplied", "applied", "unknown", "refund_unavailable"])
 async def test_paid_extension_route_reconciles_commit_before_refund(session_factory, outcome):
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -1106,6 +1106,10 @@ async def test_paid_extension_route_reconciles_commit_before_refund(session_fact
             receipt = next((event for event in self.new if isinstance(event, PaymentEventRow)
                             and event.event_type == "extend_applied"), None)
             if receipt is None:
+                if outcome == "refund_unavailable":
+                    for event in self.new:
+                        if isinstance(event, PaymentEventRow) and event.event_type == "refund_owed":
+                            event.event_type = None  # Actual NOT NULL failure, not a successful write.
                 return await super().commit()
             if outcome == "applied":
                 await super().commit()
@@ -1141,10 +1145,12 @@ async def test_paid_extension_route_reconciles_commit_before_refund(session_fact
                 await extend_vm_route(row.vm_id, VMExtendRequest(days=3), request,
                                       row, orch, cfg, SettlingGate())
             assert exc.value.status_code == (409 if outcome == "unapplied" else 503)
-            if outcome == "unknown":
+            if outcome in ("unknown", "refund_unavailable"):
                 assert "before paying again" in exc.value.detail
+            if outcome == "refund_unavailable":
+                assert "refund could not be confirmed" in exc.value.detail
         events = await _events(session_factory)
-        expected = {"applied": ["extend_applied"], "unapplied": ["refund_owed"], "unknown": []}
+        expected = {"applied": ["extend_applied"], "unapplied": ["refund_owed"], "unknown": [], "refund_unavailable": []}
         assert [event.event_type for event in events] == expected[outcome]
         if events:
             assert events[0].tx_hash == "0xEXTENSION_COMMIT"

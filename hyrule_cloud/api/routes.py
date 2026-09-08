@@ -1429,10 +1429,17 @@ async def extend_vm(
             await session.rollback()
             payment_tx = getattr(request.state, "payment_tx", None)
             waived = bool(payment_tx and payment_tx.startswith(("dev_bypass", "admin_bypass")))
-            await orch.record_extension_failure_refund(
-                vm_id=vm_id, owner_wallet=result, payment_tx=payment_tx,
-                charged_amount=total, reason="vm_extension_rejected_post_settlement",
-            )
+            try:
+                await orch.record_extension_failure_refund(
+                    vm_id=vm_id, owner_wallet=result, payment_tx=payment_tx,
+                    charged_amount=total, reason="vm_extension_rejected_post_settlement",
+                )
+            except Exception:
+                log.error("extension_refund_confirmation_failed", vm_id=vm_id, exc_info=True)
+                raise HTTPException(
+                    503, "The extension was not applied, but the refund could not be confirmed. "
+                    "Contact support before paying again."
+                ) from None
             raise HTTPException(409, "VM extension was rejected; no payment was taken" if waived
                                 else "VM extension was rejected; a refund has been recorded")
 
