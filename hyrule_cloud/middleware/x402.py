@@ -443,6 +443,11 @@ class PaymentGate:
         force_refresh: bool = False,
     ) -> AdminBypassContext | None:
         """Resolve a browser Admin waiver and validate session-bound CSRF."""
+        # Registration binds the order to a verified EVM payer. The synthetic
+        # admin identity is incompatible; use the normal payment flow without
+        # consuming waiver quota or writing a misleading bypass event.
+        if request.url.path.rstrip("/") == "/v1/domains/registrations":
+            return None
         cached = getattr(request.state, "admin_bypass_context", None)
         if not force_refresh and isinstance(cached, AdminBypassContext):
             return cached

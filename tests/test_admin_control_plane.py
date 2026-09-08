@@ -2381,3 +2381,18 @@ async def test_domain_transfer_rejects_attached_vm_deletion(admin_factory, statu
         domain = await session.scalar(select(DomainRow).where(DomainRow.fqdn == 'claimed.example'))
         assert vm.owner_account_id == domain.owner_account_id == 'HBBBBBBBBBB'
         assert list(await session.scalars(select(AdminAuditRow).where(AdminAuditRow.action == 'domain.transfer'))) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method', ['check_payment', 'verify_only'])
+async def test_marketplace_registration_uses_normal_payment_without_admin_waiver(admin_factory, method):
+    credentials = await _admin_credentials(admin_factory, elevated=True)
+    gate = _admin_gate(admin_factory)
+    request = _browser_request(credentials, path='/v1/domains/registrations')
+    result = await getattr(gate, method)(request, Decimal('12.00'), 'Domain registration')
+    assert isinstance(result, Response) and result.status_code == 402
+    assert getattr(request.state, 'payment_mode', None) != 'admin-bypass'
+    async with admin_factory() as session:
+        assert list(await session.scalars(select(AdminBypassUsageRow))) == []
+        events = list(await session.scalars(select(PaymentEventRow)))
+        assert all(event.event_type != 'admin_bypass' for event in events)
