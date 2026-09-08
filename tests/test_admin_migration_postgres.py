@@ -77,6 +77,9 @@ def test_admin_postgres_migration_roundtrip():
     run("UPDATE vms SET suspension_reason='account_disabled' WHERE vm_id='vm_paid'")
     migrate("downgrade", "020", expected_error="while account resumptions remain pending")
     run("UPDATE vms SET suspension_reason='manual_admin' WHERE vm_id='vm_paid'")
+    run("UPDATE vms SET billing_mode='admin_waived' WHERE vm_id='vm_paid'")
+    migrate("downgrade", "020", expected_error="while waived VMs remain actionable")
+    run("UPDATE vms SET billing_mode='charged' WHERE vm_id='vm_paid'")
     run("""INSERT INTO domain_quotes(
         quote_id,fqdn,action,status,provider_cost,provider_currency,fx_rate,
         provider_cost_usd,hyrule_fee_usd,tax_usd,total_usd,available,premium,

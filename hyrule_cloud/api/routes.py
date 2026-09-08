@@ -91,6 +91,7 @@ from hyrule_cloud.services.quotes import (
     get_quote,
     is_expired,
     link_quote_vm,
+    release_quote_claim,
 )
 from hyrule_cloud.services.vm_events import vm_log_events
 from hyrule_cloud.services.vm_pricing import (
@@ -1281,6 +1282,19 @@ async def create_vm(
         # PROVISIONING with no background task and no refund path.
         await orch.start_provisioning(row.vm_id)
     except HTTPException:
+        # A waiver can be revoked after settlement and after this request won
+        # the quote claim, but before the guarded resource transaction writes a
+        # VM. Reopen both unlinked claims so the quote is retryable and no
+        # capacity reservation remains pinned.
+        if row is None:
+            try:
+                if quote_row is not None:
+                    released = await release_quote_claim(orch.db, quote_row.quote_id)
+                    if not released:
+                        raise RuntimeError("rejected VM quote claim could not be released")
+            finally:
+                if reservation_row is not None:
+                    await orch.release_vm_reservation(reservation_row.vm_id)
         raise
     except AccountDisabledError as exc:
         failed_vm_id = reservation_row.vm_id if reservation_row is not None else None

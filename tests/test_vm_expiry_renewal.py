@@ -124,6 +124,13 @@ async def test_failed_resume_preserves_committed_extension():
             assert row.expires_at.replace(tzinfo=UTC) >= before + timedelta(days=5)
             assert row.status == VMStatus.SUSPENDED
             assert row.deletion_started_at is None
+            assert row.metadata_["extension_resume_pending"]["xcpng_uuid"] == "test-guest"
+        orch.xcpng.start_vm.side_effect = None
+        assert await orch.reconcile_extension_resumes() == 1
+        async with orch.db() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            assert row.status == VMStatus.RUNNING
+            assert not (row.metadata_ or {}).get("extension_resume_pending")
     finally:
         await engine.dispose()
 

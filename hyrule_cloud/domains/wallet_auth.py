@@ -386,6 +386,20 @@ class WalletAuthService:
                 return account_row, wallet, action, created, credentials
             if account is None or challenge.account_id != account.account_id:
                 raise DomainProblem(401, "authentication_required", "The session does not match this challenge.")
+            if action in {WalletAction.LINK, WalletAction.ROTATE}:
+                # Session revocation alone cannot fence an already-running
+                # request. Serialize these identity mutations with account
+                # disable and revalidate inside the challenge transaction.
+                locked_account = await session.scalar(
+                    select(AccountRow)
+                    .where(AccountRow.account_id == account.account_id)
+                    .with_for_update()
+                )
+                if locked_account is None:
+                    raise DomainProblem(401, "invalid_wallet_account", "The wallet account is unavailable.")
+                if locked_account.disabled_at is not None:
+                    raise DomainProblem(403, "account_disabled", "This account is disabled.")
+                account = locked_account
             if action is WalletAction.LINK:
                 if recovered.lower() != challenge.address.lower():
                     raise DomainProblem(401, "invalid_wallet_signature", "The wallet signature is invalid.")

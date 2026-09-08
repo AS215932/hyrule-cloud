@@ -96,6 +96,7 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 _VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable cross-worker PostgreSQL lock key
+_EXTENSION_RESUME_KEY = "extension_resume_pending"
 
 # RFC 6052 well-known NAT64 prefix. A DNS64 resolver synthesizes AAAA records
 # inside it for IPv4-only names, which is how an IPv6-only customer VM reaches
@@ -2155,10 +2156,18 @@ class Orchestrator:
         row.expires_at = max(expiry, now) + timedelta(days=days)
         suspended = row.status == VMStatus.SUSPENDED
         xcpng_uuid = row.xcpng_uuid
-        original_owner = (row.owner_account_id, row.owner_wallet)
         # This receipt and purchased time commit together. It is an application
         # record, not revenue or a second payment settlement.
         receipt_id = str(uuid4())
+        if suspended and xcpng_uuid:
+            metadata = dict(row.metadata_ or {})
+            metadata[_EXTENSION_RESUME_KEY] = {
+                "receipt_id": receipt_id,
+                "xcpng_uuid": xcpng_uuid,
+                "owner_account_id": row.owner_account_id,
+                "owner_wallet": row.owner_wallet,
+            }
+            row.metadata_ = metadata
         session.add(PaymentEventRow(
             event_id=receipt_id, event_type="extend_applied",
             resource_path=f"/v1/vm/{vm_id}/extend", method="POST",
@@ -2191,25 +2200,7 @@ class Orchestrator:
                         receipt_id=receipt_id, error_type=type(commit_error).__name__)
         try:
             if suspended and xcpng_uuid:
-                # Reacquire account then VM after committing purchased time. An
-                # account suspension, ownership change or deletion may have won.
-                async with self.locked_vm(vm_id) as (resume_session, current):
-                    if (self.vm_can_extend(current) and await self.vm_owner_enabled(resume_session, current)
-                            and current is not None and current.status == VMStatus.SUSPENDED
-                            and current.xcpng_uuid == xcpng_uuid
-                            and (current.owner_account_id, current.owner_wallet) == original_owner):
-                        try:
-                            power = await self.xcpng.get_vm_power_state(xcpng_uuid)
-                            if power == "Halted":
-                                await self.xcpng.start_vm(xcpng_uuid)
-                        except Exception:
-                            log.warning("vm_extension_resume_failed", vm_id=vm_id, exc_info=True)
-                        else:
-                            if power in ("Halted", "Running"):
-                                current.status = VMStatus.RUNNING
-                                current.suspension_reason = None
-                                current.suspended_by_account_id = None
-                                await resume_session.commit()
+                await self._reconcile_extension_resume(vm_id, session=session)
             current = await self.get_vm(vm_id)
             if current is None:
                 raise ExtensionAppliedStateUnavailableError("Applied extension VM is unavailable")
@@ -2221,6 +2212,103 @@ class Orchestrator:
             raise ExtensionAppliedStateUnavailableError(
                 "Purchased time committed; guest state requires reconciliation"
             ) from state_error
+
+    async def _reconcile_extension_resume(
+        self, vm_id: str, *, session: AsyncSession | None = None,
+    ) -> VMRow | None:
+        """Retry a paid extension's post-commit guest start safely."""
+        if session is None:
+            async with self.locked_vm(vm_id) as (locked_session, current):
+                return await self._reconcile_extension_resume_locked(locked_session, current)
+
+        # The caller has just committed purchased time but still owns this
+        # session/connection. Reacquire the standard account-then-VM locks on
+        # that connection; opening a nested session deadlocks single-connection
+        # SQLite and needlessly consumes another production pool slot.
+        session.expire_all()
+        snapshot = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id))
+        owner_id = snapshot.owner_account_id if snapshot is not None else None
+        if owner_id is not None:
+            await session.scalar(
+                select(AccountRow)
+                .where(AccountRow.account_id == owner_id)
+                .with_for_update(key_share=True)
+            )
+        current = (
+            await session.execute(
+                select(VMRow)
+                .where(VMRow.vm_id == vm_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if current is not None and current.owner_account_id != owner_id:
+            await session.rollback()
+            return current
+        return await self._reconcile_extension_resume_locked(session, current)
+
+    async def _reconcile_extension_resume_locked(
+        self, session: AsyncSession, current: VMRow | None,
+    ) -> VMRow | None:
+        """Apply one handoff while the account and VM lifecycle are fenced."""
+        if current is None:
+            return None
+        metadata = dict(current.metadata_ or {})
+        pending = metadata.get(_EXTENSION_RESUME_KEY)
+        if not isinstance(pending, dict):
+            return current
+        expected_owner = (pending.get("owner_account_id"), pending.get("owner_wallet"))
+        stale = (
+            current.status != VMStatus.SUSPENDED
+            or current.deletion_started_at is not None
+            or current.xcpng_uuid != pending.get("xcpng_uuid")
+            or (current.owner_account_id, current.owner_wallet) != expected_owner
+            or current.suspension_reason in {"account_disabled", "manual_admin"}
+        )
+        if stale:
+            metadata.pop(_EXTENSION_RESUME_KEY, None)
+            current.metadata_ = metadata or None
+            await session.commit()
+            return current
+        if not await self.vm_owner_enabled(session, current):
+            await session.rollback()
+            return current
+        assert current.xcpng_uuid is not None
+        try:
+            power = await self.xcpng.get_vm_power_state(current.xcpng_uuid)
+            if power == "Halted":
+                await self.xcpng.start_vm(current.xcpng_uuid)
+            elif power != "Running":
+                log.warning(
+                    "vm_extension_resume_power_unknown", vm_id=current.vm_id, power=power
+                )
+                await session.rollback()
+                return current
+        except Exception:
+            log.warning("vm_extension_resume_failed", vm_id=current.vm_id, exc_info=True)
+            await session.rollback()
+            return current
+        current.status = VMStatus.RUNNING
+        current.suspension_reason = None
+        current.suspended_by_account_id = None
+        metadata.pop(_EXTENSION_RESUME_KEY, None)
+        current.metadata_ = metadata or None
+        await session.commit()
+        return current
+
+    async def reconcile_extension_resumes(self) -> int:
+        """Process durable paid-extension start handoffs after API restarts."""
+        async with self.db() as session:
+            candidates = list(
+                await session.scalars(select(VMRow.vm_id).where(VMRow.status == VMStatus.SUSPENDED))
+            )
+        resumed = 0
+        for vm_id in candidates:
+            await self._reconcile_extension_resume(vm_id)
+            current = await self.get_vm(vm_id)
+            if current is not None and current.status == VMStatus.RUNNING:
+                resumed += 1
+        return resumed
 
     async def reboot_vm(
         self, vm_id: str, *, management_identity: VMManagementIdentity | None = None,
@@ -2387,6 +2475,7 @@ class Orchestrator:
 
     async def check_expiries(self) -> None:
         """Suspend expired VMs, destroy those past grace period."""
+        await self.reconcile_extension_resumes()
         now = _now()
         grace = timedelta(hours=self.config.vm_grace_period_hours)
 

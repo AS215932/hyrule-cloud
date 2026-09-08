@@ -263,6 +263,12 @@ def downgrade() -> None:
         "AND status NOT IN ('active', 'refunded', 'cancelled', 'expired')"
     )):
         raise RuntimeError("Cannot downgrade revision 023 while waived domain orders remain actionable")
+    if bind.scalar(sa.text(
+        "SELECT count(*) FROM vms "
+        "WHERE billing_mode = 'admin_waived' "
+        "AND status NOT IN ('destroyed', 'failed')"
+    )):
+        raise RuntimeError("Cannot downgrade revision 023 while waived VMs remain actionable")
     op.drop_table("admin_bypass_usage")
     op.drop_table("refund_resolutions")
     op.drop_table("admin_operations")

@@ -3159,6 +3159,80 @@ async def test_wallet_login_rejects_disabled_account_without_consuming_challenge
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", [WalletAction.LINK, WalletAction.ROTATE])
+async def test_wallet_account_mutation_rechecks_disabled_account(tmp_path, action):
+    engine = create_db_engine(f"sqlite+aiosqlite:///{tmp_path / f'wallet-{action.value}.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = create_session_factory(engine)
+    service = WalletAuthService(HyruleConfig(), sessions)
+    current = Account.create()
+    replacement = Account.create()
+    account = AccountRow(account_id="HWALLETTEST", password_hash="fixture")
+    async with sessions() as session:
+        session.add(account)
+        if action is WalletAction.ROTATE:
+            session.add(
+                AccountWalletRow(
+                    wallet_id="wallet-current",
+                    account_id=account.account_id,
+                    address=current.address,
+                    chain_id=8453,
+                )
+            )
+        await session.commit()
+
+    challenge = await service.create_challenge(
+        WalletChallengeRequest(
+            action=action,
+            address=replacement.address,
+            chain_id=8453,
+        ),
+        account=account,
+    )
+    primary = replacement if action is WalletAction.LINK else current
+    body = WalletVerifyRequest(
+        nonce=challenge.nonce,
+        signature=Account.sign_message(
+            encode_defunct(text=challenge.message), primary.key
+        ).signature.hex(),
+        secondary_signature=(
+            Account.sign_message(
+                encode_defunct(text=challenge.message), replacement.key
+            ).signature.hex()
+            if action is WalletAction.ROTATE
+            else None
+        ),
+    )
+    async with sessions() as session:
+        stored = await session.get(AccountRow, account.account_id)
+        assert stored is not None
+        stored.disabled_at = datetime.now(UTC)
+        await session.commit()
+
+    with pytest.raises(DomainProblem) as rejected:
+        await service.verify_login_or_account_action(
+            body,
+            account=account,
+            request=SimpleNamespace(headers={}, client=None),
+        )
+    assert rejected.value.status == 403
+    assert rejected.value.code == "account_disabled"
+    async with sessions() as session:
+        stored_challenge = await session.get(WalletChallengeRow, challenge.nonce)
+        assert stored_challenge is not None and stored_challenge.used_at is None
+        wallets = list(
+            await session.scalars(
+                select(AccountWalletRow).where(AccountWalletRow.account_id == account.account_id)
+            )
+        )
+        assert [wallet.address for wallet in wallets] == (
+            [current.address] if action is WalletAction.ROTATE else []
+        )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["changeset", "nameservers", "dnssec"])
 async def test_customer_domain_mutation_rechecks_disabled_owner(domain_service, action):
     service, _provider, sessions = domain_service

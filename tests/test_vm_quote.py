@@ -21,7 +21,8 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.app import app
-from hyrule_cloud.db import Base, VMQuoteRow, VMRow
+from hyrule_cloud.db import AccountRow, Base, VMQuoteRow, VMRow
+from hyrule_cloud.middleware.x402 import AdminBypassContext
 from hyrule_cloud.models import CostBreakdown, QuoteStatus, VMSize, VMStatus
 from hyrule_cloud.services import quotes as quotes_service
 
@@ -97,6 +98,9 @@ class _StubOrchestrator:
         anon_token = generate_anon_management_token()
         snapshot = kwargs.get("pricing_snapshot") or {}
         async with self.db() as session:
+            dispatch_guard = kwargs.get("dispatch_guard")
+            if dispatch_guard is not None:
+                await dispatch_guard(session)
             row = VMRow(
                 vm_id=vm_id,
                 owner_wallet=owner_wallet,
@@ -423,6 +427,38 @@ async def test_create_with_quote_paid_provisions_and_consumes(quote_state, clien
     row = await quotes_service.get_quote(quote_state.orchestrator.db, quote["quote_id"])
     assert QuoteStatus(row.status) == QuoteStatus.CONSUMED
     assert row.vm_id == res.json()["vm_id"]
+
+
+@pytest.mark.asyncio
+async def test_revoked_waiver_reopens_claimed_quote(quote_state, client):
+    actor_id = "HADMINQUOTE"
+    async with quote_state.session_factory() as session:
+        session.add(
+            AccountRow(
+                account_id=actor_id,
+                password_hash="fixture",
+                is_admin=False,
+            )
+        )
+        await session.commit()
+
+    async def revoked_waiver(request, **_kwargs):
+        request.state.payment_mode = "admin-bypass"
+        request.state.payment_tx = "admin_bypass_quote"
+        request.state.admin_bypass_context = AdminBypassContext(actor_id, "real_cost")
+        return f"admin:{actor_id}"
+
+    quote_state.payment_gate.check_payment = AsyncMock(side_effect=revoked_waiver)
+    quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+
+    rejected = await client.post("/v1/vm/create", json=_order(quote_id=quote["quote_id"]))
+
+    assert rejected.status_code == 403
+    row = await quotes_service.get_quote(quote_state.orchestrator.db, quote["quote_id"])
+    assert row is not None
+    assert QuoteStatus(row.status) == QuoteStatus.CREATED
+    assert row.vm_id is None
+    assert quote_state.orchestrator.created_vms == []
 
 
 @pytest.mark.asyncio
