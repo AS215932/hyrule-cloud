@@ -2144,7 +2144,8 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         assert provisioning is not None and str(provisioning.status) == "provisioning"
         assert provisioning.suspension_reason is None
         assert failed_disabled is not None and str(failed_disabled.status) == "failed"
-        assert failed_disabled.suspension_reason == "account_disabled"
+        assert failed_disabled.suspension_reason is None
+        assert failed_disabled.suspended_by_account_id is None
         assert mailbox is not None and mailbox.status == "active"
         assert expired_mailbox is not None and expired_mailbox.status == "suspended"
         assert expired_mailbox.suspension_reason == "expired"
@@ -2753,7 +2754,8 @@ async def test_power_off_keeps_failed_guest_terminal_across_account_enable(admin
     await _apply_account_operation(admin_factory, orch, 'enable-failed')
     async with admin_factory() as session:
         vm = await session.get(VMRow, 'vm_terminal_off')
-        assert vm.status == 'failed' and vm.suspension_reason == 'account_disabled'
+        assert vm.status == 'failed' and vm.suspension_reason is None
+        assert vm.suspended_by_account_id is None
     assert provider.started == []
     assert (provider.shut_down if action == 'shutdown' else provider.suspended) == ['failed-guest']
 

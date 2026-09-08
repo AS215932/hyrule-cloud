@@ -22,7 +22,10 @@ def downgrade() -> None:
     # Never silently drop an active fence and allow a renewal of a deleting VM.
     bind = op.get_bind()
     pending = bind.execute(sa.text(
-        "SELECT count(*) FROM vms WHERE deletion_started_at IS NOT NULL AND status != 'destroyed'"
+        "SELECT count(*) FROM vms WHERE deletion_started_at IS NOT NULL AND ("
+        "status != 'destroyed' OR ipv6_prefix_index IS NOT NULL OR ipv6_prefix IS NOT NULL OR "
+        "(xcpng_uuid IS NOT NULL AND "
+        "COALESCE(metadata ->> 'provider_deleted_uuid', '') != xcpng_uuid))"
     )).scalar_one()
     if pending:
         raise RuntimeError("Resolve pending VM deletion claims before downgrade")

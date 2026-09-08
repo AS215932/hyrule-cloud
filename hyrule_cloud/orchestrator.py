@@ -1314,11 +1314,27 @@ class Orchestrator:
             customer_message = customer_failure_message(e)
             internal_reason = internal_failure_detail(e)
             owner_wallet, amount, payment_tx, settled = "", None, None, None
-            async with self.db() as session:
-                row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+            setup_failure = (
+                isinstance(e, ProvisioningFailedError)
+                and e.customer_message == FAILURE_GUEST_SETUP
+            )
+            async with self.locked_vm(vm_id) as (session, row):
                 if row is not None:
                     if row.status != VMStatus.PROVISIONING:
                         return
+                    if setup_failure and row.xcpng_uuid:
+                        # Refund only after the customer-controlled failed
+                        # setup guest is actually stopped. A failed stop leaves
+                        # the durable receipt in PROVISIONING for a later retry.
+                        try:
+                            await self.xcpng.suspend_vm(row.xcpng_uuid)
+                        except Exception:
+                            log.warning(
+                                "failed_setup_guest_stop_failed",
+                                vm_id=vm_id,
+                                exc_info=True,
+                            )
+                            return
                     row.status = VMStatus.FAILED
                     # row.error is customer-visible (management status view and
                     # the public launch proof's operator_message), so it stores
@@ -2211,8 +2227,11 @@ class Orchestrator:
 
     async def reboot_vm(
         self, vm_id: str, *, management_identity: VMManagementIdentity | None = None,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> bool:
-        async with self.locked_vm(vm_id) as (session, row):
+        lifecycle_lock = (self.locked_vm(vm_id, dispatch_guard=dispatch_guard)
+                          if dispatch_guard is not None else self.locked_vm(vm_id))
+        async with lifecycle_lock as (session, row):
             if (row is None or not row.xcpng_uuid or row.deletion_started_at is not None
                     or (management_identity is not None and not management_identity.matches(row))):
                 return False

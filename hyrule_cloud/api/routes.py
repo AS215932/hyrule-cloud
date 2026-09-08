@@ -76,6 +76,7 @@ from hyrule_cloud.providers.network_config import (
     customer_prefix_count,
     supports_static_network_config,
 )
+from hyrule_cloud.services.admin_authorization import validate_admin_dispatch
 from hyrule_cloud.services.guest_result import (
     GuestResult,
     GuestResultRejectedError,
@@ -821,6 +822,22 @@ async def _vm_for_management(
     raise HTTPException(404, "VM not found")
 
 
+def _admin_vm_dispatch_guard(request: Request, account: Any, row: VMRow):
+    """Fence a public management call that relied on administrator authority."""
+    if (
+        account is None
+        or not getattr(account, "is_admin", False)
+        or account.account_id == getattr(row, "owner_account_id", None)
+        or can_manage_vm(row, anon_management_token(request))
+    ):
+        return None
+
+    async def guard(session):
+        await validate_admin_dispatch(session, account.account_id)
+
+    return guard
+
+
 # Block A0: public sanitized status view. Returns minimal fields needed
 # for an order-status page — NO ssh, NO firewall, NO error detail. Any
 # caller can fetch this for any vm_id; pre-A0 frontends keep working
@@ -1506,11 +1523,21 @@ async def extend_vm(
 @router.post("/vm/{vm_id}/reboot", response_model=GenericActionResponse)
 async def reboot_vm(
     vm_id: str,
+    request: Request,
     row=Depends(_vm_for_management),
     orch=Depends(get_orch),
+    account=Depends(current_account),
 ) -> GenericActionResponse:
     # Block A0: management dep ensures caller has the token.
-    if not await orch.reboot_vm(vm_id, management_identity=VMManagementIdentity.capture(row)):
+    identity = VMManagementIdentity.capture(row)
+    guard = _admin_vm_dispatch_guard(request, account, row)
+    if guard is None:
+        accepted = await orch.reboot_vm(vm_id, management_identity=identity)
+    else:
+        accepted = await orch.reboot_vm(
+            vm_id, management_identity=identity, dispatch_guard=guard,
+        )
+    if not accepted:
         raise HTTPException(404, "VM not found or not running")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} is rebooting")
 
@@ -1518,11 +1545,21 @@ async def reboot_vm(
 @router.delete("/vm/{vm_id}", response_model=GenericActionResponse)
 async def destroy_vm(
     vm_id: str,
+    request: Request,
     row=Depends(_vm_for_management),
     orch=Depends(get_orch),
+    account=Depends(current_account),
 ) -> GenericActionResponse:
     # Block A0: management dep ensures caller has the token.
-    if not await orch.destroy_vm(vm_id, management_identity=VMManagementIdentity.capture(row)):
+    identity = VMManagementIdentity.capture(row)
+    guard = _admin_vm_dispatch_guard(request, account, row)
+    if guard is None:
+        accepted = await orch.destroy_vm(vm_id, management_identity=identity)
+    else:
+        accepted = await orch.destroy_vm(
+            vm_id, management_identity=identity, dispatch_guard=guard,
+        )
+    if not accepted:
         raise HTTPException(404, "VM not found")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} destroyed")
 

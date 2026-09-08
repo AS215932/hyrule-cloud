@@ -13,12 +13,12 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
-from fastapi import HTTPException, Response
+from fastapi import HTTPException, Request, Response
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from hyrule_cloud.api.auth import ClaimByTokenRequest, claim_vm
+from hyrule_cloud.api.auth import ClaimByTokenRequest, claim_vm, delete_me
 from hyrule_cloud.app import app
 from hyrule_cloud.db import AccountRow, Base, DomainOrderRow, DomainQuoteRow, DomainRow, VMRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token as hash_anon_management_token
@@ -617,6 +617,30 @@ async def test_account_delete_detach_returns_fresh_tokens(auth_state, client):
         res = await cx.get(f"/v1/vm/{vm_id}", headers={"Authorization": f"Bearer {fresh_token}"})
         assert res.status_code == 200
         assert res.json()["vm_id"] == vm_id
+
+
+@pytest.mark.asyncio
+async def test_account_delete_detach_rechecks_stale_disabled_session(auth_state, client):
+    reg = await client.post("/v1/auth/register", json={"password": "disabled deletion password"})
+    account_id = reg.json()["account_id"]
+    vm_id = await _seed_owned_vm(auth_state, account_id)
+    async with auth_state.orchestrator.db() as session:
+        stale_account = await session.get(AccountRow, account_id)
+    async with auth_state.orchestrator.db.begin() as session:
+        current = await session.get(AccountRow, account_id)
+        current.disabled_at = _now()
+
+    request = Request({
+        "type": "http", "method": "DELETE", "path": "/v1/me",
+        "query_string": b"vm_policy=detach", "headers": [],
+    })
+    with pytest.raises(HTTPException) as refused:
+        await delete_me(request, Response(), stale_account, auth_state, None)
+    assert refused.value.status_code == 403
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm.owner_account_id == account_id
+        assert vm.anon_management_token_hash is None
 
 
 @pytest.mark.asyncio

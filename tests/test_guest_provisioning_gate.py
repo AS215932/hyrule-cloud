@@ -276,6 +276,7 @@ async def test_worker_recovers_tracked_guest_after_api_stops(tmp_path, monkeypat
         orch = Orchestrator(config, factory)
         orch.xcpng.create_vm = AsyncMock(side_effect=AssertionError('must retain existing guest'))
         orch.xcpng.destroy_vm = AsyncMock(side_effect=AssertionError('must retain guest data'))
+        orch.xcpng.suspend_vm = AsyncMock()
         orch.dns.create_aaaa = AsyncMock()
         orch.dns.verify_aaaa = AsyncMock(return_value=True)
         orch._wait_for_ipv6 = AsyncMock(return_value='2a0c:b641:b51:5::2')
@@ -330,6 +331,10 @@ async def test_worker_recovers_tracked_guest_after_api_stops(tmp_path, monkeypat
             assert vm.status == (VMStatus.READY if outcome == 'succeeded' else VMStatus.FAILED)
             assert vm.xcpng_uuid == 'retained-guest'
             assert receipt.generation == generation
+        if outcome == 'failed':
+            recovered.xcpng.suspend_vm.assert_awaited_once_with('retained-guest')
+        else:
+            recovered.xcpng.suspend_vm.assert_not_awaited()
         recovered.xcpng.create_vm.assert_not_awaited()
         recovered.xcpng.destroy_vm.assert_not_awaited()
         assert recovered._record_vm_refund.await_count == (0 if outcome == 'succeeded' else 1)
@@ -341,8 +346,10 @@ async def test_worker_recovers_tracked_guest_after_api_stops(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('exit_code', [0, 7])
-async def test_guest_completion_controls_public_status_and_launch_proof(tmp_path, monkeypatch, exit_code):
+@pytest.mark.parametrize(('exit_code', 'stop_fails'), [(0, False), (7, False), (7, True)])
+async def test_guest_completion_controls_public_status_and_launch_proof(
+    tmp_path, monkeypatch, exit_code, stop_fails,
+):
     import json
     from urllib.parse import urlsplit
 
@@ -354,12 +361,19 @@ async def test_guest_completion_controls_public_status_and_launch_proof(tmp_path
     monkeypatch.setattr('hyrule_cloud.services.launch_proof.use_real_provisioning', lambda: True)
     orch.xcpng.find_vm_ids_by_name_label = AsyncMock(return_value=[])
     orch.xcpng.destroy_vm = AsyncMock()
+    orch.xcpng.suspend_vm = AsyncMock(
+        side_effect=RuntimeError('provider stop unavailable') if stop_fails else None,
+    )
     orch.dns.create_aaaa = AsyncMock()
     orch.dns.verify_aaaa = AsyncMock(return_value=True)
     orch._wait_for_ipv6 = AsyncMock(return_value='2a0c:b641:b51:5::2')
     orch._probe_ssh = AsyncMock(return_value=True)
     orch._probe_customer_dns_resolution = AsyncMock(return_value=DNSResolutionStatus.PASSED)
-    orch._record_vm_refund = AsyncMock()
+    async def record_refund(*args, **kwargs):
+        del args, kwargs
+        orch.xcpng.suspend_vm.assert_awaited_once_with('test-guest-uuid')
+
+    orch._record_vm_refund = AsyncMock(side_effect=record_refund)
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_orch] = lambda: orch
@@ -392,12 +406,22 @@ async def test_guest_completion_controls_public_status_and_launch_proof(tmp_path
             await orch._provision_vm('vm_guest')
             response = await client.get('/v1/vm/vm_guest/status')
             body = response.json()
+            if stop_fails:
+                assert body['status'] == 'provisioning'
+                orch.xcpng.suspend_vm.assert_awaited_once_with('test-guest-uuid')
+                orch._record_vm_refund.assert_not_awaited()
+                async with factory() as session:
+                    vm = await session.get(VMRow, 'vm_guest')
+                    assert vm.status == VMStatus.PROVISIONING
+                return
             assert body['status'] == ('failed' if exit_code else 'ready')
             assert body['launch_proof_status'] == ('failed' if exit_code else 'provisioned')
             if exit_code:
                 assert 'setup script failed' in body['customer_message']
+                orch.xcpng.suspend_vm.assert_awaited_once_with('test-guest-uuid')
                 orch._record_vm_refund.assert_awaited_once()
             else:
+                orch.xcpng.suspend_vm.assert_not_awaited()
                 orch._record_vm_refund.assert_not_awaited()
             orch.xcpng.destroy_vm.assert_not_awaited()
             async with factory() as session:

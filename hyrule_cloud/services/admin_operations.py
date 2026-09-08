@@ -299,6 +299,11 @@ async def _apply_locked_account_operation(
                     # A provisioning failure can retain the disable marker and
                     # even a provider UUID. Terminal rows may already carry a
                     # refund obligation and must never be revived by enable.
+                    # The disable provenance is no longer actionable once the
+                    # account is enabled and must not block rollback forever.
+                    current.suspension_reason = None
+                    current.suspended_by_account_id = None
+                    await session.commit()
                     continue
                 if current.expires_at is not None and _aware(current.expires_at) <= now:
                     current.suspension_reason = "expired"

@@ -897,6 +897,8 @@ async def _account_deletion_snapshot(db: AsyncSession, account_id: str) -> tuple
                            .with_for_update().execution_options(populate_existing=True))
     if acct is None:
         raise HTTPException(409, "Account deletion state changed")
+    if acct.disabled_at is not None:
+        raise HTTPException(403, "Account disabled")
     if acct.is_admin:
         raise HTTPException(409, "Administrator accounts must be demoted before account deletion.")
     retained_domain_order = await db.scalar(
