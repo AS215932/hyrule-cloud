@@ -55,7 +55,12 @@ from hyrule_cloud.middleware.auth import (
 )
 from hyrule_cloud.models import VMStatus
 from hyrule_cloud.services.passwords import verify_password
-from hyrule_cloud.services.vm_retention import complete_restore, prepare_restore, stored_manifest
+from hyrule_cloud.services.vm_retention import (
+    authorize_restore,
+    complete_restore,
+    prepare_restore,
+    stored_manifest,
+)
 from hyrule_cloud.state import AppState, get_app_state
 
 router = APIRouter(
@@ -1196,35 +1201,52 @@ async def restore_retained_vm(
                                                "new_expiry": _aware(operation.new_expiry).isoformat()})
         await session.commit()
 
-    # Reacquire after the durable intent commit. Expiry workers use this fence
-    # and refuse restoring records, including after process or network failure.
-    async with _locked_admin_vm(state, actor.account_id, vm_id) as (session, vm):
-        recovered_operation = await session.get(VMRestoreRow, operation_id)
-        if recovered_operation is None:
-            raise HTTPException(409, "Restore request is unavailable")
-        operation = recovered_operation
-        if operation.state != "completed":
-            retained = await session.get(VMRetentionRow, vm_id)
-            if (vm is None or retained is None or retained.state != "restoring"
-                    or retained.restore_operation_id != operation_id
-                    or vm.deletion_started_at is None or vm.xcpng_uuid != retained.source_vm_uuid
-                    or vm.owner_account_id != retained.owner_account_id or vm.owner_wallet != retained.owner_wallet
-                    or vm.status != VMStatus.SUSPENDED):
-                raise HTTPException(409, "Retained recovery state changed")
-            owner = await session.get(AccountRow, vm.owner_account_id) if vm.owner_account_id else None
-            if ((vm.owner_account_id and (owner is None or owner.disabled_at is not None))
-                    or (not vm.owner_account_id and vm.suspension_reason == "account_disabled")):
-                raise HTTPException(409, "Enable the owner account before restoring this VM")
-            try:
-                await orch.xcpng.restore_retained_vm(stored_manifest(retained))
-            except Exception as exc:
-                raise HTTPException(503, "Recovery is pending; retry the same operation ID") from exc
-            await complete_restore(session, vm, operation)
-            _audit(session, request, actor, "vm.restore_completed", target_type="vm", target_id=vm_id,
-                   reason=body.reason, details={"operation_id": operation_id, "power_changed": False})
-            await session.commit()
-        return {"vm_id": vm_id, "operation_id": operation_id, "state": operation.state,
-                "new_expiry": _aware(operation.new_expiry).isoformat(), "power_changed": False}
+    # Authorization commits the future expiry while protections remain intact.
+    # Finalization reacquires actor/owner/VM locks and is replayable after failure.
+    for finalize in (False, True):
+        async with _locked_admin_vm(state, actor.account_id, vm_id) as (session, vm):
+            recovered_operation = await session.get(VMRestoreRow, operation_id)
+            if recovered_operation is None:
+                raise HTTPException(409, "Restore request is unavailable")
+            operation = recovered_operation
+            if operation.state != "completed":
+                retained = await session.get(VMRetentionRow, vm_id)
+                if (vm is None or retained is None or retained.state != "restoring"
+                        or retained.restore_operation_id != operation_id
+                        or vm.deletion_started_at is None or vm.xcpng_uuid != retained.source_vm_uuid
+                        or vm.owner_account_id != retained.owner_account_id or vm.owner_wallet != retained.owner_wallet
+                        or vm.status != VMStatus.SUSPENDED):
+                    raise HTTPException(409, "Retained recovery state changed")
+                owner = await session.get(AccountRow, vm.owner_account_id) if vm.owner_account_id else None
+                if ((vm.owner_account_id and (owner is None or owner.disabled_at is not None))
+                        or (not vm.owner_account_id and vm.suspension_reason == "account_disabled")):
+                    raise HTTPException(409, "Enable the owner account before restoring this VM")
+                if operation.state == "pending":
+                    try:
+                        await authorize_restore(session, vm, operation)
+                    except ValueError as exc:
+                        raise HTTPException(409, str(exc)) from exc
+                    _audit(session, request, actor, "vm.restore_authorized", target_type="vm", target_id=vm_id,
+                           reason=body.reason, details={"operation_id": operation_id,
+                                                       "new_expiry": _aware(operation.new_expiry).isoformat()})
+                    await session.commit()
+                    continue
+                if (operation.state != "authorized" or _aware(operation.new_expiry) <= datetime.now(UTC)
+                        or vm.expires_at is None or _aware(vm.expires_at) != _aware(operation.new_expiry)):
+                    raise HTTPException(409, "Recovery authorization expired or changed; operator reconciliation required")
+                if not finalize:
+                    continue
+                try:
+                    await orch.xcpng.restore_retained_vm(stored_manifest(retained))
+                except Exception as exc:
+                    raise HTTPException(503, "Recovery is pending; retry the same operation ID") from exc
+                await complete_restore(session, vm, operation)
+                _audit(session, request, actor, "vm.restore_completed", target_type="vm", target_id=vm_id,
+                       reason=body.reason, details={"operation_id": operation_id, "power_changed": False})
+                await session.commit()
+            return {"vm_id": vm_id, "operation_id": operation_id, "state": operation.state,
+                    "new_expiry": _aware(operation.new_expiry).isoformat(), "power_changed": False}
+    raise HTTPException(409, "Recovery did not reach a terminal state")
 
 
 @router.post("/vms/{vm_id}/actions/{action}")

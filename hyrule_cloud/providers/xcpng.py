@@ -750,7 +750,8 @@ disklabel "$disk"
     async def restore_retained_vm(self, manifest: VMProtectionManifest) -> None:
         """Restore recorded restart settings without starting the retained guest.
 
-        Caller must first persist audited restore intent and exclude expiry work.
+        Caller must first commit an audited future recovery expiry and keep the
+        active retention/deletion claim until finalization.
         Only retention-owned operation blocks are changed; XO applies a patch,
         where null removes a block. A lost reply can be retried from inventory.
         """

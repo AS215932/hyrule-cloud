@@ -2360,7 +2360,7 @@ async def test_admin_expiry_extension_requires_step_up_and_atomic_audit(admin_fa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('failure', ['none', 'provider', 'request_audit', 'completion_audit',
-                                   'request_ack', 'completion_ack'])
+                                   'request_ack', 'completion_ack', 'authorization_audit', 'authorization_ack'])
 async def test_retained_restore_is_audited_replayable_and_keeps_cycle_history(admin_factory, monkeypatch, failure):
     from uuid import uuid4
 
@@ -2390,7 +2390,13 @@ async def test_retained_restore_is_audited_replayable_and_keeps_cycle_history(ad
         async with admin_factory() as session:
             retained = await session.get(VMRetentionRow, 'vm_retained_restore')
             operation = await session.get(VMRestoreRow, retained.restore_operation_id)
-            assert retained.state == 'restoring' and operation.state == 'pending'
+            assert retained.state == 'restoring' and operation.state == 'authorized'
+            vm = await session.get(VMRow, retained.vm_id)
+            assert vm.expires_at == operation.new_expiry
+            assert vm.expires_at.replace(tzinfo=UTC) > datetime.now(UTC)
+            assert vm.deletion_started_at is not None
+            assert await session.scalar(select(AdminAuditRow).where(
+                AdminAuditRow.action == 'vm.restore_authorized')) is not None
             assert await session.scalar(select(AdminAuditRow).where(
                 AdminAuditRow.action == 'vm.restore_requested')) is not None
         seen.append(True)
@@ -2402,7 +2408,8 @@ async def test_retained_restore_is_audited_replayable_and_keeps_cycle_history(ad
 
     async def interrupted_commit(session):
         nonlocal injected
-        target = 'vm.restore_requested' if failure.startswith('request_') else 'vm.restore_completed'
+        target = ('vm.restore_requested' if failure.startswith('request_') else
+                  'vm.restore_authorized' if failure.startswith('authorization_') else 'vm.restore_completed')
         audits = [row for row in session.new if isinstance(row, AdminAuditRow) and row.action == target]
         inject = failure not in {'none', 'provider'} and not injected and bool(audits)
         if inject:
@@ -2442,8 +2449,12 @@ async def test_retained_restore_is_audited_replayable_and_keeps_cycle_history(ad
                     if failure == 'request_audit':
                         assert operation is None and seen == []
                     else:
-                        assert operation.state == ('completed' if failure == 'completion_ack' else 'pending')
-                    if failure == 'request_ack':
+                        expected_state = ('completed' if failure == 'completion_ack' else
+                                          'pending' if failure in {'request_ack', 'authorization_audit'} else 'authorized')
+                        assert operation.state == expected_state
+                        expected_expiry = (now - timedelta(days=3) if expected_state == 'pending' else operation.new_expiry)
+                        assert vm.expires_at.replace(tzinfo=UTC) == expected_expiry.replace(tzinfo=UTC)
+                    if failure in {'request_ack', 'authorization_audit', 'authorization_ack'}:
                         assert seen == []
                 response = await client.post(path, json=body, headers=headers)
             assert response.status_code == 200, response.text
@@ -2461,8 +2472,8 @@ async def test_retained_restore_is_audited_replayable_and_keeps_cycle_history(ad
             assert operation.retention_snapshot['manifest']['disk_ids'] == ['disk']
             assert operation.retention_snapshot['previous_expiry'] == (now - timedelta(days=3)).isoformat()
             audits = list(await session.scalars(select(AdminAuditRow).where(
-                AdminAuditRow.action.in_(['vm.restore_requested', 'vm.restore_completed']))))
-            assert len(audits) == 2
+                AdminAuditRow.action.in_(['vm.restore_requested', 'vm.restore_authorized', 'vm.restore_completed']))))
+            assert len(audits) == 3
             # A later retention cycle gets fresh evidence without overwriting recovery history.
             next_manifest = VMProtectionManifest('guest-retained', ('disk',), (), False, '', ())
             next_retained = await prepare_retention(session, vm.vm_id, next_manifest, now + timedelta(days=60))
@@ -2929,7 +2940,8 @@ async def test_account_disable_stops_provider_backed_provisioning_guest(admin_fa
 
 
 @pytest.mark.asyncio
-async def test_recovery_rechecks_admin_after_committed_request(admin_factory, monkeypatch):
+@pytest.mark.parametrize('revoke_after', [1, 2])
+async def test_recovery_rechecks_admin_after_committed_request(admin_factory, monkeypatch, revoke_after):
     from contextlib import asynccontextmanager
     from uuid import uuid4
 
@@ -2959,7 +2971,7 @@ async def test_recovery_rechecks_admin_after_committed_request(admin_factory, mo
         calls += 1
         async with original_lock(*args) as pair:
             yield pair
-        if calls == 1:
+        if calls == revoke_after:
             async with admin_factory.begin() as session:
                 current = await session.get(AccountRow, actor.account_id)
                 current.is_admin = False
@@ -2975,9 +2987,11 @@ async def test_recovery_rechecks_admin_after_committed_request(admin_factory, mo
     assert refused.value.status_code == 403
     provider.restore_retained_vm.assert_not_awaited()
     async with admin_factory() as session:
-        assert (await session.get(VMRestoreRow, str(body.operation_id))).state == 'pending'
+        assert (await session.get(VMRestoreRow, str(body.operation_id))).state == ('pending' if revoke_after == 1 else 'authorized')
         assert (await session.get(VMRetentionRow, 'vm_revoked_recovery')).state == 'restoring'
         vm = await session.get(VMRow, 'vm_revoked_recovery')
-        assert vm.deletion_started_at is not None and vm.expires_at.replace(tzinfo=UTC) < now
+        assert vm.deletion_started_at is not None
+        assert (vm.expires_at.replace(tzinfo=UTC) < now) == (revoke_after == 1)
         audits = list(await session.scalars(select(AdminAuditRow).where(AdminAuditRow.target_id == vm.vm_id)))
-        assert [audit.action for audit in audits] == ['vm.restore_requested']
+        assert [audit.action for audit in audits] == (['vm.restore_requested'] if revoke_after == 1 else
+                                                     ['vm.restore_requested', 'vm.restore_authorized'])

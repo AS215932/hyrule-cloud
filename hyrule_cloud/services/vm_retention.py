@@ -104,6 +104,26 @@ async def prepare_restore(
     return operation
 
 
+async def authorize_restore(session: AsyncSession, vm: VMRow, operation: VMRestoreRow) -> None:
+    """Commit a usable expiry before allowing provider restart settings to change.
+
+    Keep the deletion claim and active evidence until provider finalization.
+    The caller must audit and commit this transition before any provider write.
+    """
+    retained = await session.get(VMRetentionRow, vm.vm_id)
+    if (operation.state != "pending" or operation.vm_id != vm.vm_id or retained is None
+            or retained.state != "restoring" or retained.restore_operation_id != operation.operation_id
+            or vm.deletion_started_at is None or vm.xcpng_uuid != retained.source_vm_uuid
+            or vm.owner_account_id != retained.owner_account_id or vm.owner_wallet != retained.owner_wallet
+            or _aware(operation.new_expiry) <= datetime.now(UTC)):
+        raise ValueError("Recovery identity or authorization deadline changed")
+    vm.expires_at = operation.new_expiry
+    vm.suspension_reason = "manual_admin"
+    vm.suspended_by_account_id = operation.actor_account_id
+    operation.state = "authorized"
+    await session.flush()
+
+
 async def complete_restore(session: AsyncSession, vm: VMRow, operation: VMRestoreRow) -> None:
     """Finalize after provider verification, under the same lifecycle lock.
 
@@ -111,7 +131,7 @@ async def complete_restore(session: AsyncSession, vm: VMRow, operation: VMRestor
     allows a later expiry cycle to capture fresh protection and deadlines.
     """
     retained = await session.get(VMRetentionRow, vm.vm_id)
-    if (operation.state != "pending" or operation.vm_id != vm.vm_id or retained is None
+    if (operation.state != "authorized" or operation.vm_id != vm.vm_id or retained is None
             or retained.state != "restoring" or retained.restore_operation_id != operation.operation_id
             or vm.deletion_started_at is None or vm.xcpng_uuid != retained.source_vm_uuid
             or vm.owner_account_id != retained.owner_account_id or vm.owner_wallet != retained.owner_wallet):

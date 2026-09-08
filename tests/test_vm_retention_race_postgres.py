@@ -207,7 +207,7 @@ async def test_recovery_serializes_with_expiry_and_account_disable():
                 operation = await session.get(VMRestoreRow, str(body.operation_id))
                 assert operation.state == 'completed' and operation.retention_snapshot['manifest']['vm_uuid'] == guest
                 audits = list(await session.scalars(select(AdminAuditRow).where(AdminAuditRow.target_id == vm_id)))
-                assert sorted(audit.action for audit in audits) == ['vm.restore_completed', 'vm.restore_requested']
+                assert sorted(audit.action for audit in audits) == ['vm.restore_authorized', 'vm.restore_completed', 'vm.restore_requested']
             worker.xcpng.destroy_vm.assert_not_awaited()
             api.xcpng.restore_retained_vm.assert_awaited_once_with(manifest)
         # Account deletion and initial retention use the same account-first fence.
