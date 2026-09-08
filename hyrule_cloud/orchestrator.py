@@ -834,6 +834,35 @@ class Orchestrator:
             await session.commit()
         return recovered_uuid
 
+    async def _stop_restricted_provisioned_guest(self, vm_id: str, vm_uuid: str) -> bool:
+        """Stop a newly discovered guest before initialization waits when restricted.
+
+        Keep provisioning and its durable receipt retryable if the stop fails.
+        The owner/VM lock orders this check against account enable/disable.
+        """
+        async with self.locked_vm(vm_id) as (session, row):
+            if row is None or row.xcpng_uuid != vm_uuid:
+                return True
+            claimed = row.deletion_started_at is not None or row.status == VMStatus.DESTROYED
+            if not claimed:
+                restricted = (row.suspension_reason in {"account_disabled", "manual_admin"}
+                              or not await self.vm_owner_enabled(session, row))
+                if not restricted:
+                    return False
+                try:
+                    await self.xcpng.suspend_vm(vm_uuid)
+                except Exception:
+                    log.exception("restricted_provisioned_guest_stop_failed", vm_id=vm_id)
+                # Preserve PROVISIONING and its receipt for another stop attempt.
+                return True
+        # Deletion owns the guest; do not wait for network/guest initialization.
+        # Run outside the lifecycle lock because destroy_vm acquires it itself.
+        try:
+            await self.destroy_vm(vm_id)
+        except Exception:
+            log.exception("late_provisioned_guest_cleanup_failed", vm_id=vm_id)
+        return True
+
     async def _provision_vm_owned(self, vm_id: str) -> None:
         """Background provisioning: create VM, wait for IPv6, configure DNS.
 
@@ -961,6 +990,8 @@ class Orchestrator:
                     if xcpng_uuid is None:
                         xcpng_uuid = await self._recover_pre_uuid_guest(vm_id)
                         if xcpng_uuid is not None:
+                            if await self._stop_restricted_provisioned_guest(vm_id, xcpng_uuid):
+                                return
                             await self._emit(
                                 vm_id,
                                 VMEventKey.VM_CREATED,
@@ -1009,11 +1040,15 @@ class Orchestrator:
                             network_config=network_config,
                         )
 
-                        async with self.db() as session:
-                            row = await session.get(VMRow, vm_id)
+                        async with self.locked_vm(vm_id) as (session, row):
                             if row:
+                                if row.xcpng_uuid not in (None, xcpng_uuid):
+                                    raise GuestGenerationChangedError()
                                 row.xcpng_uuid = xcpng_uuid
                                 await session.commit()
+
+                        if await self._stop_restricted_provisioned_guest(vm_id, xcpng_uuid):
+                            return
 
                         # The hypervisor identity of the clone is internal; the
                         # customer only learns their machine exists and started.
@@ -1027,6 +1062,9 @@ class Orchestrator:
                                 "disk_gb": resources.disk_gb,
                             },
                         )
+
+            if await self._stop_restricted_provisioned_guest(vm_id, xcpng_uuid):
+                return
 
             async with self.db() as session:
                 receipt = await session.get(VMGuestResultRow, vm_id)
@@ -2144,7 +2182,10 @@ class Orchestrator:
             if management_identity is not None and not await self.vm_owner_enabled(session, row):
                 return False
             already_destroyed = row.status == VMStatus.DESTROYED
-            if already_destroyed and row.ipv6_prefix_index is None and row.ipv6_prefix is None:
+            deletion_verified = (row.xcpng_uuid is not None
+                                 and (row.metadata_ or {}).get("provider_deleted_uuid") == row.xcpng_uuid)
+            if (already_destroyed and row.ipv6_prefix_index is None and row.ipv6_prefix is None
+                    and (row.xcpng_uuid is None or deletion_verified)):
                 return True
             if row.deletion_started_at is None and expired_before is not None and not already_destroyed:
                 expiry = row.expires_at
@@ -2185,7 +2226,7 @@ class Orchestrator:
             # Persist before the irreversible provider call. A failed call or
             # worker crash retains the claim and prevents a paid renewal.
             await session.commit()
-            xcpng_uuid = None if already_destroyed else row.xcpng_uuid
+            xcpng_uuid = row.xcpng_uuid
             hostname = row.hostname
             status = str(row.status)
             domain_mode = row.domain_mode
@@ -2232,7 +2273,7 @@ class Orchestrator:
                     # firmware and network configuration throughout retention.
                     await retention_session.commit()
                 return True
-            else:
+            elif not deletion_verified:
                 await self.xcpng.destroy_vm(xcpng_uuid)
         elif status == str(VMStatus.PROVISIONING) or unresolved_guest:
             # Mid-provision race: the clone may exist without xcpng_uuid
@@ -2277,11 +2318,18 @@ class Orchestrator:
                             domain=domain,
                         )
 
-        async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
+        async with self.locked_vm(vm_id) as (session, row):
             if row:
                 row.status = VMStatus.DESTROYED
                 row.destroyed_at = _now()
+                if xcpng_uuid is not None:
+                    meta = dict(row.metadata_ or {})
+                    meta["provider_deleted_uuid"] = xcpng_uuid
+                    row.metadata_ = meta
+                if row.xcpng_uuid != xcpng_uuid:
+                    # A clone finished while provider/DNS cleanup was outside
+                    # the lock. This attempt did not delete that new identity.
+                    cleanup_ok = False
                 if cleanup_ok:
                     # Release the customer /64 for reuse: the unique index on
                     # ipv6_prefix_index would otherwise pin it to this dead
@@ -2309,6 +2357,9 @@ class Orchestrator:
                 )
             ).scalar_one_or_none()
             if row is not None and str(row.status) == VMStatus.DESTROYED.value:
+                if (row.xcpng_uuid is not None
+                        and (row.metadata_ or {}).get("provider_deleted_uuid") != row.xcpng_uuid):
+                    return
                 if row.xcpng_uuid is None and await session.get(VMGuestResultRow, vm_id) is not None:
                     # DNS convergence cannot prove retained guests are gone.
                     # Operator reconciliation must establish guest identity and
@@ -2403,7 +2454,9 @@ class Orchestrator:
         async with self.db() as session:
             result = await session.execute(
                 select(VMRow).where(
-                    VMRow.status != VMStatus.DESTROYED,
+                    or_(VMRow.status != VMStatus.DESTROYED,
+                        and_(VMRow.xcpng_uuid.isnot(None),
+                             func.coalesce(VMRow.metadata_["provider_deleted_uuid"].as_string(), "") != VMRow.xcpng_uuid)),
                     ~select(VMRetentionRow.vm_id).where(
                         VMRetentionRow.vm_id == VMRow.vm_id,
                         VMRetentionRow.state.in_(("retained", "restoring")),
@@ -2427,7 +2480,11 @@ class Orchestrator:
 
         for vm in expired_vms:
             async with self.locked_vm(vm["vm_id"]) as (session, current):
-                if current is None or current.status == VMStatus.DESTROYED:
+                if current is None:
+                    continue
+                if (current.status == VMStatus.DESTROYED
+                        and (current.xcpng_uuid is None
+                             or (current.metadata_ or {}).get("provider_deleted_uuid") == current.xcpng_uuid)):
                     continue
                 claimed = current.deletion_started_at is not None
                 expiry = current.expires_at

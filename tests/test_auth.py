@@ -930,3 +930,39 @@ async def test_account_delete_rechecks_retention_after_provider_phase(auth_state
         assert (await session.get(VMRow, vm_id)).owner_account_id == account_id
         assert await session.get(AccountRow, account_id) is not None
         assert (await session.get(VMRetentionRow, vm_id)).owner_account_id == account_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lifecycle', ['prepared', 'retained', 'restoring', 'claimed', 'destroyed'])
+async def test_claim_preserves_ownerless_retention_and_deletion_identity(auth_state, client, lifecycle):
+    from hyrule_cloud.db import VMRetentionRow
+    from hyrule_cloud.providers.xcpng import VMProtectionManifest
+    from hyrule_cloud.services.vm_retention import prepare_retention
+
+    token = generate_anon_management_token()
+    token_hash = hash_anon_management_token(token)
+    vm_id = generate_vm_id()
+    async with auth_state.orchestrator.db.begin() as session:
+        session.add(VMRow(vm_id=vm_id, owner_wallet='fixture-ownerless', owner_account_id=None,
+                          anon_management_token_hash=token_hash, xcpng_uuid='fixture-guest',
+                          status=VMStatus.DESTROYED if lifecycle == 'destroyed' else VMStatus.SUSPENDED,
+                          deletion_started_at=_now() if lifecycle in ('claimed', 'destroyed') else None))
+    if lifecycle in ('prepared', 'retained', 'restoring'):
+        async with auth_state.orchestrator.db.begin() as session:
+            retained = await prepare_retention(session, vm_id,
+                                               VMProtectionManifest('fixture-guest', ('fixture-disk',), (), False, '', ()),
+                                               _now() + timedelta(days=30))
+            retained.state = lifecycle
+    await client.post('/v1/auth/register', json={'password': 'claim fixture password 12345678'})
+    response = await client.post(f'/v1/me/vms/{vm_id}/claim',
+                                 json={'proof': 'management_token', 'token': token})
+    assert response.status_code == 409
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm.owner_account_id is None
+        assert vm.anon_management_token_hash == token_hash
+        if lifecycle in ('prepared', 'retained', 'restoring'):
+            retained = await session.get(VMRetentionRow, vm_id)
+            assert retained.owner_account_id is None
+            assert retained.owner_wallet == vm.owner_wallet
+            assert retained.state == lifecycle

@@ -38,9 +38,12 @@ before considering a schema downgrade. A compatible application rollback that
 retains the schema should be evaluated first. Never use the disposable test's
 database-reset procedure on production.
 
-This foundation does not implement the operator expiry-extension endpoint from
-issue #110. That endpoint still needs explicit authorization, step-up checks,
-audit evidence and serialization with expiry/deletion before rollout.
+The operator endpoint `POST /v1/admin/vms/{vm_id}/actions/extend` implements
+issue #110 expiry extension with current administrator authorization, CSRF,
+step-up authentication, reason/audit evidence and serialization with deletion.
+After promotion, verify rejection of unauthenticated or revoked administrators
+and deletion-claimed VMs, the recorded expiry and audit, and unchanged guest
+power state. The endpoint does not charge a customer or start the guest.
 
 ### Administrator revocation during a request
 

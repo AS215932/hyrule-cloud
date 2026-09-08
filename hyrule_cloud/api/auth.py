@@ -1020,7 +1020,13 @@ async def claim_vm(
         raise HTTPException(503, "Database not available")
 
     async with factory() as db:
-        vm = await db.get(VMRow, vm_id)
+        # Claiming changes lifecycle ownership: fence the destination account
+        # before the VM, matching disable/delete and retention lock ordering.
+        current_account = await db.scalar(select(AccountRow).where(
+            AccountRow.account_id == account.account_id).with_for_update())
+        if current_account is None or current_account.disabled_at is not None:
+            raise HTTPException(403, "Account is disabled or unavailable")
+        vm = await db.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
         if vm is None:
             raise HTTPException(404, "VM not found")
         if vm.owner_account_id is not None:
@@ -1074,6 +1080,9 @@ async def claim_vm(
         if not proven:
             raise HTTPException(403, "Proof of ownership rejected")
 
+        if (vm.deletion_started_at is not None or vm.status == VMStatus.DESTROYED
+                or await db.get(VMRetentionRow, vm_id) is not None):
+            raise HTTPException(409, "VM deletion or retention is in progress")
         vm.owner_account_id = account.account_id
         # Burn the anon token once claimed — account auth now supersedes.
         vm.anon_management_token_hash = None

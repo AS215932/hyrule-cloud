@@ -271,3 +271,80 @@ async def test_owner_transfer_after_paid_commit_does_not_resume_guest():
         assert updated.status == VMStatus.SUSPENDED
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('prefix_released', [False, True])
+async def test_late_uuid_is_deleted_by_worker_even_after_destroyed_state(prefix_released):
+    orch, engine = await _stored_vm(VMStatus.PROVISIONING)
+    async with orch.db.begin() as session:
+        row = await session.get(VMRow, 'vm_lifecycle')
+        row.xcpng_uuid = None
+        row.ipv6_prefix_index = 5
+        row.ipv6_prefix = '2001:db8:5::/64'
+    try:
+        assert await orch.destroy_vm('vm_lifecycle')
+        orch.xcpng.destroy_vm.assert_not_awaited()
+        async with orch.db.begin() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            assert row.status == VMStatus.DESTROYED
+            assert row.ipv6_prefix_index == 5
+            # The clone call returns after the deletion attempt committed.
+            row.xcpng_uuid = 'late-guest'
+            if prefix_released:
+                row.ipv6_prefix_index = None
+                row.ipv6_prefix = None
+        await orch.release_destroyed_prefix('vm_lifecycle')
+        async with orch.db() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            if not prefix_released:
+                assert row.ipv6_prefix_index == 5
+        orch.xcpng.destroy_vm.side_effect = RuntimeError('provider unavailable')
+        await orch.check_expiries()
+        async with orch.db() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            assert (row.metadata_ or {}).get('provider_deleted_uuid') is None
+        orch.xcpng.destroy_vm.side_effect = None
+        await orch.check_expiries()
+        assert orch.xcpng.destroy_vm.await_count == 2
+        async with orch.db() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            assert row.metadata_['provider_deleted_uuid'] == 'late-guest'
+            assert row.ipv6_prefix_index is None
+        await orch.check_expiries()
+        assert await orch.destroy_vm('vm_lifecycle')
+        assert orch.xcpng.destroy_vm.await_count == 2
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_late_uuid_during_cleanup_cannot_release_prefix():
+    orch, engine = await _stored_vm(VMStatus.PROVISIONING)
+    async with orch.db.begin() as session:
+        row = await session.get(VMRow, 'vm_lifecycle')
+        row.xcpng_uuid = None
+        row.hostname = 'test.deploy.hyrule.host'
+        row.ipv6_prefix_index = 5
+        row.ipv6_prefix = '2001:db8:5::/64'
+
+    async def late_uuid(*args):
+        async with orch.db.begin() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            row.xcpng_uuid = 'late-guest'
+
+    orch.dns = SimpleNamespace(delete_aaaa=AsyncMock(side_effect=late_uuid))
+    try:
+        assert await orch.destroy_vm('vm_lifecycle')
+        async with orch.db() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            assert row.ipv6_prefix_index == 5
+            assert (row.metadata_ or {}).get('provider_deleted_uuid') is None
+        await orch.release_destroyed_prefix('vm_lifecycle')
+        async with orch.db() as session:
+            assert (await session.get(VMRow, 'vm_lifecycle')).ipv6_prefix_index == 5
+        orch.dns.delete_aaaa.side_effect = None
+        assert await orch.destroy_vm('vm_lifecycle')
+        orch.xcpng.destroy_vm.assert_awaited_once_with('late-guest')
+    finally:
+        await engine.dispose()
