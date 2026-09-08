@@ -306,6 +306,7 @@ async def test_failed_provision_ends_in_provisioning_failed_with_safe_message(
 @pytest.mark.asyncio
 async def test_dns_failure_maps_to_the_dns_message(session_factory, monkeypatch) -> None:
     orch = _real_orchestrator(session_factory, monkeypatch)
+    orch.xcpng.suspend_vm = AsyncMock()
     orch.dns.create_aaaa = AsyncMock(
         side_effect=RuntimeError("DNS update failed: SERVFAIL from ns1.servify.network")
     )
@@ -320,11 +321,13 @@ async def test_dns_failure_maps_to_the_dns_message(session_factory, monkeypatch)
     assert events[-1].message == FAILURE_DNS
     assert "SERVFAIL" not in events[-1].message
     assert "ns1.servify.network" not in events[-1].message
+    orch.xcpng.suspend_vm.assert_awaited_once_with(XO_VM_UUID)
 
 
 @pytest.mark.asyncio
 async def test_boot_timeout_maps_to_the_timeout_message(session_factory, monkeypatch) -> None:
     orch = _real_orchestrator(session_factory, monkeypatch)
+    orch.xcpng.suspend_vm = AsyncMock()
     orch._wait_for_ipv6 = AsyncMock(return_value=None)
     async with session_factory() as session:
         session.add(_vm("vm_slow"))
@@ -338,6 +341,7 @@ async def test_boot_timeout_maps_to_the_timeout_message(session_factory, monkeyp
     # The internal wait target (the VM's expected address) is not narrated back
     # as raw error text.
     assert "within 120s" not in events[-1].message
+    orch.xcpng.suspend_vm.assert_awaited_once_with(XO_VM_UUID)
 
 
 @pytest.mark.asyncio
