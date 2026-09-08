@@ -763,7 +763,8 @@ class Orchestrator:
                 admin_waived=admin_waived,
                 payment_tx=payment_tx,
             )
-            await self.prepare_provisioning_dispatch(session, row)
+            if row.status == VMStatus.PROVISIONING:
+                await self.prepare_provisioning_dispatch(session, row)
             await session.commit()
             await session.refresh(row)
         if start_provisioning:
