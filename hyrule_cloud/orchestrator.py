@@ -403,6 +403,8 @@ class Orchestrator:
                             admin_waived=admin_waived,
                             payment_tx=payment_tx,
                         )
+                        if existing.status == VMStatus.PROVISIONING and existing.owner_wallet:
+                            await self.prepare_provisioning_dispatch(session, existing)
                         await session.commit()
                         return existing, ""
                 prefix_index, prefix = await self._allocate_customer_prefix(
@@ -443,6 +445,12 @@ class Orchestrator:
                 )
                 session.add(row)
                 try:
+                    # The durable worker discovers receipt-backed provisioning
+                    # rows. Stage that evidence in the same transaction that
+                    # accepts a paid VM so an API exit before task creation is
+                    # recoverable across processes.
+                    if row.owner_wallet:
+                        await self.prepare_provisioning_dispatch(session, row)
                     await session.commit()
                 except IntegrityError:
                     await session.rollback()
@@ -755,6 +763,7 @@ class Orchestrator:
                 admin_waived=admin_waived,
                 payment_tx=payment_tx,
             )
+            await self.prepare_provisioning_dispatch(session, row)
             await session.commit()
             await session.refresh(row)
         if start_provisioning:

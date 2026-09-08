@@ -52,26 +52,33 @@ async def test_paid_dispatch_survives_restart_while_waiting_for_provisioning_slo
             vm, _ = await original.create_vm(request, owner_wallet='paid-fixture',
                                              vm_id=f'vm_queued_{i}', start_provisioning=False)
             async with factory() as session:
-                assert await session.get(VMGuestResultRow, vm.vm_id) is None
+                assert await session.get(VMGuestResultRow, vm.vm_id) is not None
             # Models dispatch after the caller has linked its paid quote/intent.
             await original.start_provisioning(vm.vm_id)
+        accepted, _ = await original.create_vm(
+            request, owner_wallet='paid-fixture', vm_id='vm_accepted_no_task',
+            start_provisioning=False,
+        )
+        async with factory() as session:
+            assert await session.get(VMGuestResultRow, accepted.vm_id) is not None
         unpaid, _ = await original.reserve_vm(request, vm_id='vm_unpaid')
         await original.start_provisioning(unpaid.vm_id)
         await asyncio.wait_for(four_active.wait(), 5)
         assert len(entered) == 4
         assert len(original._tasks) == 8
         async with factory() as session:
-            assert len(list(await session.scalars(select(VMGuestResultRow.vm_id)))) == 8
+            assert len(list(await session.scalars(select(VMGuestResultRow.vm_id)))) == 9
             assert await session.get(VMGuestResultRow, unpaid.vm_id) is None
         await original.shutdown()
         await engine.dispose()
         assert await recovered.recover_tracked_provisioning() == 4
         assert await recovered.recover_tracked_provisioning() == 4
+        assert await recovered.recover_tracked_provisioning() == 1
         await asyncio.wait_for(asyncio.gather(*list(recovered._tasks)), 5)
         async with factory() as session:
             rows = list(await session.scalars(select(VMRow).where(VMRow.vm_id.like('vm_queued_%'))))
             assert len(rows) == 8 and all(row.status == VMStatus.PROVISIONING for row in rows)
-            assert sorted(resumed) == sorted(row.vm_id for row in rows)
+            assert sorted(resumed) == sorted([*(row.vm_id for row in rows), accepted.vm_id])
             assert (await session.get(VMRow, unpaid.vm_id)).status == VMStatus.PROVISIONING
     finally:
         await original.shutdown()

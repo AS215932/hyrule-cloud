@@ -8,14 +8,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
 from hyrule_cloud.api.admin import ReasonRequest, disable_account
+from hyrule_cloud.api.auth import ClaimByTokenRequest, claim_vm
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import AccountRow, DomainOperationRow, DomainRow
+from hyrule_cloud.db import AccountRow, DomainOperationRow, DomainRow, VMRow
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.domains.models import (
     DNSChange,
@@ -69,16 +71,23 @@ async def test_domain_mutations_serialize_with_account_disable():
         async with sessions.begin() as session:
             session.add(actor)
         for index, (action, mutation_first) in enumerate(
-                (action, first) for action in ('changeset', 'nameservers', 'dnssec', 'claim') for first in (True, False)):
+                (action, first) for action in ('changeset', 'nameservers', 'dnssec', 'claim', 'vm_claim') for first in (True, False)):
             owner_id, fqdn = f'HOWNER0000{index}', f'fixture{index}.dev'
+            owner = AccountRow(account_id=owner_id, password_hash='fixture')
+            vm_id = f'vm_claim_{index}'
             async with sessions.begin() as session:
-                session.add(AccountRow(account_id=owner_id, password_hash='fixture'))
+                session.add(owner)
                 await session.flush()
                 session.add(DomainRow(name=f'fixture{index}', extension='dev', fqdn=fqdn,
                     owner_wallet='fixture', owner_account_id=None if action == 'claim' else owner_id, status='active',
                     anon_management_token_hash=hash_anon_token('fixture-token') if action == 'claim' else None,
                     nameserver_mode='managed', nameservers=['ns1.servify.network', 'ns2.servify.network'],
                     dnssec_mode='managed', dnssec_status='active'))
+                if action == 'vm_claim':
+                    session.add(VMRow(
+                        vm_id=vm_id, owner_wallet='fixture', status='running',
+                        anon_management_token_hash=hash_anon_token('fixture-token'),
+                    ))
             entered, release = asyncio.Event(), asyncio.Event()
             releases.append(release)
 
@@ -98,6 +107,19 @@ async def test_domain_mutations_serialize_with_account_disable():
                 class_=AsyncSession if mutation_first else HeldCommitSession))
 
             async def mutate():
+                if action == 'vm_claim':
+                    claim_state = SimpleNamespace(
+                        orchestrator=SimpleNamespace(db=service.db)
+                    )
+                    return await claim_vm(
+                        vm_id,
+                        ClaimByTokenRequest(
+                            proof='management_token', token='fixture-token'
+                        ),
+                        request,
+                        owner,
+                        claim_state,
+                    )
                 if action == 'claim':
                     return await service.claim_legacy_domain(owner_id, fqdn, 'fixture-token')
                 if action == 'changeset':
@@ -124,6 +146,10 @@ async def test_domain_mutations_serialize_with_account_disable():
             await asyncio.wait_for(first, 5)
             if mutation_first:
                 await asyncio.wait_for(second, 5)
+            elif action == 'vm_claim':
+                with pytest.raises(HTTPException) as denied:
+                    await asyncio.wait_for(second, 5)
+                assert denied.value.status_code == 403
             else:
                 with pytest.raises(DomainProblem) as denied:
                     await asyncio.wait_for(second, 5)
@@ -136,6 +162,12 @@ async def test_domain_mutations_serialize_with_account_disable():
                 if action == 'claim':
                     assert domain.owner_account_id == (owner_id if mutation_first else None)
                     assert domain.anon_management_token_hash == (None if mutation_first else hash_anon_token('fixture-token'))
+                if action == 'vm_claim':
+                    vm = await session.get(VMRow, vm_id)
+                    assert vm.owner_account_id == (owner_id if mutation_first else None)
+                    assert vm.anon_management_token_hash == (
+                        None if mutation_first else hash_anon_token('fixture-token')
+                    )
                 operations = list(await session.scalars(select(DomainOperationRow).where(DomainOperationRow.fqdn == fqdn)))
                 assert len(operations) == int(mutation_first and action in ('nameservers', 'dnssec'))
     finally:

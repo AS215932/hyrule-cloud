@@ -967,6 +967,38 @@ async def test_transferred_vm_revalidates_disabled_recipient_before_resume(
 
 
 @pytest.mark.asyncio
+async def test_transferred_vm_does_not_resume_after_deletion_claim(admin_factory) -> None:
+    async with admin_factory.begin() as session:
+        session.add(AccountRow(account_id="HBBBBBBBBBB", password_hash="unused"))
+        session.add(
+            VMRow(
+                vm_id="vm_transfer_deletion_claim",
+                owner_wallet="0xowner",
+                owner_account_id="HBBBBBBBBBB",
+                xcpng_uuid="uuid-transfer-deletion-claim",
+                status="suspended",
+                suspension_reason="account_disabled",
+                deletion_started_at=datetime.now(UTC),
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+
+    xcpng = _AdminXCPNG()
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(xcpng=xcpng),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    await _resume_transferred_vm(state, "vm_transfer_deletion_claim")
+    assert xcpng.started == []
+    async with admin_factory() as session:
+        row = await session.get(VMRow, "vm_transfer_deletion_claim")
+        assert row.suspension_reason == "account_disabled"
+
+
+@pytest.mark.asyncio
 async def test_transfers_block_active_domain_attachment_jobs(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
     async with admin_factory() as session:
@@ -2008,6 +2040,7 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
                     vm_id="vm_provisioning",
                     owner_wallet="0xowner",
                     owner_account_id="HBBBBBBBBBB",
+                    xcpng_uuid="uuid-provisioning",
                     status="provisioning",
                     expires_at=datetime.now(UTC) + timedelta(days=1),
                 ),
@@ -2107,8 +2140,8 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         assert expired_mailbox.suspension_reason == "expired"
         assert operation is not None and operation.status == "completed"
 
-    assert xcpng.suspended == ["uuid-active", "uuid-failed-disabled"]
-    assert xcpng.started == ["uuid-active"]
+    assert xcpng.suspended == ["uuid-active", "uuid-provisioning", "uuid-failed-disabled"]
+    assert xcpng.started == ["uuid-active", "uuid-provisioning"]
 
 
 @pytest.mark.asyncio

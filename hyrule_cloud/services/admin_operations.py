@@ -306,9 +306,11 @@ async def _apply_locked_account_operation(
                     await session.commit()
                     continue
                 if str(current.status) == VMStatus.PROVISIONING.value:
-                    # The existing provisioner will observe the cleared marker
-                    # and complete normally; do not invent a RUNNING row before
-                    # a provider UUID exists.
+                    # A provider-backed provisioning guest was stopped during
+                    # disable. Start that exact guest while preserving the
+                    # durable PROVISIONING state for receipt reconciliation.
+                    if current.xcpng_uuid:
+                        await orchestrator.xcpng.start_vm(current.xcpng_uuid)
                     current.suspension_reason = None
                     current.suspended_by_account_id = None
                 elif current.xcpng_uuid:

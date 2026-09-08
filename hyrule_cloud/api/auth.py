@@ -1082,7 +1082,42 @@ async def claim_vm(
         if not proven:
             raise HTTPException(403, "Proof of ownership rejected")
 
-        vm.owner_account_id = account.account_id
+        # Account disable locks the account before snapshotting its VMs. Take
+        # the compatible account-first lock here so a claim either completes
+        # before that snapshot or observes the committed disabled state.
+        destination = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == account.account_id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+        if destination is None or destination.disabled_at is not None:
+            raise HTTPException(403, "Account access is disabled")
+        proof_state = (
+            vm.owner_account_id,
+            vm.anon_management_token_hash,
+            vm.owner_wallet,
+            vm.ssh_pubkey,
+        )
+        vm = await db.scalar(
+            select(VMRow)
+            .where(VMRow.vm_id == vm_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if vm is None:
+            raise HTTPException(404, "VM not found")
+        if vm.owner_account_id is not None:
+            raise HTTPException(409, "VM already claimed")
+        if (
+            vm.owner_account_id,
+            vm.anon_management_token_hash,
+            vm.owner_wallet,
+            vm.ssh_pubkey,
+        ) != proof_state:
+            raise HTTPException(409, "VM claim state changed; retry the claim")
+
+        vm.owner_account_id = destination.account_id
         # Burn the anon token once claimed — account auth now supersedes.
         vm.anon_management_token_hash = None
         await db.commit()

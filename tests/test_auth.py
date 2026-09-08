@@ -9,16 +9,18 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
-from fastapi import Response
+from fastapi import HTTPException, Response
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from hyrule_cloud.api.auth import ClaimByTokenRequest, claim_vm
 from hyrule_cloud.app import app
-from hyrule_cloud.db import Base, DomainOrderRow, DomainQuoteRow, DomainRow, VMRow
+from hyrule_cloud.db import AccountRow, Base, DomainOrderRow, DomainQuoteRow, DomainRow, VMRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token as hash_anon_management_token
 from hyrule_cloud.models import (
     VMSize,
@@ -524,6 +526,50 @@ async def test_claim_rejects_wrong_token(auth_state, client):
         json={"proof": "management_token", "token": generate_anon_management_token()},
     )
     assert claim.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_claim_revalidates_stale_destination_account(auth_state):
+    token = generate_anon_management_token()
+    vm_id = generate_vm_id()
+    account_id = "HCLAIMFENCE"
+    async with auth_state.orchestrator.db() as session:
+        stale_account = AccountRow(account_id=account_id, password_hash="fixture")
+        session.add(stale_account)
+        session.add(
+            VMRow(
+                vm_id=vm_id,
+                owner_wallet="0xAnonPayer",
+                anon_management_token_hash=hash_anon_management_token(token),
+                status=VMStatus.READY,
+                size=VMSize.XS,
+                os="debian-13",
+                ssh_pubkey="",
+                open_ports=[22],
+                expires_at=_now() + timedelta(days=7),
+                cost_total=Decimal("0.35"),
+            )
+        )
+        await session.commit()
+    assert stale_account is not None
+    async with auth_state.orchestrator.db() as session:
+        current = await session.get(AccountRow, account_id)
+        current.disabled_at = _now()
+        await session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await claim_vm(
+            vm_id,
+            ClaimByTokenRequest(proof="management_token", token=token),
+            SimpleNamespace(),
+            stale_account,
+            auth_state,
+        )
+    assert exc.value.status_code == 403
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm.owner_account_id is None
+        assert vm.anon_management_token_hash == hash_anon_management_token(token)
 
 
 @pytest.mark.asyncio

@@ -1204,18 +1204,36 @@ async def vm_action(
     return {"vm_id": vm_id, "action": action, "status": "accepted"}
 
 
-async def _assert_transfer_target(session: AsyncSession, account_id: str) -> AccountRow:
-    await lock_account_lifecycle(session, account_id)
+async def _assert_transfer_accounts(
+    session: AsyncSession,
+    target_account_id: str,
+    *source_account_ids: str | None,
+) -> AccountRow:
+    # Account deletion holds this advisory guard across its complete detach or
+    # destroy flow. Acquire every source and target guard in stable order before
+    # resource rows so a completed deletion cannot return a stale credential.
+    account_ids = {
+        account_id
+        for account_id in (*source_account_ids, target_account_id)
+        if account_id is not None
+    }
+    for account_id in sorted(account_ids):
+        await lock_account_lifecycle(session, account_id)
     target = (
         await session.execute(
             select(AccountRow)
-            .where(AccountRow.account_id == account_id)
+            .where(AccountRow.account_id == target_account_id)
             .with_for_update()
         )
     ).scalar_one_or_none()
     if target is None or target.disabled_at is not None:
         raise HTTPException(409, "Target account is missing or disabled")
     return target
+
+
+async def _assert_transfer_target(session: AsyncSession, account_id: str) -> AccountRow:
+    """Compatibility helper for callers that have no source account."""
+    return await _assert_transfer_accounts(session, account_id)
 
 
 async def _transfer_wallet_identity(session: AsyncSession, account_id: str) -> str:
@@ -1258,6 +1276,7 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
             or recipient is None
             or recipient.disabled_at is not None
             or current.suspension_reason != "account_disabled"
+            or current.deletion_started_at is not None
         ):
             return
         if current.expires_at is not None and _aware(current.expires_at) <= _now():
@@ -1384,13 +1403,28 @@ async def transfer_vm(
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
         await _validate_admin_dispatch(session, actor.account_id)
-        await _assert_transfer_target(session, body.target_account_id)
+        source_snapshot = (
+            await session.execute(
+                select(VMRow.owner_account_id).where(VMRow.vm_id == vm_id)
+            )
+        ).one_or_none()
+        if source_snapshot is None:
+            raise HTTPException(404, "VM not found")
+        expected_source_account_id = source_snapshot[0]
+        await _assert_transfer_accounts(
+            session, body.target_account_id, expected_source_account_id
+        )
         new_owner_wallet = await _transfer_wallet_identity(session, body.target_account_id)
         vm = (
-            await session.execute(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+            await session.execute(
+                select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                .execution_options(populate_existing=True)
+            )
         ).scalar_one_or_none()
         if vm is None:
             raise HTTPException(404, "VM not found")
+        if vm.owner_account_id != expected_source_account_id:
+            raise HTTPException(409, "VM ownership changed; retry the transfer")
         if vm.deletion_started_at is not None or vm.status == VMStatus.DESTROYED:
             raise HTTPException(409, "Deleting or destroyed VMs cannot be transferred")
         if str(vm.status) == VMStatus.PROVISIONING.value:
@@ -1445,9 +1479,34 @@ async def transfer_domain(
     attached_vm_id: str | None = None
     async with _factory(state)() as session:
         await _validate_admin_dispatch(session, actor.account_id)
-        await _assert_transfer_target(session, body.target_account_id)
+        source_snapshot = (
+            await session.execute(
+                select(DomainRow.owner_account_id, DomainRow.vm_id)
+                .where(DomainRow.fqdn == fqdn)
+            )
+        ).one_or_none()
+        if source_snapshot is None:
+            raise HTTPException(404, "Domain not found")
+        expected_source_account_id, expected_vm_id = source_snapshot
+        expected_vm_owner_account_id = None
+        if expected_vm_id is not None:
+            expected_vm_owner_account_id = await session.scalar(
+                select(VMRow.owner_account_id).where(VMRow.vm_id == expected_vm_id)
+            )
+        await _assert_transfer_accounts(
+            session,
+            body.target_account_id,
+            expected_source_account_id,
+            expected_vm_owner_account_id,
+        )
         new_owner_wallet = await _transfer_wallet_identity(session, body.target_account_id)
         domain, vm = await _lock_domain_transfer_bundle(session, fqdn)
+        if (
+            domain.owner_account_id != expected_source_account_id
+            or domain.vm_id != expected_vm_id
+            or (vm is not None and vm.owner_account_id != expected_vm_owner_account_id)
+        ):
+            raise HTTPException(409, "Domain ownership changed; retry the transfer")
         if await _pending_domain_work(session, fqdn=fqdn, vm_id=domain.vm_id):
             raise HTTPException(409, "Domain has a pending operation")
         if domain.vm_id:
