@@ -73,13 +73,14 @@ async def test_recovery_serializes_with_expiry_and_account_disable():
         assert migrated.returncode == 0, migrated.stderr
         async with sessions.begin() as session:
             session.add(actor)
+            session.add(AccountRow(account_id="HOWNER00001", password_hash="fixture"))
         for index, ordering in enumerate(('restore_first', 'protect_first', 'stale_protect', 'disable_first')):
             vm_id = f'vm_{ordering}'
             guest = str(uuid4())
             manifest = VMProtectionManifest(guest, (str(uuid4()),), (), True, 'restart', ())
             now = datetime.now(UTC)
             async with sessions.begin() as session:
-                session.add(VMRow(vm_id=vm_id, owner_wallet='fixture', owner_account_id=actor.account_id,
+                session.add(VMRow(vm_id=vm_id, owner_wallet='fixture', owner_account_id='HOWNER00001',
                                   status=VMStatus.SUSPENDED, xcpng_uuid=guest,
                                   expires_at=now - timedelta(days=3), deletion_started_at=now,
                                   suspension_reason='expired', ipv6_prefix_index=40 + index))
@@ -93,7 +94,7 @@ async def test_recovery_serializes_with_expiry_and_account_disable():
             releases.append(release)
 
             async def recover():
-                return await restore_retained_vm(vm_id, body, request, actor, SimpleNamespace(orchestrator=api))
+                return await restore_retained_vm(vm_id, body, request, actor, SimpleNamespace(orchestrator=api, session_factory=api.db))
 
             async def sweep():
                 # Completed retention is excluded from automatic expiry sweeps;
@@ -108,7 +109,7 @@ async def test_recovery_serializes_with_expiry_and_account_disable():
             if ordering == 'disable_first':
                 async with sessions.begin() as session:
                     owner = await session.scalar(select(AccountRow).where(
-                        AccountRow.account_id == actor.account_id).with_for_update())
+                        AccountRow.account_id == 'HOWNER00001').with_for_update())
                     owner.disabled_at = now
                     await session.flush()
                     recovery = asyncio.create_task(recover())
@@ -119,7 +120,7 @@ async def test_recovery_serializes_with_expiry_and_account_disable():
                 assert exc.value.status_code == 409
                 api.xcpng.restore_retained_vm.assert_not_awaited()
                 async with sessions.begin() as session:
-                    owner = await session.get(AccountRow, actor.account_id)
+                    owner = await session.get(AccountRow, 'HOWNER00001')
                     owner.disabled_at = None
                 assert (await recover())['state'] == 'completed'
             elif ordering == 'stale_protect':

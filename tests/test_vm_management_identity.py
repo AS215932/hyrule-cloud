@@ -56,3 +56,31 @@ async def test_management_action_rechecks_authorized_resource_identity(action, c
                 assert (await session.get(VMRow, 'vm_lifecycle')).deletion_started_at is None
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_customer_delete_rechecks_disabled_owner_when_token_was_already_absent():
+    from datetime import UTC, datetime
+
+    orch, engine = await _stored_vm()
+    try:
+        async with orch.db.begin() as session:
+            session.add(AccountRow(account_id='H1234567890', password_hash='fixture'))
+            await session.flush()
+            vm = await session.get(VMRow, 'vm_lifecycle')
+            vm.owner_account_id = 'H1234567890'
+            vm.anon_management_token_hash = None
+        identity = VMManagementIdentity.capture(await orch.get_vm('vm_lifecycle'))
+        async with orch.db.begin() as session:
+            owner = await session.get(AccountRow, 'H1234567890')
+            owner.disabled_at = datetime.now(UTC)
+        assert identity.matches(await orch.get_vm('vm_lifecycle'))
+        assert not await orch.destroy_vm('vm_lifecycle', management_identity=identity)
+        orch.xcpng.destroy_vm.assert_not_awaited()
+        async with orch.db() as session:
+            assert (await session.get(VMRow, 'vm_lifecycle')).deletion_started_at is None
+        # Trusted lifecycle cleanup does not borrow a revoked customer request.
+        assert await orch.destroy_vm('vm_lifecycle')
+        orch.xcpng.destroy_vm.assert_awaited_once()
+    finally:
+        await engine.dispose()

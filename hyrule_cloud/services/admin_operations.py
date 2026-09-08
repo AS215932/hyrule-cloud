@@ -246,11 +246,12 @@ async def _apply_locked_account_operation(
                     continue
                 if str(current.status) == VMStatus.FAILED.value and not current.xcpng_uuid:
                     continue
-                if str(current.status) != VMStatus.PROVISIONING.value and current.xcpng_uuid:
+                if current.xcpng_uuid:
                     await orchestrator.xcpng.suspend_vm(current.xcpng_uuid)
                 # A provisioner owns the PROVISIONING transition. Mark the
-                # desired terminal state without making its initial guard exit;
-                # finalization will suspend the new provider VM under the row lock.
+                # desired suspension without making its initial guard exit.
+                # Stop a recorded provider guest now; finalization also observes
+                # the marker if provider creation has not recorded a UUID yet.
                 if str(current.status) not in {VMStatus.PROVISIONING.value, VMStatus.FAILED.value}:
                     current.status = VMStatus.SUSPENDED
                 current.suspension_reason = "account_disabled"

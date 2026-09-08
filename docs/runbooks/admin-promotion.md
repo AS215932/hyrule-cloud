@@ -40,3 +40,22 @@ database-reset procedure on production.
 This foundation does not implement the operator expiry-extension endpoint from
 issue #110. That endpoint still needs explicit authorization, step-up checks,
 audit evidence and serialization with expiry/deletion before rollout.
+
+### Administrator revocation during a request
+
+Privileged mutations reload the actor inside their accepting transaction. They
+lock the enabled-administrator set in account-ID order before actor, owner,
+target and resource locks, and refuse a missing, disabled or demoted actor.
+These account locks use PostgreSQL `FOR NO KEY UPDATE` so payment quota foreign-key
+checks can still finish. Power actions hold the fence through provider dispatch.
+Deletion claims and domain jobs validate before durable acceptance; already
+accepted work remains eligible for worker retries after later revocation.
+DNS changes hold the actor fence through the provider call. Request audits commit
+independently before external effects while the accepting transaction retains the
+actor fence.
+
+The opt-in `tests/test_admin_revocation_postgres.py` requires a fresh local
+`admin_revocation_test` database via `HCP_ADMIN_REVOCATION_TEST_DATABASE_URL`.
+It observes actual PostgreSQL lock waiters for dispatch-first and demotion-first
+orderings. Run the existing admin-expiry PostgreSQL test too: it verifies that
+these locks do not block the separate payment-quota foreign-key transaction.

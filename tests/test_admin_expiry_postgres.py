@@ -60,7 +60,8 @@ async def test_admin_extension_serializes_with_deletion_and_rolls_back_audit_fai
     old_expiry = datetime.now(UTC) - timedelta(days=3)
 
     async def extend(vm_id):
-        return await extend_vm_expiry(vm_id, body, request, actor, SimpleNamespace(orchestrator=api))
+        return await extend_vm_expiry(vm_id, body, request, actor,
+                                      SimpleNamespace(orchestrator=api, session_factory=api.db))
 
     try:
         async with engines[2].connect() as conn:

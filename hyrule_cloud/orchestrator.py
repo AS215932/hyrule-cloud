@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1993,9 +1993,13 @@ class Orchestrator:
             return result.scalar_one_or_none()
 
     @asynccontextmanager
-    async def locked_vm(self, vm_id: str) -> AsyncIterator[tuple[AsyncSession, VMRow | None]]:
+    async def locked_vm(
+        self, vm_id: str, *, dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[tuple[AsyncSession, VMRow | None]]:
         """One PostgreSQL row lock shared by renewal/payment and expiry decisions."""
         async with self.db() as session:
+            if dispatch_guard is not None:
+                await dispatch_guard(session)
             snapshot = await session.get(VMRow, vm_id)
             owner_id = snapshot.owner_account_id if snapshot is not None else None
             if owner_id is not None:
@@ -2130,9 +2134,14 @@ class Orchestrator:
         self, vm_id: str, *, expired_before: datetime | None = None,
         management_identity: VMManagementIdentity | None = None,
         reconcile_retention: bool = False,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> bool:
-        async with self.locked_vm(vm_id) as (session, row):
+        lifecycle_lock = (self.locked_vm(vm_id, dispatch_guard=dispatch_guard)
+                          if dispatch_guard is not None else self.locked_vm(vm_id))
+        async with lifecycle_lock as (session, row):
             if row is None or (management_identity is not None and not management_identity.matches(row)):
+                return False
+            if management_identity is not None and not await self.vm_owner_enabled(session, row):
                 return False
             already_destroyed = row.status == VMStatus.DESTROYED
             if already_destroyed and row.ipv6_prefix_index is None and row.ipv6_prefix is None:
