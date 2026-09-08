@@ -48,6 +48,22 @@ class XCPNGCapacity:
     free_storage_bytes: int
 
 
+@dataclass(frozen=True)
+class RetainedDisk:
+    vdi_uuid: str
+    sr_uuid: str
+    size_bytes: int
+    position: str
+    bootable: bool
+    read_only: bool
+
+
+@dataclass(frozen=True)
+class VMRetentionManifest:
+    vm_uuid: str
+    disks: tuple[RetainedDisk, ...]
+
+
 class XCPNGProvider(Provider):
     """XO JSON-RPC client for XCP-NG VM lifecycle."""
 
@@ -665,6 +681,74 @@ disklabel "$disk"
     async def suspend_vm(self, vm_uuid: str) -> None:
         """Hard stop — used for expired VMs in grace period."""
         await self._xo_call("vm.stop", id=vm_uuid, force=True)
+
+    async def _retention_object(self, object_uuid: str) -> dict | None:
+        objects = await self._xo_objects(id=object_uuid)
+        if (not isinstance(objects, dict) or set(objects) - {object_uuid}
+                or (object_uuid in objects and not isinstance(objects[object_uuid], dict))):
+            raise XOError("retention_inventory", {"message": "Invalid exact-object inventory"})
+        return objects.get(object_uuid)
+
+    async def capture_retention_manifest(self, vm_uuid: str) -> VMRetentionManifest:
+        """Read all original data disks; callers must persist before deletion."""
+        vm = await self._retention_object(vm_uuid)
+        if not vm or vm.get("type") != "VM" or not isinstance(vm.get("VBDs"), list):
+            raise XOError("capture_retention", {"message": "VM inventory unavailable"})
+        # XO recursively deletes child snapshots even with deleteDisks=False.
+        # Preserve existing recovery points until a separate retention policy
+        # can account for them; unknown snapshot coverage is also rejected.
+        if vm.get("snapshots") != []:
+            raise XOError("capture_retention", {"message": "Snapshot retention requires reconciliation"})
+        vbds = await self._xo_objects(type="VBD", VM=vm_uuid)
+        if not isinstance(vbds, dict) or set(vbds) != set(vm["VBDs"]):
+            raise XOError("capture_retention", {"message": "Incomplete attachment inventory"})
+        disks = []
+        for vbd in vbds.values():
+            if vbd.get("VM") != vm_uuid or type(vbd.get("is_cd_drive")) is not bool:
+                raise XOError("capture_retention", {"message": "Invalid attachment identity"})
+            if vbd["is_cd_drive"]:
+                continue
+            vdi_uuid = vbd.get("VDI")
+            vdi = await self._retention_object(vdi_uuid) if isinstance(vdi_uuid, str) else None
+            if (not vdi or vdi.get("type") != "VDI" or vdi.get("missing") is not False
+                    or not isinstance(vdi.get("$SR"), str)
+                    or type(vdi.get("size")) is not int or vdi["size"] <= 0
+                    or not isinstance(vbd.get("position"), str)
+                    or type(vbd.get("bootable")) is not bool
+                    or type(vbd.get("read_only")) is not bool):
+                raise XOError("capture_retention", {"message": "Incomplete disk metadata"})
+            disks.append(RetainedDisk(vdi_uuid, vdi["$SR"], vdi["size"],
+                                      vbd["position"], vbd["bootable"], vbd["read_only"]))
+        if not disks or len({disk.vdi_uuid for disk in disks}) != len(disks):
+            raise XOError("capture_retention", {"message": "Missing or duplicate data disks"})
+        return VMRetentionManifest(vm_uuid, tuple(sorted(disks, key=lambda disk: disk.position)))
+
+    async def delete_vm_retaining_disks(self, manifest: VMRetentionManifest) -> None:
+        """Delete only a manifest-matched VM; verify retained disks even on retry.
+
+        Does not persist the manifest, protect orphan disks, or prove restoration.
+        The retention state machine must provide those guarantees before use.
+        """
+        if not manifest.disks:
+            raise XOError("retain_delete", {"message": "Empty retention manifest"})
+        vm = await self._retention_object(manifest.vm_uuid)
+        if vm is not None:
+            current = await self.capture_retention_manifest(manifest.vm_uuid)
+            if current != manifest:
+                raise XOError("retain_delete", {"message": "Disk manifest changed"})
+            try:
+                await self._xo_call("vm.delete", id=manifest.vm_uuid, deleteDisks=False)
+            except Exception:
+                # Lost replies are reconciled only by complete successful reads.
+                if await self._retention_object(manifest.vm_uuid) is not None:
+                    raise
+        if await self._retention_object(manifest.vm_uuid) is not None:
+            raise XOError("retain_delete", {"message": "VM deletion unconfirmed"})
+        for disk in manifest.disks:
+            vdi = await self._retention_object(disk.vdi_uuid)
+            if (not vdi or vdi.get("type") != "VDI" or vdi.get("missing") is not False
+                    or vdi.get("$SR") != disk.sr_uuid or vdi.get("size") != disk.size_bytes):
+                raise XOError("retain_delete", {"message": "Retained disk verification failed"})
 
     async def destroy_vm(self, vm_uuid: str) -> None:
         """Destroy a VM and all associated VDIs."""

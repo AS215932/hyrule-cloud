@@ -1157,3 +1157,20 @@ class RecoveryChallengeRow(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class VMRetentionRow(Base):
+    """Recovery evidence survives deletion of the application VM/account rows."""
+
+    __tablename__ = "vm_retention"
+
+    vm_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    source_vm_uuid: Mapped[str] = mapped_column(String(36), unique=True)
+    owner_account_id: Mapped[str | None] = mapped_column(String(11))
+    owner_wallet: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(24), default="prepared", server_default="prepared")
+    manifest: Mapped[dict] = mapped_column(_JSONB)
+    restore_config: Mapped[dict] = mapped_column(_JSONB)
+    retain_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    retained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
