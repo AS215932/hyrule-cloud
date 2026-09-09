@@ -258,11 +258,14 @@ def downgrade() -> None:
     )):
         raise RuntimeError("Cannot downgrade revision 023 while account resumptions remain pending")
     pending_extension = (
-        "metadata ? 'extension_resume_pending'"
+        sa.text("SELECT count(*) FROM vms WHERE metadata ? 'extension_resume_pending'")
         if bind.dialect.name == "postgresql"
-        else "json_type(metadata, '$.extension_resume_pending') IS NOT NULL"
+        else sa.text(
+            "SELECT count(*) FROM vms "
+            "WHERE json_type(metadata, '$.extension_resume_pending') IS NOT NULL"
+        )
     )
-    if bind.scalar(sa.text("SELECT count(*) FROM vms WHERE " + pending_extension)):
+    if bind.scalar(pending_extension):
         raise RuntimeError("Cannot downgrade revision 023 while paid VM resumptions remain pending")
     if bind.scalar(sa.text(
         "SELECT count(*) FROM domain_orders "
