@@ -11,13 +11,13 @@ async def lock_account_lifecycle(
     session: AsyncSession, account_id: str, *, shared: bool = False
 ) -> None:
     if session.bind is not None and session.bind.dialect.name == "postgresql":
-        lock_function = (
-            "pg_try_advisory_xact_lock_shared"
+        lock_query = (
+            text("SELECT pg_try_advisory_xact_lock_shared(hashtextextended(:key, 0))")
             if shared
-            else "pg_try_advisory_xact_lock"
+            else text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))")
         )
         acquired = await session.scalar(
-            text(f"SELECT {lock_function}(hashtextextended(:key, 0))"),
+            lock_query,
             {"key": "account-deletion:" + account_id},
         )
         if not acquired:
