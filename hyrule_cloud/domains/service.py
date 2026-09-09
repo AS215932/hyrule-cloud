@@ -1311,7 +1311,7 @@ class DomainService:
             snapshot = await session.get(DomainOrderRow, order_id)
             if snapshot is None or snapshot.owner_account_id != owner_account_id:
                 raise DomainProblem(404, "order_not_found", "Domain order not found.")
-            await lock_account_lifecycle(session, owner_account_id)
+            await lock_account_lifecycle(session, owner_account_id, shared=True)
             owner = (
                 await session.execute(
                     select(AccountRow)

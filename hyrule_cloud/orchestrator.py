@@ -2224,6 +2224,14 @@ class Orchestrator:
         """Reconcile an expiry stop whose following database commit was lost."""
         if row is None or row.expires_at is None:
             return True
+        if (
+            row.deletion_started_at is not None
+            or row.status in {VMStatus.DESTROYED, VMStatus.FAILED, VMStatus.PROVISIONING}
+            or row.suspension_reason in {"account_disabled", "manual_admin"}
+        ):
+            # The normal eligibility check rejects these rows. Do not inspect or
+            # rewrite provider state for a lifecycle that cannot be extended.
+            return True
         expiry = row.expires_at
         if expiry.tzinfo is None:
             expiry = expiry.replace(tzinfo=UTC)
