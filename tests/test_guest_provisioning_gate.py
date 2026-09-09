@@ -54,6 +54,40 @@ async def test_guest_recovery_waits_for_native_intent_handoff(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_recovery_cycle_wraps_despite_sustained_higher_id_arrivals(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'recovery-wrap.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    orch = Orchestrator(HyruleConfig(), factory)
+    orch._spawn_provisioning = AsyncMock()
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            for index in range(5):
+                vm_id = f"vm_old_{index}"
+                session.add(VMRow(vm_id=vm_id, owner_wallet="paid", status=VMStatus.PROVISIONING))
+                session.add(VMGuestResultRow(
+                    vm_id=vm_id, generation="a" * 31 + str(index), token_hash="b" * 64,
+                    deadline=datetime.now(UTC) + timedelta(minutes=5),
+                ))
+        assert await orch.recover_tracked_provisioning() == 4
+        async with factory.begin() as session:
+            for index in range(4):
+                vm_id = f"vm_z_new_{index}"
+                session.add(VMRow(vm_id=vm_id, owner_wallet="paid", status=VMStatus.PROVISIONING))
+                session.add(VMGuestResultRow(
+                    vm_id=vm_id, generation="c" * 31 + str(index), token_hash="d" * 64,
+                    deadline=datetime.now(UTC) + timedelta(minutes=5),
+                ))
+        assert await orch.recover_tracked_provisioning() == 1
+        assert orch._spawn_provisioning.await_args_list[4].args == ("vm_old_4",)
+        assert orch._recovery_cursor == ""
+        assert orch._recovery_cycle_max == ""
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_paid_dispatch_survives_restart_while_waiting_for_provisioning_slots(tmp_path, monkeypatch):
     from hyrule_cloud.db import VMGuestResultRow
 
@@ -361,6 +395,7 @@ async def test_guest_completion_controls_public_status_and_launch_proof(
     monkeypatch.setattr('hyrule_cloud.services.launch_proof.use_real_provisioning', lambda: True)
     orch.xcpng.find_vm_ids_by_name_label = AsyncMock(return_value=[])
     orch.xcpng.destroy_vm = AsyncMock()
+    orch.xcpng.get_vm_power_state = AsyncMock(return_value="Running")
     orch.xcpng.suspend_vm = AsyncMock(
         side_effect=RuntimeError('provider stop unavailable') if stop_fails else None,
     )
@@ -449,6 +484,7 @@ async def test_guest_report_timeout_stops_guest_before_refund(
     )
     orch.xcpng.find_vm_ids_by_name_label = AsyncMock(return_value=[])
     orch.xcpng.create_vm = AsyncMock(return_value="timed-out-guest")
+    orch.xcpng.get_vm_power_state = AsyncMock(return_value="Running")
     orch.xcpng.suspend_vm = AsyncMock(
         side_effect=RuntimeError("provider stop unavailable") if stop_fails else None
     )

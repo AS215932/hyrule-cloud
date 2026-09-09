@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -51,6 +52,7 @@ from hyrule_cloud.db import (
 )
 from hyrule_cloud.domains.models import DomainOperationStatus
 from hyrule_cloud.middleware.x402 import ADMIN_PAYMENT_MODE_HEADER, PaymentGate
+from hyrule_cloud.models import VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.services.admin_operations import (
     _apply_account_operation,
@@ -836,16 +838,24 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
                     suspended_by_account_id="HAAAAAAAAAA",
                     expires_at=datetime.now(UTC) + timedelta(days=1),
                 ),
+                VMRow(
+                    vm_id="vm_transfer_failed",
+                    owner_wallet="0x5555555555555555555555555555555555555555",
+                    owner_account_id="HBBBBBBBBBB",
+                    xcpng_uuid="uuid-transfer-failed",
+                    status="failed",
+                    suspension_reason="account_disabled",
+                    suspended_by_account_id="HAAAAAAAAAA",
+                ),
             ]
         )
         await session.commit()
 
+    transfer_orchestrator = Orchestrator(HyruleConfig(), admin_factory)
+    transfer_orchestrator.xcpng = xcpng
     state = AppState(
         config=SimpleNamespace(),
-        orchestrator=SimpleNamespace(
-            xcpng=xcpng,
-            start_provisioning=lambda _vm_id: None,
-        ),
+        orchestrator=transfer_orchestrator,
         payment_gate=None,
         network_provider=None,
         session_factory=admin_factory,
@@ -875,6 +885,13 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
         actor,
         state,
     )
+    await transfer_vm(
+        "vm_transfer_failed",
+        body,
+        _browser_request(credentials, path="/v1/admin/vms/vm_transfer_failed/transfer"),
+        actor,
+        state,
+    )
 
     target_wallet = "0x1111111111111111111111111111111111111111"
     async with admin_factory() as session:
@@ -882,6 +899,7 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
             "vm_transfer_direct",
             "vm_transfer_attached",
             "vm_transfer_manual",
+            "vm_transfer_failed",
         ):
             vm = await session.get(VMRow, vm_id)
             assert vm is not None and vm.owner_account_id == "HCCCCCCCCCC"
@@ -898,12 +916,18 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
         direct = await session.get(VMRow, "vm_transfer_direct")
         attached = await session.get(VMRow, "vm_transfer_attached")
         manual = await session.get(VMRow, "vm_transfer_manual")
+        failed = await session.get(VMRow, "vm_transfer_failed")
         assert direct is not None and str(direct.status) == "running"
         assert direct.suspension_reason is None
+        assert not (direct.metadata_ or {}).get("transfer_resume_pending")
         assert attached is not None and str(attached.status) == "running"
         assert attached.suspension_reason is None
+        assert not (attached.metadata_ or {}).get("transfer_resume_pending")
         assert manual is not None and str(manual.status) == "suspended"
         assert manual.suspension_reason == "manual_admin"
+        assert failed is not None and str(failed.status) == "failed"
+        assert failed.suspension_reason is None
+        assert failed.suspended_by_account_id is None
 
         stored_actor = await session.get(AccountRow, "HAAAAAAAAAA")
         assert stored_actor is not None
@@ -919,6 +943,37 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
     assert retained_manual is not None
     assert retained_manual.suspended_by_account_id == "HAAAAAAAAAA"
     assert xcpng.started == ["uuid-transfer-direct", "uuid-transfer-attached"]
+
+
+@pytest.mark.asyncio
+async def test_transfer_resume_handoff_survives_provider_failure(admin_factory) -> None:
+    async with admin_factory.begin() as session:
+        session.add(AccountRow(account_id="HCCCCCCCCCC", password_hash="unused"))
+        session.add(VMRow(
+            vm_id="vm_transfer_retry", owner_wallet="fixture",
+            owner_account_id="HCCCCCCCCCC", xcpng_uuid="transfer-guest",
+            status=VMStatus.SUSPENDED, suspension_reason="account_disabled",
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+            metadata_={"transfer_resume_pending": {
+                "owner_account_id": "HCCCCCCCCCC", "xcpng_uuid": "transfer-guest",
+            }},
+        ))
+    orch = Orchestrator(HyruleConfig(), admin_factory)
+    orch.xcpng.get_vm_power_state = AsyncMock(
+        side_effect=[RuntimeError("provider unavailable"), "Halted"]
+    )
+    orch.xcpng.start_vm = AsyncMock()
+    assert not await orch.reconcile_transfer_resume("vm_transfer_retry")
+    async with admin_factory() as session:
+        failed = await session.get(VMRow, "vm_transfer_retry")
+        assert (failed.metadata_ or {}).get("transfer_resume_pending")
+    assert await orch.reconcile_transfer_resumes() == 1
+    async with admin_factory() as session:
+        recovered = await session.get(VMRow, "vm_transfer_retry")
+        assert recovered.status == VMStatus.RUNNING
+        assert recovered.suspension_reason is None
+        assert not (recovered.metadata_ or {}).get("transfer_resume_pending")
+    orch.xcpng.start_vm.assert_awaited_once_with("transfer-guest")
 
 
 @pytest.mark.asyncio

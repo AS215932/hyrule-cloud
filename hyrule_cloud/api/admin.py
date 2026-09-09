@@ -67,6 +67,7 @@ router = APIRouter(
 
 _ADMIN_STEP_UP_ATTEMPT_LIMIT = 5
 _ADMIN_STEP_UP_ATTEMPT_WINDOW = timedelta(minutes=15)
+_TRANSFER_RESUME_KEY = "transfer_resume_pending"
 
 
 def _now() -> datetime:
@@ -1249,6 +1250,9 @@ async def _transfer_wallet_identity(session: AsyncSession, account_id: str) -> s
 
 async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
     """Clear an old owner's account suspension after a successful transfer."""
+    if state.orchestrator is not None and hasattr(state.orchestrator, "reconcile_transfer_resume"):
+        await state.orchestrator.reconcile_transfer_resume(vm_id)
+        return
     restart_provisioning = False
     async with _factory(state)() as session:
         snapshot = (
@@ -1451,6 +1455,17 @@ async def transfer_vm(
         vm.owner_account_id = body.target_account_id
         vm.owner_wallet = new_owner_wallet
         vm.anon_management_token_hash = None
+        if vm.suspension_reason == "account_disabled":
+            if str(vm.status) in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
+                vm.suspension_reason = None
+                vm.suspended_by_account_id = None
+            else:
+                metadata = dict(vm.metadata_ or {})
+                metadata[_TRANSFER_RESUME_KEY] = {
+                    "owner_account_id": body.target_account_id,
+                    "xcpng_uuid": vm.xcpng_uuid,
+                }
+                vm.metadata_ = metadata
         if domain is not None:
             domain.owner_account_id = body.target_account_id
             domain.owner_wallet = new_owner_wallet
@@ -1530,6 +1545,17 @@ async def transfer_domain(
             vm.owner_account_id = body.target_account_id
             vm.owner_wallet = new_owner_wallet
             vm.anon_management_token_hash = None
+            if vm.suspension_reason == "account_disabled":
+                if str(vm.status) in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
+                    vm.suspension_reason = None
+                    vm.suspended_by_account_id = None
+                else:
+                    metadata = dict(vm.metadata_ or {})
+                    metadata[_TRANSFER_RESUME_KEY] = {
+                        "owner_account_id": body.target_account_id,
+                        "xcpng_uuid": vm.xcpng_uuid,
+                    }
+                    vm.metadata_ = metadata
         _audit(
             session,
             request,

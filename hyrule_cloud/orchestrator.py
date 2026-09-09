@@ -97,6 +97,7 @@ log = structlog.get_logger()
 
 _VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable cross-worker PostgreSQL lock key
 _EXTENSION_RESUME_KEY = "extension_resume_pending"
+_TRANSFER_RESUME_KEY = "transfer_resume_pending"
 
 # RFC 6052 well-known NAT64 prefix. A DNS64 resolver synthesizes AAAA records
 # inside it for IPv4-only names, which is how an IPv6-only customer VM reaches
@@ -166,6 +167,9 @@ class Orchestrator:
         self._vm_capacity_reservation_lock = asyncio.Lock()
         self._provisioning_slots = asyncio.Semaphore(4)
         self._recovery_cursor = ""
+        self._recovery_cycle_max = ""
+        self._extension_resume_cursor = ""
+        self._transfer_resume_cursor = ""
 
     async def startup(self) -> None:
         # Fail fast on malformed customer-network settings: an operator typo
@@ -571,6 +575,23 @@ class Orchestrator:
         before UUID persistence; never replace a running guest's credential.
         """
         async with self.db() as session:
+            if not getattr(self, "_recovery_cycle_max", ""):
+                self._recovery_cycle_max = await session.scalar(
+                    select(func.max(VMRow.vm_id))
+                    .join(VMGuestResultRow)
+                    .outerjoin(
+                        CryptoIntentRow,
+                        and_(
+                            CryptoIntentRow.vm_id == VMRow.vm_id,
+                            CryptoIntentRow.resource_type == "vm",
+                            CryptoIntentRow.status == CryptoIntentStatus.PROVISIONING,
+                        ),
+                    )
+                    .where(
+                        VMRow.status == VMStatus.PROVISIONING,
+                        CryptoIntentRow.intent_id.is_(None),
+                    )
+                ) or ""
             vm_ids = list((await session.scalars(
                 select(VMRow.vm_id)
                 .join(VMGuestResultRow)
@@ -584,10 +605,18 @@ class Orchestrator:
                 )
                 .where(VMRow.status == VMStatus.PROVISIONING,
                        CryptoIntentRow.intent_id.is_(None),
-                       VMRow.vm_id > self._recovery_cursor)
+                       VMRow.vm_id > getattr(self, "_recovery_cursor", ""),
+                       VMRow.vm_id <= self._recovery_cycle_max)
                 .order_by(VMRow.vm_id).limit(4)
             )).all())
-        self._recovery_cursor = vm_ids[-1] if vm_ids else ""
+        if vm_ids and vm_ids[-1] != self._recovery_cycle_max:
+            self._recovery_cursor = vm_ids[-1]
+        else:
+            # A cycle has a fixed high-water mark. New arrivals cannot keep
+            # extending its tail and starving an older row skipped by another
+            # worker; the next sweep wraps to the beginning.
+            self._recovery_cursor = ""
+            self._recovery_cycle_max = ""
         for vm_id in vm_ids:
             await self._spawn_provisioning(vm_id)
         return len(vm_ids)
@@ -1325,7 +1354,16 @@ class Orchestrator:
                         # are both customer-controllable; a failed stop leaves
                         # the durable receipt in PROVISIONING for a later retry.
                         try:
-                            await self.xcpng.suspend_vm(row.xcpng_uuid)
+                            power = await self.xcpng.get_vm_power_state(row.xcpng_uuid)
+                            if power == "Running":
+                                await self.xcpng.suspend_vm(row.xcpng_uuid)
+                            elif power != "Halted":
+                                log.warning(
+                                    "failed_provision_guest_power_unknown",
+                                    vm_id=vm_id,
+                                    power=power,
+                                )
+                                return
                         except Exception:
                             log.warning(
                                 "failed_provision_guest_stop_failed",
@@ -2305,11 +2343,13 @@ class Orchestrator:
                     .where(
                         VMRow.status == VMStatus.SUSPENDED,
                         VMRow.metadata_[_EXTENSION_RESUME_KEY].as_string().is_not(None),
+                        VMRow.vm_id > getattr(self, "_extension_resume_cursor", ""),
                     )
                     .order_by(VMRow.vm_id)
                     .limit(100)
                 )
             )
+        self._extension_resume_cursor = candidates[-1] if len(candidates) == 100 else ""
         resumed = 0
         for vm_id in candidates:
             await self._reconcile_extension_resume(vm_id)
@@ -2317,6 +2357,108 @@ class Orchestrator:
             if current is not None and current.status == VMStatus.RUNNING:
                 resumed += 1
         return resumed
+
+    async def reconcile_transfer_resume(self, vm_id: str) -> bool:
+        """Finish one ownership-transfer resume handoff idempotently."""
+        restart_provisioning = False
+        async with self.db() as session:
+            snapshot = await session.scalar(
+                select(VMRow.owner_account_id).where(VMRow.vm_id == vm_id)
+            )
+            if snapshot is None:
+                return False
+            recipient = await session.scalar(
+                select(AccountRow)
+                .where(AccountRow.account_id == snapshot)
+                .with_for_update()
+            )
+            current = await session.scalar(
+                select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+            )
+            if current is None:
+                return False
+            metadata = dict(current.metadata_ or {})
+            pending = metadata.get(_TRANSFER_RESUME_KEY)
+            if not isinstance(pending, dict):
+                return False
+            if current.owner_account_id != pending.get("owner_account_id"):
+                metadata.pop(_TRANSFER_RESUME_KEY, None)
+                current.metadata_ = metadata or None
+                await session.commit()
+                return False
+            if recipient is None or recipient.disabled_at is not None:
+                await session.rollback()
+                return False
+            if current.deletion_started_at is not None:
+                metadata.pop(_TRANSFER_RESUME_KEY, None)
+                current.metadata_ = metadata or None
+                await session.commit()
+                return False
+            expiry = current.expires_at
+            if expiry is not None and expiry.replace(tzinfo=expiry.tzinfo or UTC) <= _now():
+                current.suspension_reason = "expired"
+                current.suspended_by_account_id = None
+                metadata.pop(_TRANSFER_RESUME_KEY, None)
+                current.metadata_ = metadata or None
+                await session.commit()
+                return True
+
+            status = str(current.status)
+            if status in {VMStatus.DESTROYED.value, VMStatus.FAILED.value}:
+                current.suspension_reason = None
+                current.suspended_by_account_id = None
+            elif status in {VMStatus.PROVISIONING.value, VMStatus.SUSPENDED.value} and current.xcpng_uuid:
+                try:
+                    power = await self.xcpng.get_vm_power_state(current.xcpng_uuid)
+                    if power == "Halted":
+                        await self.xcpng.start_vm(current.xcpng_uuid)
+                    elif power != "Running":
+                        await session.rollback()
+                        return False
+                except Exception:
+                    log.warning("vm_transfer_resume_failed", vm_id=vm_id, exc_info=True)
+                    await session.rollback()
+                    return False
+                if status == VMStatus.PROVISIONING.value:
+                    await self.renew_provisioning_report_deadline(session, current)
+                else:
+                    current.status = VMStatus.RUNNING
+                current.suspension_reason = None
+                current.suspended_by_account_id = None
+            elif status == VMStatus.SUSPENDED.value:
+                current.status = VMStatus.PROVISIONING
+                current.suspension_reason = None
+                current.suspended_by_account_id = None
+                current.error = None
+                await self.prepare_provisioning_dispatch(session, current)
+                restart_provisioning = True
+            else:
+                current.suspension_reason = None
+                current.suspended_by_account_id = None
+            metadata.pop(_TRANSFER_RESUME_KEY, None)
+            current.metadata_ = metadata or None
+            await session.commit()
+        if restart_provisioning:
+            await self.start_provisioning(vm_id)
+        return True
+
+    async def reconcile_transfer_resumes(self) -> int:
+        """Retry durable ownership-transfer resume handoffs."""
+        async with self.db() as session:
+            candidates = list(await session.scalars(
+                select(VMRow.vm_id)
+                .where(
+                    VMRow.metadata_[_TRANSFER_RESUME_KEY].as_string().is_not(None),
+                    VMRow.vm_id > getattr(self, "_transfer_resume_cursor", ""),
+                )
+                .order_by(VMRow.vm_id)
+                .limit(100)
+            ))
+        self._transfer_resume_cursor = candidates[-1] if len(candidates) == 100 else ""
+        completed = 0
+        for vm_id in candidates:
+            completed += int(await self.reconcile_transfer_resume(vm_id))
+        return completed
 
     async def reboot_vm(
         self, vm_id: str, *, management_identity: VMManagementIdentity | None = None,
@@ -2484,6 +2626,7 @@ class Orchestrator:
     async def check_expiries(self) -> None:
         """Suspend expired VMs, destroy those past grace period."""
         await self.reconcile_extension_resumes()
+        await self.reconcile_transfer_resumes()
         now = _now()
         grace = timedelta(hours=self.config.vm_grace_period_hours)
 
@@ -2525,7 +2668,9 @@ class Orchestrator:
                 select(VMRow).where(
                     or_(VMRow.status != VMStatus.DESTROYED,
                         and_(VMRow.xcpng_uuid.isnot(None),
-                             func.coalesce(VMRow.metadata_["provider_deleted_uuid"].as_string(), "") != VMRow.xcpng_uuid)),
+                             func.coalesce(VMRow.metadata_["provider_deleted_uuid"].as_string(), "") != VMRow.xcpng_uuid),
+                        and_(VMRow.status == VMStatus.DESTROYED,
+                             or_(VMRow.ipv6_prefix_index.isnot(None), VMRow.ipv6_prefix.isnot(None)))),
                     or_(
                         VMRow.deletion_started_at.isnot(None),
                         and_(VMRow.status != VMStatus.FAILED, VMRow.expires_at < now),
@@ -2548,6 +2693,7 @@ class Orchestrator:
                 if current is None:
                     continue
                 if (current.status == VMStatus.DESTROYED
+                        and current.ipv6_prefix_index is None and current.ipv6_prefix is None
                         and (current.xcpng_uuid is None
                              or (current.metadata_ or {}).get("provider_deleted_uuid") == current.xcpng_uuid)):
                     continue

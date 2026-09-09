@@ -106,6 +106,7 @@ def _real_orchestrator(session_factory, monkeypatch) -> Orchestrator:
     config.xcpng.templates = {"debian-13": TEMPLATE_UUID}
     orch = Orchestrator(config, session_factory)
     orch.xcpng.find_vm_ids_by_name_label = AsyncMock(return_value=[])
+    orch.xcpng.get_vm_power_state = AsyncMock(return_value="Running")
     async def create_with_guest_completion(**kwargs):
         config_data = yaml.safe_load(kwargs["cloud_init_config"])
         report = json.loads(next(
@@ -307,6 +308,9 @@ async def test_failed_provision_ends_in_provisioning_failed_with_safe_message(
 async def test_dns_failure_maps_to_the_dns_message(session_factory, monkeypatch) -> None:
     orch = _real_orchestrator(session_factory, monkeypatch)
     orch.xcpng.suspend_vm = AsyncMock()
+    # Models recovery after provider stop succeeded but the FAILED commit was
+    # lost: an already-halted guest must advance without replaying vm.stop.
+    orch.xcpng.get_vm_power_state = AsyncMock(return_value="Halted")
     orch.dns.create_aaaa = AsyncMock(
         side_effect=RuntimeError("DNS update failed: SERVFAIL from ns1.servify.network")
     )
@@ -321,7 +325,7 @@ async def test_dns_failure_maps_to_the_dns_message(session_factory, monkeypatch)
     assert events[-1].message == FAILURE_DNS
     assert "SERVFAIL" not in events[-1].message
     assert "ns1.servify.network" not in events[-1].message
-    orch.xcpng.suspend_vm.assert_awaited_once_with(XO_VM_UUID)
+    orch.xcpng.suspend_vm.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -148,6 +148,28 @@ async def test_failed_resume_preserves_committed_extension():
 
 
 @pytest.mark.asyncio
+async def test_extension_resume_batches_advance_past_failing_first_page():
+    orch, engine = await _stored_vm(VMStatus.SUSPENDED)
+    orch._extension_resume_cursor = ""
+    orch._reconcile_extension_resume = AsyncMock()
+    try:
+        async with orch.db.begin() as session:
+            for index in range(101):
+                session.add(VMRow(
+                    vm_id=f"vm_pending_{index:03d}", owner_wallet="test-owner",
+                    status=VMStatus.SUSPENDED,
+                    metadata_={"extension_resume_pending": {"xcpng_uuid": "guest"}},
+                ))
+        assert await orch.reconcile_extension_resumes() == 0
+        assert orch._reconcile_extension_resume.await_count == 100
+        assert await orch.reconcile_extension_resumes() == 0
+        assert orch._reconcile_extension_resume.await_count == 101
+        assert orch._reconcile_extension_resume.await_args_list[-1].args == ("vm_pending_100",)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_failed_suspend_is_not_recorded_as_suspended():
     orch, engine = await _stored_vm()
     async with orch.db() as session:
@@ -181,7 +203,7 @@ async def test_destroyed_vm_retries_quarantined_dns_cleanup_without_deleting_aga
             assert row.status == VMStatus.DESTROYED
             assert row.ipv6_prefix_index == 5
         orch.dns.delete_aaaa.side_effect = None
-        assert await orch.destroy_vm("vm_lifecycle")
+        await orch.check_expiries()
         orch.xcpng.destroy_vm.assert_awaited_once()
         async with orch.db() as session:
             row = await session.get(VMRow, "vm_lifecycle")
