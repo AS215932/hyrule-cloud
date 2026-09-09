@@ -961,6 +961,9 @@ async def test_native_intent_rejects_cross_account_quote(intent_state, client):
         quote_id="q_native_owned",
         owner_account_id="HOWNER00001",
     )
+    async with intent_state.orchestrator.db() as db:
+        db.add(AccountRow(account_id="HOTHER00001", password_hash="test-only"))
+        await db.commit()
     order_payload = dict(quote.order_payload)
     order_payload["quote_id"] = quote.quote_id
     app.dependency_overrides[current_account] = lambda: SimpleNamespace(
