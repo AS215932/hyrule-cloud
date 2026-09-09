@@ -50,7 +50,7 @@ from hyrule_cloud.db import (
     VMGuestResultRow,
     VMRow,
 )
-from hyrule_cloud.domains.models import DomainOperationStatus
+from hyrule_cloud.domains.models import DomainOperationStatus, DomainOrderStatus
 from hyrule_cloud.middleware.x402 import ADMIN_PAYMENT_MODE_HEADER, PaymentGate
 from hyrule_cloud.models import VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
@@ -680,6 +680,75 @@ async def test_each_refund_event_can_be_resolved_for_the_same_vm(admin_factory) 
         "refund-repeat-two",
     }
     assert {row.resource_id for row in resolutions} == {"vm_repeat_refund"}
+
+
+@pytest.mark.asyncio
+async def test_resolved_domain_refund_advances_customer_order(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory, elevated=True)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add(
+            DomainOrderRow(
+                order_id="do_refund_resolved",
+                quote_id="dq_refund_resolved",
+                fqdn="refund-resolved.example",
+                action="register",
+                owner_account_id="HAAAAAAAAAA",
+                idempotency_key="refund-resolved",
+                status=DomainOrderStatus.REFUND_DUE.value,
+                amount_usd=Decimal("10.00"),
+                domain_amount_usd=Decimal("10.00"),
+                vm_amount_usd=Decimal("0"),
+                payment_method="usdc",
+                terms_version="2026-01",
+                terms_accepted_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            PaymentEventRow(
+                event_id="domain-refund-resolved",
+                event_type="refund_owed",
+                resource_path="/v1/domains/orders/do_refund_resolved",
+                method="POST",
+                service_group="domain",
+                amount_usd=Decimal("10.00"),
+                extra={"order_id": "do_refund_resolved"},
+            )
+        )
+        await session.commit()
+
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    await resolve_refund(
+        "domain-refund-resolved",
+        RefundResolutionRequest(
+            status="resolved",
+            external_reference="operator-refund-reference",
+            reason="refund sent to original payer",
+        ),
+        _browser_request(
+            credentials,
+            path="/v1/admin/refunds/domain-refund-resolved/resolve",
+        ),
+        actor,
+        state,
+    )
+
+    async with admin_factory() as session:
+        order = await session.get(DomainOrderRow, "do_refund_resolved")
+        resolution = await session.scalar(
+            select(RefundResolutionRow).where(
+                RefundResolutionRow.payment_event_id == "domain-refund-resolved"
+            )
+        )
+    assert order is not None and order.status == DomainOrderStatus.REFUNDED.value
+    assert resolution is not None and resolution.status == "resolved"
 
 
 @pytest.mark.asyncio
@@ -1623,6 +1692,69 @@ async def test_admin_start_updates_vm_while_owner_fence_is_held(admin_factory) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "database_status", "provider_power"),
+    [
+        ("start", "suspended", "Running"),
+        ("shutdown", "running", "Halted"),
+        ("suspend", "running", "Halted"),
+    ],
+)
+async def test_admin_power_action_reconciles_completed_provider_dispatch(
+    admin_factory,
+    action,
+    database_status,
+    provider_power,
+) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    vm_uuid = f"uuid-admin-replay-{action}"
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add(
+            VMRow(
+                vm_id=f"vm_admin_replay_{action}",
+                owner_wallet="0xowner",
+                owner_account_id="HAAAAAAAAAA",
+                xcpng_uuid=vm_uuid,
+                status=database_status,
+                suspension_reason="manual_admin" if action == "start" else None,
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+        await session.commit()
+
+    xcpng = _AdminXCPNG()
+    xcpng.power[vm_uuid] = provider_power
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(xcpng=xcpng),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    await vm_action(
+        f"vm_admin_replay_{action}",
+        action,
+        ReasonRequest(reason="reconcile completed provider dispatch"),
+        _browser_request(
+            credentials,
+            path=f"/v1/admin/vms/vm_admin_replay_{action}/actions/{action}",
+        ),
+        actor,
+        state,
+    )
+
+    assert xcpng.started == []
+    assert xcpng.shut_down == []
+    assert xcpng.suspended == []
+    async with admin_factory() as session:
+        row = await session.get(VMRow, f"vm_admin_replay_{action}")
+    assert row is not None
+    assert str(row.status) == ("running" if action == "start" else "suspended")
+
+
+@pytest.mark.asyncio
 async def test_admin_reboot_preserves_running_vm_suspension_provenance(
     admin_factory,
 ) -> None:
@@ -1690,6 +1822,7 @@ async def test_admin_shutdown_persists_under_the_vm_action_fence(admin_factory) 
         await session.commit()
 
     xcpng = _AdminXCPNG()
+    xcpng.power["uuid-admin-shutdown"] = "Running"
     state = AppState(
         config=SimpleNamespace(),
         orchestrator=SimpleNamespace(xcpng=xcpng),
@@ -2862,6 +2995,7 @@ async def test_power_off_keeps_failed_guest_terminal_across_account_enable(admin
         session.add(AdminOperationRow(operation_id='enable-failed', kind='resume_account_resources',
                                       account_id='HBBBBBBBBBB', status='running'))
     provider = _AdminXCPNG()
+    provider.power["failed-guest"] = "Running"
     orch = SimpleNamespace(xcpng=provider)
     state = AppState(config=HyruleConfig(), orchestrator=orch, payment_gate=None,
                      network_provider=None, session_factory=admin_factory)

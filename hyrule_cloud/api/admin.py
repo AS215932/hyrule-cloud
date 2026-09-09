@@ -1175,18 +1175,36 @@ async def vm_action(
                 reason=body.reason,
             )
             if action == "start":
-                await orch.xcpng.start_vm(current.xcpng_uuid)
+                power = await orch.xcpng.get_vm_power_state(current.xcpng_uuid)
+                if power == "Halted":
+                    await orch.xcpng.start_vm(current.xcpng_uuid)
+                elif power != "Running":
+                    raise RuntimeError(
+                        f"unexpected VM power state during admin start: {power}"
+                    )
                 current.status = VMStatus.RUNNING
                 current.suspension_reason = None
                 current.suspended_by_account_id = None
             elif action == "reboot":
                 await orch.xcpng.reboot_vm(current.xcpng_uuid)
             elif action == "shutdown":
-                await orch.xcpng.shutdown_vm(current.xcpng_uuid)
+                power = await orch.xcpng.get_vm_power_state(current.xcpng_uuid)
+                if power == "Running":
+                    await orch.xcpng.shutdown_vm(current.xcpng_uuid)
+                elif power != "Halted":
+                    raise RuntimeError(
+                        f"unexpected VM power state during admin shutdown: {power}"
+                    )
                 if current.status not in {VMStatus.FAILED, VMStatus.PROVISIONING}:
                     current.status = VMStatus.SUSPENDED
             else:
-                await orch.xcpng.suspend_vm(current.xcpng_uuid)
+                power = await orch.xcpng.get_vm_power_state(current.xcpng_uuid)
+                if power == "Running":
+                    await orch.xcpng.suspend_vm(current.xcpng_uuid)
+                elif power != "Halted":
+                    raise RuntimeError(
+                        f"unexpected VM power state during admin suspension: {power}"
+                    )
                 if current.status not in {VMStatus.FAILED, VMStatus.PROVISIONING}:
                     current.status = VMStatus.SUSPENDED
             if (
@@ -1842,15 +1860,38 @@ async def resolve_refund(
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
         await _validate_admin_dispatch(session, actor.account_id)
+        snapshot = await session.get(PaymentEventRow, event_id)
+        if snapshot is None or snapshot.event_type != "refund_owed":
+            raise HTTPException(404, "Refund obligation not found")
+        snapshot_extra = snapshot.extra if isinstance(snapshot.extra, dict) else {}
+        linked_order_id = _bounded_text(snapshot_extra.get("order_id"), max_length=32)
+        linked_order = None
+        if body.status == "resolved" and linked_order_id is not None:
+            # Domain refund creation holds the order before appending its
+            # payment event. Preserve that lock order here while advancing
+            # customer-visible order state in the same resolution transaction.
+            linked_order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == linked_order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if linked_order is None:
+                raise HTTPException(409, "Linked domain order no longer exists")
         event = (
             await session.execute(
                 select(PaymentEventRow)
                 .where(PaymentEventRow.event_id == event_id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if event is None or event.event_type != "refund_owed":
             raise HTTPException(404, "Refund obligation not found")
+        event_extra = event.extra if isinstance(event.extra, dict) else {}
+        if _bounded_text(event_extra.get("order_id"), max_length=32) != linked_order_id:
+            raise HTTPException(409, "Refund obligation changed; retry the resolution")
         existing = await session.scalar(
             select(RefundResolutionRow.resolution_id).where(
                 RefundResolutionRow.payment_event_id == event_id
@@ -1880,6 +1921,8 @@ async def resolve_refund(
             actor_account_id=actor.account_id,
         )
         session.add(resolution)
+        if linked_order is not None:
+            linked_order.status = DomainOrderStatus.REFUNDED.value
         _audit(
             session,
             request,
