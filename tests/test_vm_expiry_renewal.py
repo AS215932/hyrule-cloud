@@ -242,6 +242,10 @@ async def test_extension_reconciles_lost_commit_acknowledgment(committed):
     from hyrule_cloud.db import PaymentEventRow
 
     orch, engine = await _stored_vm()
+    # This regression isolates the extension receipt commit. Provider power is
+    # coherent with the stored RUNNING state; stale Halted-state reconciliation
+    # has its own route-level coverage.
+    orch.xcpng.get_vm_power_state.return_value = "Running"
     try:
         async with orch.locked_vm("vm_lifecycle") as (session, row):
             old_expiry = row.expires_at

@@ -2220,6 +2220,35 @@ class Orchestrator:
                     and row.status not in (VMStatus.DESTROYED, VMStatus.FAILED, VMStatus.PROVISIONING)
                     and row.suspension_reason not in ("account_disabled", "manual_admin"))
 
+    async def reconcile_extension_power(self, row: VMRow | None) -> bool:
+        """Reconcile an expiry stop whose following database commit was lost."""
+        if row is None or row.expires_at is None:
+            return True
+        expiry = row.expires_at
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        if (
+            expiry >= _now()
+            or row.xcpng_uuid is None
+            or row.status == VMStatus.SUSPENDED
+        ):
+            return True
+        try:
+            power = await self.xcpng.get_vm_power_state(row.xcpng_uuid)
+        except Exception:
+            log.warning("vm_extension_power_check_failed", vm_id=row.vm_id, exc_info=True)
+            return False
+        if power == "Running":
+            return True
+        if power != "Halted":
+            log.warning("vm_extension_power_unknown", vm_id=row.vm_id, power=power)
+            return False
+        row.status = VMStatus.SUSPENDED
+        if row.suspension_reason not in {"account_disabled", "manual_admin"}:
+            row.suspension_reason = "expired"
+            row.suspended_by_account_id = None
+        return True
+
     async def extend_vm(
         self, vm_id: str, days: int, *, session: AsyncSession | None = None,
         payment_tx: str | None = None, payer_wallet: str | None = None,
@@ -2231,6 +2260,8 @@ class Orchestrator:
                 return await self.extend_vm(vm_id, days, session=locked_session,
                                             payment_tx=payment_tx, payer_wallet=payer_wallet)
         row = await session.get(VMRow, vm_id)
+        if not await self.reconcile_extension_power(row):
+            return None
         if not self.vm_can_extend(row) or not await self.vm_owner_enabled(session, row):
             return None
         assert row is not None and row.expires_at is not None
