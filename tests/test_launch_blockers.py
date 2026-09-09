@@ -100,6 +100,7 @@ class _Orch:
     locked_vm = Orchestrator.locked_vm
     vm_can_extend = staticmethod(Orchestrator.vm_can_extend)
     vm_owner_enabled = staticmethod(Orchestrator.vm_owner_enabled)
+    reconcile_extension_power = Orchestrator.reconcile_extension_power
 
     def __init__(self, factory):
         self.db = factory
