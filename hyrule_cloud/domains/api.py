@@ -424,18 +424,18 @@ async def create_order(
         response.status_code = 201 if created else 200
         return await service.order_response(order)
     if order.status == "awaiting_payment":
-        await service.assert_x402_payable(order.order_id)
-        paid = await gate.check_payment(
-            request,
-            amount=order.amount_usd,
-            description=f"Hyrule domain order for {order.fqdn}",
-            extra_body={
-                "order_id": order.order_id,
-                "domain": order.fqdn,
-                "amount_usd": f"{order.amount_usd:.2f}",
-                "quote_id": order.quote_id,
-            },
-        )
+        async with service.x402_payment_guard(order.order_id, account.account_id) as order:
+            paid = await gate.check_payment(
+                request,
+                amount=order.amount_usd,
+                description=f"Hyrule domain order for {order.fqdn}",
+                extra_body={
+                    "order_id": order.order_id,
+                    "domain": order.fqdn,
+                    "amount_usd": f"{order.amount_usd:.2f}",
+                    "quote_id": order.quote_id,
+                },
+            )
         if isinstance(paid, Response):
             return paid
         handoff_error: Exception | None = None

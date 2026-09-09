@@ -478,6 +478,80 @@ async def test_guest_completion_controls_public_status_and_launch_proof(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("power", ["Halted", "Running", "Unknown", "error"])
+async def test_successful_guest_finalization_reconciles_admin_suspension(
+    tmp_path, monkeypatch, power,
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'admin-finalize.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    config = HyruleConfig()
+    config.xcpng.templates = {"debian-13": "test-template"}
+    orch = Orchestrator(config, factory)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    orch.xcpng.find_vm_ids_by_name_label = AsyncMock(return_value=[])
+    orch.xcpng.create_vm = AsyncMock(return_value="admin-suspended-guest")
+    orch.xcpng.suspend_vm = AsyncMock()
+    if power == "error":
+        orch.xcpng.get_vm_power_state = AsyncMock(
+            side_effect=RuntimeError("provider unavailable")
+        )
+    else:
+        orch.xcpng.get_vm_power_state = AsyncMock(return_value=power)
+    orch.dns.create_aaaa = AsyncMock()
+    orch.dns.verify_aaaa = AsyncMock(return_value=True)
+    orch._wait_for_ipv6 = AsyncMock(return_value="2a0c:b641:b51:5::2")
+    orch._probe_ssh = AsyncMock(return_value=True)
+    orch._probe_customer_dns_resolution = AsyncMock(
+        return_value=DNSResolutionStatus.PASSED
+    )
+    orch._record_vm_refund = AsyncMock()
+
+    async def complete_after_admin_suspend(vm_id, generation):
+        async with factory.begin() as session:
+            row = await session.get(VMRow, vm_id)
+            receipt = await session.get(VMGuestResultRow, vm_id)
+            row.suspension_reason = "account_disabled"
+            receipt.outcome = "succeeded"
+            receipt.stage = "cloud_init"
+            receipt.exit_code = 0
+        return generation
+
+    orch._wait_for_guest_result = AsyncMock(side_effect=complete_after_admin_suspend)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            session.add(
+                VMRow(
+                    vm_id="vm_admin_finalize",
+                    owner_wallet="test",
+                    hostname="admin-finalize.deploy.hyrule.host",
+                    ipv6_prefix="2a0c:b641:b51:5::/64",
+                    ipv6_prefix_index=5,
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                )
+            )
+        await orch._provision_vm("vm_admin_finalize")
+        async with factory() as session:
+            row = await session.get(VMRow, "vm_admin_finalize")
+            assert row.status == (
+                VMStatus.SUSPENDED
+                if power in {"Halted", "Running"}
+                else VMStatus.PROVISIONING
+            )
+        if power == "Running":
+            orch.xcpng.suspend_vm.assert_awaited_once_with("admin-suspended-guest")
+        else:
+            orch.xcpng.suspend_vm.assert_not_awaited()
+        orch._record_vm_refund.assert_not_awaited()
+    finally:
+        await orch.shutdown()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stop_fails", [False, True])
 async def test_guest_report_timeout_stops_guest_before_refund(
     tmp_path, monkeypatch, stop_fails,

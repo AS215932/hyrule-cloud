@@ -22,6 +22,8 @@ from hyrule_cloud.api.admin import (
     _assert_transfer_target,
     _lock_domain_transfer_bundle,
     _resume_transferred_vm,
+    disable_account,
+    enable_account,
     resolve_refund,
     retry_job,
     step_up,
@@ -2577,6 +2579,75 @@ async def test_admin_resource_operations_wait_for_same_account_operation(
     async with admin_factory() as session:
         queued = await session.get(AdminOperationRow, "operation-queued")
         assert queued is not None and queued.status == "queued"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ["disable", "enable"])
+async def test_account_transition_supersedes_only_failed_inverse_operation(
+    admin_factory, transition,
+) -> None:
+    credentials = await _admin_credentials(admin_factory, elevated=True)
+    async with admin_factory.begin() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        target = AccountRow(
+            account_id="HBBBBBBBBBB",
+            password_hash="fixture",
+            disabled_at=(datetime.now(UTC) if transition == "enable" else None),
+        )
+        session.add(target)
+        inverse_kind = (
+            "resume_account_resources"
+            if transition == "disable"
+            else "suspend_account_resources"
+        )
+        same_kind = (
+            "suspend_account_resources"
+            if transition == "disable"
+            else "resume_account_resources"
+        )
+        session.add_all(
+            [
+                AdminOperationRow(
+                    operation_id="failed-inverse",
+                    kind=inverse_kind,
+                    account_id=target.account_id,
+                    status="failed",
+                    error="provider unavailable",
+                ),
+                AdminOperationRow(
+                    operation_id="failed-same-direction",
+                    kind=same_kind,
+                    account_id=target.account_id,
+                    status="failed",
+                    error="retry me",
+                ),
+            ]
+        )
+    state = AppState(
+        config=HyruleConfig(),
+        orchestrator=SimpleNamespace(xcpng=_AdminXCPNG()),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    operation = disable_account if transition == "disable" else enable_account
+    result = await operation(
+        "HBBBBBBBBBB",
+        ReasonRequest(reason=f"fixture {transition}"),
+        _browser_request(credentials, path=f"/v1/admin/accounts/HBBBBBBBBBB/{transition}"),
+        actor,
+        state,
+    )
+    async with admin_factory() as session:
+        inverse = await session.get(AdminOperationRow, "failed-inverse")
+        same = await session.get(AdminOperationRow, "failed-same-direction")
+        replacement = await session.get(AdminOperationRow, result["operation_id"])
+        assert inverse.status == "completed" and inverse.completed_at is not None
+        assert inverse.error == "provider unavailable"
+        assert inverse.progress["superseded"]["by_operation_id"] == replacement.operation_id
+        assert inverse.progress["superseded"]["by_kind"] == replacement.kind
+        assert same.status == "failed" and same.completed_at is None
+        assert replacement.status == "queued"
 
 
 @pytest.mark.asyncio

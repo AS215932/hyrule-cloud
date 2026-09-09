@@ -1267,7 +1267,16 @@ class Orchestrator:
                     # Serialize with account re-enablement while the row lock is
                     # held: a disabled account must never observe a newly built
                     # provider VM transition through READY.
-                    await self.xcpng.suspend_vm(xcpng_uuid)
+                    try:
+                        power = await self.xcpng.get_vm_power_state(xcpng_uuid)
+                        if power == "Running":
+                            await self.xcpng.suspend_vm(xcpng_uuid)
+                        elif power != "Halted":
+                            raise GuestRecoveryPendingError()
+                    except GuestRecoveryPendingError:
+                        raise
+                    except Exception as exc:
+                        raise GuestRecoveryPendingError() from exc
                 row.ipv6 = ipv6
                 row.status = VMStatus.SUSPENDED if admin_suspended else VMStatus.READY
                 # Block B (Wave 2): timestamp the READY transition so
@@ -1294,7 +1303,15 @@ class Orchestrator:
 
                 hostname = row.hostname
 
-                await session.commit()
+                try:
+                    await session.commit()
+                except Exception as exc:
+                    if admin_suspended:
+                        # A successful provider stop followed by a lost commit
+                        # acknowledgement is retryable. Never turn that
+                        # ambiguity into a terminal failure/refund.
+                        raise GuestRecoveryPendingError() from exc
+                    raise
 
             await self._emit(
                 vm_id,

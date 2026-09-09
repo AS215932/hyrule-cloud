@@ -824,6 +824,38 @@ async def _locked_account(session: AsyncSession, account_id: str) -> AccountRow 
     ).scalar_one_or_none()
 
 
+async def _supersede_failed_inverse_operations(
+    session: AsyncSession,
+    *,
+    account_id: str,
+    inverse_kind: str,
+    replacement: AdminOperationRow,
+) -> None:
+    failed = list(
+        await session.scalars(
+            select(AdminOperationRow)
+            .where(
+                AdminOperationRow.account_id == account_id,
+                AdminOperationRow.kind == inverse_kind,
+                AdminOperationRow.status == "failed",
+            )
+            .with_for_update()
+        )
+    )
+    for operation in failed:
+        progress = dict(operation.progress or {})
+        progress["superseded"] = {
+            "by_operation_id": replacement.operation_id,
+            "by_kind": replacement.kind,
+            "actor_account_id": replacement.actor_account_id,
+            "at": replacement.created_at.isoformat(),
+            "reason": replacement.reason,
+        }
+        operation.progress = progress
+        operation.status = "completed"
+        operation.completed_at = replacement.created_at
+
+
 
 
 @asynccontextmanager
@@ -907,6 +939,12 @@ async def disable_account(
             reason=body.reason,
             created_at=now,
         )
+        await _supersede_failed_inverse_operations(
+            session,
+            account_id=account_id,
+            inverse_kind="resume_account_resources",
+            replacement=operation,
+        )
         session.add(operation)
         _audit(
             session,
@@ -945,6 +983,12 @@ async def enable_account(
             actor_account_id=actor.account_id,
             reason=body.reason,
             created_at=now,
+        )
+        await _supersede_failed_inverse_operations(
+            session,
+            account_id=account_id,
+            inverse_kind="suspend_account_resources",
+            replacement=operation,
         )
         session.add(operation)
         _audit(

@@ -60,6 +60,51 @@ async def test_management_action_rechecks_authorized_resource_identity(action, c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("power", ["Halted", "Unknown", "error"])
+async def test_expired_extension_reconciles_provider_power_before_payment(power):
+    orch, engine = await _stored_vm()
+    gate = SimpleNamespace(check_payment=AsyncMock(return_value="test-owner"))
+    authorized = await orch.get_vm("vm_lifecycle")
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/fixture", "headers": []}
+    )
+    if power == "error":
+        orch.xcpng.get_vm_power_state.side_effect = RuntimeError("provider unavailable")
+    else:
+        orch.xcpng.get_vm_power_state.return_value = power
+    try:
+        if power == "Halted":
+            result = await extend_vm(
+                "vm_lifecycle",
+                VMExtendRequest(days=3),
+                request,
+                authorized,
+                orch,
+                HyruleConfig(),
+                gate,
+            )
+            assert result["status"] == "running"
+            gate.check_payment.assert_awaited_once()
+            orch.xcpng.start_vm.assert_awaited_once_with("test-guest")
+        else:
+            with pytest.raises(HTTPException) as refused:
+                await extend_vm(
+                    "vm_lifecycle",
+                    VMExtendRequest(days=3),
+                    request,
+                    authorized,
+                    orch,
+                    HyruleConfig(),
+                    gate,
+                )
+            assert refused.value.status_code == 503
+            gate.check_payment.assert_not_awaited()
+            orch.xcpng.start_vm.assert_not_awaited()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('action', ['delete', 'reboot'])
 async def test_customer_action_rechecks_disabled_owner_when_token_was_already_absent(action):
     from datetime import UTC, datetime

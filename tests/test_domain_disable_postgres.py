@@ -3,6 +3,8 @@ import asyncio
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -17,7 +19,14 @@ from starlette.requests import Request
 from hyrule_cloud.api.admin import ReasonRequest, disable_account
 from hyrule_cloud.api.auth import ClaimByTokenRequest, claim_vm
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import AccountRow, DomainOperationRow, DomainRow, VMRow
+from hyrule_cloud.db import (
+    AccountRow,
+    DomainOperationRow,
+    DomainOrderRow,
+    DomainQuoteRow,
+    DomainRow,
+    VMRow,
+)
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.domains.models import (
     DNSChange,
@@ -32,6 +41,148 @@ from hyrule_cloud.domains.models import (
 )
 from hyrule_cloud.domains.service import DomainService
 from hyrule_cloud.middleware.anon_token import hash_anon_token
+
+
+@pytest.mark.asyncio
+async def test_domain_payment_guard_holds_account_fence_through_settlement():
+    url = os.getenv("HCP_DOMAIN_DISABLE_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("requires fresh local domain_disable_test PostgreSQL")
+    parsed = make_url(url)
+    assert parsed.drivername == "postgresql+asyncpg" and parsed.database == "domain_disable_test"
+    assert parsed.host in (None, "localhost", "127.0.0.1", "::1")
+    names = ("domain-payment-fixture", "domain-disable-fixture", "domain-observer-fixture")
+    engines = [
+        create_async_engine(
+            url, connect_args={"server_settings": {"application_name": name}}
+        )
+        for name in names
+    ]
+    sessions = async_sessionmaker(engines[2], expire_on_commit=False)
+    entered, release = asyncio.Event(), asyncio.Event()
+    tasks: list[asyncio.Task] = []
+    request = Request({"type": "http", "method": "POST", "path": "/fixture", "headers": []})
+    actor = AccountRow(account_id="HADMIN00001", password_hash="fixture", is_admin=True)
+    owner_id = "HOWNERPAY01"
+
+    async def wait_until_disable_is_blocked() -> None:
+        async with asyncio.timeout(5):
+            while True:
+                async with engines[2].connect() as connection:
+                    waiting = await connection.scalar(
+                        text(
+                            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity "
+                            "WHERE application_name='domain-disable-fixture' "
+                            "AND cardinality(pg_blocking_pids(pid)) > 0)"
+                        )
+                    )
+                if waiting:
+                    return
+                await asyncio.sleep(0.02)
+
+    try:
+        async with engines[2].connect() as connection:
+            assert (
+                await connection.scalar(
+                    text(
+                        "SELECT count(*) FROM information_schema.tables "
+                        "WHERE table_schema='public'"
+                    )
+                )
+                == 0
+            )
+        migrated = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=Path(__file__).resolve().parents[1],
+            env=dict(os.environ, HYRULE_DATABASE_URL=url),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert migrated.returncode == 0, migrated.stderr
+        async with sessions.begin() as session:
+            session.add_all(
+                [actor, AccountRow(account_id=owner_id, password_hash="fixture")]
+            )
+            await session.flush()
+            session.add(
+                DomainQuoteRow(
+                    quote_id="quote-payment-fence",
+                    fqdn="payment-fence.dev",
+                    action="register",
+                    owner_account_id=owner_id,
+                    status="reserved",
+                    provider_cost=Decimal("10"),
+                    provider_currency="USD",
+                    fx_rate=Decimal("1"),
+                    provider_cost_usd=Decimal("10"),
+                    hyrule_fee_usd=Decimal("3"),
+                    tax_usd=Decimal("0"),
+                    total_usd=Decimal("13"),
+                    available=True,
+                    premium=False,
+                    terms_version="fixture",
+                    expires_at=datetime.now(UTC) + timedelta(minutes=10),
+                )
+            )
+            await session.flush()
+            session.add(
+                DomainOrderRow(
+                    order_id="order-payment-fence",
+                    quote_id="quote-payment-fence",
+                    fqdn="payment-fence.dev",
+                    action="register",
+                    owner_account_id=owner_id,
+                    idempotency_key="payment-fence",
+                    status="awaiting_payment",
+                    amount_usd=Decimal("13"),
+                    domain_amount_usd=Decimal("13"),
+                    vm_amount_usd=Decimal("0"),
+                    payment_method="usdc",
+                    terms_version="fixture",
+                    terms_accepted_at=datetime.now(UTC),
+                )
+            )
+        service = object.__new__(DomainService)
+        service.db = async_sessionmaker(engines[0], expire_on_commit=False)
+
+        async def settle() -> None:
+            async with service.x402_payment_guard(
+                "order-payment-fence", owner_id
+            ):
+                entered.set()
+                await release.wait()
+
+        settlement = asyncio.create_task(settle())
+        tasks.append(settlement)
+        await asyncio.wait_for(entered.wait(), 5)
+        disable = asyncio.create_task(
+            disable_account(
+                owner_id,
+                ReasonRequest(reason="fixture disable"),
+                request,
+                actor,
+                SimpleNamespace(
+                    session_factory=async_sessionmaker(engines[1], expire_on_commit=False)
+                ),
+            )
+        )
+        tasks.append(disable)
+        await wait_until_disable_is_blocked()
+        assert not disable.done()
+        release.set()
+        await asyncio.wait_for(settlement, 5)
+        await asyncio.wait_for(disable, 5)
+        async with sessions() as session:
+            assert (await session.get(AccountRow, owner_id)).disabled_at is not None
+    finally:
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for engine in engines:
+            await engine.dispose()
 
 
 @pytest.mark.asyncio

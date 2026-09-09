@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from decimal import Decimal
 from ipaddress import IPv6Network
 from typing import Any
@@ -1477,6 +1478,34 @@ async def extend_vm(
     async with lifecycle_lock as (session, row):
         if row is None or not management_identity.matches(row):
             raise HTTPException(404, "VM not found")
+        expiry = row.expires_at
+        if expiry is not None and expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        if (
+            expiry is not None
+            and expiry < datetime.now(UTC)
+            and row.xcpng_uuid is not None
+            and row.status != VMStatus.SUSPENDED
+        ):
+            # The expiry worker can halt the guest and lose its database commit.
+            # Reconcile that side effect before collecting another payment so a
+            # paid extension records the durable resume handoff below.
+            try:
+                power = await orch.xcpng.get_vm_power_state(row.xcpng_uuid)
+            except Exception as exc:
+                raise HTTPException(
+                    503, "The VM power state could not be verified; no payment was taken"
+                ) from exc
+            if power == "Halted":
+                row.status = VMStatus.SUSPENDED
+                if row.suspension_reason not in {"account_disabled", "manual_admin"}:
+                    row.suspension_reason = "expired"
+                    row.suspended_by_account_id = None
+                await session.flush()
+            elif power != "Running":
+                raise HTTPException(
+                    503, "The VM power state could not be verified; no payment was taken"
+                )
         if not orch.vm_can_extend(row) or not await orch.vm_owner_enabled(session, row):
             raise HTTPException(409, "This VM can no longer be extended")
         total = current_daily_price_for_vm(row, cfg.payment) * body.days

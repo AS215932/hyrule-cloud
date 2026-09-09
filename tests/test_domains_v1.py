@@ -41,6 +41,9 @@ from hyrule_cloud.domains.api import (
     register_domain_x402,
 )
 from hyrule_cloud.domains.api import (
+    create_order as create_order_route,
+)
+from hyrule_cloud.domains.api import (
     get_operation as get_operation_route,
 )
 from hyrule_cloud.domains.catalog import parse_iana_root_db
@@ -1201,6 +1204,39 @@ async def test_native_domain_settlement_refunds_disabled_owner(domain_service):
     assert Decimal(refunds[0].extra["amount_received_crypto"]) == Decimal(
         "0.000271828182"
     )
+
+
+@pytest.mark.asyncio
+async def test_domain_order_rechecks_disabled_owner_before_payment(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote(
+        "disabled-before-charge.dev", DomainAction.REGISTER, "H1234567890"
+    )
+    async with sessions() as session:
+        stale_account = await session.get(AccountRow, "H1234567890")
+    async with sessions.begin() as session:
+        current = await session.get(AccountRow, "H1234567890")
+        current.disabled_at = datetime.now(UTC)
+    gate = SimpleNamespace(check_payment=AsyncMock(return_value="0x" + "1" * 40))
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/v1/domains/orders", "headers": []}
+    )
+    with pytest.raises(DomainProblem) as denied:
+        await create_order_route(
+            DomainOrderRequest(
+                quote_id=quote.quote_id,
+                payment_method=DomainPaymentMethod.USDC,
+                terms_version=service.domain_config.terms_version,
+            ),
+            request,
+            Response(),
+            "disabled-before-charge",
+            stale_account,
+            service,
+            gate,
+        )
+    assert denied.value.code == "account_disabled"
+    gate.check_payment.assert_not_awaited()
 
 
 @pytest.mark.asyncio
