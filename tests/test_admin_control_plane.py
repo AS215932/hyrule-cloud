@@ -2885,6 +2885,7 @@ async def test_account_disable_stops_provider_backed_provisioning_guest(admin_fa
         session.add(AdminOperationRow(operation_id='disable-initializing', kind='suspend_account_resources',
                                       account_id='HBBBBBBBBBB', status='running'))
     provider = _AdminXCPNG()
+    provider.power["initializing-guest"] = "Running"
     await _apply_account_operation(admin_factory, SimpleNamespace(xcpng=provider), 'disable-initializing')
     assert provider.suspended == ['initializing-guest']
     async with admin_factory() as session:
