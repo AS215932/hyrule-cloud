@@ -334,12 +334,15 @@ async def register_domain_x402(
         response.status_code = 200
         return await service.registration_response(intent.registration_id)
 
-    await service.assert_x402_payable(order.order_id)
     settlement_extra = {
         **challenge,
         "order_id": order.order_id,
     }
-    settled = await gate.settle_verified(request, verified, settlement_extra)
+    # Account disable uses the same lifecycle fence. Keep the owner and order
+    # locked through the external settlement so a stale authenticated request
+    # cannot charge after disable has committed.
+    async with service.x402_payment_guard(order.order_id, owner.account_id):
+        settled = await gate.settle_verified(request, verified, settlement_extra)
     if not settled:
         ambiguous = bool(
             getattr(request.state, "payment_settlement_ambiguous", False)

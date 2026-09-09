@@ -317,6 +317,23 @@ async def step_up(
         raise HTTPException(401, "Browser session required")
     now = _now()
     async with _factory(state)() as session:
+        # Password changes take the account lock before touching sessions.
+        # Use the same order and refresh the credential so an in-flight
+        # step-up cannot elevate with a password that has just been rotated.
+        current_account = (
+            await session.execute(
+                select(AccountRow)
+                .where(AccountRow.account_id == account.account_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if (
+            current_account is None
+            or not current_account.is_admin
+            or current_account.disabled_at is not None
+        ):
+            raise HTTPException(403, "Administrator access was revoked")
         row = (
             await session.execute(
                 select(SessionRow)
@@ -339,11 +356,11 @@ async def step_up(
         # Hold the session row lock across Argon verification so concurrent
         # requests cannot each slip through the same pre-verification limit.
         row.admin_step_up_attempts += 1
-        if not verify_password(account.password_hash, body.password):
+        if not verify_password(current_account.password_hash, body.password):
             _audit(
                 session,
                 request,
-                account,
+                current_account,
                 "admin.step_up_failed",
                 target_type="session",
                 succeeded=False,
@@ -354,7 +371,7 @@ async def step_up(
         row.admin_step_up_attempts = 0
         row.admin_step_up_window_started_at = None
         row.admin_elevated_at = now
-        _audit(session, request, account, "admin.step_up", target_type="session")
+        _audit(session, request, current_account, "admin.step_up", target_type="session")
         await session.commit()
     request.state.admin_elevated_at = now
     return {

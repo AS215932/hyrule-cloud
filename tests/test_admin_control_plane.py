@@ -834,6 +834,61 @@ async def test_admin_step_up_rate_limits_argon_checks_per_session(
 
 
 @pytest.mark.asyncio
+async def test_admin_step_up_rechecks_password_under_account_lock(
+    admin_factory,
+    monkeypatch,
+) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        stale_actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert stale_actor is not None
+        session_row = (
+            await session.execute(
+                select(SessionRow).where(SessionRow.account_id == "HAAAAAAAAAA")
+            )
+        ).scalar_one()
+        token_hash = session_row.token_hash
+        stale_password_hash = stale_actor.password_hash
+    assert stale_password_hash is not None
+
+    rotated_password_hash = "rotated-password-hash"
+    async with admin_factory() as session:
+        current_actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert current_actor is not None
+        current_actor.password_hash = rotated_password_hash
+        await session.commit()
+
+    verified_hashes: list[str | None] = []
+
+    def verify_stale_only(password_hash: str | None, _password: str) -> bool:
+        verified_hashes.append(password_hash)
+        return password_hash == stale_password_hash
+
+    monkeypatch.setattr("hyrule_cloud.api.admin.verify_password", verify_stale_only)
+    state = AppState(
+        config=SimpleNamespace(admin_step_up_seconds=600),
+        orchestrator=SimpleNamespace(),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    request = _browser_request(credentials, path="/v1/admin/step-up")
+    request.state.session_token_hash = token_hash
+
+    with pytest.raises(HTTPException) as refused:
+        await step_up(
+            StepUpRequest(password="old password"), request, stale_actor, state
+        )
+
+    assert refused.value.status_code == 401
+    assert verified_hashes == [rotated_password_hash]
+    async with admin_factory() as session:
+        stored_session = await session.get(SessionRow, token_hash)
+        assert stored_session is not None
+        assert stored_session.admin_elevated_at is None
+
+
+@pytest.mark.asyncio
 async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
     xcpng = _AdminXCPNG()

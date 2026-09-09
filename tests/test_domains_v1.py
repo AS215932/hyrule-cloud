@@ -686,11 +686,27 @@ async def test_verified_payer_does_not_auto_link_a_disabled_browser_account(doma
 async def test_public_registration_route_settles_once_and_issues_management_session(
     domain_service,
 ):
+    from contextlib import asynccontextmanager
+
     service, _provider, sessions = domain_service
     service.domain_config.marketplace_sales_enabled = True
     service.domain_config.tld_allowlist = ["dev"]
     wallet_auth = WalletAuthService(service.config, sessions)
     _REGISTRATION_PREFLIGHTS.clear()
+    payment_guard_held = False
+    real_payment_guard = service.x402_payment_guard
+
+    @asynccontextmanager
+    async def tracked_payment_guard(order_id: str, owner_account_id: str):
+        nonlocal payment_guard_held
+        async with real_payment_guard(order_id, owner_account_id) as order:
+            payment_guard_held = True
+            try:
+                yield order
+            finally:
+                payment_guard_held = False
+
+    service.x402_payment_guard = tracked_payment_guard
 
     class Gate:
         def __init__(self) -> None:
@@ -711,6 +727,7 @@ async def test_public_registration_route_settles_once_and_issues_management_sess
             return "a" * 64
 
         async def settle_verified(self, request, _verified, extra):
+            assert payment_guard_held
             self.settlements += 1
             request.state.payment_tx = "0xroute"
             request.state.payment_network = "eip155:8453"
