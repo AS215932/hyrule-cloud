@@ -249,6 +249,13 @@ async def _apply_locked_account_operation(
                         await orchestrator.xcpng.suspend_vm(current.xcpng_uuid)
                     elif power != "Halted":
                         raise RuntimeError(f"unexpected VM power state during suspension: {power}")
+                # Preserve independent restrictions after reconciling power.
+                # Account re-enablement must not undo manual or expiry stops.
+                if (
+                    str(current.status) == VMStatus.SUSPENDED.value
+                    and current.suspension_reason in {"manual_admin", "expired"}
+                ):
+                    continue
                 # A provisioner owns the PROVISIONING transition. Mark the
                 # desired suspension without making its initial guard exit.
                 # Stop a recorded provider guest now; finalization also observes

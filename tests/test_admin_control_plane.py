@@ -3217,11 +3217,12 @@ async def test_power_off_keeps_failed_guest_terminal_across_account_enable(admin
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["provisioning", "suspended"])
 @pytest.mark.parametrize("power", ["Running", "Halted", "Unknown"])
-async def test_account_disable_reconciles_provider_guest(admin_factory, status, power):
+@pytest.mark.parametrize("reason", [None, "manual_admin", "expired"])
+async def test_account_disable_reconciles_provider_guest(admin_factory, status, power, reason):
     async with admin_factory.begin() as session:
         session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture', disabled_at=datetime.now(UTC)))
         session.add(VMRow(vm_id='vm_initializing_disable', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
-                          status=status, xcpng_uuid='initializing-guest'))
+                          status=status, suspension_reason=reason, xcpng_uuid='initializing-guest'))
         session.add(AdminOperationRow(operation_id='disable-initializing', kind='suspend_account_resources',
                                       account_id='HBBBBBBBBBB', status='running'))
     provider = _AdminXCPNG()
@@ -3235,4 +3236,5 @@ async def test_account_disable_reconciles_provider_guest(admin_factory, status, 
     async with admin_factory() as session:
         vm = await session.get(VMRow, 'vm_initializing_disable')
         assert vm.status == status
-        assert vm.suspension_reason == (None if power == 'Unknown' else 'account_disabled')
+        preserve_reason = power == 'Unknown' or (status == 'suspended' and reason is not None)
+        assert vm.suspension_reason == (reason if preserve_reason else 'account_disabled')
