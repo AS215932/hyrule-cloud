@@ -3238,3 +3238,29 @@ async def test_account_disable_reconciles_provider_guest(admin_factory, status, 
         assert vm.status == status
         preserve_reason = power == 'Unknown' or (status == 'suspended' and reason is not None)
         assert vm.suspension_reason == (reason if preserve_reason else 'account_disabled')
+
+
+@pytest.mark.asyncio
+async def test_transfer_handoff_waits_for_recipient_reenable(admin_factory):
+    async with admin_factory.begin() as session:
+        session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture', disabled_at=datetime.now(UTC)))
+        session.add(VMRow(vm_id='vm_disabled_handoff', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
+                          status='suspended', xcpng_uuid='handoff-guest', suspension_reason='account_disabled',
+                          expires_at=datetime.now(UTC) + timedelta(days=1),
+                          metadata_={'transfer_resume_pending': {'owner_account_id': 'HBBBBBBBBBB'}}))
+    provider = _AdminXCPNG()
+    orch = Orchestrator(HyruleConfig(), admin_factory)
+    orch.xcpng = provider
+    assert not await orch.reconcile_transfer_resume('vm_disabled_handoff')
+    assert provider.started == []
+    async with admin_factory.begin() as session:
+        row = await session.get(VMRow, 'vm_disabled_handoff')
+        assert row.metadata_['transfer_resume_pending']
+        owner = await session.get(AccountRow, 'HBBBBBBBBBB')
+        owner.disabled_at = None
+    assert await orch.reconcile_transfer_resume('vm_disabled_handoff')
+    assert provider.started == ['handoff-guest']
+    async with admin_factory() as session:
+        row = await session.get(VMRow, 'vm_disabled_handoff')
+        assert row.status == 'running'
+        assert not (row.metadata_ or {}).get('transfer_resume_pending')

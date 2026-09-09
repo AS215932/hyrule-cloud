@@ -419,3 +419,45 @@ async def test_late_uuid_during_cleanup_cannot_release_prefix():
         orch.xcpng.destroy_vm.assert_awaited_once_with('late-guest')
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_worker_recovers_provider_delete_followed_by_lost_commit(monkeypatch, committed):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from hyrule_cloud.providers.xcpng import XCPNGProvider, XOError
+
+    orch, engine = await _stored_vm()
+    provider = object.__new__(XCPNGProvider)
+    provider._xo_call = AsyncMock(side_effect=[{}, XOError("vm.delete", {"message": "missing"}), {}])
+    orch.xcpng = provider
+    async with orch.db.begin() as session:
+        row = await session.get(VMRow, "vm_lifecycle")
+        row.ipv6_prefix_index = 5
+        row.ipv6_prefix = "2001:db8:5::/64"
+    real_commit = AsyncSession.commit
+    failed = False
+
+    async def lose_final_commit(session):
+        nonlocal failed
+        if not failed and any(isinstance(row, VMRow) and row.status == VMStatus.DESTROYED for row in session.dirty):
+            failed = True
+            if committed:
+                await real_commit(session)
+            raise ConnectionError("lost final delete commit acknowledgment")
+        await real_commit(session)
+
+    monkeypatch.setattr(AsyncSession, "commit", lose_final_commit)
+    try:
+        with pytest.raises(ConnectionError, match="lost final delete"):
+            await orch.destroy_vm("vm_lifecycle")
+        await orch.check_expiries()
+        async with orch.db() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            assert row.status == VMStatus.DESTROYED
+            assert row.metadata_["provider_deleted_uuid"] == "test-guest"
+            assert row.ipv6_prefix_index is None and row.ipv6_prefix is None
+        assert provider._xo_call.await_count == (1 if committed else 3)
+    finally:
+        await engine.dispose()
