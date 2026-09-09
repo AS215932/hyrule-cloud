@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from ipaddress import IPv6Network
@@ -1699,7 +1700,23 @@ from hyrule_cloud.services.intents import (
     IntentExistsError,
     create_intent,
     get_intent_by_client_order_id,
+    native_intent_account_guard,
 )
+
+
+async def _native_intent_account_dependency(
+    orch=Depends(get_orch),
+    account=Depends(current_account),
+) -> AsyncIterator[Any]:
+    if account is None:
+        yield None
+        return
+    try:
+        async with native_intent_account_guard(orch.db, account.account_id):
+            yield account
+    except AccountDisabledError as exc:
+        raise HTTPException(403, "Account access is disabled") from exc
+
 
 # Intent states that carry no committed payment: a same-key replay only
 # re-serves the deposit address. While the VM service is closed (simulation)
@@ -1817,7 +1834,7 @@ async def create_crypto_intent(
     orch=Depends(get_orch),
     cfg=Depends(get_cfg),
     gate=Depends(get_gate),
-    account=Depends(current_account),
+    account=Depends(_native_intent_account_dependency),
 ) -> CryptoIntentResponse:
     """Block E: open a payment intent for BTC or XMR.
 

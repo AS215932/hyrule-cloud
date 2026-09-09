@@ -1072,6 +1072,84 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
 
 
 @pytest.mark.asyncio
+async def test_transfers_wait_for_extension_resume_handoff(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add_all(
+            [
+                AccountRow(account_id="HBBBBBBBBBB", password_hash="unused"),
+                AccountRow(account_id="HCCCCCCCCCC", password_hash="unused"),
+                VMRow(
+                    vm_id="vm_extension_transfer",
+                    owner_wallet="source",
+                    owner_account_id="HBBBBBBBBBB",
+                    xcpng_uuid="extension-guest",
+                    status="suspended",
+                    metadata_={
+                        "extension_resume_pending": {
+                            "owner_account_id": "HBBBBBBBBBB",
+                            "xcpng_uuid": "extension-guest",
+                        }
+                    },
+                ),
+                DomainRow(
+                    name="extension-transfer",
+                    extension="example",
+                    fqdn="extension-transfer.example",
+                    vm_id="vm_extension_transfer",
+                    owner_wallet="source",
+                    owner_account_id="HBBBBBBBBBB",
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=Orchestrator(HyruleConfig(), admin_factory),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    body = OwnershipTransferRequest(
+        target_account_id="HCCCCCCCCCC",
+        reason="wait for extension recovery",
+    )
+    with pytest.raises(HTTPException) as vm_refused:
+        await transfer_vm(
+            "vm_extension_transfer",
+            body,
+            _browser_request(credentials, path="/v1/admin/vms/vm_extension_transfer/transfer"),
+            actor,
+            state,
+        )
+    with pytest.raises(HTTPException) as domain_refused:
+        await transfer_domain(
+            "extension-transfer.example",
+            body,
+            _browser_request(credentials, path="/v1/admin/domains/extension-transfer.example/transfer"),
+            actor,
+            state,
+        )
+
+    assert vm_refused.value.status_code == 409
+    assert domain_refused.value.status_code == 409
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, "vm_extension_transfer")
+        domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "extension-transfer.example")
+            )
+        ).scalar_one()
+        assert vm is not None and vm.owner_account_id == "HBBBBBBBBBB"
+        assert domain.owner_account_id == "HBBBBBBBBBB"
+        assert list(await session.scalars(select(AdminAuditRow))) == []
+
+
+@pytest.mark.asyncio
 async def test_transfer_resume_handoff_survives_provider_failure(admin_factory) -> None:
     async with admin_factory.begin() as session:
         session.add(AccountRow(account_id="HCCCCCCCCCC", password_hash="unused"))

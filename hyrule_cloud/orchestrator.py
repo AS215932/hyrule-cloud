@@ -2840,6 +2840,13 @@ class Orchestrator:
                     assert expiry is not None
                     if expiry >= action_now or current.status == VMStatus.SUSPENDED:
                         continue
+                    # A receipt-backed attempt without a recorded provider UUID
+                    # may still have an ambiguous generation-labelled guest to
+                    # reconcile. Keep it in PROVISIONING so ordinary recovery
+                    # can identify/stop/finalize that guest; SUSPENDED would make
+                    # both recovery and future extension resumption skip it.
+                    if current.status == VMStatus.PROVISIONING and current.xcpng_uuid is None:
+                        continue
                     log.info("vm_expiry_suspend", vm_id=current.vm_id)
                     if current.xcpng_uuid:
                         # Failure must not be committed as a successful suspend,

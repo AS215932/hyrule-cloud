@@ -42,6 +42,8 @@ from hyrule_cloud.domains.models import (
 )
 from hyrule_cloud.domains.service import DomainService
 from hyrule_cloud.middleware.anon_token import hash_anon_token
+from hyrule_cloud.orchestrator import AccountDisabledError
+from hyrule_cloud.services.intents import native_intent_account_guard
 
 
 @pytest.mark.asyncio
@@ -62,12 +64,15 @@ async def test_domain_payment_guard_holds_account_fence_through_settlement():
     sessions = async_sessionmaker(engines[2], expire_on_commit=False)
     entered, release = asyncio.Event(), asyncio.Event()
     vm_entered, vm_release = asyncio.Event(), asyncio.Event()
+    native_entered, native_release = asyncio.Event(), asyncio.Event()
     tasks: list[asyncio.Task] = []
     request = Request({"type": "http", "method": "POST", "path": "/fixture", "headers": []})
     actor = AccountRow(account_id="HADMIN00001", password_hash="fixture", is_admin=True)
     owner_id = "HOWNERPAY01"
     vm_owner_id = "HOWNERPAY02"
     disabled_owner_id = "HOWNERPAY03"
+    native_owner_id = "HOWNERPAY04"
+    disabled_native_owner_id = "HOWNERPAY05"
 
     async def wait_until_disable_is_blocked() -> None:
         async with asyncio.timeout(5):
@@ -111,6 +116,8 @@ async def test_domain_payment_guard_holds_account_fence_through_settlement():
                     AccountRow(account_id=owner_id, password_hash="fixture"),
                     AccountRow(account_id=vm_owner_id, password_hash="fixture"),
                     AccountRow(account_id=disabled_owner_id, password_hash="fixture"),
+                    AccountRow(account_id=native_owner_id, password_hash="fixture"),
+                    AccountRow(account_id=disabled_native_owner_id, password_hash="fixture"),
                 ]
             )
             await session.flush()
@@ -240,9 +247,61 @@ async def test_domain_payment_guard_holds_account_fence_through_settlement():
                 payment_called = True
         assert refused.value.status_code == 403
         assert payment_called is False
+
+        # Native BTC/XMR address allocation and intent persistence hold the
+        # same cross-process account lifecycle fence.
+        native_factory = async_sessionmaker(engines[0], expire_on_commit=False)
+
+        async def issue_native_address() -> None:
+            async with native_intent_account_guard(native_factory, native_owner_id):
+                native_entered.set()
+                await native_release.wait()
+
+        native_issuance = asyncio.create_task(issue_native_address())
+        tasks.append(native_issuance)
+        await asyncio.wait_for(native_entered.wait(), 5)
+        native_disable = asyncio.create_task(
+            disable_account(
+                native_owner_id,
+                ReasonRequest(reason="fixture disable"),
+                request,
+                actor,
+                SimpleNamespace(
+                    session_factory=async_sessionmaker(
+                        engines[1], expire_on_commit=False
+                    )
+                ),
+            )
+        )
+        tasks.append(native_disable)
+        await wait_until_disable_is_blocked()
+        assert not native_disable.done()
+        native_release.set()
+        await asyncio.wait_for(native_issuance, 5)
+        await asyncio.wait_for(native_disable, 5)
+
+        await disable_account(
+            disabled_native_owner_id,
+            ReasonRequest(reason="fixture disable first"),
+            request,
+            actor,
+            SimpleNamespace(
+                session_factory=async_sessionmaker(
+                    engines[1], expire_on_commit=False
+                )
+            ),
+        )
+        address_allocated = False
+        with pytest.raises(AccountDisabledError):
+            async with native_intent_account_guard(
+                native_factory, disabled_native_owner_id
+            ):
+                address_allocated = True
+        assert address_allocated is False
     finally:
         release.set()
         vm_release.set()
+        native_release.set()
         for task in tasks:
             if not task.done():
                 task.cancel()

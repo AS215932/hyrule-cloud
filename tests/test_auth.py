@@ -782,6 +782,32 @@ async def test_account_delete_detach_waits_for_account_resource_resume(auth_stat
 
 
 @pytest.mark.asyncio
+async def test_account_delete_detach_waits_for_extension_resume(auth_state, client):
+    reg = await client.post("/v1/auth/register", json={"password": "extending deletion password"})
+    account_id = reg.json()["account_id"]
+    vm_id = await _seed_owned_vm(auth_state, account_id)
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm is not None
+        vm.metadata_ = {
+            "extension_resume_pending": {
+                "owner_account_id": account_id,
+                "xcpng_uuid": "fixture-guest",
+            }
+        }
+        await session.commit()
+
+    response = await client.delete("/v1/me?vm_policy=detach")
+
+    assert response.status_code == 409
+    assert "finish resuming" in response.json()["detail"]
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm is not None and vm.owner_account_id == account_id
+        assert vm.anon_management_token_hash is None
+
+
+@pytest.mark.asyncio
 async def test_account_delete_destroy_actually_destroys(auth_state, client):
     reg = await client.post("/v1/auth/register", json={"password": "gwen long pw 12345678"})
     account_id = reg.json()["account_id"]

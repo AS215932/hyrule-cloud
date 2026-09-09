@@ -1069,6 +1069,14 @@ async def _delete_account_resources(
                     409,
                     "Account resources must finish resuming before VM detachment.",
                 )
+            if any(
+                (vm.metadata_ or {}).get("extension_resume_pending") is not None
+                for vm in owned_vms
+            ):
+                raise HTTPException(
+                    409,
+                    "VM extensions must finish resuming before account detachment.",
+                )
             for vm in owned_vms:
                 fresh_token = generate_anon_management_token()
                 vm.anon_management_token_hash = hash_anon_token(fresh_token)

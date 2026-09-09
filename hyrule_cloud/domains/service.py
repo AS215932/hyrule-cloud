@@ -98,6 +98,7 @@ from hyrule_cloud.models import (
     VMStatus,
     generate_vm_id,
 )
+from hyrule_cloud.orchestrator import AccountDisabledError
 from hyrule_cloud.providers.native_crypto import Asset, NativeCryptoProvider
 from hyrule_cloud.providers.openprovider import (
     OpenproviderClient,
@@ -1230,6 +1231,12 @@ class DomainService:
             )
         except IntentExistsError as exc:
             intent = exc.existing
+        except AccountDisabledError as exc:
+            raise DomainProblem(
+                403,
+                "account_disabled",
+                "Account access is disabled.",
+            ) from exc
         except Exception as exc:
             await self._set_order_error(
                 order.order_id,

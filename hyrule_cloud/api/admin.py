@@ -68,6 +68,7 @@ router = APIRouter(
 _ADMIN_STEP_UP_ATTEMPT_LIMIT = 5
 _ADMIN_STEP_UP_ATTEMPT_WINDOW = timedelta(minutes=15)
 _TRANSFER_RESUME_KEY = "transfer_resume_pending"
+_EXTENSION_RESUME_KEY = "extension_resume_pending"
 
 
 def _now() -> datetime:
@@ -1517,6 +1518,8 @@ async def transfer_vm(
             raise HTTPException(409, "VM ownership changed; retry the transfer")
         if vm.deletion_started_at is not None or vm.status == VMStatus.DESTROYED:
             raise HTTPException(409, "Deleting or destroyed VMs cannot be transferred")
+        if (vm.metadata_ or {}).get(_EXTENSION_RESUME_KEY) is not None:
+            raise HTTPException(409, "VM extension resumption must finish before transfer")
         if str(vm.status) == VMStatus.PROVISIONING.value:
             raise HTTPException(409, "Provisioning VMs cannot be transferred")
         domain = (
@@ -1614,6 +1617,8 @@ async def transfer_domain(
             attached_vm_id = domain.vm_id
             if vm is not None and (vm.deletion_started_at is not None or vm.status == VMStatus.DESTROYED):
                 raise HTTPException(409, "Deletion-claimed or destroyed VMs cannot be transferred")
+            if vm is not None and (vm.metadata_ or {}).get(_EXTENSION_RESUME_KEY) is not None:
+                raise HTTPException(409, "VM extension resumption must finish before transfer")
             if vm is not None and str(vm.status) == VMStatus.PROVISIONING.value:
                 raise HTTPException(409, "Provisioning VMs cannot be transferred")
         previous_account_id = domain.owner_account_id

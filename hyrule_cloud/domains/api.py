@@ -57,6 +57,8 @@ from hyrule_cloud.middleware.auth import (
     require_scope,
 )
 from hyrule_cloud.middleware.x402 import PaymentGate
+from hyrule_cloud.orchestrator import AccountDisabledError
+from hyrule_cloud.services.intents import native_intent_account_guard
 from hyrule_cloud.state import AppState, get_app_state
 
 router = APIRouter(prefix="/v1/domains", tags=["domains"])
@@ -418,14 +420,28 @@ async def create_order(
         needed = "domain:renew" if quote is not None and quote.action == "renew" else "domain:purchase"
         if needed not in held:
             raise DomainProblem(403, "missing_scope", f"API key missing required scope: {needed}.")
+    if body.payment_method.value in {"btc", "xmr"}:
+        try:
+            async with native_intent_account_guard(service.db, account.account_id):
+                order, created = await service.create_order(
+                    body,
+                    owner_account_id=account.account_id,
+                    idempotency_key=_idempotency(idempotency_key),
+                )
+                result = await service.order_response(order)
+        except AccountDisabledError as exc:
+            raise DomainProblem(
+                403,
+                "account_disabled",
+                "Account access is disabled.",
+            ) from exc
+        response.status_code = 201 if created else 200
+        return result
     order, created = await service.create_order(
         body,
         owner_account_id=account.account_id,
         idempotency_key=_idempotency(idempotency_key),
     )
-    if body.payment_method.value in {"btc", "xmr"}:
-        response.status_code = 201 if created else 200
-        return await service.order_response(order)
     if order.status == "awaiting_payment":
         async with service.x402_payment_guard(order.order_id, account.account_id) as order:
             paid = await gate.check_payment(

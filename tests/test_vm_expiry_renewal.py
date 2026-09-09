@@ -95,6 +95,26 @@ async def _stored_vm(status=VMStatus.RUNNING):
 
 
 @pytest.mark.asyncio
+async def test_expiry_keeps_uuidless_provisioning_guest_recoverable():
+    orch, engine = await _stored_vm(VMStatus.PROVISIONING)
+    try:
+        async with orch.db.begin() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            row.xcpng_uuid = None
+            row.expires_at = datetime.now(UTC) - timedelta(days=1)
+
+        await orch.check_expiries()
+
+        async with orch.db() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            assert row.status == VMStatus.PROVISIONING
+        orch.xcpng.suspend_vm.assert_not_awaited()
+        orch.xcpng.destroy_vm.assert_not_awaited()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_failed_delete_retains_claim_and_refuses_renewal_after_restart():
     orch, engine = await _stored_vm()
     orch.xcpng.destroy_vm.side_effect = RuntimeError("provider unavailable")
