@@ -311,6 +311,7 @@ async def test_worker_recovers_tracked_guest_after_api_stops(tmp_path, monkeypat
         orch.xcpng.create_vm = AsyncMock(side_effect=AssertionError('must retain existing guest'))
         orch.xcpng.destroy_vm = AsyncMock(side_effect=AssertionError('must retain guest data'))
         orch.xcpng.suspend_vm = AsyncMock()
+        orch.xcpng.get_vm_power_state = AsyncMock(return_value="Running")
         orch.dns.create_aaaa = AsyncMock()
         orch.dns.verify_aaaa = AsyncMock(return_value=True)
         orch._wait_for_ipv6 = AsyncMock(return_value='2a0c:b641:b51:5::2')

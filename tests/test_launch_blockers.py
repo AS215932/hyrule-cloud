@@ -276,6 +276,10 @@ async def test_expiry_suspend_and_destroy_paths_are_exercised(launch_state):
             # Neither expiry fixture carries a paid-extension handoff.
             return 0
 
+        async def reconcile_transfer_resumes(self):
+            # Neither expiry fixture carries an ownership-transfer handoff.
+            return 0
+
         async def destroy_vm(self, vm_id, *, expired_before=None):
             self.destroyed.append(vm_id)
             async with self.db() as session:

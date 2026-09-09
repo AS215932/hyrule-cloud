@@ -2531,7 +2531,10 @@ async def test_legacy_restart_receipt_survives_commit_before_scheduling_crash(ad
         session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture'))
         session.add(VMRow(vm_id='vm_legacy_restart', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
                           status='suspended', suspension_reason='account_disabled',
-                          expires_at=datetime.now(UTC) + timedelta(days=1)))
+                          expires_at=datetime.now(UTC) + timedelta(days=1),
+                          metadata_={"transfer_resume_pending": {
+                              "owner_account_id": "HBBBBBBBBBB", "xcpng_uuid": None,
+                          }} if source == 'ownership_transfer' else None))
         session.add(AdminOperationRow(operation_id='legacy-restart', kind='resume_account_resources',
                                       account_id='HBBBBBBBBBB', status='running'))
     generations = []
