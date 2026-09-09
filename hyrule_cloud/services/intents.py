@@ -19,6 +19,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -76,6 +77,10 @@ VM_PROVISIONING_RECOVERY_DELAY = timedelta(minutes=5)
 # process also need a keyed lock. Weak values avoid retaining one lock for
 # every intent ever seen; PostgreSQL row locks remain the cross-process fence.
 _poll_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+_guarded_native_accounts: ContextVar[frozenset[tuple[int, int, str]]] = ContextVar(
+    "guarded_native_accounts",
+    default=frozenset(),
+)
 
 
 def _poll_lock(intent_id: str) -> asyncio.Lock:
@@ -123,6 +128,12 @@ async def native_intent_account_guard(
     if owner_account_id is None:
         yield
         return
+    guarded = _guarded_native_accounts.get()
+    # Child tasks inherit ContextVars but must acquire their own transaction.
+    guard_key = (id(asyncio.current_task()), id(session_factory), owner_account_id)
+    if guard_key in guarded:
+        yield
+        return
     async with session_factory() as session:
         await lock_account_lifecycle(session, owner_account_id, shared=True)
         owner = await session.scalar(
@@ -133,7 +144,11 @@ async def native_intent_account_guard(
         )
         if owner is None or owner.disabled_at is not None:
             raise AccountDisabledError("Account access is disabled")
-        yield
+        token = _guarded_native_accounts.set(guarded | {guard_key})
+        try:
+            yield
+        finally:
+            _guarded_native_accounts.reset(token)
 
 
 async def create_intent(

@@ -1304,11 +1304,12 @@ class Orchestrator:
                     raise GuestGenerationChangedError()
                 if receipt.outcome != "succeeded":
                     raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
-                admin_suspended = row.suspension_reason in {
+                must_remain_suspended = row.suspension_reason in {
+                    "expired",
                     "account_disabled",
                     "manual_admin",
                 }
-                if admin_suspended:
+                if must_remain_suspended:
                     # Serialize with account re-enablement while the row lock is
                     # held: a disabled account must never observe a newly built
                     # provider VM transition through READY.
@@ -1323,7 +1324,7 @@ class Orchestrator:
                     except Exception as exc:
                         raise GuestRecoveryPendingError() from exc
                 row.ipv6 = ipv6
-                row.status = VMStatus.SUSPENDED if admin_suspended else VMStatus.READY
+                row.status = VMStatus.SUSPENDED if must_remain_suspended else VMStatus.READY
                 # Block B (Wave 2): timestamp the READY transition so
                 # /v1/stats/runtime can roll a rolling avg over recent
                 # provisioning durations.
@@ -1351,7 +1352,7 @@ class Orchestrator:
                 try:
                     await session.commit()
                 except Exception as exc:
-                    if admin_suspended:
+                    if must_remain_suspended:
                         # A successful provider stop followed by a lost commit
                         # acknowledgement is retryable. Never turn that
                         # ambiguity into a terminal failure/refund.
@@ -2856,7 +2857,8 @@ class Orchestrator:
                         except Exception:
                             log.warning("suspend_failed", vm_id=current.vm_id, exc_info=True)
                             continue
-                    current.status = VMStatus.SUSPENDED
+                    if current.status != VMStatus.PROVISIONING:
+                        current.status = VMStatus.SUSPENDED
                     if current.suspension_reason not in {"account_disabled", "manual_admin"}:
                         current.suspension_reason = "expired"
                         current.suspended_by_account_id = None

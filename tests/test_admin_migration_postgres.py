@@ -22,17 +22,17 @@ def test_admin_postgres_migration_roundtrip():
     assert parsed.database == "admin_migration_test"
     assert parsed.host in (None, "localhost", "127.0.0.1", "::1")
 
-    async def query(sql):
+    async def query(sql, params):
         engine = create_async_engine(url)
         try:
             async with engine.begin() as conn:
-                result = await conn.execute(text(sql))
+                result = await conn.execute(text(sql), params)
                 return result.all() if result.returns_rows else []
         finally:
             await engine.dispose()
 
-    def run(sql):
-        return asyncio.run(query(sql))
+    def run(sql, params=None):
+        return asyncio.run(query(sql, params or {}))
 
     def migrate(direction, revision, *, expected_error=None):
         result = subprocess.run(
@@ -77,6 +77,12 @@ def test_admin_postgres_migration_roundtrip():
     run("UPDATE vms SET suspension_reason='account_disabled' WHERE vm_id='vm_paid'")
     migrate("downgrade", "020", expected_error="while account resumptions remain pending")
     run("UPDATE vms SET suspension_reason='manual_admin' WHERE vm_id='vm_paid'")
+    for marker in ('null', '{}'):
+        run("UPDATE vms SET metadata = CAST(:metadata AS jsonb) WHERE vm_id='vm_paid'",
+            {"metadata": '{"extension_resume_pending":' + marker + '}'})
+        migrate("downgrade", "020", expected_error="while paid VM resumptions remain pending")
+        assert run("SELECT version_num FROM alembic_version") == [('023',)]
+    run("UPDATE vms SET metadata='{}' WHERE vm_id='vm_paid'")
     run("UPDATE vms SET billing_mode='admin_waived' WHERE vm_id='vm_paid'")
     migrate("downgrade", "020", expected_error="while waived VMs remain actionable")
     run("UPDATE vms SET billing_mode='charged' WHERE vm_id='vm_paid'")

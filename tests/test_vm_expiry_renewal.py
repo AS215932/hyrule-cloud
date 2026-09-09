@@ -95,12 +95,13 @@ async def _stored_vm(status=VMStatus.RUNNING):
 
 
 @pytest.mark.asyncio
-async def test_expiry_keeps_uuidless_provisioning_guest_recoverable():
+@pytest.mark.parametrize("provider_uuid", [None, "test-guest"])
+async def test_expiry_keeps_provisioning_guest_recoverable(provider_uuid):
     orch, engine = await _stored_vm(VMStatus.PROVISIONING)
     try:
         async with orch.db.begin() as session:
             row = await session.get(VMRow, "vm_lifecycle")
-            row.xcpng_uuid = None
+            row.xcpng_uuid = provider_uuid
             row.expires_at = datetime.now(UTC) - timedelta(days=1)
 
         await orch.check_expiries()
@@ -108,7 +109,12 @@ async def test_expiry_keeps_uuidless_provisioning_guest_recoverable():
         async with orch.db() as session:
             row = await session.get(VMRow, "vm_lifecycle")
             assert row.status == VMStatus.PROVISIONING
-        orch.xcpng.suspend_vm.assert_not_awaited()
+            assert not orch.vm_can_extend(row)
+            assert row.suspension_reason == ("expired" if provider_uuid else None)
+        if provider_uuid:
+            orch.xcpng.suspend_vm.assert_awaited_once_with(provider_uuid)
+        else:
+            orch.xcpng.suspend_vm.assert_not_awaited()
         orch.xcpng.destroy_vm.assert_not_awaited()
     finally:
         await engine.dispose()

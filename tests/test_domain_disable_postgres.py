@@ -254,8 +254,11 @@ async def test_domain_payment_guard_holds_account_fence_through_settlement():
 
         async def issue_native_address() -> None:
             async with native_intent_account_guard(native_factory, native_owner_id):
-                native_entered.set()
-                await native_release.wait()
+                # Route/domain callers deliberately retain this outer fence;
+                # the service-level guard must reuse it without self-blocking.
+                async with native_intent_account_guard(native_factory, native_owner_id):
+                    native_entered.set()
+                    await native_release.wait()
 
         native_issuance = asyncio.create_task(issue_native_address())
         tasks.append(native_issuance)

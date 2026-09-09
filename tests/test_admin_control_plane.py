@@ -3215,17 +3215,24 @@ async def test_power_off_keeps_failed_guest_terminal_across_account_enable(admin
 
 
 @pytest.mark.asyncio
-async def test_account_disable_stops_provider_backed_provisioning_guest(admin_factory):
+@pytest.mark.parametrize("status", ["provisioning", "suspended"])
+@pytest.mark.parametrize("power", ["Running", "Halted", "Unknown"])
+async def test_account_disable_reconciles_provider_guest(admin_factory, status, power):
     async with admin_factory.begin() as session:
         session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture', disabled_at=datetime.now(UTC)))
         session.add(VMRow(vm_id='vm_initializing_disable', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
-                          status='provisioning', xcpng_uuid='initializing-guest'))
+                          status=status, xcpng_uuid='initializing-guest'))
         session.add(AdminOperationRow(operation_id='disable-initializing', kind='suspend_account_resources',
                                       account_id='HBBBBBBBBBB', status='running'))
     provider = _AdminXCPNG()
-    provider.power["initializing-guest"] = "Running"
-    await _apply_account_operation(admin_factory, SimpleNamespace(xcpng=provider), 'disable-initializing')
-    assert provider.suspended == ['initializing-guest']
+    provider.power["initializing-guest"] = power
+    if power == "Unknown":
+        with pytest.raises(RuntimeError, match="unexpected VM power state"):
+            await _apply_account_operation(admin_factory, SimpleNamespace(xcpng=provider), 'disable-initializing')
+    else:
+        await _apply_account_operation(admin_factory, SimpleNamespace(xcpng=provider), 'disable-initializing')
+    assert provider.suspended == (['initializing-guest'] if power == "Running" else [])
     async with admin_factory() as session:
         vm = await session.get(VMRow, 'vm_initializing_disable')
-        assert vm.status == 'provisioning' and vm.suspension_reason == 'account_disabled'
+        assert vm.status == status
+        assert vm.suspension_reason == (None if power == 'Unknown' else 'account_disabled')

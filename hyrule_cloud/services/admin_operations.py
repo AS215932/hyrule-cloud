@@ -239,10 +239,7 @@ async def _apply_locked_account_operation(
                 ).scalar_one_or_none()
                 if current is None or current.owner_account_id != account_id:
                     continue
-                if str(current.status) in {
-                    VMStatus.DESTROYED.value,
-                    VMStatus.SUSPENDED.value,
-                }:
+                if str(current.status) == VMStatus.DESTROYED.value:
                     continue
                 if str(current.status) == VMStatus.FAILED.value and not current.xcpng_uuid:
                     continue

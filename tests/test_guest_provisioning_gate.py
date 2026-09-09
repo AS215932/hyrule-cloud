@@ -537,8 +537,9 @@ async def test_guest_completion_controls_public_status_and_launch_proof(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("power", ["Halted", "Running", "Unknown", "error"])
+@pytest.mark.parametrize("reason", ["account_disabled", "expired"])
 async def test_successful_guest_finalization_reconciles_admin_suspension(
-    tmp_path, monkeypatch, power,
+    tmp_path, monkeypatch, power, reason,
 ):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'admin-finalize.db'}")
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -570,7 +571,7 @@ async def test_successful_guest_finalization_reconciles_admin_suspension(
         async with factory.begin() as session:
             row = await session.get(VMRow, vm_id)
             receipt = await session.get(VMGuestResultRow, vm_id)
-            row.suspension_reason = "account_disabled"
+            row.suspension_reason = reason
             receipt.outcome = "succeeded"
             receipt.stage = "cloud_init"
             receipt.exit_code = 0
