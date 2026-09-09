@@ -125,8 +125,20 @@ async def test_failed_resume_preserves_committed_extension():
             assert row.status == VMStatus.SUSPENDED
             assert row.deletion_started_at is None
             assert row.metadata_["extension_resume_pending"]["xcpng_uuid"] == "test-guest"
+            session.add(
+                VMRow(
+                    vm_id="vm_unrelated_suspension",
+                    owner_wallet="test-owner",
+                    status=VMStatus.SUSPENDED,
+                    suspension_reason="manual_admin",
+                )
+            )
+            await session.commit()
         orch.xcpng.start_vm.side_effect = None
+        original_reconcile = orch._reconcile_extension_resume
+        orch._reconcile_extension_resume = AsyncMock(wraps=original_reconcile)
         assert await orch.reconcile_extension_resumes() == 1
+        orch._reconcile_extension_resume.assert_awaited_once_with("vm_lifecycle")
         async with orch.db() as session:
             row = await session.get(VMRow, "vm_lifecycle")
             assert row.status == VMStatus.RUNNING

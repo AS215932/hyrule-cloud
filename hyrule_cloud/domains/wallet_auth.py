@@ -130,6 +130,16 @@ class WalletAuthService:
         normalized = _normalize_address(address)
         for _attempt in range(2):
             async with self.db() as session:
+                locked_account: AccountRow | None = None
+                if account is not None:
+                    locked_account = await session.scalar(
+                        select(AccountRow)
+                        .where(AccountRow.account_id == account.account_id)
+                        .with_for_update(key_share=True)
+                        .execution_options(populate_existing=True)
+                    )
+                    if locked_account is None or locked_account.disabled_at is not None:
+                        raise DomainProblem(403, "account_disabled", "This account is disabled.")
                 wallet = (
                     await session.execute(
                         select(AccountWalletRow)
@@ -172,9 +182,8 @@ class WalletAuthService:
                             "wallet_account_mismatch",
                             "This account is linked to a different payment wallet.",
                         )
-                    owner = await session.get(AccountRow, account.account_id)
-                    if owner is None:
-                        raise DomainProblem(401, "authentication_required", "The account is unavailable.")
+                    assert locked_account is not None
+                    owner = locked_account
                 else:
                     owner = AccountRow(
                         account_id=generate_account_id(),

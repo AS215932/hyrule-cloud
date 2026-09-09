@@ -2300,7 +2300,15 @@ class Orchestrator:
         """Process durable paid-extension start handoffs after API restarts."""
         async with self.db() as session:
             candidates = list(
-                await session.scalars(select(VMRow.vm_id).where(VMRow.status == VMStatus.SUSPENDED))
+                await session.scalars(
+                    select(VMRow.vm_id)
+                    .where(
+                        VMRow.status == VMStatus.SUSPENDED,
+                        VMRow.metadata_[_EXTENSION_RESUME_KEY].as_string().is_not(None),
+                    )
+                    .order_by(VMRow.vm_id)
+                    .limit(100)
+                )
             )
         resumed = 0
         for vm_id in candidates:

@@ -315,14 +315,22 @@ async def _apply_locked_account_operation(
                     # disable. Start that exact guest while preserving the
                     # durable PROVISIONING state for receipt reconciliation.
                     if current.xcpng_uuid:
-                        await orchestrator.xcpng.start_vm(current.xcpng_uuid)
+                        power = await orchestrator.xcpng.get_vm_power_state(current.xcpng_uuid)
+                        if power == "Halted":
+                            await orchestrator.xcpng.start_vm(current.xcpng_uuid)
+                        elif power != "Running":
+                            raise RuntimeError(f"unexpected VM power state during resume: {power}")
                         await orchestrator.renew_provisioning_report_deadline(
                             session, current
                         )
                     current.suspension_reason = None
                     current.suspended_by_account_id = None
                 elif current.xcpng_uuid:
-                    await orchestrator.xcpng.start_vm(current.xcpng_uuid)
+                    power = await orchestrator.xcpng.get_vm_power_state(current.xcpng_uuid)
+                    if power == "Halted":
+                        await orchestrator.xcpng.start_vm(current.xcpng_uuid)
+                    elif power != "Running":
+                        raise RuntimeError(f"unexpected VM power state during resume: {power}")
                     current.status = VMStatus.RUNNING
                     current.suspension_reason = None
                     current.suspended_by_account_id = None

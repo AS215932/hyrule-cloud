@@ -1011,7 +1011,7 @@ async def revoke_account_sessions(
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
         await _validate_admin_dispatch(session, actor.account_id)
-        if await session.get(AccountRow, account_id) is None:
+        if await _locked_account(session, account_id) is None:
             raise HTTPException(404, "Account not found")
         result = cast(
             CursorResult[Any],
@@ -1041,7 +1041,7 @@ async def revoke_account_keys(
     now = _now()
     async with _factory(state)() as session:
         await _validate_admin_dispatch(session, actor.account_id)
-        if await session.get(AccountRow, account_id) is None:
+        if await _locked_account(session, account_id) is None:
             raise HTTPException(404, "Account not found")
         result = cast(
             CursorResult[Any],

@@ -1448,12 +1448,18 @@ class _AdminXCPNG:
         self.started: list[str] = []
         self.shut_down: list[str] = []
         self.rebooted: list[str] = []
+        self.power: dict[str, str] = {}
 
     async def suspend_vm(self, vm_uuid: str) -> None:
         self.suspended.append(vm_uuid)
+        self.power[vm_uuid] = "Halted"
 
     async def start_vm(self, vm_uuid: str) -> None:
         self.started.append(vm_uuid)
+        self.power[vm_uuid] = "Running"
+
+    async def get_vm_power_state(self, vm_uuid: str) -> str:
+        return self.power.get(vm_uuid, "Halted")
 
     async def shutdown_vm(self, vm_uuid: str) -> None:
         self.shut_down.append(vm_uuid)
@@ -2114,6 +2120,9 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         account.disabled_at = None
         account.disabled_reason = None
         account.disabled_by_account_id = None
+        # Model a worker that started this guest before crashing ahead of its
+        # database commit. Resume must reconcile rather than replay start.
+        xcpng.power["uuid-active"] = "Running"
         session.add(
             AdminOperationRow(
                 operation_id="operation-resume",
@@ -2159,7 +2168,7 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         assert receipt_deadline > old_report_deadline
 
     assert xcpng.suspended == ["uuid-active", "uuid-provisioning", "uuid-failed-disabled"]
-    assert xcpng.started == ["uuid-active", "uuid-provisioning"]
+    assert xcpng.started == ["uuid-provisioning"]
 
 
 @pytest.mark.asyncio

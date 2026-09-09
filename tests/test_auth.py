@@ -20,7 +20,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.api.auth import ClaimByTokenRequest, claim_vm, delete_me
 from hyrule_cloud.app import app
-from hyrule_cloud.db import AccountRow, Base, DomainOrderRow, DomainQuoteRow, DomainRow, VMRow
+from hyrule_cloud.db import (
+    AccountRow,
+    AdminOperationRow,
+    Base,
+    DomainOrderRow,
+    DomainQuoteRow,
+    DomainRow,
+    VMRow,
+)
 from hyrule_cloud.middleware.anon_token import hash_anon_token as hash_anon_management_token
 from hyrule_cloud.models import (
     VMSize,
@@ -669,6 +677,36 @@ async def test_account_delete_detach_rechecks_stale_disabled_session(auth_state,
     async with auth_state.orchestrator.db() as session:
         vm = await session.get(VMRow, vm_id)
         assert vm.owner_account_id == account_id
+        assert vm.anon_management_token_hash is None
+
+
+@pytest.mark.asyncio
+async def test_account_delete_detach_waits_for_account_resource_resume(auth_state, client):
+    reg = await client.post("/v1/auth/register", json={"password": "resuming deletion password"})
+    account_id = reg.json()["account_id"]
+    vm_id = await _seed_owned_vm(auth_state, account_id)
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm is not None
+        vm.status = VMStatus.SUSPENDED
+        vm.suspension_reason = "account_disabled"
+        session.add(
+            AdminOperationRow(
+                operation_id="resume-before-detach",
+                kind="resume_account_resources",
+                account_id=account_id,
+                status="queued",
+            )
+        )
+        await session.commit()
+
+    response = await client.delete("/v1/me?vm_policy=detach")
+
+    assert response.status_code == 409
+    assert "finish resuming" in response.json()["detail"]
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm is not None and vm.owner_account_id == account_id
         assert vm.anon_management_token_hash is None
 
 

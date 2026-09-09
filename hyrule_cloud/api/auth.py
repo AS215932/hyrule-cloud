@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from hyrule_cloud.db import (
     AccountRow,
+    AdminOperationRow,
     DomainOrderRow,
     DomainRow,
     RecoveryAttemptRow,
@@ -1044,6 +1045,22 @@ async def _delete_account_resources(
         acct, owned_vms = await _account_deletion_snapshot(db, account.account_id)
 
         if vm_policy == "detach":
+            pending_resume = await db.scalar(
+                select(AdminOperationRow.operation_id)
+                .where(
+                    AdminOperationRow.account_id == account.account_id,
+                    AdminOperationRow.kind == "resume_account_resources",
+                    AdminOperationRow.status.in_(["queued", "running", "failed"]),
+                )
+                .limit(1)
+            )
+            if pending_resume is not None or any(
+                vm.suspension_reason == "account_disabled" for vm in owned_vms
+            ):
+                raise HTTPException(
+                    409,
+                    "Account resources must finish resuming before VM detachment.",
+                )
             for vm in owned_vms:
                 fresh_token = generate_anon_management_token()
                 vm.anon_management_token_hash = hash_anon_token(fresh_token)

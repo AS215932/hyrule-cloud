@@ -652,6 +652,34 @@ async def test_verified_payer_resolution_links_browser_but_never_api_key(
 
 
 @pytest.mark.asyncio
+async def test_verified_payer_does_not_auto_link_a_disabled_browser_account(domain_service):
+    service, _provider, sessions = domain_service
+    wallet_auth = WalletAuthService(service.config, sessions)
+    async with sessions() as session:
+        stale_account = await session.get(AccountRow, "H1234567890")
+    assert stale_account is not None
+    async with sessions.begin() as session:
+        current = await session.get(AccountRow, stale_account.account_id)
+        assert current is not None
+        current.disabled_at = datetime.now(UTC)
+
+    with pytest.raises(DomainProblem) as refused:
+        await wallet_auth.resolve_x402_owner(
+            address="0x" + "D" * 40,
+            chain_id=8453,
+            account=stale_account,
+            allow_link=True,
+        )
+
+    assert refused.value.code == "account_disabled"
+    async with sessions() as session:
+        linked = await session.scalar(
+            select(AccountWalletRow).where(AccountWalletRow.account_id == stale_account.account_id)
+        )
+    assert linked is None
+
+
+@pytest.mark.asyncio
 async def test_public_registration_route_settles_once_and_issues_management_session(
     domain_service,
 ):
