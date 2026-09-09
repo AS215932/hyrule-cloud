@@ -9,6 +9,7 @@ AppState fixture style of test_intent_engine.py.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock
@@ -20,8 +21,10 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from hyrule_cloud.api import routes
 from hyrule_cloud.app import app
 from hyrule_cloud.db import AccountRow, Base, VMQuoteRow, VMRow
+from hyrule_cloud.middleware.auth import current_account
 from hyrule_cloud.middleware.x402 import AdminBypassContext
 from hyrule_cloud.models import CostBreakdown, QuoteStatus, VMSize, VMStatus
 from hyrule_cloud.services import quotes as quotes_service
@@ -427,6 +430,52 @@ async def test_create_with_quote_paid_provisions_and_consumes(quote_state, clien
     row = await quotes_service.get_quote(quote_state.orchestrator.db, quote["quote_id"])
     assert QuoteStatus(row.status) == QuoteStatus.CONSUMED
     assert row.vm_id == res.json()["vm_id"]
+
+
+@pytest.mark.asyncio
+async def test_authenticated_vm_payment_runs_inside_account_guard(
+    quote_state,
+    client,
+    monkeypatch,
+):
+    account = AccountRow(account_id="HPAYGUARD01", password_hash="fixture")
+    async with quote_state.session_factory() as session:
+        session.add(account)
+        await session.commit()
+
+    async def authenticated_account():
+        return account
+
+    guard_held = False
+    real_guard = routes._vm_payment_account_guard
+
+    @asynccontextmanager
+    async def tracked_guard(orch, account_id):
+        nonlocal guard_held
+        async with real_guard(orch, account_id):
+            guard_held = True
+            try:
+                yield
+            finally:
+                guard_held = False
+
+    async def settle(*_args, **_kwargs):
+        assert guard_held
+        return "0xWALLET"
+
+    app.dependency_overrides[current_account] = authenticated_account
+    monkeypatch.setattr(routes, "_vm_payment_account_guard", tracked_guard)
+    quote_state.payment_gate.check_payment = AsyncMock(side_effect=settle)
+    try:
+        quote = (await client.post("/v1/vm/quote", json={"order_payload": _order()})).json()
+        response = await client.post(
+            "/v1/vm/create", json=_order(quote_id=quote["quote_id"])
+        )
+    finally:
+        app.dependency_overrides.pop(current_account, None)
+
+    assert response.status_code == 202, response.text
+    quote_state.payment_gate.check_payment.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -96,6 +96,7 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 _VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable cross-worker PostgreSQL lock key
+_PROVISIONING_HANDOFF_KEY = "provisioning_handoff_state"
 _EXTENSION_RESUME_KEY = "extension_resume_pending"
 _TRANSFER_RESUME_KEY = "transfer_resume_pending"
 
@@ -315,6 +316,7 @@ class Orchestrator:
         payment_tx: str | None = None,
         retail_amount: Decimal | None = None,
         admin_waived: bool = False,
+        provisioning_handoff_ready: bool = True,
         dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> tuple[VMRow, str]:
         """Persist a VM row and atomically claim a customer /64 (unique index).
@@ -413,6 +415,10 @@ class Orchestrator:
                             payment_tx=payment_tx,
                         )
                         if existing.status == VMStatus.PROVISIONING and existing.owner_wallet:
+                            self._set_provisioning_handoff_state(
+                                existing,
+                                ready=provisioning_handoff_ready,
+                            )
                             await self.prepare_provisioning_dispatch(session, existing)
                         await session.commit()
                         return existing, ""
@@ -452,6 +458,11 @@ class Orchestrator:
                     admin_waived=admin_waived,
                     payment_tx=payment_tx,
                 )
+                if row.owner_wallet:
+                    self._set_provisioning_handoff_state(
+                        row,
+                        ready=provisioning_handoff_ready,
+                    )
                 session.add(row)
                 try:
                     # The durable worker discovers receipt-backed provisioning
@@ -512,6 +523,14 @@ class Orchestrator:
                 session, row.vm_id, _now() + timedelta(seconds=self.config.guest_report_timeout_seconds),
             )
 
+    @staticmethod
+    def _set_provisioning_handoff_state(row: VMRow, *, ready: bool) -> None:
+        metadata = dict(row.metadata_ or {})
+        if not ready and metadata.get(_PROVISIONING_HANDOFF_KEY) == "ready":
+            return
+        metadata[_PROVISIONING_HANDOFF_KEY] = "ready" if ready else "pending"
+        row.metadata_ = metadata
+
     async def renew_provisioning_report_deadline(
         self,
         session: AsyncSession,
@@ -569,7 +588,22 @@ class Orchestrator:
         crypto intent setting its vm_id) BEFORE provisioning can fail, so the
         failure path can always find the paying record.
         """
-        await self._spawn_provisioning(vm_id)
+        # Publish the completed quote/intent handoff before task creation. The
+        # recovery worker ignores explicit pending rows, so it cannot race the
+        # caller's pre-handoff refund path. Once this commit succeeds, a local
+        # task-scheduling failure is recoverable and must not become a refund.
+        async with self.db() as session:
+            row = await session.scalar(
+                select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+            )
+            if row is None or row.status != VMStatus.PROVISIONING or not row.owner_wallet:
+                return
+            self._set_provisioning_handoff_state(row, ready=True)
+            await session.commit()
+        try:
+            await self._spawn_provisioning(vm_id)
+        except Exception:
+            log.exception("provisioning_task_schedule_deferred", vm_id=vm_id)
 
     async def recover_tracked_provisioning(self) -> int:
         """Incrementally recover ordinary paid guests, including x402 orders.
@@ -594,6 +628,9 @@ class Orchestrator:
                     .where(
                         VMRow.status == VMStatus.PROVISIONING,
                         CryptoIntentRow.intent_id.is_(None),
+                        func.coalesce(
+                            VMRow.metadata_[_PROVISIONING_HANDOFF_KEY].as_string(), ""
+                        ) != "pending",
                     )
                 ) or ""
             vm_ids = list((await session.scalars(
@@ -609,6 +646,9 @@ class Orchestrator:
                 )
                 .where(VMRow.status == VMStatus.PROVISIONING,
                        CryptoIntentRow.intent_id.is_(None),
+                       func.coalesce(
+                           VMRow.metadata_[_PROVISIONING_HANDOFF_KEY].as_string(), ""
+                       ) != "pending",
                        VMRow.vm_id > getattr(self, "_recovery_cursor", ""),
                        VMRow.vm_id <= self._recovery_cycle_max)
                 .order_by(VMRow.vm_id).limit(4)
@@ -666,10 +706,11 @@ class Orchestrator:
             payment_tx=payment_tx,
             retail_amount=retail_amount,
             admin_waived=admin_waived,
+            provisioning_handoff_ready=start_provisioning,
             dispatch_guard=dispatch_guard,
         )
         if start_provisioning:
-            await self._spawn_provisioning(row.vm_id)
+            await self.start_provisioning(row.vm_id)
         return row, anon_token
 
     async def reserve_vm(
@@ -831,11 +872,15 @@ class Orchestrator:
                 payment_tx=payment_tx,
             )
             if row.status == VMStatus.PROVISIONING:
+                self._set_provisioning_handoff_state(
+                    row,
+                    ready=start_provisioning,
+                )
                 await self.prepare_provisioning_dispatch(session, row)
             await session.commit()
             await session.refresh(row)
         if start_provisioning:
-            await self._spawn_provisioning(vm_id)
+            await self.start_provisioning(vm_id)
         return row
 
     async def release_vm_reservation(self, vm_id: str) -> None:

@@ -54,6 +54,58 @@ async def test_guest_recovery_waits_for_native_intent_handoff(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_guest_recovery_waits_for_create_handoff_and_recovers_schedule_failure(
+    tmp_path,
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'create-handoff.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    orch = Orchestrator(HyruleConfig(), factory)
+    failed_schedule = AsyncMock(side_effect=RuntimeError("task scheduler unavailable"))
+    orch._spawn_provisioning = failed_schedule
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            session.add(
+                VMRow(
+                    vm_id="vm_create_handoff",
+                    owner_wallet="paid",
+                    status=VMStatus.PROVISIONING,
+                    metadata_={"provisioning_handoff_state": "pending"},
+                )
+            )
+            session.add(
+                VMGuestResultRow(
+                    vm_id="vm_create_handoff",
+                    generation="a" * 32,
+                    token_hash="b" * 64,
+                    deadline=datetime.now(UTC) + timedelta(minutes=5),
+                )
+            )
+
+        assert await orch.recover_tracked_provisioning() == 0
+        failed_schedule.assert_not_awaited()
+
+        # The API publishes the completed quote/intent handoff before trying
+        # to create the local task. A scheduler failure is then worker-owned,
+        # not a terminal/refund path.
+        await orch.start_provisioning("vm_create_handoff")
+        failed_schedule.assert_awaited_once_with("vm_create_handoff")
+        async with factory() as session:
+            row = await session.get(VMRow, "vm_create_handoff")
+            assert row is not None
+            assert row.status == VMStatus.PROVISIONING
+            assert row.metadata_["provisioning_handoff_state"] == "ready"
+
+        recovered_schedule = AsyncMock()
+        orch._spawn_provisioning = recovered_schedule
+        assert await orch.recover_tracked_provisioning() == 1
+        recovered_schedule.assert_awaited_once_with("vm_create_handoff")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_recovery_cycle_wraps_despite_sustained_higher_id_arrivals(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'recovery-wrap.db'}")
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -144,7 +196,13 @@ async def test_paid_dispatch_survives_restart_while_waiting_for_provisioning_slo
         await engine.dispose()
         assert await recovered.recover_tracked_provisioning() == 4
         assert await recovered.recover_tracked_provisioning() == 4
-        assert await recovered.recover_tracked_provisioning() == 1
+        # The accepted row has not completed its quote/intent handoff, so a
+        # different worker must leave it alone until the caller publishes the
+        # durable ready marker.
+        assert accepted.vm_id not in resumed
+        assert recovered._recovery_cursor == ""
+        assert recovered._recovery_cycle_max == ""
+        await recovered.start_provisioning(accepted.vm_id)
         await asyncio.wait_for(asyncio.gather(*list(recovered._tasks)), 5)
         async with factory() as session:
             rows = list(await session.scalars(select(VMRow).where(VMRow.vm_id.like('vm_queued_%'))))

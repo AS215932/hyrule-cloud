@@ -18,6 +18,7 @@ from starlette.requests import Request
 
 from hyrule_cloud.api.admin import ReasonRequest, disable_account
 from hyrule_cloud.api.auth import ClaimByTokenRequest, claim_vm
+from hyrule_cloud.api.routes import _vm_payment_account_guard
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
     AccountRow,
@@ -60,10 +61,13 @@ async def test_domain_payment_guard_holds_account_fence_through_settlement():
     ]
     sessions = async_sessionmaker(engines[2], expire_on_commit=False)
     entered, release = asyncio.Event(), asyncio.Event()
+    vm_entered, vm_release = asyncio.Event(), asyncio.Event()
     tasks: list[asyncio.Task] = []
     request = Request({"type": "http", "method": "POST", "path": "/fixture", "headers": []})
     actor = AccountRow(account_id="HADMIN00001", password_hash="fixture", is_admin=True)
     owner_id = "HOWNERPAY01"
+    vm_owner_id = "HOWNERPAY02"
+    disabled_owner_id = "HOWNERPAY03"
 
     async def wait_until_disable_is_blocked() -> None:
         async with asyncio.timeout(5):
@@ -102,7 +106,12 @@ async def test_domain_payment_guard_holds_account_fence_through_settlement():
         assert migrated.returncode == 0, migrated.stderr
         async with sessions.begin() as session:
             session.add_all(
-                [actor, AccountRow(account_id=owner_id, password_hash="fixture")]
+                [
+                    actor,
+                    AccountRow(account_id=owner_id, password_hash="fixture"),
+                    AccountRow(account_id=vm_owner_id, password_hash="fixture"),
+                    AccountRow(account_id=disabled_owner_id, password_hash="fixture"),
+                ]
             )
             await session.flush()
             session.add(
@@ -175,8 +184,65 @@ async def test_domain_payment_guard_holds_account_fence_through_settlement():
         await asyncio.wait_for(disable, 5)
         async with sessions() as session:
             assert (await session.get(AccountRow, owner_id)).disabled_at is not None
+
+        # The authenticated VM create path uses the same lifecycle fence and
+        # holds it through its external check_payment call.
+        vm_orchestrator = SimpleNamespace(
+            db=async_sessionmaker(engines[0], expire_on_commit=False)
+        )
+
+        async def settle_vm() -> None:
+            async with _vm_payment_account_guard(vm_orchestrator, vm_owner_id):
+                vm_entered.set()
+                await vm_release.wait()
+
+        vm_settlement = asyncio.create_task(settle_vm())
+        tasks.append(vm_settlement)
+        await asyncio.wait_for(vm_entered.wait(), 5)
+        vm_disable = asyncio.create_task(
+            disable_account(
+                vm_owner_id,
+                ReasonRequest(reason="fixture disable"),
+                request,
+                actor,
+                SimpleNamespace(
+                    session_factory=async_sessionmaker(
+                        engines[1], expire_on_commit=False
+                    )
+                ),
+            )
+        )
+        tasks.append(vm_disable)
+        await wait_until_disable_is_blocked()
+        assert not vm_disable.done()
+        vm_release.set()
+        await asyncio.wait_for(vm_settlement, 5)
+        await asyncio.wait_for(vm_disable, 5)
+
+        # If disable commits first, the guarded body (the payment call in the
+        # route) is never entered.
+        await disable_account(
+            disabled_owner_id,
+            ReasonRequest(reason="fixture disable first"),
+            request,
+            actor,
+            SimpleNamespace(
+                session_factory=async_sessionmaker(
+                    engines[1], expire_on_commit=False
+                )
+            ),
+        )
+        payment_called = False
+        with pytest.raises(HTTPException) as refused:
+            async with _vm_payment_account_guard(
+                vm_orchestrator, disabled_owner_id
+            ):
+                payment_called = True
+        assert refused.value.status_code == 403
+        assert payment_called is False
     finally:
         release.set()
+        vm_release.set()
         for task in tasks:
             if not task.done():
                 task.cancel()

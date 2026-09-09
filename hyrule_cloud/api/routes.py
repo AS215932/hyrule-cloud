@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy import update as _sql_update
 
-from hyrule_cloud.db import VMQuoteRow, VMRow
+from hyrule_cloud.db import AccountRow, VMQuoteRow, VMRow
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.middleware.anon_token import (
     VMManagementIdentity,
@@ -76,6 +76,7 @@ from hyrule_cloud.providers.network_config import (
     customer_prefix_count,
     supports_static_network_config,
 )
+from hyrule_cloud.services.account_deletion import lock_account_lifecycle
 from hyrule_cloud.services.admin_authorization import validate_admin_dispatch
 from hyrule_cloud.services.guest_result import (
     GuestResult,
@@ -131,6 +132,25 @@ async def _proxy_authorization_guard(request: Request):
         yield
     finally:
         _proxy_inflight_auth.discard(key)
+
+
+@asynccontextmanager
+async def _vm_payment_account_guard(orch, account_id: str | None):
+    """Fence an authenticated account through external VM settlement."""
+    if account_id is None:
+        yield
+        return
+    async with orch.db() as session:
+        await lock_account_lifecycle(session, account_id, shared=True)
+        owner = await session.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == account_id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+        if owner is None or owner.disabled_at is not None:
+            raise HTTPException(403, "Account access is disabled")
+        yield
 
 
 async def get_orch(app_state: AppState = Depends(get_app_state)):
@@ -1129,19 +1149,22 @@ async def create_vm(
         await _enforce_compute_capacity(orch, order)
 
     try:
-        result = await gate.check_payment(
-            request,
-            amount=total,
-            description=(
-                f"Hyrule Cloud VM ({VM_PROFILE_LABELS[order.size]}) "
-                f"for {order.duration_days} days"
-            ),
-            extra_body={
-                "cost_breakdown": breakdown.model_dump(),
-                "specs": {**specs, "ipv6": True, "ipv4": False, "region": "eu-west"},
-                "estimated_provision_time_seconds": 60,
-            },
-        )
+        async with _vm_payment_account_guard(
+            orch, account.account_id if account is not None else None
+        ):
+            result = await gate.check_payment(
+                request,
+                amount=total,
+                description=(
+                    f"Hyrule Cloud VM ({VM_PROFILE_LABELS[order.size]}) "
+                    f"for {order.duration_days} days"
+                ),
+                extra_body={
+                    "cost_breakdown": breakdown.model_dump(),
+                    "specs": {**specs, "ipv6": True, "ipv4": False, "region": "eu-west"},
+                    "estimated_provision_time_seconds": 60,
+                },
+            )
     except Exception:
         # Admin quota and required-audit failures raise instead of returning a
         # 402. They must release the unpaid capacity reservation just like the
