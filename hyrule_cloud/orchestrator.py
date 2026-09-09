@@ -121,6 +121,10 @@ class AccountDisabledError(RuntimeError):
     """A VM reservation was fenced by its disabled owner account."""
 
 
+class GuestRecoveryPendingError(RuntimeError):
+    """An untracked provider guest must be reconciled before terminal refund."""
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -897,8 +901,28 @@ class Orchestrator:
             if received is not None or legacy:
                 raise ProvisioningFailedError(FAILURE_GUEST_RECOVERY)
             return None
-        if len(candidates) != 1 or await self.xcpng.get_vm_power_state(candidates[0]) != "Running":
+        if len(candidates) != 1:
+            # Every exact-generation candidate may be customer-accessible. Halt
+            # the ones we can identify, but retain PROVISIONING because no one
+            # UUID can truthfully own the row or drive later cleanup.
+            try:
+                for candidate in candidates:
+                    power = await self.xcpng.get_vm_power_state(candidate)
+                    if power == "Running":
+                        await self.xcpng.suspend_vm(candidate)
+                    elif power != "Halted":
+                        raise RuntimeError(f"unexpected recovery candidate power state: {power}")
+            except Exception as exc:
+                raise GuestRecoveryPendingError() from exc
+            raise GuestRecoveryPendingError()
+        try:
+            power = await self.xcpng.get_vm_power_state(candidates[0])
+        except Exception as exc:
+            raise GuestRecoveryPendingError() from exc
+        if power == "Halted":
             raise ProvisioningFailedError(FAILURE_GUEST_RECOVERY)
+        if power != "Running":
+            raise GuestRecoveryPendingError()
         recovered_uuid = candidates[0]
         async with self.db() as session:
             row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
@@ -1336,6 +1360,12 @@ class Orchestrator:
 
         except GuestGenerationChangedError:
             log.info("provision_attempt_superseded", vm_id=vm_id)
+            return
+        except GuestRecoveryPendingError:
+            # The worker retries this durable PROVISIONING row. A refund is
+            # unsafe until every matching provider guest is known to be halted
+            # and one identity can be attached or cleaned up deliberately.
+            log.warning("provision_guest_recovery_pending", vm_id=vm_id)
             return
         except Exception as e:
             log.error("provision_failed", vm_id=vm_id, error=str(e), exc_info=True)

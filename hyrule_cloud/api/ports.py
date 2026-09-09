@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request, Response
 
-from hyrule_cloud.api._contract import diagnostic_quote, payment_price, require_paid_diagnostic
+from hyrule_cloud.api._contract import (
+    diagnostic_quote,
+    paid_diagnostic_delivery_guard,
+    payment_price,
+    require_paid_diagnostic,
+)
 from hyrule_cloud.models import (
     CapabilityEndpoint,
     DiagnosticResponse,
@@ -57,4 +62,5 @@ async def quote_port_check(request: Request, body: PortCheckRequest) -> PaidEndp
 async def port_check(request: Request, body: PortCheckRequest) -> DiagnosticResponse | Response:
     if payment := await require_paid_diagnostic(request, price_attr="price_port_check", default="0.003", description="Hyrule outside-in port reachability check"):
         return payment
-    return await run_port_check(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await run_port_check(body)

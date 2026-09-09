@@ -1524,6 +1524,48 @@ class _AdminXCPNG:
 
 
 @pytest.mark.asyncio
+async def test_account_suspend_reconciles_already_halted_guest(admin_factory) -> None:
+    xcpng = _AdminXCPNG()
+    xcpng.power["uuid-halted-before-commit"] = "Halted"
+    async with admin_factory.begin() as session:
+        session.add(
+            AccountRow(
+                account_id="HALREADYOFF",
+                password_hash="unused",
+                disabled_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            VMRow(
+                vm_id="vm_halted_before_commit",
+                owner_wallet="0xowner",
+                owner_account_id="HALREADYOFF",
+                xcpng_uuid="uuid-halted-before-commit",
+                status="running",
+            )
+        )
+        session.add(
+            AdminOperationRow(
+                operation_id="operation-replay-suspend",
+                kind="suspend_account_resources",
+                account_id="HALREADYOFF",
+                status="queued",
+            )
+        )
+
+    assert await process_admin_operations(
+        admin_factory, SimpleNamespace(xcpng=xcpng)
+    ) == 1
+    assert xcpng.suspended == []
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, "vm_halted_before_commit")
+        operation = await session.get(AdminOperationRow, "operation-replay-suspend")
+        assert vm is not None and str(vm.status) == "suspended"
+        assert vm.suspension_reason == "account_disabled"
+        assert operation is not None and operation.status == "completed"
+
+
+@pytest.mark.asyncio
 async def test_admin_start_updates_vm_while_owner_fence_is_held(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
     async with admin_factory() as session:
@@ -2064,6 +2106,13 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
     admin_factory,
 ) -> None:
     xcpng = _AdminXCPNG()
+    xcpng.power.update(
+        {
+            "uuid-active": "Running",
+            "uuid-provisioning": "Running",
+            "uuid-failed-disabled": "Running",
+        }
+    )
     orchestrator = Orchestrator(HyruleConfig(), admin_factory)
     orchestrator.xcpng = xcpng
     old_report_deadline = datetime.now(UTC) - timedelta(minutes=1)

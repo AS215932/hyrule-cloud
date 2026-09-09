@@ -18,7 +18,15 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from hyrule_cloud.api.auth import ClaimByTokenRequest, claim_vm, delete_me
+from hyrule_cloud.api.auth import (
+    ChangePasswordRequest,
+    ClaimByTokenRequest,
+    RotateRecoveryCodeRequest,
+    change_password,
+    claim_vm,
+    delete_me,
+    rotate_recovery_code,
+)
 from hyrule_cloud.app import app
 from hyrule_cloud.db import (
     AccountRow,
@@ -35,6 +43,12 @@ from hyrule_cloud.models import (
     VMStatus,
     generate_anon_management_token,
     generate_vm_id,
+)
+from hyrule_cloud.services.passwords import (
+    hash_password,
+    hash_recovery_code,
+    verify_password,
+    verify_recovery_code,
 )
 
 # --- Fixtures: in-process DB + orchestrator stub ---
@@ -370,6 +384,63 @@ async def test_change_password_rejects_wrong_current_password(auth_state, client
         json={"current_password": "wrong", "new_password": "newer than ever long pw"},
     )
     assert res.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_stale_session_cannot_mutate_disabled_account_credentials(auth_state):
+    password = "existing credential password"
+    async with auth_state.orchestrator.db.begin() as session:
+        session.add_all(
+            [
+                AccountRow(
+                    account_id="HSTALEPASS1",
+                    password_hash=hash_password(password),
+                ),
+                AccountRow(
+                    account_id="HSTALEREC01",
+                    password_hash=hash_password(password),
+                    recovery_code_hash=hash_recovery_code("hyr-rec-original-code"),
+                ),
+            ]
+        )
+    async with auth_state.orchestrator.db() as session:
+        stale_password = await session.get(AccountRow, "HSTALEPASS1")
+        stale_recovery = await session.get(AccountRow, "HSTALEREC01")
+        assert stale_password is not None and stale_recovery is not None
+    async with auth_state.orchestrator.db.begin() as session:
+        for account_id in ("HSTALEPASS1", "HSTALEREC01"):
+            stored = await session.get(AccountRow, account_id)
+            assert stored is not None
+            stored.disabled_at = _now()
+
+    with pytest.raises(HTTPException) as password_denied:
+        await change_password(
+            ChangePasswordRequest(
+                current_password=password,
+                new_password="replacement credential password",
+            ),
+            stale_password,
+            auth_state,
+            None,
+        )
+    assert password_denied.value.status_code == 403
+    with pytest.raises(HTTPException) as recovery_denied:
+        await rotate_recovery_code(
+            RotateRecoveryCodeRequest(current_password=password),
+            stale_recovery,
+            auth_state,
+        )
+    assert recovery_denied.value.status_code == 403
+
+    async with auth_state.orchestrator.db() as session:
+        stored_password = await session.get(AccountRow, "HSTALEPASS1")
+        stored_recovery = await session.get(AccountRow, "HSTALEREC01")
+        assert stored_password is not None and verify_password(
+            stored_password.password_hash, password
+        )
+        assert stored_recovery is not None and verify_recovery_code(
+            stored_recovery.recovery_code_hash, "hyr-rec-original-code"
+        )
 
 
 # --- Test: account-owned VM ownership enforcement ---

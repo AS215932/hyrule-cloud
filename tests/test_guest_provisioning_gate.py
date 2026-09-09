@@ -1,7 +1,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 import yaml
@@ -216,6 +216,7 @@ async def test_receipt_backed_pre_uuid_attempts_are_reconciled(tmp_path, monkeyp
 
         orch.xcpng.find_vm_ids_by_name_label = AsyncMock(side_effect=find)
         orch.xcpng.get_vm_power_state = AsyncMock(return_value='Halted' if crash_state == 'halted' else 'Running')
+        orch.xcpng.suspend_vm = AsyncMock()
         orch.xcpng.create_vm = AsyncMock(side_effect=create)
         assert await orch.recover_tracked_provisioning() == 1  # No UUID is persisted.
         await asyncio.wait_for(asyncio.gather(*list(orch._tasks)), 10)
@@ -231,6 +232,14 @@ async def test_receipt_backed_pre_uuid_attempts_are_reconciled(tmp_path, monkeyp
                 ))
                 assert events.count('vm_created') == 1
                 assert events.index('vm_created') < events.index('network_ready')
+            elif crash_state == 'multiple':
+                assert vm.status == VMStatus.PROVISIONING
+                assert vm.xcpng_uuid is None
+                orch._record_vm_refund.assert_not_awaited()
+                assert orch.xcpng.suspend_vm.await_args_list == [
+                    call('first'),
+                    call('second'),
+                ]
             else:
                 assert vm.status == VMStatus.FAILED
                 assert vm.xcpng_uuid is None
@@ -240,7 +249,7 @@ async def test_receipt_backed_pre_uuid_attempts_are_reconciled(tmp_path, monkeyp
                 assert receipt.generation == generation
                 orch.xcpng.create_vm.assert_not_awaited()
         orch.xcpng.destroy_vm.assert_not_awaited()
-        if crash_state not in ('running', 'no_clone'):
+        if crash_state not in ('running', 'no_clone', 'multiple'):
             orch.dns.delete_aaaa = AsyncMock()
             # Customer rollback, repeated deletion and deferred DNS cleanup
             # must all preserve quarantine while retained guests lack a UUID.

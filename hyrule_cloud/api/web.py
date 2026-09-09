@@ -7,6 +7,7 @@ from fastapi import APIRouter, Request, Response
 from hyrule_cloud.api._contract import (
     diagnostic_quote,
     not_implemented,
+    paid_diagnostic_delivery_guard,
     payment_price,
     require_paid_diagnostic,
 )
@@ -82,7 +83,8 @@ async def quote_web_tls_deep(request: Request, body: WebTLSDeepRequest) -> PaidE
 async def web_check(request: Request, body: WebCheckRequest) -> DiagnosticResponse | Response:
     if payment := await require_paid_diagnostic(request, price_attr="price_web_check", default="0.005", description="Hyrule web reachability diagnostic check"):
         return payment
-    return await run_web_check(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await run_web_check(body)
 
 
 @router.get("/http", response_model=DiagnosticResponse)
@@ -130,7 +132,8 @@ async def create_web_report(request: Request, body: WebReportRequest) -> Diagnos
 async def create_web_tls_deep(request: Request, body: WebTLSDeepRequest) -> DiagnosticResponse | Response:
     if payment := await require_paid_diagnostic(request, price_attr="price_web_tls_deep", default="0.10", description="Hyrule deep TLS protocol/certificate/cipher scan"):
         return payment
-    return await run_web_tls_deep(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await run_web_tls_deep(body)
 
 
 @router.get("/jobs/{job_id}", response_model=DiagnosticJobResponse)

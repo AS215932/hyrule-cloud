@@ -247,7 +247,11 @@ async def _apply_locked_account_operation(
                 if str(current.status) == VMStatus.FAILED.value and not current.xcpng_uuid:
                     continue
                 if current.xcpng_uuid:
-                    await orchestrator.xcpng.suspend_vm(current.xcpng_uuid)
+                    power = await orchestrator.xcpng.get_vm_power_state(current.xcpng_uuid)
+                    if power == "Running":
+                        await orchestrator.xcpng.suspend_vm(current.xcpng_uuid)
+                    elif power != "Halted":
+                        raise RuntimeError(f"unexpected VM power state during suspension: {power}")
                 # A provisioner owns the PROVISIONING transition. Mark the
                 # desired suspension without making its initial guard exit.
                 # Stop a recorded provider guest now; finalization also observes

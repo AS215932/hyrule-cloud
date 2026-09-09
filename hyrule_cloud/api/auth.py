@@ -851,25 +851,27 @@ async def change_password(
     factory = _get_session_factory(app_state)
     if factory is None:
         raise HTTPException(503, "Database not available")
-    # A wallet-only account has no password to confirm; the browser session
-    # (which required a wallet signature to obtain) is the proof of control,
-    # so it may set an initial password. Accounts that DO have one must still
-    # present it.
-    if account.password_hash is not None:
-        if not verify_password(account.password_hash, body.current_password):
-            raise HTTPException(401, "Current password is incorrect")
-
     async with factory() as db:
-        acct = await db.get(AccountRow, account.account_id)
+        acct = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == account.account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if acct is None:
             raise HTTPException(404, "Account not found")
+        if acct.disabled_at is not None:
+            raise HTTPException(403, "Account access is disabled")
+        # Recheck the proof under the same account lock used by disable. A
+        # wallet-only account may set its first password from its browser
+        # session; an existing password must still be presented.
+        if acct.password_hash is not None and not verify_password(
+            acct.password_hash, body.current_password
+        ):
+            raise HTTPException(401, "Current password is incorrect")
         acct.password_hash = hash_password(body.new_password)
         acct.password_changed_at = _now()
-        await db.commit()
         # Revoke all other sessions; keep this one alive for UX continuity.
-        await db.execute(
-            select(AccountRow).where(AccountRow.account_id == account.account_id)
-        )
         from sqlalchemy import delete
 
         from hyrule_cloud.db import SessionRow
@@ -898,14 +900,20 @@ async def rotate_recovery_code(
     factory = _get_session_factory(app_state)
     if factory is None:
         raise HTTPException(503, "Database not available")
-    if not verify_password(account.password_hash, body.current_password):
-        raise HTTPException(401, "Current password is incorrect")
-
     new_code = generate_recovery_code()
     async with factory() as db:
-        acct = await db.get(AccountRow, account.account_id)
+        acct = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == account.account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if acct is None:
             raise HTTPException(404, "Account not found")
+        if acct.disabled_at is not None:
+            raise HTTPException(403, "Account access is disabled")
+        if not verify_password(acct.password_hash, body.current_password):
+            raise HTTPException(401, "Current password is incorrect")
         acct.recovery_code_hash = hash_recovery_code(new_code)
         acct.recovery_code_issued_at = _now()
         acct.recovery_code_used_at = None
