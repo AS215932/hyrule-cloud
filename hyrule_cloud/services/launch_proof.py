@@ -183,6 +183,10 @@ def build_launch_proof(
     # --- Messages ---
     operator_message: str | None = lp_meta.get("operator_message")
     customer_message: str | None = lp_meta.get("customer_message")
+    if operator_message:
+        operator_message = normalize_legacy_failure_message(operator_message)
+    if customer_message:
+        customer_message = normalize_legacy_failure_message(customer_message)
 
     if vm_status == VMStatus.FAILED:
         if not operator_message:

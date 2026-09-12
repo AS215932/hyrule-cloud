@@ -655,3 +655,30 @@ async def test_logs_route_surfaces_the_failure_event_and_sanitized_error(
     assert body["events"][-1]["message"] == FAILURE_INTERNAL
     assert body["error"] == FAILURE_INTERNAL
     assert XO_HOST not in res.text and XO_VM_UUID not in res.text
+
+
+@pytest.mark.asyncio
+async def test_legacy_logs_normalize_response_without_rewriting_history(session_factory, logs_client):
+    legacy = (
+        "Provisioning failed because of a problem on our side. "
+        "The order was stopped and any payment is refunded."
+    )
+    async with session_factory() as session:
+        row = _vm("vm_old_failure")
+        row.status = VMStatus.FAILED
+        row.error = legacy
+        session.add(row)
+        await session.flush()
+        session.add(VMEventRow(vm_id=row.vm_id, event=VMEventKey.PROVISIONING_FAILED, message=legacy))
+        await session.commit()
+    response = await logs_client.get(
+        "/v1/vm/vm_old_failure/logs", headers={"Authorization": f"Bearer {TOKEN}"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["error"] == FAILURE_INTERNAL
+    assert body["events"][0]["message"] == FAILURE_INTERNAL
+    assert "is refunded" not in response.text
+    async with session_factory() as session:
+        assert (await session.get(VMRow, "vm_old_failure")).error == legacy
+    assert (await _events(session_factory, "vm_old_failure"))[0].message == legacy

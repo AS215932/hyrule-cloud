@@ -95,7 +95,7 @@ from hyrule_cloud.services.quotes import (
     link_quote_vm,
     release_quote_claim,
 )
-from hyrule_cloud.services.vm_events import vm_log_events
+from hyrule_cloud.services.vm_events import normalize_legacy_failure_message, vm_log_events
 from hyrule_cloud.services.vm_expiry import build_vm_expiry
 from hyrule_cloud.services.vm_pricing import (
     VMResourceValidationError,
@@ -980,7 +980,7 @@ async def get_vm_status(
         profile=profile,
         resources=resources,
         firewall=firewall,
-        error=row.error,
+        error=normalize_legacy_failure_message(row.error) if row.error else row.error,
         expiry=await _vm_expiry_info(row, cfg, orch),
     )
 
@@ -1008,7 +1008,7 @@ async def get_vm_logs(
         vm_id=row.vm_id,
         status=row.status,
         events=await vm_log_events(orch, row),
-        error=row.error,
+        error=normalize_legacy_failure_message(row.error) if row.error else row.error,
     )
 
 

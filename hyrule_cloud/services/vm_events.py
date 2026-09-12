@@ -204,7 +204,7 @@ async def vm_log_events(orchestrator: object, row: object) -> list[VMLogEvent]:
             VMLogEvent(
                 ts=r.created_at.isoformat(),
                 event=r.event,
-                message=r.message,
+                message=normalize_legacy_failure_message(r.message) if r.message else r.message,
                 detail=r.detail,
             )
             for r in rows
