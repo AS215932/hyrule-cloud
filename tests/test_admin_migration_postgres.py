@@ -22,17 +22,17 @@ def test_admin_postgres_migration_roundtrip():
     assert parsed.database == "admin_migration_test"
     assert parsed.host in (None, "localhost", "127.0.0.1", "::1")
 
-    async def query(sql):
+    async def query(sql, params):
         engine = create_async_engine(url)
         try:
             async with engine.begin() as conn:
-                result = await conn.execute(text(sql))
+                result = await conn.execute(text(sql), params)
                 return result.all() if result.returns_rows else []
         finally:
             await engine.dispose()
 
-    def run(sql):
-        return asyncio.run(query(sql))
+    def run(sql, params=None):
+        return asyncio.run(query(sql, params or {}))
 
     def migrate(direction, revision, *, expected_error=None):
         result = subprocess.run(
@@ -70,6 +70,37 @@ def test_admin_postgres_migration_roundtrip():
     assert run("SELECT count(*) FROM admin_audit") == [(1,)]
     # Explicitly resolve the fixture's restriction before the ordinary rollback.
     run("UPDATE accounts SET disabled_at=NULL WHERE account_id='HTEST000001'")
+    run("""INSERT INTO admin_operations(operation_id,kind,account_id,status)
+        VALUES ('fixture-resume','resume_account_resources','HTEST000001','failed')""")
+    migrate("downgrade", "020", expected_error="while account operations remain unresolved")
+    run("UPDATE admin_operations SET status='completed' WHERE operation_id='fixture-resume'")
+    run("UPDATE vms SET suspension_reason='account_disabled' WHERE vm_id='vm_paid'")
+    migrate("downgrade", "020", expected_error="while account resumptions remain pending")
+    run("UPDATE vms SET suspension_reason='manual_admin' WHERE vm_id='vm_paid'")
+    for marker in ('null', '{}'):
+        run("UPDATE vms SET metadata = CAST(:metadata AS jsonb) WHERE vm_id='vm_paid'",
+            {"metadata": '{"extension_resume_pending":' + marker + '}'})
+        migrate("downgrade", "020", expected_error="while paid VM resumptions remain pending")
+        assert run("SELECT version_num FROM alembic_version") == [('023',)]
+    run("UPDATE vms SET metadata='{}' WHERE vm_id='vm_paid'")
+    run("UPDATE vms SET billing_mode='admin_waived' WHERE vm_id='vm_paid'")
+    migrate("downgrade", "020", expected_error="while waived VMs remain actionable")
+    run("UPDATE vms SET billing_mode='charged' WHERE vm_id='vm_paid'")
+    run("""INSERT INTO domain_quotes(
+        quote_id,fqdn,action,status,provider_cost,provider_currency,fx_rate,
+        provider_cost_usd,hyrule_fee_usd,tax_usd,total_usd,available,premium,
+        terms_version,expires_at)
+        VALUES ('quote-waived','fixture.dev','register','consumed',1,'USD',1,1,0,0,1,
+                true,false,'fixture',now()+interval '1 hour')""")
+    run("""INSERT INTO domain_orders(
+        order_id,quote_id,fqdn,action,owner_account_id,idempotency_key,status,
+        amount_usd,domain_amount_usd,vm_amount_usd,payment_method,billing_mode,
+        on_domain_failure,terms_version,terms_accepted_at)
+        VALUES ('order-waived','quote-waived','fixture.dev','register','HTEST000001',
+                'fixture-waived','failed',1,1,0,'x402','admin_waived','keep_vm',
+                'fixture',now())""")
+    migrate("downgrade", "020", expected_error="while waived domain orders remain actionable")
+    run("UPDATE domain_orders SET status='active' WHERE order_id='order-waived'")
     migrate("downgrade", "020")
     assert run("SELECT count(*) FROM vms") == [(2,)]
     assert run("SELECT count(*) FROM accounts") == [(1,)]

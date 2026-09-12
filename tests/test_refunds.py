@@ -638,9 +638,23 @@ async def test_create_vm_can_defer_provisioning(session_factory, monkeypatch) ->
 
     row, _ = await orch.create_vm(order, owner_wallet=EVM_WALLET, start_provisioning=False)
     assert spawned == []  # deferred — nothing provisioning yet
+    assert row.metadata_["provisioning_handoff_state"] == "pending"
 
     await orch.start_provisioning(row.vm_id)
     assert spawned == [row.vm_id]  # explicit start works
+    async with session_factory() as session:
+        stored = await session.get(VMRow, row.vm_id)
+        assert stored.metadata_["provisioning_handoff_state"] == "ready"
+
+    # An idempotent replay cannot hide a handoff that has already been
+    # published, even if the replaying caller asks to defer local scheduling.
+    replayed, _ = await orch.create_vm(
+        order,
+        owner_wallet=EVM_WALLET,
+        vm_id=row.vm_id,
+        start_provisioning=False,
+    )
+    assert replayed.metadata_["provisioning_handoff_state"] == "ready"
 
 
 @pytest.mark.asyncio
@@ -785,9 +799,13 @@ async def test_activate_reservation_can_defer_provisioning(session_factory, monk
     )
     assert row is not None
     assert spawned == []  # deferred until the quote is linked
+    assert row.metadata_["provisioning_handoff_state"] == "pending"
 
     await orch.start_provisioning("vm_res")
     assert spawned == ["vm_res"]
+    async with session_factory() as session:
+        stored = await session.get(VMRow, "vm_res")
+        assert stored.metadata_["provisioning_handoff_state"] == "ready"
 
 
 @pytest.mark.asyncio

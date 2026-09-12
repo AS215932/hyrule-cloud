@@ -4,6 +4,7 @@ import importlib.util
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 
 
@@ -135,3 +136,26 @@ def test_migration_023_backfills_legacy_dev_bypass_resources() -> None:
     assert vm_rows["vm-paid"].cost_total == Decimal("2.500000")
     assert module.revision == "023"
     assert module.down_revision == "022"
+
+
+@pytest.mark.parametrize("marker", ['null', '{}'])
+def test_downgrade_preserves_paid_resume_handoff(monkeypatch, marker):
+    module = _migration_module()
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as connection:
+        for statement in (
+            "CREATE TABLE accounts (disabled_at TEXT)",
+            "CREATE TABLE admin_operations (status TEXT)",
+            "CREATE TABLE vms (suspension_reason TEXT, metadata TEXT)",
+            "CREATE TABLE mail_accounts (suspension_reason TEXT)",
+        ):
+            connection.execute(sa.text(statement))
+        connection.execute(
+            sa.text("INSERT INTO vms(metadata) VALUES (:metadata)"),
+            {"metadata": '{"extension_resume_pending":' + marker + '}'},
+        )
+        monkeypatch.setattr(module.op, "get_bind", lambda: connection)
+        with pytest.raises(RuntimeError, match="while paid VM resumptions remain pending"):
+            module.downgrade()
+        assert connection.scalar(sa.text("SELECT count(*) FROM vms")) == 1
+    engine.dispose()

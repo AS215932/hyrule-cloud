@@ -124,11 +124,13 @@ async def test_renewal_and_expiry_serialize_across_postgres_connections(monkeypa
         restarted = _orchestrator(observer)
         gate = SimpleNamespace(check_payment=AsyncMock())
         monkeypatch.setattr(routes, "_require_vm_service_open", lambda _gate: None)
+        authorized = await restarted.get_vm("vm_pg_lifecycle")
+        assert authorized is not None
         with pytest.raises(HTTPException) as rejected:
             await routes.extend_vm(
                 "vm_pg_lifecycle", VMExtendRequest(days=5),
                 Request({"type": "http", "method": "POST", "path": "/"}),
-                row=None, orch=restarted, cfg=None, gate=gate,
+                row=authorized, orch=restarted, cfg=None, gate=gate,
             )
         assert rejected.value.status_code == 409
         gate.check_payment.assert_not_awaited()
@@ -142,6 +144,19 @@ async def test_renewal_and_expiry_serialize_across_postgres_connections(monkeypa
             with pytest.raises(RuntimeError, match="pending VM deletion claims"):
                 await connection.run_sync(run_migration, "downgrade")
             await connection.execute(text("UPDATE vms SET status='destroyed' WHERE vm_id='vm_pg_lifecycle'"))
+            with pytest.raises(RuntimeError, match="pending VM deletion claims"):
+                await connection.run_sync(run_migration, "downgrade")
+            await connection.execute(text(
+                "UPDATE vms SET metadata=jsonb_build_object('provider_deleted_uuid', xcpng_uuid), "
+                "ipv6_prefix_index=7, ipv6_prefix='2a0c:b641:b51:7::/64' "
+                "WHERE vm_id='vm_pg_lifecycle'"
+            ))
+            with pytest.raises(RuntimeError, match="pending VM deletion claims"):
+                await connection.run_sync(run_migration, "downgrade")
+            await connection.execute(text(
+                "UPDATE vms SET ipv6_prefix_index=NULL, ipv6_prefix=NULL "
+                "WHERE vm_id='vm_pg_lifecycle'"
+            ))
             await connection.run_sync(run_migration, "downgrade")
             await connection.run_sync(run_migration, "upgrade")
             assert await connection.scalar(text("SELECT count(*) FROM vms WHERE vm_id='vm_pg_lifecycle' AND deletion_started_at IS NULL")) == 1

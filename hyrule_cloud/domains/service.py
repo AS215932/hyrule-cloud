@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, cast, overload
@@ -97,6 +98,7 @@ from hyrule_cloud.models import (
     VMStatus,
     generate_vm_id,
 )
+from hyrule_cloud.orchestrator import AccountDisabledError
 from hyrule_cloud.providers.native_crypto import Asset, NativeCryptoProvider
 from hyrule_cloud.providers.openprovider import (
     OpenproviderClient,
@@ -104,6 +106,7 @@ from hyrule_cloud.providers.openprovider import (
     OpenproviderUnavailableError,
 )
 from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.services.account_deletion import lock_account_lifecycle
 from hyrule_cloud.services.intents import IntentExistsError, create_intent
 from hyrule_cloud.services.quotes import link_quote_vm
 from hyrule_cloud.services.vm_events import customer_failure_message
@@ -1228,6 +1231,12 @@ class DomainService:
             )
         except IntentExistsError as exc:
             intent = exc.existing
+        except AccountDisabledError as exc:
+            raise DomainProblem(
+                403,
+                "account_disabled",
+                "Account access is disabled.",
+            ) from exc
         except Exception as exc:
             await self._set_order_error(
                 order.order_id,
@@ -1299,6 +1308,59 @@ class DomainService:
                 raise DomainProblem(
                     409, "quote_expired", "This order's payment window has expired."
                 )
+
+    @asynccontextmanager
+    async def x402_payment_guard(
+        self, order_id: str, owner_account_id: str
+    ) -> AsyncIterator[DomainOrderRow]:
+        """Fence account disable/transfer through external x402 settlement."""
+        async with self.db() as session:
+            snapshot = await session.get(DomainOrderRow, order_id)
+            if snapshot is None or snapshot.owner_account_id != owner_account_id:
+                raise DomainProblem(404, "order_not_found", "Domain order not found.")
+            await lock_account_lifecycle(session, owner_account_id, shared=True)
+            owner = (
+                await session.execute(
+                    select(AccountRow)
+                    .where(AccountRow.account_id == owner_account_id)
+                    .with_for_update(key_share=True)
+                )
+            ).scalar_one_or_none()
+            order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == order_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if order is None or order.owner_account_id != owner_account_id:
+                raise DomainProblem(409, "order_owner_changed", "The order owner changed.")
+            if owner is None or owner.disabled_at is not None:
+                raise DomainProblem(403, "account_disabled", "This account is disabled.")
+            if order.status != DomainOrderStatus.AWAITING_PAYMENT.value:
+                raise DomainProblem(409, "order_not_payable", "This order is no longer payable.")
+            quote = (
+                await session.execute(
+                    select(DomainQuoteRow)
+                    .where(DomainQuoteRow.quote_id == order.quote_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                quote is None
+                or quote.status not in {"active", "reserved"}
+                or _aware(quote.expires_at) <= _now()
+            ):
+                now = _now()
+                await self._expire_unpaid_order(session, order, now=now)
+                if quote is not None and _aware(quote.expires_at) <= now:
+                    quote.status = "expired"
+                await session.commit()
+                raise DomainProblem(
+                    409, "quote_expired", "This order's payment window has expired."
+                )
+            yield order
 
     async def native_order_settled(self, order_id: str, intent: CryptoIntentRow) -> DomainOrderRow:
         return await self._mark_paid(

@@ -100,6 +100,7 @@ class _Orch:
     locked_vm = Orchestrator.locked_vm
     vm_can_extend = staticmethod(Orchestrator.vm_can_extend)
     vm_owner_enabled = staticmethod(Orchestrator.vm_owner_enabled)
+    reconcile_extension_power = Orchestrator.reconcile_extension_power
 
     def __init__(self, factory):
         self.db = factory
@@ -271,6 +272,14 @@ async def test_expiry_suspend_and_destroy_paths_are_exercised(launch_state):
         db = launch_state.orchestrator.db
         xcpng = _XCPNG()
         destroyed: list[str] = []
+
+        async def reconcile_extension_resumes(self):
+            # Neither expiry fixture carries a paid-extension handoff.
+            return 0
+
+        async def reconcile_transfer_resumes(self):
+            # Neither expiry fixture carries an ownership-transfer handoff.
+            return 0
 
         async def destroy_vm(self, vm_id, *, expired_before=None):
             self.destroyed.append(vm_id)

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from hyrule_cloud.db import (
     AccountRow,
+    AdminOperationRow,
     DomainOrderRow,
     DomainRow,
     RecoveryAttemptRow,
@@ -412,14 +413,28 @@ async def login(
         if acct is None or acct.password_hash is None:
             _ = hash_password(body.password)  # constant-time-ish defense
             raise HTTPException(401, "Invalid credentials")
-        if not verify_password(acct.password_hash, body.password):
+        verified_password_hash = acct.password_hash
+        if not verify_password(verified_password_hash, body.password):
+            raise HTTPException(401, "Invalid credentials")
+        # Password verification is intentionally outside the row lock. Re-lock
+        # and revalidate the credential at issuance so account disable either
+        # revokes this new session or wins first and prevents its creation.
+        acct = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == body.account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if (
+            acct is None
+            or acct.password_hash is None
+            or acct.password_hash != verified_password_hash
+        ):
             raise HTTPException(401, "Invalid credentials")
         if acct.disabled_at is not None:
             raise HTTPException(403, "Account disabled")
 
         acct.last_login_at = _now()
-        await db.commit()
-
         credentials = await create_session(
             db,
             acct.account_id,
@@ -475,28 +490,81 @@ async def recover_with_code(
             and verify_recovery_code(acct.recovery_code_hash, body.recovery_code)
         )
 
-        db.add(
-            RecoveryAttemptRow(
-                account_id=acct.account_id if acct else None,
-                method="code",
-                success=valid,
-                ip_prefix_hash=ip_hash,
-            )
-        )
-        await db.commit()
-
         if not valid or acct is None:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=acct.account_id if acct else None,
+                    method="code",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
             raise HTTPException(401, "Invalid recovery code")
 
-        # Rotate password + recovery code; revoke all sessions.
+        # Account disable revokes credentials under the account-row lock. Take
+        # the conflicting lock and revalidate the proof so recovery cannot
+        # replace credentials after disable wins.
+        acct = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == body.account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if acct is None:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=None,
+                    method="code",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise HTTPException(401, "Invalid recovery code")
+        if acct.disabled_at is not None:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=acct.account_id,
+                    method="code",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise HTTPException(403, "Account access is disabled")
+        if (
+            acct.recovery_code_hash is None
+            or acct.recovery_code_used_at is not None
+            or not verify_recovery_code(acct.recovery_code_hash, body.recovery_code)
+        ):
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=acct.account_id,
+                    method="code",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise HTTPException(401, "Invalid recovery code")
+
+        # Rotate password + recovery code and revoke sessions in the same
+        # transaction that still owns the account fence.
         acct.password_hash = hash_password(body.new_password)
         new_code = generate_recovery_code()
         acct.recovery_code_hash = hash_recovery_code(new_code)
         acct.recovery_code_issued_at = _now()
-        acct.recovery_code_used_at = _now()  # mark old code as consumed
+        acct.recovery_code_used_at = None
         acct.password_changed_at = _now()
-        await db.commit()
-
+        db.add(
+            RecoveryAttemptRow(
+                account_id=acct.account_id,
+                method="code",
+                success=True,
+                ip_prefix_hash=ip_hash,
+            )
+        )
         revoked = await revoke_all_sessions_for(db, acct.account_id)
 
     log.info("recovery_code_used", account_id=acct.account_id, sessions_revoked=revoked)
@@ -601,7 +669,11 @@ async def recover_wallet_verify(
     invalid = HTTPException(401, "Invalid or expired recovery challenge")
 
     async with factory() as db:
-        chal = await db.get(RecoveryChallengeRow, body.nonce)
+        chal = await db.scalar(
+            select(RecoveryChallengeRow)
+            .where(RecoveryChallengeRow.nonce == body.nonce)
+            .with_for_update()
+        )
 
         # Use the same "always log an attempt" pattern as code recovery so
         # the audit trail captures both real and probe traffic.
@@ -676,12 +748,14 @@ async def recover_wallet_verify(
             await db.commit()
             raise invalid
 
-        # Burn the challenge BEFORE doing anything else so a racing duplicate
-        # request can't double-spend the same signature.
-        chal.used_at = now
-        await db.commit()
-
-        acct = await db.get(AccountRow, chal.account_id)
+        # Account disable revokes credentials under the account-row lock. Lock
+        # and revalidate before burning the proof or changing the password.
+        acct = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == chal.account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if acct is None:
             # The wallet+account pair matched a VM row but the account row
             # itself is gone — treat as opaque failure.
@@ -695,16 +769,26 @@ async def recover_wallet_verify(
             )
             await db.commit()
             raise invalid
+        if acct.disabled_at is not None:
+            db.add(
+                RecoveryAttemptRow(
+                    account_id=acct.account_id,
+                    method="wallet",
+                    success=False,
+                    ip_prefix_hash=ip_hash,
+                )
+            )
+            await db.commit()
+            raise HTTPException(403, "Account access is disabled")
 
+        # Burn the challenge, change the password, revoke sessions and record
+        # success atomically while the account and challenge locks are held.
+        chal.used_at = now
         acct.password_hash = hash_password(body.new_password)
         acct.password_changed_at = now
         # Don't auto-rotate recovery_code on this path — the user can do that
         # explicitly from the dashboard. The code endpoint rotates because the
         # code is consumed in that flow; signatures aren't consumed analogously.
-        await db.commit()
-
-        revoked = await revoke_all_sessions_for(db, acct.account_id)
-
         db.add(
             RecoveryAttemptRow(
                 account_id=acct.account_id,
@@ -713,7 +797,7 @@ async def recover_wallet_verify(
                 ip_prefix_hash=ip_hash,
             )
         )
-        await db.commit()
+        revoked = await revoke_all_sessions_for(db, acct.account_id)
 
     log.info(
         "recovery_wallet_used",
@@ -768,25 +852,27 @@ async def change_password(
     factory = _get_session_factory(app_state)
     if factory is None:
         raise HTTPException(503, "Database not available")
-    # A wallet-only account has no password to confirm; the browser session
-    # (which required a wallet signature to obtain) is the proof of control,
-    # so it may set an initial password. Accounts that DO have one must still
-    # present it.
-    if account.password_hash is not None:
-        if not verify_password(account.password_hash, body.current_password):
-            raise HTTPException(401, "Current password is incorrect")
-
     async with factory() as db:
-        acct = await db.get(AccountRow, account.account_id)
+        acct = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == account.account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if acct is None:
             raise HTTPException(404, "Account not found")
+        if acct.disabled_at is not None:
+            raise HTTPException(403, "Account access is disabled")
+        # Recheck the proof under the same account lock used by disable. A
+        # wallet-only account may set its first password from its browser
+        # session; an existing password must still be presented.
+        if acct.password_hash is not None and not verify_password(
+            acct.password_hash, body.current_password
+        ):
+            raise HTTPException(401, "Current password is incorrect")
         acct.password_hash = hash_password(body.new_password)
         acct.password_changed_at = _now()
-        await db.commit()
         # Revoke all other sessions; keep this one alive for UX continuity.
-        await db.execute(
-            select(AccountRow).where(AccountRow.account_id == account.account_id)
-        )
         from sqlalchemy import delete
 
         from hyrule_cloud.db import SessionRow
@@ -815,14 +901,20 @@ async def rotate_recovery_code(
     factory = _get_session_factory(app_state)
     if factory is None:
         raise HTTPException(503, "Database not available")
-    if not verify_password(account.password_hash, body.current_password):
-        raise HTTPException(401, "Current password is incorrect")
-
     new_code = generate_recovery_code()
     async with factory() as db:
-        acct = await db.get(AccountRow, account.account_id)
+        acct = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == account.account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if acct is None:
             raise HTTPException(404, "Account not found")
+        if acct.disabled_at is not None:
+            raise HTTPException(403, "Account access is disabled")
+        if not verify_password(acct.password_hash, body.current_password):
+            raise HTTPException(401, "Current password is incorrect")
         acct.recovery_code_hash = hash_recovery_code(new_code)
         acct.recovery_code_issued_at = _now()
         acct.recovery_code_used_at = None
@@ -884,6 +976,8 @@ async def _account_deletion_snapshot(db: AsyncSession, account_id: str) -> tuple
                            .with_for_update().execution_options(populate_existing=True))
     if acct is None:
         raise HTTPException(409, "Account deletion state changed")
+    if acct.disabled_at is not None:
+        raise HTTPException(403, "Account disabled")
     if acct.is_admin:
         raise HTTPException(409, "Administrator accounts must be demoted before account deletion.")
     retained_domain_order = await db.scalar(
@@ -966,6 +1060,30 @@ async def _delete_account_resources(
         acct, owned_vms = await _account_deletion_snapshot(db, account.account_id)
 
         if vm_policy == "detach":
+            pending_resume = await db.scalar(
+                select(AdminOperationRow.operation_id)
+                .where(
+                    AdminOperationRow.account_id == account.account_id,
+                    AdminOperationRow.kind == "resume_account_resources",
+                    AdminOperationRow.status.in_(["queued", "running", "failed"]),
+                )
+                .limit(1)
+            )
+            if pending_resume is not None or any(
+                vm.suspension_reason == "account_disabled" for vm in owned_vms
+            ):
+                raise HTTPException(
+                    409,
+                    "Account resources must finish resuming before VM detachment.",
+                )
+            if any(
+                (vm.metadata_ or {}).get("extension_resume_pending") is not None
+                for vm in owned_vms
+            ):
+                raise HTTPException(
+                    409,
+                    "VM extensions must finish resuming before account detachment.",
+                )
             for vm in owned_vms:
                 fresh_token = generate_anon_management_token()
                 vm.anon_management_token_hash = hash_anon_token(fresh_token)
@@ -1095,10 +1213,45 @@ async def claim_vm(
         if not proven:
             raise HTTPException(403, "Proof of ownership rejected")
 
+        # Account disable locks the account before snapshotting its VMs. Take
+        # the compatible account-first lock here so a claim either completes
+        # before that snapshot or observes the committed disabled state.
+        destination = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == account.account_id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+        if destination is None or destination.disabled_at is not None:
+            raise HTTPException(403, "Account access is disabled")
+        proof_state = (
+            vm.owner_account_id,
+            vm.anon_management_token_hash,
+            vm.owner_wallet,
+            vm.ssh_pubkey,
+        )
+        vm = await db.scalar(
+            select(VMRow)
+            .where(VMRow.vm_id == vm_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if vm is None:
+            raise HTTPException(404, "VM not found")
+        if vm.owner_account_id is not None:
+            raise HTTPException(409, "VM already claimed")
+        if (
+            vm.owner_account_id,
+            vm.anon_management_token_hash,
+            vm.owner_wallet,
+            vm.ssh_pubkey,
+        ) != proof_state:
+            raise HTTPException(409, "VM claim state changed; retry the claim")
+
         if (vm.deletion_started_at is not None or vm.status == VMStatus.DESTROYED
                 or await db.get(VMRetentionRow, vm_id) is not None):
             raise HTTPException(409, "VM deletion or retention is in progress")
-        vm.owner_account_id = account.account_id
+        vm.owner_account_id = destination.account_id
         # Burn the anon token once claimed — account auth now supersedes.
         vm.anon_management_token_hash = None
         await db.commit()
@@ -1181,6 +1334,13 @@ async def create_api_key_endpoint(
         expires_at = _now() + timedelta(days=body.expires_in_days)
 
     async with factory() as db:
+        current_account = await db.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == account.account_id)
+            .with_for_update()
+        )
+        if current_account is None or current_account.disabled_at is not None:
+            raise HTTPException(403, "Account disabled")
         try:
             cleartext, row = await svc_create_api_key(
                 db,

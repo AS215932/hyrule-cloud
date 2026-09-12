@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -27,7 +30,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
-from hyrule_cloud.db import CryptoIntentRow, DomainOrderRow
+from hyrule_cloud.db import AccountRow, CryptoIntentRow, DomainOrderRow
 from hyrule_cloud.models import (
     CryptoIntentStatus,
     DomainMode,
@@ -38,6 +41,7 @@ from hyrule_cloud.models import (
 from hyrule_cloud.orchestrator import AccountDisabledError
 from hyrule_cloud.providers.native_crypto import AddressScanResult, NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.services.account_deletion import lock_account_lifecycle
 from hyrule_cloud.services.quotes import (
     claim_quote,
     get_quote,
@@ -73,6 +77,10 @@ VM_PROVISIONING_RECOVERY_DELAY = timedelta(minutes=5)
 # process also need a keyed lock. Weak values avoid retaining one lock for
 # every intent ever seen; PostgreSQL row locks remain the cross-process fence.
 _poll_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+_guarded_native_accounts: ContextVar[frozenset[tuple[int, int, str]]] = ContextVar(
+    "guarded_native_accounts",
+    default=frozenset(),
+)
 
 
 def _poll_lock(intent_id: str) -> asyncio.Lock:
@@ -111,7 +119,75 @@ class IntentExistsError(Exception):
         self.existing = existing
 
 
+@asynccontextmanager
+async def native_intent_account_guard(
+    session_factory: async_sessionmaker,
+    owner_account_id: str | None,
+) -> AsyncIterator[None]:
+    """Fence account disable/delete through native address persistence."""
+    if owner_account_id is None:
+        yield
+        return
+    guarded = _guarded_native_accounts.get()
+    # Child tasks inherit ContextVars but must acquire their own transaction.
+    guard_key = (id(asyncio.current_task()), id(session_factory), owner_account_id)
+    if guard_key in guarded:
+        yield
+        return
+    async with session_factory() as session:
+        await lock_account_lifecycle(session, owner_account_id, shared=True)
+        owner = await session.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == owner_account_id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+        if owner is None or owner.disabled_at is not None:
+            raise AccountDisabledError("Account access is disabled")
+        token = _guarded_native_accounts.set(guarded | {guard_key})
+        try:
+            yield
+        finally:
+            _guarded_native_accounts.reset(token)
+
+
 async def create_intent(
+    *,
+    session_factory: async_sessionmaker,
+    provider: NativeCryptoProvider,
+    rates: RateProvider,
+    asset: str,
+    order_payload: BaseModel | dict[str, Any],
+    amount_usd: Decimal,
+    client_order_id: str | None,
+    owner_account_id: str | None,
+    expires_at: datetime | None = None,
+    resource_type: str = "vm",
+    resource_id: str | None = None,
+    refund_address: str | None = None,
+    planned_vm_id: str | None = None,
+    pricing_snapshot: dict[str, Any] | None = None,
+) -> CryptoIntentRow:
+    async with native_intent_account_guard(session_factory, owner_account_id):
+        return await _create_intent_unfenced(
+            session_factory=session_factory,
+            provider=provider,
+            rates=rates,
+            asset=asset,
+            order_payload=order_payload,
+            amount_usd=amount_usd,
+            client_order_id=client_order_id,
+            owner_account_id=owner_account_id,
+            expires_at=expires_at,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            refund_address=refund_address,
+            planned_vm_id=planned_vm_id,
+            pricing_snapshot=pricing_snapshot,
+        )
+
+
+async def _create_intent_unfenced(
     *,
     session_factory: async_sessionmaker,
     provider: NativeCryptoProvider,

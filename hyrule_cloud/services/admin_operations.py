@@ -239,15 +239,23 @@ async def _apply_locked_account_operation(
                 ).scalar_one_or_none()
                 if current is None or current.owner_account_id != account_id:
                     continue
-                if str(current.status) in {
-                    VMStatus.DESTROYED.value,
-                    VMStatus.SUSPENDED.value,
-                }:
+                if str(current.status) == VMStatus.DESTROYED.value:
                     continue
                 if str(current.status) == VMStatus.FAILED.value and not current.xcpng_uuid:
                     continue
                 if current.xcpng_uuid:
-                    await orchestrator.xcpng.suspend_vm(current.xcpng_uuid)
+                    power = await orchestrator.xcpng.get_vm_power_state(current.xcpng_uuid)
+                    if power == "Running":
+                        await orchestrator.xcpng.suspend_vm(current.xcpng_uuid)
+                    elif power != "Halted":
+                        raise RuntimeError(f"unexpected VM power state during suspension: {power}")
+                # Preserve independent restrictions after reconciling power.
+                # Account re-enablement must not undo manual or expiry stops.
+                if (
+                    str(current.status) == VMStatus.SUSPENDED.value
+                    and current.suspension_reason in {"manual_admin", "expired"}
+                ):
+                    continue
                 # A provisioner owns the PROVISIONING transition. Mark the
                 # desired suspension without making its initial guard exit.
                 # Stop a recorded provider guest now; finalization also observes
@@ -299,6 +307,11 @@ async def _apply_locked_account_operation(
                     # A provisioning failure can retain the disable marker and
                     # even a provider UUID. Terminal rows may already carry a
                     # refund obligation and must never be revived by enable.
+                    # The disable provenance is no longer actionable once the
+                    # account is enabled and must not block rollback forever.
+                    current.suspension_reason = None
+                    current.suspended_by_account_id = None
+                    await session.commit()
                     continue
                 if current.expires_at is not None and _aware(current.expires_at) <= now:
                     current.suspension_reason = "expired"
@@ -306,13 +319,26 @@ async def _apply_locked_account_operation(
                     await session.commit()
                     continue
                 if str(current.status) == VMStatus.PROVISIONING.value:
-                    # The existing provisioner will observe the cleared marker
-                    # and complete normally; do not invent a RUNNING row before
-                    # a provider UUID exists.
+                    # A provider-backed provisioning guest was stopped during
+                    # disable. Start that exact guest while preserving the
+                    # durable PROVISIONING state for receipt reconciliation.
+                    if current.xcpng_uuid:
+                        power = await orchestrator.xcpng.get_vm_power_state(current.xcpng_uuid)
+                        if power == "Halted":
+                            await orchestrator.xcpng.start_vm(current.xcpng_uuid)
+                        elif power != "Running":
+                            raise RuntimeError(f"unexpected VM power state during resume: {power}")
+                        await orchestrator.renew_provisioning_report_deadline(
+                            session, current
+                        )
                     current.suspension_reason = None
                     current.suspended_by_account_id = None
                 elif current.xcpng_uuid:
-                    await orchestrator.xcpng.start_vm(current.xcpng_uuid)
+                    power = await orchestrator.xcpng.get_vm_power_state(current.xcpng_uuid)
+                    if power == "Halted":
+                        await orchestrator.xcpng.start_vm(current.xcpng_uuid)
+                    elif power != "Running":
+                        raise RuntimeError(f"unexpected VM power state during resume: {power}")
                     current.status = VMStatus.RUNNING
                     current.suspension_reason = None
                     current.suspended_by_account_id = None

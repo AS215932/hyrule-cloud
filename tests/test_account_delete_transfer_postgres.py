@@ -14,7 +14,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
-from hyrule_cloud.api.admin import OwnershipTransferRequest, transfer_domain
+from hyrule_cloud.api.admin import OwnershipTransferRequest, transfer_domain, transfer_vm
 from hyrule_cloud.api.auth import delete_me
 from hyrule_cloud.db import AccountRow, AdminAuditRow, DomainRow, VMRow
 from hyrule_cloud.orchestrator import Orchestrator
@@ -126,6 +126,109 @@ async def test_account_delete_and_domain_transfer_are_serialized():
                 with pytest.raises(HTTPException) as assisted:
                     await deleting()
                 assert 'assisted deletion' in assisted.value.detail
+
+        # The source account uses the same guard. In particular, a completed
+        # detach must never return a one-time token that a waiting transfer can
+        # immediately invalidate.
+        for index, delete_first in enumerate((True, False), start=3):
+            actor = AccountRow(account_id=f'HADMIN0000{index}', password_hash='fixture', is_admin=True)
+            source = AccountRow(account_id=f'HSOURCE000{index}', password_hash='fixture')
+            target = AccountRow(account_id=f'HTARGET000{index}', password_hash='fixture')
+            vm_id = f'vm_detach_source_{index}'
+            async with sessions.begin() as session:
+                session.add_all([actor, source, target])
+                await session.flush()
+                session.add(VMRow(
+                    vm_id=vm_id, owner_wallet='source', owner_account_id=source.account_id,
+                    status='running', xcpng_uuid=f'detach-guest-{index}',
+                    anon_management_token_hash='source-token',
+                ))
+            entered, release = asyncio.Event(), asyncio.Event()
+            releases.append(release)
+
+            class HeldSourceDeleteSession(AsyncSession):
+                async def delete(self, instance):
+                    await super().delete(instance)
+                    if (
+                        isinstance(instance, AccountRow)
+                        and instance.account_id == source.account_id
+                    ):
+                        await self.flush()
+                        entered.set()
+                        await release.wait()
+
+            class HeldVMTransferSession(AsyncSession):
+                async def commit(self):
+                    if any(
+                        isinstance(row, AdminAuditRow) and row.action == 'vm.transfer'
+                        for row in self.new
+                    ):
+                        await self.flush()
+                        entered.set()
+                        await release.wait()
+                    await super().commit()
+
+            delete_factory = async_sessionmaker(
+                engines[0],
+                class_=HeldSourceDeleteSession if delete_first else AsyncSession,
+                expire_on_commit=False,
+            )
+            transfer_factory = async_sessionmaker(
+                engines[1],
+                class_=AsyncSession if delete_first else HeldVMTransferSession,
+                expire_on_commit=False,
+            )
+            delete_state = SimpleNamespace(
+                session_factory=delete_factory,
+                orchestrator=SimpleNamespace(db=delete_factory),
+            )
+            transfer_state = SimpleNamespace(session_factory=transfer_factory, orchestrator=None)
+            detach_request = Request({
+                'type': 'http', 'method': 'DELETE', 'path': '/v1/me',
+                'query_string': b'vm_policy=detach', 'headers': [],
+            })
+
+            async def deleting_source():
+                return await delete_me(
+                    detach_request, Response(), source, delete_state, None
+                )
+
+            async def transferring_vm():
+                return await transfer_vm(
+                    vm_id,
+                    OwnershipTransferRequest(
+                        target_account_id=target.account_id, reason='fixture transfer'
+                    ),
+                    detach_request,
+                    actor,
+                    transfer_state,
+                )
+
+            first = asyncio.create_task(
+                deleting_source() if delete_first else transferring_vm()
+            )
+            tasks.append(first)
+            await asyncio.wait_for(entered.wait(), 5)
+            with pytest.raises(HTTPException) as refused:
+                await asyncio.wait_for(
+                    transferring_vm() if delete_first else deleting_source(), 5
+                )
+            assert refused.value.status_code == 409
+            assert 'in progress' in refused.value.detail
+            release.set()
+            first_result = await asyncio.wait_for(first, 5)
+
+            async with sessions() as session:
+                vm = await session.get(VMRow, vm_id)
+                if delete_first:
+                    assert await session.get(AccountRow, source.account_id) is None
+                    assert vm.owner_account_id is None
+                    assert vm.anon_management_token_hash != 'source-token'
+                    assert first_result.detached_vms[0]['vm_id'] == vm_id
+                else:
+                    assert await session.get(AccountRow, source.account_id) is not None
+                    assert vm.owner_account_id == target.account_id
+                    assert vm.anon_management_token_hash is None
     finally:
         for release in releases:
             release.set()

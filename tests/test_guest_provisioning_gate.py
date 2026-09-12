@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock
+from decimal import Decimal
+from unittest.mock import AsyncMock, call
 
 import pytest
 import yaml
@@ -11,9 +12,131 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.api.routes import get_orch, router
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import Base, VMEventRow, VMRow
-from hyrule_cloud.models import DNSResolutionStatus, VMCreateRequest, VMStatus
+from hyrule_cloud.db import Base, CryptoIntentRow, VMEventRow, VMGuestResultRow, VMRow
+from hyrule_cloud.models import CryptoIntentStatus, DNSResolutionStatus, VMCreateRequest, VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
+
+
+@pytest.mark.asyncio
+async def test_guest_recovery_waits_for_native_intent_handoff(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'native-handoff.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    orch = Orchestrator(HyruleConfig(), factory)
+    orch._spawn_provisioning = AsyncMock()
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            session.add(VMRow(
+                vm_id='vm_native_handoff', owner_wallet='fixture',
+                status=VMStatus.PROVISIONING,
+            ))
+            session.add(VMGuestResultRow(
+                vm_id='vm_native_handoff', generation='a' * 32,
+                token_hash='b' * 64,
+                deadline=datetime.now(UTC) + timedelta(minutes=5),
+            ))
+            session.add(CryptoIntentRow(
+                intent_id='native-handoff', asset='BTC', amount_crypto=Decimal('0.1'),
+                address='fixture', status=CryptoIntentStatus.PROVISIONING,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                resource_type='vm', vm_id='vm_native_handoff',
+            ))
+        assert await orch.recover_tracked_provisioning() == 0
+        orch._spawn_provisioning.assert_not_awaited()
+        async with factory.begin() as session:
+            intent = await session.get(CryptoIntentRow, 'native-handoff')
+            intent.status = CryptoIntentStatus.PROVISIONED
+        assert await orch.recover_tracked_provisioning() == 1
+        orch._spawn_provisioning.assert_awaited_once_with('vm_native_handoff')
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_guest_recovery_waits_for_create_handoff_and_recovers_schedule_failure(
+    tmp_path,
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'create-handoff.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    orch = Orchestrator(HyruleConfig(), factory)
+    failed_schedule = AsyncMock(side_effect=RuntimeError("task scheduler unavailable"))
+    orch._spawn_provisioning = failed_schedule
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            session.add(
+                VMRow(
+                    vm_id="vm_create_handoff",
+                    owner_wallet="paid",
+                    status=VMStatus.PROVISIONING,
+                    metadata_={"provisioning_handoff_state": "pending"},
+                )
+            )
+            session.add(
+                VMGuestResultRow(
+                    vm_id="vm_create_handoff",
+                    generation="a" * 32,
+                    token_hash="b" * 64,
+                    deadline=datetime.now(UTC) + timedelta(minutes=5),
+                )
+            )
+
+        assert await orch.recover_tracked_provisioning() == 0
+        failed_schedule.assert_not_awaited()
+
+        # The API publishes the completed quote/intent handoff before trying
+        # to create the local task. A scheduler failure is then worker-owned,
+        # not a terminal/refund path.
+        await orch.start_provisioning("vm_create_handoff")
+        failed_schedule.assert_awaited_once_with("vm_create_handoff")
+        async with factory() as session:
+            row = await session.get(VMRow, "vm_create_handoff")
+            assert row is not None
+            assert row.status == VMStatus.PROVISIONING
+            assert row.metadata_["provisioning_handoff_state"] == "ready"
+
+        recovered_schedule = AsyncMock()
+        orch._spawn_provisioning = recovered_schedule
+        assert await orch.recover_tracked_provisioning() == 1
+        recovered_schedule.assert_awaited_once_with("vm_create_handoff")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_cycle_wraps_despite_sustained_higher_id_arrivals(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'recovery-wrap.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    orch = Orchestrator(HyruleConfig(), factory)
+    orch._spawn_provisioning = AsyncMock()
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            for index in range(5):
+                vm_id = f"vm_old_{index}"
+                session.add(VMRow(vm_id=vm_id, owner_wallet="paid", status=VMStatus.PROVISIONING))
+                session.add(VMGuestResultRow(
+                    vm_id=vm_id, generation="a" * 31 + str(index), token_hash="b" * 64,
+                    deadline=datetime.now(UTC) + timedelta(minutes=5),
+                ))
+        assert await orch.recover_tracked_provisioning() == 4
+        async with factory.begin() as session:
+            for index in range(4):
+                vm_id = f"vm_z_new_{index}"
+                session.add(VMRow(vm_id=vm_id, owner_wallet="paid", status=VMStatus.PROVISIONING))
+                session.add(VMGuestResultRow(
+                    vm_id=vm_id, generation="c" * 31 + str(index), token_hash="d" * 64,
+                    deadline=datetime.now(UTC) + timedelta(minutes=5),
+                ))
+        assert await orch.recover_tracked_provisioning() == 1
+        assert orch._spawn_provisioning.await_args_list[4].args == ("vm_old_4",)
+        assert orch._recovery_cursor == ""
+        assert orch._recovery_cycle_max == ""
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -52,26 +175,39 @@ async def test_paid_dispatch_survives_restart_while_waiting_for_provisioning_slo
             vm, _ = await original.create_vm(request, owner_wallet='paid-fixture',
                                              vm_id=f'vm_queued_{i}', start_provisioning=False)
             async with factory() as session:
-                assert await session.get(VMGuestResultRow, vm.vm_id) is None
+                assert await session.get(VMGuestResultRow, vm.vm_id) is not None
             # Models dispatch after the caller has linked its paid quote/intent.
             await original.start_provisioning(vm.vm_id)
+        accepted, _ = await original.create_vm(
+            request, owner_wallet='paid-fixture', vm_id='vm_accepted_no_task',
+            start_provisioning=False,
+        )
+        async with factory() as session:
+            assert await session.get(VMGuestResultRow, accepted.vm_id) is not None
         unpaid, _ = await original.reserve_vm(request, vm_id='vm_unpaid')
         await original.start_provisioning(unpaid.vm_id)
         await asyncio.wait_for(four_active.wait(), 5)
         assert len(entered) == 4
         assert len(original._tasks) == 8
         async with factory() as session:
-            assert len(list(await session.scalars(select(VMGuestResultRow.vm_id)))) == 8
+            assert len(list(await session.scalars(select(VMGuestResultRow.vm_id)))) == 9
             assert await session.get(VMGuestResultRow, unpaid.vm_id) is None
         await original.shutdown()
         await engine.dispose()
         assert await recovered.recover_tracked_provisioning() == 4
         assert await recovered.recover_tracked_provisioning() == 4
+        # The accepted row has not completed its quote/intent handoff, so a
+        # different worker must leave it alone until the caller publishes the
+        # durable ready marker.
+        assert accepted.vm_id not in resumed
+        assert recovered._recovery_cursor == ""
+        assert recovered._recovery_cycle_max == ""
+        await recovered.start_provisioning(accepted.vm_id)
         await asyncio.wait_for(asyncio.gather(*list(recovered._tasks)), 5)
         async with factory() as session:
             rows = list(await session.scalars(select(VMRow).where(VMRow.vm_id.like('vm_queued_%'))))
             assert len(rows) == 8 and all(row.status == VMStatus.PROVISIONING for row in rows)
-            assert sorted(resumed) == sorted(row.vm_id for row in rows)
+            assert sorted(resumed) == sorted([*(row.vm_id for row in rows), accepted.vm_id])
             assert (await session.get(VMRow, unpaid.vm_id)).status == VMStatus.PROVISIONING
     finally:
         await original.shutdown()
@@ -138,6 +274,7 @@ async def test_receipt_backed_pre_uuid_attempts_are_reconciled(tmp_path, monkeyp
 
         orch.xcpng.find_vm_ids_by_name_label = AsyncMock(side_effect=find)
         orch.xcpng.get_vm_power_state = AsyncMock(return_value='Halted' if crash_state == 'halted' else 'Running')
+        orch.xcpng.suspend_vm = AsyncMock()
         orch.xcpng.create_vm = AsyncMock(side_effect=create)
         assert await orch.recover_tracked_provisioning() == 1  # No UUID is persisted.
         await asyncio.wait_for(asyncio.gather(*list(orch._tasks)), 10)
@@ -153,6 +290,14 @@ async def test_receipt_backed_pre_uuid_attempts_are_reconciled(tmp_path, monkeyp
                 ))
                 assert events.count('vm_created') == 1
                 assert events.index('vm_created') < events.index('network_ready')
+            elif crash_state == 'multiple':
+                assert vm.status == VMStatus.PROVISIONING
+                assert vm.xcpng_uuid is None
+                orch._record_vm_refund.assert_not_awaited()
+                assert orch.xcpng.suspend_vm.await_args_list == [
+                    call('first'),
+                    call('second'),
+                ]
             else:
                 assert vm.status == VMStatus.FAILED
                 assert vm.xcpng_uuid is None
@@ -162,7 +307,7 @@ async def test_receipt_backed_pre_uuid_attempts_are_reconciled(tmp_path, monkeyp
                 assert receipt.generation == generation
                 orch.xcpng.create_vm.assert_not_awaited()
         orch.xcpng.destroy_vm.assert_not_awaited()
-        if crash_state not in ('running', 'no_clone'):
+        if crash_state not in ('running', 'no_clone', 'multiple'):
             orch.dns.delete_aaaa = AsyncMock()
             # Customer rollback, repeated deletion and deferred DNS cleanup
             # must all preserve quarantine while retained guests lack a UUID.
@@ -232,6 +377,8 @@ async def test_worker_recovers_tracked_guest_after_api_stops(tmp_path, monkeypat
         orch = Orchestrator(config, factory)
         orch.xcpng.create_vm = AsyncMock(side_effect=AssertionError('must retain existing guest'))
         orch.xcpng.destroy_vm = AsyncMock(side_effect=AssertionError('must retain guest data'))
+        orch.xcpng.suspend_vm = AsyncMock()
+        orch.xcpng.get_vm_power_state = AsyncMock(return_value="Running")
         orch.dns.create_aaaa = AsyncMock()
         orch.dns.verify_aaaa = AsyncMock(return_value=True)
         orch._wait_for_ipv6 = AsyncMock(return_value='2a0c:b641:b51:5::2')
@@ -286,6 +433,10 @@ async def test_worker_recovers_tracked_guest_after_api_stops(tmp_path, monkeypat
             assert vm.status == (VMStatus.READY if outcome == 'succeeded' else VMStatus.FAILED)
             assert vm.xcpng_uuid == 'retained-guest'
             assert receipt.generation == generation
+        if outcome in {'failed', 'timeout'}:
+            recovered.xcpng.suspend_vm.assert_awaited_once_with('retained-guest')
+        else:
+            recovered.xcpng.suspend_vm.assert_not_awaited()
         recovered.xcpng.create_vm.assert_not_awaited()
         recovered.xcpng.destroy_vm.assert_not_awaited()
         assert recovered._record_vm_refund.await_count == (0 if outcome == 'succeeded' else 1)
@@ -297,8 +448,10 @@ async def test_worker_recovers_tracked_guest_after_api_stops(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('exit_code', [0, 7])
-async def test_guest_completion_controls_public_status_and_launch_proof(tmp_path, monkeypatch, exit_code):
+@pytest.mark.parametrize(('exit_code', 'stop_fails'), [(0, False), (7, False), (7, True)])
+async def test_guest_completion_controls_public_status_and_launch_proof(
+    tmp_path, monkeypatch, exit_code, stop_fails,
+):
     import json
     from urllib.parse import urlsplit
 
@@ -310,12 +463,20 @@ async def test_guest_completion_controls_public_status_and_launch_proof(tmp_path
     monkeypatch.setattr('hyrule_cloud.services.launch_proof.use_real_provisioning', lambda: True)
     orch.xcpng.find_vm_ids_by_name_label = AsyncMock(return_value=[])
     orch.xcpng.destroy_vm = AsyncMock()
+    orch.xcpng.get_vm_power_state = AsyncMock(return_value="Running")
+    orch.xcpng.suspend_vm = AsyncMock(
+        side_effect=RuntimeError('provider stop unavailable') if stop_fails else None,
+    )
     orch.dns.create_aaaa = AsyncMock()
     orch.dns.verify_aaaa = AsyncMock(return_value=True)
     orch._wait_for_ipv6 = AsyncMock(return_value='2a0c:b641:b51:5::2')
     orch._probe_ssh = AsyncMock(return_value=True)
     orch._probe_customer_dns_resolution = AsyncMock(return_value=DNSResolutionStatus.PASSED)
-    orch._record_vm_refund = AsyncMock()
+    async def record_refund(*args, **kwargs):
+        del args, kwargs
+        orch.xcpng.suspend_vm.assert_awaited_once_with('test-guest-uuid')
+
+    orch._record_vm_refund = AsyncMock(side_effect=record_refund)
     app = FastAPI()
     from hyrule_cloud.state import AppState
 
@@ -352,18 +513,170 @@ async def test_guest_completion_controls_public_status_and_launch_proof(tmp_path
             await orch._provision_vm('vm_guest')
             response = await client.get('/v1/vm/vm_guest/status')
             body = response.json()
+            if stop_fails:
+                assert body['status'] == 'provisioning'
+                orch.xcpng.suspend_vm.assert_awaited_once_with('test-guest-uuid')
+                orch._record_vm_refund.assert_not_awaited()
+                async with factory() as session:
+                    vm = await session.get(VMRow, 'vm_guest')
+                    assert vm.status == VMStatus.PROVISIONING
+                return
             assert body['status'] == ('failed' if exit_code else 'ready')
             assert body['launch_proof_status'] == ('failed' if exit_code else 'provisioned')
             if exit_code:
                 assert 'setup script failed' in body['customer_message']
+                orch.xcpng.suspend_vm.assert_awaited_once_with('test-guest-uuid')
                 orch._record_vm_refund.assert_awaited_once()
             else:
+                orch.xcpng.suspend_vm.assert_not_awaited()
                 orch._record_vm_refund.assert_not_awaited()
             orch.xcpng.destroy_vm.assert_not_awaited()
             async with factory() as session:
                 vm = await session.get(VMRow, 'vm_guest')
                 assert vm.xcpng_uuid == 'test-guest-uuid'
                 assert vm.status == (VMStatus.FAILED if exit_code else VMStatus.READY)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("power", ["Halted", "Running", "Unknown", "error"])
+@pytest.mark.parametrize("reason", ["account_disabled", "expired"])
+async def test_successful_guest_finalization_reconciles_admin_suspension(
+    tmp_path, monkeypatch, power, reason,
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'admin-finalize.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    config = HyruleConfig()
+    config.xcpng.templates = {"debian-13": "test-template"}
+    orch = Orchestrator(config, factory)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    orch.xcpng.find_vm_ids_by_name_label = AsyncMock(return_value=[])
+    orch.xcpng.create_vm = AsyncMock(return_value="admin-suspended-guest")
+    orch.xcpng.suspend_vm = AsyncMock()
+    if power == "error":
+        orch.xcpng.get_vm_power_state = AsyncMock(
+            side_effect=RuntimeError("provider unavailable")
+        )
+    else:
+        orch.xcpng.get_vm_power_state = AsyncMock(return_value=power)
+    orch.dns.create_aaaa = AsyncMock()
+    orch.dns.verify_aaaa = AsyncMock(return_value=True)
+    orch._wait_for_ipv6 = AsyncMock(return_value="2a0c:b641:b51:5::2")
+    orch._probe_ssh = AsyncMock(return_value=True)
+    orch._probe_customer_dns_resolution = AsyncMock(
+        return_value=DNSResolutionStatus.PASSED
+    )
+    orch._record_vm_refund = AsyncMock()
+
+    async def complete_after_admin_suspend(vm_id, generation):
+        async with factory.begin() as session:
+            row = await session.get(VMRow, vm_id)
+            receipt = await session.get(VMGuestResultRow, vm_id)
+            row.suspension_reason = reason
+            receipt.outcome = "succeeded"
+            receipt.stage = "cloud_init"
+            receipt.exit_code = 0
+        return generation
+
+    orch._wait_for_guest_result = AsyncMock(side_effect=complete_after_admin_suspend)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            session.add(
+                VMRow(
+                    vm_id="vm_admin_finalize",
+                    owner_wallet="test",
+                    hostname="admin-finalize.deploy.hyrule.host",
+                    ipv6_prefix="2a0c:b641:b51:5::/64",
+                    ipv6_prefix_index=5,
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                )
+            )
+        await orch._provision_vm("vm_admin_finalize")
+        async with factory() as session:
+            row = await session.get(VMRow, "vm_admin_finalize")
+            assert row.status == (
+                VMStatus.SUSPENDED
+                if power in {"Halted", "Running"}
+                else VMStatus.PROVISIONING
+            )
+        if power == "Running":
+            orch.xcpng.suspend_vm.assert_awaited_once_with("admin-suspended-guest")
+        else:
+            orch.xcpng.suspend_vm.assert_not_awaited()
+        orch._record_vm_refund.assert_not_awaited()
+    finally:
+        await orch.shutdown()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_fails", [False, True])
+async def test_guest_report_timeout_stops_guest_before_refund(
+    tmp_path, monkeypatch, stop_fails,
+):
+    from hyrule_cloud.services.vm_events import FAILURE_GUEST_REPORT, ProvisioningFailedError
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'timeout-stop.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    config = HyruleConfig()
+    config.xcpng.templates = {"debian-13": "test-template"}
+    orch = Orchestrator(config, factory)
+    monkeypatch.setattr(
+        "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
+    )
+    orch.xcpng.find_vm_ids_by_name_label = AsyncMock(return_value=[])
+    orch.xcpng.create_vm = AsyncMock(return_value="timed-out-guest")
+    orch.xcpng.get_vm_power_state = AsyncMock(return_value="Running")
+    orch.xcpng.suspend_vm = AsyncMock(
+        side_effect=RuntimeError("provider stop unavailable") if stop_fails else None
+    )
+    orch.dns.create_aaaa = AsyncMock()
+    orch.dns.verify_aaaa = AsyncMock(return_value=True)
+    orch._wait_for_ipv6 = AsyncMock(return_value="2a0c:b641:b51:5::2")
+    orch._probe_ssh = AsyncMock(return_value=True)
+    orch._probe_customer_dns_resolution = AsyncMock(
+        return_value=DNSResolutionStatus.PASSED
+    )
+    orch._wait_for_guest_result = AsyncMock(
+        side_effect=ProvisioningFailedError(FAILURE_GUEST_REPORT)
+    )
+
+    async def record_refund(*args, **kwargs):
+        del args, kwargs
+        orch.xcpng.suspend_vm.assert_awaited_once_with("timed-out-guest")
+
+    orch._record_vm_refund = AsyncMock(side_effect=record_refund)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory.begin() as session:
+            session.add(
+                VMRow(
+                    vm_id="vm_guest_timeout",
+                    owner_wallet="test",
+                    hostname="timeout.deploy.hyrule.host",
+                    ipv6_prefix="2a0c:b641:b51:5::/64",
+                    ipv6_prefix_index=5,
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                )
+            )
+
+        await orch._provision_vm("vm_guest_timeout")
+        orch.xcpng.suspend_vm.assert_awaited_once_with("timed-out-guest")
+        async with factory() as session:
+            vm = await session.get(VMRow, "vm_guest_timeout")
+            assert vm.status == (
+                VMStatus.PROVISIONING if stop_fails else VMStatus.FAILED
+            )
+        if stop_fails:
+            orch._record_vm_refund.assert_not_awaited()
+        else:
+            orch._record_vm_refund.assert_awaited_once()
     finally:
         await engine.dispose()
 

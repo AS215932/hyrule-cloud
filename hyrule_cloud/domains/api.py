@@ -57,6 +57,8 @@ from hyrule_cloud.middleware.auth import (
     require_scope,
 )
 from hyrule_cloud.middleware.x402 import PaymentGate
+from hyrule_cloud.orchestrator import AccountDisabledError
+from hyrule_cloud.services.intents import native_intent_account_guard
 from hyrule_cloud.state import AppState, get_app_state
 
 router = APIRouter(prefix="/v1/domains", tags=["domains"])
@@ -334,12 +336,15 @@ async def register_domain_x402(
         response.status_code = 200
         return await service.registration_response(intent.registration_id)
 
-    await service.assert_x402_payable(order.order_id)
     settlement_extra = {
         **challenge,
         "order_id": order.order_id,
     }
-    settled = await gate.settle_verified(request, verified, settlement_extra)
+    # Account disable uses the same lifecycle fence. Keep the owner and order
+    # locked through the external settlement so a stale authenticated request
+    # cannot charge after disable has committed.
+    async with service.x402_payment_guard(order.order_id, owner.account_id):
+        settled = await gate.settle_verified(request, verified, settlement_extra)
     if not settled:
         ambiguous = bool(
             getattr(request.state, "payment_settlement_ambiguous", False)
@@ -415,27 +420,41 @@ async def create_order(
         needed = "domain:renew" if quote is not None and quote.action == "renew" else "domain:purchase"
         if needed not in held:
             raise DomainProblem(403, "missing_scope", f"API key missing required scope: {needed}.")
+    if body.payment_method.value in {"btc", "xmr"}:
+        try:
+            async with native_intent_account_guard(service.db, account.account_id):
+                order, created = await service.create_order(
+                    body,
+                    owner_account_id=account.account_id,
+                    idempotency_key=_idempotency(idempotency_key),
+                )
+                result = await service.order_response(order)
+        except AccountDisabledError as exc:
+            raise DomainProblem(
+                403,
+                "account_disabled",
+                "Account access is disabled.",
+            ) from exc
+        response.status_code = 201 if created else 200
+        return result
     order, created = await service.create_order(
         body,
         owner_account_id=account.account_id,
         idempotency_key=_idempotency(idempotency_key),
     )
-    if body.payment_method.value in {"btc", "xmr"}:
-        response.status_code = 201 if created else 200
-        return await service.order_response(order)
     if order.status == "awaiting_payment":
-        await service.assert_x402_payable(order.order_id)
-        paid = await gate.check_payment(
-            request,
-            amount=order.amount_usd,
-            description=f"Hyrule domain order for {order.fqdn}",
-            extra_body={
-                "order_id": order.order_id,
-                "domain": order.fqdn,
-                "amount_usd": f"{order.amount_usd:.2f}",
-                "quote_id": order.quote_id,
-            },
-        )
+        async with service.x402_payment_guard(order.order_id, account.account_id) as order:
+            paid = await gate.check_payment(
+                request,
+                amount=order.amount_usd,
+                description=f"Hyrule domain order for {order.fqdn}",
+                extra_body={
+                    "order_id": order.order_id,
+                    "domain": order.fqdn,
+                    "amount_usd": f"{order.amount_usd:.2f}",
+                    "quote_id": order.quote_id,
+                },
+            )
         if isinstance(paid, Response):
             return paid
         handoff_error: Exception | None = None

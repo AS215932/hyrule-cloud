@@ -180,6 +180,30 @@ async def claim_quote(session_factory: async_sessionmaker, quote_id: str) -> boo
             return won
 
 
+async def release_quote_claim(session_factory: async_sessionmaker, quote_id: str) -> bool:
+    """Return an unlinked claim to CREATED after acceptance was rejected.
+
+    The same per-quote lock serializes this with local claimers. The conditional
+    update prevents a linked/provisioned quote from ever being reopened.
+    """
+    async with _claim_lock(quote_id):
+        async with session_factory() as db:
+            result = await db.execute(
+                _sql_update(VMQuoteRow)
+                .where(
+                    VMQuoteRow.quote_id == quote_id,
+                    VMQuoteRow.status == QuoteStatus.CONSUMED.value,
+                    VMQuoteRow.vm_id.is_(None),
+                )
+                .values(status=QuoteStatus.CREATED.value)
+            )
+            await db.commit()
+            released = result.rowcount == 1
+            if released:
+                _claimed_quote_ids.discard(quote_id)
+            return released
+
+
 async def link_quote_vm(session_factory: async_sessionmaker, quote_id: str, vm_id: str) -> None:
     """Attach the provisioned VM to its already-claimed quote (idempotent replay
     of a consumed quote then returns this vm_id)."""

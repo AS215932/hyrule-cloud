@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from ipaddress import IPv6Network
@@ -20,7 +21,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy import update as _sql_update
 
-from hyrule_cloud.db import VMQuoteRow, VMRetentionRow, VMRow
+from hyrule_cloud.db import AccountRow, VMQuoteRow, VMRetentionRow, VMRow
 from hyrule_cloud.domains.errors import DomainProblem
 from hyrule_cloud.middleware.anon_token import (
     VMManagementIdentity,
@@ -76,6 +77,8 @@ from hyrule_cloud.providers.network_config import (
     customer_prefix_count,
     supports_static_network_config,
 )
+from hyrule_cloud.services.account_deletion import lock_account_lifecycle
+from hyrule_cloud.services.admin_authorization import validate_admin_dispatch
 from hyrule_cloud.services.guest_result import (
     GuestResult,
     GuestResultRejectedError,
@@ -90,6 +93,7 @@ from hyrule_cloud.services.quotes import (
     get_quote,
     is_expired,
     link_quote_vm,
+    release_quote_claim,
 )
 from hyrule_cloud.services.vm_events import vm_log_events
 from hyrule_cloud.services.vm_expiry import build_vm_expiry
@@ -130,6 +134,25 @@ async def _proxy_authorization_guard(request: Request):
         yield
     finally:
         _proxy_inflight_auth.discard(key)
+
+
+@asynccontextmanager
+async def _vm_payment_account_guard(orch, account_id: str | None):
+    """Fence an authenticated account through external VM settlement."""
+    if account_id is None:
+        yield
+        return
+    async with orch.db() as session:
+        await lock_account_lifecycle(session, account_id, shared=True)
+        owner = await session.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == account_id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+        if owner is None or owner.disabled_at is not None:
+            raise HTTPException(403, "Account access is disabled")
+        yield
 
 
 async def get_orch(app_state: AppState = Depends(get_app_state)):
@@ -822,6 +845,22 @@ async def _vm_for_management(
     raise HTTPException(404, "VM not found")
 
 
+def _admin_vm_dispatch_guard(request: Request, account: Any, row: VMRow):
+    """Fence a public management call that relied on administrator authority."""
+    if (
+        account is None
+        or not getattr(account, "is_admin", False)
+        or account.account_id == getattr(row, "owner_account_id", None)
+        or can_manage_vm(row, anon_management_token(request))
+    ):
+        return None
+
+    async def guard(session):
+        await validate_admin_dispatch(session, account.account_id)
+
+    return guard
+
+
 # Block A0: public sanitized status view. Returns minimal fields needed
 # for an order-status page — NO ssh, NO firewall, NO error detail. Any
 # caller can fetch this for any vm_id; pre-A0 frontends keep working
@@ -1136,19 +1175,22 @@ async def create_vm(
         await _enforce_compute_capacity(orch, order)
 
     try:
-        result = await gate.check_payment(
-            request,
-            amount=total,
-            description=(
-                f"Hyrule Cloud VM ({VM_PROFILE_LABELS[order.size]}) "
-                f"for {order.duration_days} days"
-            ),
-            extra_body={
-                "cost_breakdown": breakdown.model_dump(),
-                "specs": {**specs, "ipv6": True, "ipv4": False, "region": "eu-west"},
-                "estimated_provision_time_seconds": 60,
-            },
-        )
+        async with _vm_payment_account_guard(
+            orch, account.account_id if account is not None else None
+        ):
+            result = await gate.check_payment(
+                request,
+                amount=total,
+                description=(
+                    f"Hyrule Cloud VM ({VM_PROFILE_LABELS[order.size]}) "
+                    f"for {order.duration_days} days"
+                ),
+                extra_body={
+                    "cost_breakdown": breakdown.model_dump(),
+                    "specs": {**specs, "ipv6": True, "ipv4": False, "region": "eu-west"},
+                    "estimated_provision_time_seconds": 60,
+                },
+            )
     except Exception:
         # Admin quota and required-audit failures raise instead of returning a
         # 402. They must release the unpaid capacity reservation just like the
@@ -1289,6 +1331,19 @@ async def create_vm(
         # PROVISIONING with no background task and no refund path.
         await orch.start_provisioning(row.vm_id)
     except HTTPException:
+        # A waiver can be revoked after settlement and after this request won
+        # the quote claim, but before the guarded resource transaction writes a
+        # VM. Reopen both unlinked claims so the quote is retryable and no
+        # capacity reservation remains pinned.
+        if row is None:
+            try:
+                if quote_row is not None:
+                    released = await release_quote_claim(orch.db, quote_row.quote_id)
+                    if not released:
+                        raise RuntimeError("rejected VM quote claim could not be released")
+            finally:
+                if reservation_row is not None:
+                    await orch.release_vm_reservation(reservation_row.vm_id)
         raise
     except AccountDisabledError as exc:
         failed_vm_id = reservation_row.vm_id if reservation_row is not None else None
@@ -1471,6 +1526,13 @@ async def extend_vm(
     async with lifecycle_lock as (session, row):
         if row is None or not management_identity.matches(row):
             raise HTTPException(404, "VM not found")
+        # The expiry worker can halt the guest and lose its database commit.
+        # Reconcile that side effect before collecting another payment so a
+        # paid extension records the durable resume handoff below.
+        if not await orch.reconcile_extension_power(row):
+            raise HTTPException(
+                503, "The VM power state could not be verified; no payment was taken"
+            )
         if not orch.vm_can_extend(row) or not await orch.vm_owner_enabled(session, row):
             raise HTTPException(409, "This VM can no longer be extended")
         total = current_daily_price_for_vm(row, cfg.payment) * body.days
@@ -1531,11 +1593,21 @@ async def extend_vm(
 @router.post("/vm/{vm_id}/reboot", response_model=GenericActionResponse)
 async def reboot_vm(
     vm_id: str,
+    request: Request,
     row=Depends(_vm_for_management),
     orch=Depends(get_orch),
+    account=Depends(current_account),
 ) -> GenericActionResponse:
     # Block A0: management dep ensures caller has the token.
-    if not await orch.reboot_vm(vm_id, management_identity=VMManagementIdentity.capture(row)):
+    identity = VMManagementIdentity.capture(row)
+    guard = _admin_vm_dispatch_guard(request, account, row)
+    if guard is None:
+        accepted = await orch.reboot_vm(vm_id, management_identity=identity)
+    else:
+        accepted = await orch.reboot_vm(
+            vm_id, management_identity=identity, dispatch_guard=guard,
+        )
+    if not accepted:
         raise HTTPException(404, "VM not found or not running")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} is rebooting")
 
@@ -1543,11 +1615,21 @@ async def reboot_vm(
 @router.delete("/vm/{vm_id}", response_model=GenericActionResponse)
 async def destroy_vm(
     vm_id: str,
+    request: Request,
     row=Depends(_vm_for_management),
     orch=Depends(get_orch),
+    account=Depends(current_account),
 ) -> GenericActionResponse:
     # Block A0: management dep ensures caller has the token.
-    if not await orch.destroy_vm(vm_id, management_identity=VMManagementIdentity.capture(row)):
+    identity = VMManagementIdentity.capture(row)
+    guard = _admin_vm_dispatch_guard(request, account, row)
+    if guard is None:
+        accepted = await orch.destroy_vm(vm_id, management_identity=identity)
+    else:
+        accepted = await orch.destroy_vm(
+            vm_id, management_identity=identity, dispatch_guard=guard,
+        )
+    if not accepted:
         raise HTTPException(404, "VM not found")
     current = await orch.get_vm(vm_id)
     if (current is not None and current.status == VMStatus.SUSPENDED
@@ -1647,7 +1729,23 @@ from hyrule_cloud.services.intents import (
     IntentExistsError,
     create_intent,
     get_intent_by_client_order_id,
+    native_intent_account_guard,
 )
+
+
+async def _native_intent_account_dependency(
+    orch=Depends(get_orch),
+    account=Depends(current_account),
+) -> AsyncIterator[Any]:
+    if account is None:
+        yield None
+        return
+    try:
+        async with native_intent_account_guard(orch.db, account.account_id):
+            yield account
+    except AccountDisabledError as exc:
+        raise HTTPException(403, "Account access is disabled") from exc
+
 
 # Intent states that carry no committed payment: a same-key replay only
 # re-serves the deposit address. While the VM service is closed (simulation)
@@ -1765,7 +1863,7 @@ async def create_crypto_intent(
     orch=Depends(get_orch),
     cfg=Depends(get_cfg),
     gate=Depends(get_gate),
-    account=Depends(current_account),
+    account=Depends(_native_intent_account_dependency),
 ) -> CryptoIntentResponse:
     """Block E: open a payment intent for BTC or XMR.
 

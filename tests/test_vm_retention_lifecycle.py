@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
+from starlette.requests import Request
 
 from hyrule_cloud.api.routes import destroy_vm as destroy_vm_route
 from hyrule_cloud.db import VMRetentionRow, VMRow
@@ -86,7 +87,10 @@ async def test_expiry_commits_retention_before_delete_and_preserves_it_on_retry(
             saved = await session.get(VMRetentionRow, 'vm_lifecycle')
             assert saved.state == 'retained'
             assert saved.retained_at is not None
-        response = await destroy_vm_route('vm_lifecycle', await orch.get_vm('vm_lifecycle'), orch)
+        request = Request({'type': 'http', 'method': 'DELETE', 'path': '/fixture', 'headers': []})
+        response = await destroy_vm_route(
+            'vm_lifecycle', request, row=await orch.get_vm('vm_lifecycle'), orch=orch, account=None,
+        )
         assert response.status == 'retained'
         assert 'stopped and retained' in response.message
         orch.xcpng.capture_vm_protection.assert_awaited_once_with('test-guest')

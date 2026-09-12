@@ -22,6 +22,8 @@ from hyrule_cloud.api.admin import (
     _assert_transfer_target,
     _lock_domain_transfer_bundle,
     _resume_transferred_vm,
+    disable_account,
+    enable_account,
     resolve_refund,
     retry_job,
     step_up,
@@ -47,10 +49,12 @@ from hyrule_cloud.db import (
     PaymentEventRow,
     RefundResolutionRow,
     SessionRow,
+    VMGuestResultRow,
     VMRow,
 )
-from hyrule_cloud.domains.models import DomainOperationStatus
+from hyrule_cloud.domains.models import DomainOperationStatus, DomainOrderStatus
 from hyrule_cloud.middleware.x402 import ADMIN_PAYMENT_MODE_HEADER, PaymentGate
+from hyrule_cloud.models import VMStatus
 from hyrule_cloud.orchestrator import Orchestrator
 from hyrule_cloud.services.admin_operations import (
     _apply_account_operation,
@@ -681,6 +685,75 @@ async def test_each_refund_event_can_be_resolved_for_the_same_vm(admin_factory) 
 
 
 @pytest.mark.asyncio
+async def test_resolved_domain_refund_advances_customer_order(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory, elevated=True)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add(
+            DomainOrderRow(
+                order_id="do_refund_resolved",
+                quote_id="dq_refund_resolved",
+                fqdn="refund-resolved.example",
+                action="register",
+                owner_account_id="HAAAAAAAAAA",
+                idempotency_key="refund-resolved",
+                status=DomainOrderStatus.REFUND_DUE.value,
+                amount_usd=Decimal("10.00"),
+                domain_amount_usd=Decimal("10.00"),
+                vm_amount_usd=Decimal("0"),
+                payment_method="usdc",
+                terms_version="2026-01",
+                terms_accepted_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            PaymentEventRow(
+                event_id="domain-refund-resolved",
+                event_type="refund_owed",
+                resource_path="/v1/domains/orders/do_refund_resolved",
+                method="POST",
+                service_group="domain",
+                amount_usd=Decimal("10.00"),
+                extra={"order_id": "do_refund_resolved"},
+            )
+        )
+        await session.commit()
+
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    await resolve_refund(
+        "domain-refund-resolved",
+        RefundResolutionRequest(
+            status="resolved",
+            external_reference="operator-refund-reference",
+            reason="refund sent to original payer",
+        ),
+        _browser_request(
+            credentials,
+            path="/v1/admin/refunds/domain-refund-resolved/resolve",
+        ),
+        actor,
+        state,
+    )
+
+    async with admin_factory() as session:
+        order = await session.get(DomainOrderRow, "do_refund_resolved")
+        resolution = await session.scalar(
+            select(RefundResolutionRow).where(
+                RefundResolutionRow.payment_event_id == "domain-refund-resolved"
+            )
+        )
+    assert order is not None and order.status == DomainOrderStatus.REFUNDED.value
+    assert resolution is not None and resolution.status == "resolved"
+
+
+@pytest.mark.asyncio
 async def test_admin_step_up_rate_limits_argon_checks_per_session(
     admin_factory,
     monkeypatch,
@@ -761,6 +834,61 @@ async def test_admin_step_up_rate_limits_argon_checks_per_session(
 
 
 @pytest.mark.asyncio
+async def test_admin_step_up_rechecks_password_under_account_lock(
+    admin_factory,
+    monkeypatch,
+) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        stale_actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert stale_actor is not None
+        session_row = (
+            await session.execute(
+                select(SessionRow).where(SessionRow.account_id == "HAAAAAAAAAA")
+            )
+        ).scalar_one()
+        token_hash = session_row.token_hash
+        stale_password_hash = stale_actor.password_hash
+    assert stale_password_hash is not None
+
+    rotated_password_hash = "rotated-password-hash"
+    async with admin_factory() as session:
+        current_actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert current_actor is not None
+        current_actor.password_hash = rotated_password_hash
+        await session.commit()
+
+    verified_hashes: list[str | None] = []
+
+    def verify_stale_only(password_hash: str | None, _password: str) -> bool:
+        verified_hashes.append(password_hash)
+        return password_hash == stale_password_hash
+
+    monkeypatch.setattr("hyrule_cloud.api.admin.verify_password", verify_stale_only)
+    state = AppState(
+        config=SimpleNamespace(admin_step_up_seconds=600),
+        orchestrator=SimpleNamespace(),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    request = _browser_request(credentials, path="/v1/admin/step-up")
+    request.state.session_token_hash = token_hash
+
+    with pytest.raises(HTTPException) as refused:
+        await step_up(
+            StepUpRequest(password="old password"), request, stale_actor, state
+        )
+
+    assert refused.value.status_code == 401
+    assert verified_hashes == [rotated_password_hash]
+    async with admin_factory() as session:
+        stored_session = await session.get(SessionRow, token_hash)
+        assert stored_session is not None
+        assert stored_session.admin_elevated_at is None
+
+
+@pytest.mark.asyncio
 async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_factory) -> None:
     credentials = await _admin_credentials(admin_factory)
     xcpng = _AdminXCPNG()
@@ -836,16 +964,24 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
                     suspended_by_account_id="HAAAAAAAAAA",
                     expires_at=datetime.now(UTC) + timedelta(days=1),
                 ),
+                VMRow(
+                    vm_id="vm_transfer_failed",
+                    owner_wallet="0x5555555555555555555555555555555555555555",
+                    owner_account_id="HBBBBBBBBBB",
+                    xcpng_uuid="uuid-transfer-failed",
+                    status="failed",
+                    suspension_reason="account_disabled",
+                    suspended_by_account_id="HAAAAAAAAAA",
+                ),
             ]
         )
         await session.commit()
 
+    transfer_orchestrator = Orchestrator(HyruleConfig(), admin_factory)
+    transfer_orchestrator.xcpng = xcpng
     state = AppState(
         config=SimpleNamespace(),
-        orchestrator=SimpleNamespace(
-            xcpng=xcpng,
-            start_provisioning=AsyncMock(),
-        ),
+        orchestrator=transfer_orchestrator,
         payment_gate=None,
         network_provider=None,
         session_factory=admin_factory,
@@ -875,6 +1011,13 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
         actor,
         state,
     )
+    await transfer_vm(
+        "vm_transfer_failed",
+        body,
+        _browser_request(credentials, path="/v1/admin/vms/vm_transfer_failed/transfer"),
+        actor,
+        state,
+    )
 
     target_wallet = "0x1111111111111111111111111111111111111111"
     async with admin_factory() as session:
@@ -882,6 +1025,7 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
             "vm_transfer_direct",
             "vm_transfer_attached",
             "vm_transfer_manual",
+            "vm_transfer_failed",
         ):
             vm = await session.get(VMRow, vm_id)
             assert vm is not None and vm.owner_account_id == "HCCCCCCCCCC"
@@ -898,12 +1042,18 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
         direct = await session.get(VMRow, "vm_transfer_direct")
         attached = await session.get(VMRow, "vm_transfer_attached")
         manual = await session.get(VMRow, "vm_transfer_manual")
+        failed = await session.get(VMRow, "vm_transfer_failed")
         assert direct is not None and str(direct.status) == "running"
         assert direct.suspension_reason is None
+        assert not (direct.metadata_ or {}).get("transfer_resume_pending")
         assert attached is not None and str(attached.status) == "running"
         assert attached.suspension_reason is None
+        assert not (attached.metadata_ or {}).get("transfer_resume_pending")
         assert manual is not None and str(manual.status) == "suspended"
         assert manual.suspension_reason == "manual_admin"
+        assert failed is not None and str(failed.status) == "failed"
+        assert failed.suspension_reason is None
+        assert failed.suspended_by_account_id is None
 
         stored_actor = await session.get(AccountRow, "HAAAAAAAAAA")
         assert stored_actor is not None
@@ -919,6 +1069,115 @@ async def test_transfers_rotate_credentials_and_preserve_audit_actor(admin_facto
     assert retained_manual is not None
     assert retained_manual.suspended_by_account_id == "HAAAAAAAAAA"
     assert xcpng.started == ["uuid-transfer-direct", "uuid-transfer-attached"]
+
+
+@pytest.mark.asyncio
+async def test_transfers_wait_for_extension_resume_handoff(admin_factory) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add_all(
+            [
+                AccountRow(account_id="HBBBBBBBBBB", password_hash="unused"),
+                AccountRow(account_id="HCCCCCCCCCC", password_hash="unused"),
+                VMRow(
+                    vm_id="vm_extension_transfer",
+                    owner_wallet="source",
+                    owner_account_id="HBBBBBBBBBB",
+                    xcpng_uuid="extension-guest",
+                    status="suspended",
+                    metadata_={
+                        "extension_resume_pending": {
+                            "owner_account_id": "HBBBBBBBBBB",
+                            "xcpng_uuid": "extension-guest",
+                        }
+                    },
+                ),
+                DomainRow(
+                    name="extension-transfer",
+                    extension="example",
+                    fqdn="extension-transfer.example",
+                    vm_id="vm_extension_transfer",
+                    owner_wallet="source",
+                    owner_account_id="HBBBBBBBBBB",
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=Orchestrator(HyruleConfig(), admin_factory),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    body = OwnershipTransferRequest(
+        target_account_id="HCCCCCCCCCC",
+        reason="wait for extension recovery",
+    )
+    with pytest.raises(HTTPException) as vm_refused:
+        await transfer_vm(
+            "vm_extension_transfer",
+            body,
+            _browser_request(credentials, path="/v1/admin/vms/vm_extension_transfer/transfer"),
+            actor,
+            state,
+        )
+    with pytest.raises(HTTPException) as domain_refused:
+        await transfer_domain(
+            "extension-transfer.example",
+            body,
+            _browser_request(credentials, path="/v1/admin/domains/extension-transfer.example/transfer"),
+            actor,
+            state,
+        )
+
+    assert vm_refused.value.status_code == 409
+    assert domain_refused.value.status_code == 409
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, "vm_extension_transfer")
+        domain = (
+            await session.execute(
+                select(DomainRow).where(DomainRow.fqdn == "extension-transfer.example")
+            )
+        ).scalar_one()
+        assert vm is not None and vm.owner_account_id == "HBBBBBBBBBB"
+        assert domain.owner_account_id == "HBBBBBBBBBB"
+        assert list(await session.scalars(select(AdminAuditRow))) == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_resume_handoff_survives_provider_failure(admin_factory) -> None:
+    async with admin_factory.begin() as session:
+        session.add(AccountRow(account_id="HCCCCCCCCCC", password_hash="unused"))
+        session.add(VMRow(
+            vm_id="vm_transfer_retry", owner_wallet="fixture",
+            owner_account_id="HCCCCCCCCCC", xcpng_uuid="transfer-guest",
+            status=VMStatus.SUSPENDED, suspension_reason="account_disabled",
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+            metadata_={"transfer_resume_pending": {
+                "owner_account_id": "HCCCCCCCCCC", "xcpng_uuid": "transfer-guest",
+            }},
+        ))
+    orch = Orchestrator(HyruleConfig(), admin_factory)
+    orch.xcpng.get_vm_power_state = AsyncMock(
+        side_effect=[RuntimeError("provider unavailable"), "Halted"]
+    )
+    orch.xcpng.start_vm = AsyncMock()
+    assert not await orch.reconcile_transfer_resume("vm_transfer_retry")
+    async with admin_factory() as session:
+        failed = await session.get(VMRow, "vm_transfer_retry")
+        assert (failed.metadata_ or {}).get("transfer_resume_pending")
+    assert await orch.reconcile_transfer_resumes() == 1
+    async with admin_factory() as session:
+        recovered = await session.get(VMRow, "vm_transfer_retry")
+        assert recovered.status == VMStatus.RUNNING
+        assert recovered.suspension_reason is None
+        assert not (recovered.metadata_ or {}).get("transfer_resume_pending")
+    orch.xcpng.start_vm.assert_awaited_once_with("transfer-guest")
 
 
 @pytest.mark.asyncio
@@ -965,6 +1224,38 @@ async def test_transferred_vm_revalidates_disabled_recipient_before_resume(
         row = await session.get(VMRow, "vm_transfer_disabled_recipient")
     assert row is not None and str(row.status) == "suspended"
     assert row.suspension_reason == "account_disabled"
+
+
+@pytest.mark.asyncio
+async def test_transferred_vm_does_not_resume_after_deletion_claim(admin_factory) -> None:
+    async with admin_factory.begin() as session:
+        session.add(AccountRow(account_id="HBBBBBBBBBB", password_hash="unused"))
+        session.add(
+            VMRow(
+                vm_id="vm_transfer_deletion_claim",
+                owner_wallet="0xowner",
+                owner_account_id="HBBBBBBBBBB",
+                xcpng_uuid="uuid-transfer-deletion-claim",
+                status="suspended",
+                suspension_reason="account_disabled",
+                deletion_started_at=datetime.now(UTC),
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+
+    xcpng = _AdminXCPNG()
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(xcpng=xcpng),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    await _resume_transferred_vm(state, "vm_transfer_deletion_claim")
+    assert xcpng.started == []
+    async with admin_factory() as session:
+        row = await session.get(VMRow, "vm_transfer_deletion_claim")
+        assert row.suspension_reason == "account_disabled"
 
 
 @pytest.mark.asyncio
@@ -1416,18 +1707,66 @@ class _AdminXCPNG:
         self.started: list[str] = []
         self.shut_down: list[str] = []
         self.rebooted: list[str] = []
+        self.power: dict[str, str] = {}
 
     async def suspend_vm(self, vm_uuid: str) -> None:
         self.suspended.append(vm_uuid)
+        self.power[vm_uuid] = "Halted"
 
     async def start_vm(self, vm_uuid: str) -> None:
         self.started.append(vm_uuid)
+        self.power[vm_uuid] = "Running"
+
+    async def get_vm_power_state(self, vm_uuid: str) -> str:
+        return self.power.get(vm_uuid, "Halted")
 
     async def shutdown_vm(self, vm_uuid: str) -> None:
         self.shut_down.append(vm_uuid)
 
     async def reboot_vm(self, vm_uuid: str) -> None:
         self.rebooted.append(vm_uuid)
+
+
+@pytest.mark.asyncio
+async def test_account_suspend_reconciles_already_halted_guest(admin_factory) -> None:
+    xcpng = _AdminXCPNG()
+    xcpng.power["uuid-halted-before-commit"] = "Halted"
+    async with admin_factory.begin() as session:
+        session.add(
+            AccountRow(
+                account_id="HALREADYOFF",
+                password_hash="unused",
+                disabled_at=datetime.now(UTC),
+            )
+        )
+        session.add(
+            VMRow(
+                vm_id="vm_halted_before_commit",
+                owner_wallet="0xowner",
+                owner_account_id="HALREADYOFF",
+                xcpng_uuid="uuid-halted-before-commit",
+                status="running",
+            )
+        )
+        session.add(
+            AdminOperationRow(
+                operation_id="operation-replay-suspend",
+                kind="suspend_account_resources",
+                account_id="HALREADYOFF",
+                status="queued",
+            )
+        )
+
+    assert await process_admin_operations(
+        admin_factory, SimpleNamespace(xcpng=xcpng)
+    ) == 1
+    assert xcpng.suspended == []
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, "vm_halted_before_commit")
+        operation = await session.get(AdminOperationRow, "operation-replay-suspend")
+        assert vm is not None and str(vm.status) == "suspended"
+        assert vm.suspension_reason == "account_disabled"
+        assert operation is not None and operation.status == "completed"
 
 
 @pytest.mark.asyncio
@@ -1485,6 +1824,69 @@ async def test_admin_start_updates_vm_while_owner_fence_is_held(admin_factory) -
     assert row.suspension_reason is None
     assert row.suspended_by_account_id is None
     assert audit.succeeded is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "database_status", "provider_power"),
+    [
+        ("start", "suspended", "Running"),
+        ("shutdown", "running", "Halted"),
+        ("suspend", "running", "Halted"),
+    ],
+)
+async def test_admin_power_action_reconciles_completed_provider_dispatch(
+    admin_factory,
+    action,
+    database_status,
+    provider_power,
+) -> None:
+    credentials = await _admin_credentials(admin_factory)
+    vm_uuid = f"uuid-admin-replay-{action}"
+    async with admin_factory() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        assert actor is not None
+        session.add(
+            VMRow(
+                vm_id=f"vm_admin_replay_{action}",
+                owner_wallet="0xowner",
+                owner_account_id="HAAAAAAAAAA",
+                xcpng_uuid=vm_uuid,
+                status=database_status,
+                suspension_reason="manual_admin" if action == "start" else None,
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+        await session.commit()
+
+    xcpng = _AdminXCPNG()
+    xcpng.power[vm_uuid] = provider_power
+    state = AppState(
+        config=SimpleNamespace(),
+        orchestrator=SimpleNamespace(xcpng=xcpng),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    await vm_action(
+        f"vm_admin_replay_{action}",
+        action,
+        ReasonRequest(reason="reconcile completed provider dispatch"),
+        _browser_request(
+            credentials,
+            path=f"/v1/admin/vms/vm_admin_replay_{action}/actions/{action}",
+        ),
+        actor,
+        state,
+    )
+
+    assert xcpng.started == []
+    assert xcpng.shut_down == []
+    assert xcpng.suspended == []
+    async with admin_factory() as session:
+        row = await session.get(VMRow, f"vm_admin_replay_{action}")
+    assert row is not None
+    assert str(row.status) == ("running" if action == "start" else "suspended")
 
 
 @pytest.mark.asyncio
@@ -1555,6 +1957,7 @@ async def test_admin_shutdown_persists_under_the_vm_action_fence(admin_factory) 
         await session.commit()
 
     xcpng = _AdminXCPNG()
+    xcpng.power["uuid-admin-shutdown"] = "Running"
     state = AppState(
         config=SimpleNamespace(),
         orchestrator=SimpleNamespace(xcpng=xcpng),
@@ -1975,7 +2378,16 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
     admin_factory,
 ) -> None:
     xcpng = _AdminXCPNG()
-    orchestrator = SimpleNamespace(xcpng=xcpng)
+    xcpng.power.update(
+        {
+            "uuid-active": "Running",
+            "uuid-provisioning": "Running",
+            "uuid-failed-disabled": "Running",
+        }
+    )
+    orchestrator = Orchestrator(HyruleConfig(), admin_factory)
+    orchestrator.xcpng = xcpng
+    old_report_deadline = datetime.now(UTC) - timedelta(minutes=1)
     async with admin_factory() as session:
         session.add_all(
             [
@@ -2013,6 +2425,7 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
                     vm_id="vm_provisioning",
                     owner_wallet="0xowner",
                     owner_account_id="HBBBBBBBBBB",
+                    xcpng_uuid="uuid-provisioning",
                     status="provisioning",
                     expires_at=datetime.now(UTC) + timedelta(days=1),
                 ),
@@ -2046,6 +2459,12 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
                     actor_account_id="HAAAAAAAAAA",
                     reason="abuse response",
                 ),
+                VMGuestResultRow(
+                    vm_id="vm_provisioning",
+                    generation="a" * 32,
+                    token_hash="b" * 64,
+                    deadline=old_report_deadline,
+                ),
             ]
         )
         await session.commit()
@@ -2077,6 +2496,9 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         account.disabled_at = None
         account.disabled_reason = None
         account.disabled_by_account_id = None
+        # Model a worker that started this guest before crashing ahead of its
+        # database commit. Resume must reconcile rather than replay start.
+        xcpng.power["uuid-active"] = "Running"
         session.add(
             AdminOperationRow(
                 operation_id="operation-resume",
@@ -2100,20 +2522,29 @@ async def test_admin_resource_operations_are_resumable_and_preserve_provenance(
         mailbox = await session.get(MailAccountRow, "mailbox-1")
         expired_mailbox = await session.get(MailAccountRow, "mailbox-expired")
         operation = await session.get(AdminOperationRow, "operation-resume")
+        receipt = await session.get(VMGuestResultRow, "vm_provisioning")
         assert active is not None and str(active.status) == "running"
         assert active.suspension_reason is None
         assert manual is not None and manual.suspension_reason == "manual_admin"
         assert provisioning is not None and str(provisioning.status) == "provisioning"
         assert provisioning.suspension_reason is None
         assert failed_disabled is not None and str(failed_disabled.status) == "failed"
-        assert failed_disabled.suspension_reason == "account_disabled"
+        assert failed_disabled.suspension_reason is None
+        assert failed_disabled.suspended_by_account_id is None
         assert mailbox is not None and mailbox.status == "active"
         assert expired_mailbox is not None and expired_mailbox.status == "suspended"
         assert expired_mailbox.suspension_reason == "expired"
         assert operation is not None and operation.status == "completed"
+        assert receipt is not None
+        receipt_deadline = (
+            receipt.deadline.replace(tzinfo=UTC)
+            if receipt.deadline.tzinfo is None
+            else receipt.deadline
+        )
+        assert receipt_deadline > old_report_deadline
 
-    assert xcpng.suspended == ["uuid-active", "uuid-failed-disabled"]
-    assert xcpng.started == ["uuid-active"]
+    assert xcpng.suspended == ["uuid-active", "uuid-provisioning", "uuid-failed-disabled"]
+    assert xcpng.started == ["uuid-provisioning"]
 
 
 @pytest.mark.asyncio
@@ -2285,6 +2716,75 @@ async def test_admin_resource_operations_wait_for_same_account_operation(
     async with admin_factory() as session:
         queued = await session.get(AdminOperationRow, "operation-queued")
         assert queued is not None and queued.status == "queued"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ["disable", "enable"])
+async def test_account_transition_supersedes_only_failed_inverse_operation(
+    admin_factory, transition,
+) -> None:
+    credentials = await _admin_credentials(admin_factory, elevated=True)
+    async with admin_factory.begin() as session:
+        actor = await session.get(AccountRow, "HAAAAAAAAAA")
+        target = AccountRow(
+            account_id="HBBBBBBBBBB",
+            password_hash="fixture",
+            disabled_at=(datetime.now(UTC) if transition == "enable" else None),
+        )
+        session.add(target)
+        inverse_kind = (
+            "resume_account_resources"
+            if transition == "disable"
+            else "suspend_account_resources"
+        )
+        same_kind = (
+            "suspend_account_resources"
+            if transition == "disable"
+            else "resume_account_resources"
+        )
+        session.add_all(
+            [
+                AdminOperationRow(
+                    operation_id="failed-inverse",
+                    kind=inverse_kind,
+                    account_id=target.account_id,
+                    status="failed",
+                    error="provider unavailable",
+                ),
+                AdminOperationRow(
+                    operation_id="failed-same-direction",
+                    kind=same_kind,
+                    account_id=target.account_id,
+                    status="failed",
+                    error="retry me",
+                ),
+            ]
+        )
+    state = AppState(
+        config=HyruleConfig(),
+        orchestrator=SimpleNamespace(xcpng=_AdminXCPNG()),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    operation = disable_account if transition == "disable" else enable_account
+    result = await operation(
+        "HBBBBBBBBBB",
+        ReasonRequest(reason=f"fixture {transition}"),
+        _browser_request(credentials, path=f"/v1/admin/accounts/HBBBBBBBBBB/{transition}"),
+        actor,
+        state,
+    )
+    async with admin_factory() as session:
+        inverse = await session.get(AdminOperationRow, "failed-inverse")
+        same = await session.get(AdminOperationRow, "failed-same-direction")
+        replacement = await session.get(AdminOperationRow, result["operation_id"])
+        assert inverse.status == "completed" and inverse.completed_at is not None
+        assert inverse.error == "provider unavailable"
+        assert inverse.progress["superseded"]["by_operation_id"] == replacement.operation_id
+        assert inverse.progress["superseded"]["by_kind"] == replacement.kind
+        assert same.status == "failed" and same.completed_at is None
+        assert replacement.status == "queued"
 
 
 @pytest.mark.asyncio
@@ -2607,7 +3107,10 @@ async def test_legacy_restart_receipt_survives_commit_before_scheduling_crash(ad
         session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture'))
         session.add(VMRow(vm_id='vm_legacy_restart', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
                           status='suspended', suspension_reason='account_disabled',
-                          expires_at=datetime.now(UTC) + timedelta(days=1)))
+                          expires_at=datetime.now(UTC) + timedelta(days=1),
+                          metadata_={"transfer_resume_pending": {
+                              "owner_account_id": "HBBBBBBBBBB", "xcpng_uuid": None,
+                          }} if source == 'ownership_transfer' else None))
         session.add(AdminOperationRow(operation_id='legacy-restart', kind='resume_account_resources',
                                       account_id='HBBBBBBBBBB', status='running'))
     generations = []
@@ -2900,6 +3403,45 @@ async def test_admin_power_rejects_committed_deletion_claim(admin_factory, actio
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('action', ['shutdown', 'suspend'])
+async def test_admin_power_off_rejects_provisioning_guest(admin_factory, action):
+    from unittest.mock import AsyncMock
+
+    credentials = await _admin_credentials(admin_factory)
+    async with admin_factory.begin() as session:
+        actor = await session.get(AccountRow, 'HAAAAAAAAAA')
+        session.add(VMRow(
+            vm_id='vm_power_provisioning', owner_wallet='fixture',
+            status='provisioning', xcpng_uuid='provisioning-guest',
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+        ))
+    provider = SimpleNamespace(**{
+        name: AsyncMock()
+        for name in ('start_vm', 'reboot_vm', 'shutdown_vm', 'suspend_vm')
+    })
+    state = AppState(
+        config=HyruleConfig(),
+        orchestrator=SimpleNamespace(xcpng=provider),
+        payment_gate=None,
+        network_provider=None,
+        session_factory=admin_factory,
+    )
+    with pytest.raises(HTTPException) as refused:
+        await vm_action(
+            'vm_power_provisioning', action,
+            ReasonRequest(reason='fixture power off'),
+            _browser_request(credentials, path='/fixture'), actor, state,
+        )
+    assert refused.value.status_code == 409
+    provider.shutdown_vm.assert_not_awaited()
+    provider.suspend_vm.assert_not_awaited()
+    async with admin_factory() as session:
+        vm = await session.get(VMRow, 'vm_power_provisioning')
+        assert vm.status == 'provisioning' and vm.suspension_reason is None
+        assert list(await session.scalars(select(AdminAuditRow))) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action', ['shutdown', 'suspend'])
 async def test_power_off_keeps_failed_guest_terminal_across_account_enable(admin_factory, action):
     credentials = await _admin_credentials(admin_factory)
     async with admin_factory.begin() as session:
@@ -2911,6 +3453,7 @@ async def test_power_off_keeps_failed_guest_terminal_across_account_enable(admin
         session.add(AdminOperationRow(operation_id='enable-failed', kind='resume_account_resources',
                                       account_id='HBBBBBBBBBB', status='running'))
     provider = _AdminXCPNG()
+    provider.power["failed-guest"] = "Running"
     orch = SimpleNamespace(xcpng=provider)
     state = AppState(config=HyruleConfig(), orchestrator=orch, payment_gate=None,
                      network_provider=None, session_factory=admin_factory)
@@ -2919,25 +3462,62 @@ async def test_power_off_keeps_failed_guest_terminal_across_account_enable(admin
     await _apply_account_operation(admin_factory, orch, 'enable-failed')
     async with admin_factory() as session:
         vm = await session.get(VMRow, 'vm_terminal_off')
-        assert vm.status == 'failed' and vm.suspension_reason == 'account_disabled'
+        assert vm.status == 'failed' and vm.suspension_reason is None
+        assert vm.suspended_by_account_id is None
     assert provider.started == []
     assert (provider.shut_down if action == 'shutdown' else provider.suspended) == ['failed-guest']
 
 
 @pytest.mark.asyncio
-async def test_account_disable_stops_provider_backed_provisioning_guest(admin_factory):
+@pytest.mark.parametrize("status", ["provisioning", "suspended"])
+@pytest.mark.parametrize("power", ["Running", "Halted", "Unknown"])
+@pytest.mark.parametrize("reason", [None, "manual_admin", "expired"])
+async def test_account_disable_reconciles_provider_guest(admin_factory, status, power, reason):
     async with admin_factory.begin() as session:
         session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture', disabled_at=datetime.now(UTC)))
         session.add(VMRow(vm_id='vm_initializing_disable', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
-                          status='provisioning', xcpng_uuid='initializing-guest'))
+                          status=status, suspension_reason=reason, xcpng_uuid='initializing-guest'))
         session.add(AdminOperationRow(operation_id='disable-initializing', kind='suspend_account_resources',
                                       account_id='HBBBBBBBBBB', status='running'))
     provider = _AdminXCPNG()
-    await _apply_account_operation(admin_factory, SimpleNamespace(xcpng=provider), 'disable-initializing')
-    assert provider.suspended == ['initializing-guest']
+    provider.power["initializing-guest"] = power
+    if power == "Unknown":
+        with pytest.raises(RuntimeError, match="unexpected VM power state"):
+            await _apply_account_operation(admin_factory, SimpleNamespace(xcpng=provider), 'disable-initializing')
+    else:
+        await _apply_account_operation(admin_factory, SimpleNamespace(xcpng=provider), 'disable-initializing')
+    assert provider.suspended == (['initializing-guest'] if power == "Running" else [])
     async with admin_factory() as session:
         vm = await session.get(VMRow, 'vm_initializing_disable')
-        assert vm.status == 'provisioning' and vm.suspension_reason == 'account_disabled'
+        assert vm.status == status
+        preserve_reason = power == 'Unknown' or (status == 'suspended' and reason is not None)
+        assert vm.suspension_reason == (reason if preserve_reason else 'account_disabled')
+
+
+@pytest.mark.asyncio
+async def test_transfer_handoff_waits_for_recipient_reenable(admin_factory):
+    async with admin_factory.begin() as session:
+        session.add(AccountRow(account_id='HBBBBBBBBBB', password_hash='fixture', disabled_at=datetime.now(UTC)))
+        session.add(VMRow(vm_id='vm_disabled_handoff', owner_wallet='fixture', owner_account_id='HBBBBBBBBBB',
+                          status='suspended', xcpng_uuid='handoff-guest', suspension_reason='account_disabled',
+                          expires_at=datetime.now(UTC) + timedelta(days=1),
+                          metadata_={'transfer_resume_pending': {'owner_account_id': 'HBBBBBBBBBB'}}))
+    provider = _AdminXCPNG()
+    orch = Orchestrator(HyruleConfig(), admin_factory)
+    orch.xcpng = provider
+    assert not await orch.reconcile_transfer_resume('vm_disabled_handoff')
+    assert provider.started == []
+    async with admin_factory.begin() as session:
+        row = await session.get(VMRow, 'vm_disabled_handoff')
+        assert row.metadata_['transfer_resume_pending']
+        owner = await session.get(AccountRow, 'HBBBBBBBBBB')
+        owner.disabled_at = None
+    assert await orch.reconcile_transfer_resume('vm_disabled_handoff')
+    assert provider.started == ['handoff-guest']
+    async with admin_factory() as session:
+        row = await session.get(VMRow, 'vm_disabled_handoff')
+        assert row.status == 'running'
+        assert not (row.metadata_ or {}).get('transfer_resume_pending')
 
 
 @pytest.mark.asyncio

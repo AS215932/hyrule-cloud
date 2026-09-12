@@ -10,13 +10,20 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
-from hyrule_cloud.api.admin import ReasonRequest, RoleRequest, set_account_role, vm_action
-from hyrule_cloud.db import AccountRow, AdminAuditRow, VMRow
+from hyrule_cloud.api.admin import (
+    ReasonRequest,
+    RoleRequest,
+    disable_account,
+    retry_admin_operation,
+    set_account_role,
+    vm_action,
+)
+from hyrule_cloud.db import AccountRow, AdminAuditRow, AdminOperationRow, VMRow
 
 
 @pytest.mark.asyncio
@@ -116,6 +123,114 @@ async def test_admin_revocation_serializes_with_provider_dispatch():
                 assert (await session.get(VMRow, vm_id)).status == ('running' if dispatch_first else 'suspended')
                 audits = list(await session.scalars(select(AdminAuditRow).where(AdminAuditRow.target_id == vm_id)))
                 assert len(audits) == int(dispatch_first)
+
+        # With exactly two enabled administrators, concurrent cross-disables
+        # must serialize so both transactions cannot leave the system with no
+        # enabled administrator.
+        last_a = AccountRow(account_id='HLAST000001', password_hash='fixture', is_admin=True)
+        last_b = AccountRow(account_id='HLAST000002', password_hash='fixture', is_admin=True)
+        async with sessions.begin() as session:
+            await session.execute(update(AccountRow).values(disabled_at=datetime.now(UTC)))
+            session.add_all([last_a, last_b])
+        disable_entered, disable_release = asyncio.Event(), asyncio.Event()
+        releases.append(disable_release)
+
+        class HeldDisableSession(AsyncSession):
+            async def commit(self):
+                if any(
+                    isinstance(row, AdminAuditRow)
+                    and row.action == 'account.disable'
+                    and row.target_id == last_b.account_id
+                    for row in self.new
+                ):
+                    await self.flush()
+                    disable_entered.set()
+                    await disable_release.wait()
+                await super().commit()
+
+        first_disable_state = SimpleNamespace(session_factory=async_sessionmaker(
+            engines[0], class_=HeldDisableSession, expire_on_commit=False))
+        second_disable_state = SimpleNamespace(session_factory=async_sessionmaker(
+            engines[1], expire_on_commit=False))
+
+        first_disable = asyncio.create_task(disable_account(
+            last_b.account_id, ReasonRequest(reason='fixture cross-disable'),
+            request, last_a, first_disable_state))
+        tasks.append(first_disable)
+        await asyncio.wait_for(disable_entered.wait(), 5)
+        second_disable = asyncio.create_task(disable_account(
+            last_a.account_id, ReasonRequest(reason='fixture cross-disable'),
+            request, last_b, second_disable_state))
+        tasks.append(second_disable)
+        await blocked(names[1])
+        disable_release.set()
+        assert (await asyncio.wait_for(first_disable, 5))['status'] == 'disabled'
+        with pytest.raises(HTTPException) as refused_disable:
+            await asyncio.wait_for(second_disable, 5)
+        assert refused_disable.value.status_code == 403
+        async with sessions() as session:
+            assert await session.scalar(
+                select(func.count()).select_from(AccountRow).where(
+                    AccountRow.is_admin.is_(True), AccountRow.disabled_at.is_(None)
+                )
+            ) == 1
+
+        # Concurrent retries of the same failed operation must likewise lock
+        # and refresh the row; the stale retry observes queued after waiting.
+        operation = AdminOperationRow(
+            operation_id='operation-retry-race',
+            kind='suspend_account_resources',
+            account_id=last_b.account_id,
+            actor_account_id=last_a.account_id,
+            status='failed',
+            reason='fixture',
+            error='temporary provider failure',
+        )
+        async with sessions.begin() as session:
+            session.add(operation)
+        retry_entered, retry_release = asyncio.Event(), asyncio.Event()
+        releases.append(retry_release)
+
+        class HeldRetrySession(AsyncSession):
+            async def commit(self):
+                if any(
+                    isinstance(row, AdminOperationRow)
+                    and row.operation_id == operation.operation_id
+                    and row.status == 'queued'
+                    for row in self.dirty
+                ):
+                    await self.flush()
+                    retry_entered.set()
+                    await retry_release.wait()
+                await super().commit()
+
+        first_retry_state = SimpleNamespace(session_factory=async_sessionmaker(
+            engines[0], class_=HeldRetrySession, expire_on_commit=False))
+        second_retry_state = SimpleNamespace(session_factory=async_sessionmaker(
+            engines[1], expire_on_commit=False))
+
+        async def retry(state):
+            return await retry_admin_operation(
+                operation.operation_id,
+                ReasonRequest(reason='provider recovered'),
+                request,
+                last_a,
+                state,
+            )
+
+        first_retry = asyncio.create_task(retry(first_retry_state))
+        tasks.append(first_retry)
+        await asyncio.wait_for(retry_entered.wait(), 5)
+        second_retry = asyncio.create_task(retry(second_retry_state))
+        tasks.append(second_retry)
+        await blocked(names[1])
+        retry_release.set()
+        assert (await asyncio.wait_for(first_retry, 5))['status'] == 'queued'
+        with pytest.raises(HTTPException) as refused_retry:
+            await asyncio.wait_for(second_retry, 5)
+        assert refused_retry.value.status_code == 409
+        async with sessions() as session:
+            assert (await session.get(AdminOperationRow, operation.operation_id)).status == 'queued'
     finally:
         for release in releases:
             release.set()

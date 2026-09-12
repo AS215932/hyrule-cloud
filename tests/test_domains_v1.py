@@ -41,6 +41,9 @@ from hyrule_cloud.domains.api import (
     register_domain_x402,
 )
 from hyrule_cloud.domains.api import (
+    create_order as create_order_route,
+)
+from hyrule_cloud.domains.api import (
     get_operation as get_operation_route,
 )
 from hyrule_cloud.domains.catalog import parse_iana_root_db
@@ -652,14 +655,58 @@ async def test_verified_payer_resolution_links_browser_but_never_api_key(
 
 
 @pytest.mark.asyncio
+async def test_verified_payer_does_not_auto_link_a_disabled_browser_account(domain_service):
+    service, _provider, sessions = domain_service
+    wallet_auth = WalletAuthService(service.config, sessions)
+    async with sessions() as session:
+        stale_account = await session.get(AccountRow, "H1234567890")
+    assert stale_account is not None
+    async with sessions.begin() as session:
+        current = await session.get(AccountRow, stale_account.account_id)
+        assert current is not None
+        current.disabled_at = datetime.now(UTC)
+
+    with pytest.raises(DomainProblem) as refused:
+        await wallet_auth.resolve_x402_owner(
+            address="0x" + "D" * 40,
+            chain_id=8453,
+            account=stale_account,
+            allow_link=True,
+        )
+
+    assert refused.value.code == "account_disabled"
+    async with sessions() as session:
+        linked = await session.scalar(
+            select(AccountWalletRow).where(AccountWalletRow.account_id == stale_account.account_id)
+        )
+    assert linked is None
+
+
+@pytest.mark.asyncio
 async def test_public_registration_route_settles_once_and_issues_management_session(
     domain_service,
 ):
+    from contextlib import asynccontextmanager
+
     service, _provider, sessions = domain_service
     service.domain_config.marketplace_sales_enabled = True
     service.domain_config.tld_allowlist = ["dev"]
     wallet_auth = WalletAuthService(service.config, sessions)
     _REGISTRATION_PREFLIGHTS.clear()
+    payment_guard_held = False
+    real_payment_guard = service.x402_payment_guard
+
+    @asynccontextmanager
+    async def tracked_payment_guard(order_id: str, owner_account_id: str):
+        nonlocal payment_guard_held
+        async with real_payment_guard(order_id, owner_account_id) as order:
+            payment_guard_held = True
+            try:
+                yield order
+            finally:
+                payment_guard_held = False
+
+    service.x402_payment_guard = tracked_payment_guard
 
     class Gate:
         def __init__(self) -> None:
@@ -680,6 +727,7 @@ async def test_public_registration_route_settles_once_and_issues_management_sess
             return "a" * 64
 
         async def settle_verified(self, request, _verified, extra):
+            assert payment_guard_held
             self.settlements += 1
             request.state.payment_tx = "0xroute"
             request.state.payment_network = "eip155:8453"
@@ -1173,6 +1221,39 @@ async def test_native_domain_settlement_refunds_disabled_owner(domain_service):
     assert Decimal(refunds[0].extra["amount_received_crypto"]) == Decimal(
         "0.000271828182"
     )
+
+
+@pytest.mark.asyncio
+async def test_domain_order_rechecks_disabled_owner_before_payment(domain_service):
+    service, _provider, sessions = domain_service
+    quote = await service.create_quote(
+        "disabled-before-charge.dev", DomainAction.REGISTER, "H1234567890"
+    )
+    async with sessions() as session:
+        stale_account = await session.get(AccountRow, "H1234567890")
+    async with sessions.begin() as session:
+        current = await session.get(AccountRow, "H1234567890")
+        current.disabled_at = datetime.now(UTC)
+    gate = SimpleNamespace(check_payment=AsyncMock(return_value="0x" + "1" * 40))
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/v1/domains/orders", "headers": []}
+    )
+    with pytest.raises(DomainProblem) as denied:
+        await create_order_route(
+            DomainOrderRequest(
+                quote_id=quote.quote_id,
+                payment_method=DomainPaymentMethod.USDC,
+                terms_version=service.domain_config.terms_version,
+            ),
+            request,
+            Response(),
+            "disabled-before-charge",
+            stale_account,
+            service,
+            gate,
+        )
+    assert denied.value.code == "account_disabled"
+    gate.check_payment.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3155,6 +3236,80 @@ async def test_wallet_login_rejects_disabled_account_without_consuming_challenge
     async with sessions() as session:
         stored_challenge = await session.get(WalletChallengeRow, retry.nonce)
         assert stored_challenge is not None and stored_challenge.used_at is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", [WalletAction.LINK, WalletAction.ROTATE])
+async def test_wallet_account_mutation_rechecks_disabled_account(tmp_path, action):
+    engine = create_db_engine(f"sqlite+aiosqlite:///{tmp_path / f'wallet-{action.value}.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = create_session_factory(engine)
+    service = WalletAuthService(HyruleConfig(), sessions)
+    current = Account.create()
+    replacement = Account.create()
+    account = AccountRow(account_id="HWALLETTEST", password_hash="fixture")
+    async with sessions() as session:
+        session.add(account)
+        if action is WalletAction.ROTATE:
+            session.add(
+                AccountWalletRow(
+                    wallet_id="wallet-current",
+                    account_id=account.account_id,
+                    address=current.address,
+                    chain_id=8453,
+                )
+            )
+        await session.commit()
+
+    challenge = await service.create_challenge(
+        WalletChallengeRequest(
+            action=action,
+            address=replacement.address,
+            chain_id=8453,
+        ),
+        account=account,
+    )
+    primary = replacement if action is WalletAction.LINK else current
+    body = WalletVerifyRequest(
+        nonce=challenge.nonce,
+        signature=Account.sign_message(
+            encode_defunct(text=challenge.message), primary.key
+        ).signature.hex(),
+        secondary_signature=(
+            Account.sign_message(
+                encode_defunct(text=challenge.message), replacement.key
+            ).signature.hex()
+            if action is WalletAction.ROTATE
+            else None
+        ),
+    )
+    async with sessions() as session:
+        stored = await session.get(AccountRow, account.account_id)
+        assert stored is not None
+        stored.disabled_at = datetime.now(UTC)
+        await session.commit()
+
+    with pytest.raises(DomainProblem) as rejected:
+        await service.verify_login_or_account_action(
+            body,
+            account=account,
+            request=SimpleNamespace(headers={}, client=None),
+        )
+    assert rejected.value.status == 403
+    assert rejected.value.code == "account_disabled"
+    async with sessions() as session:
+        stored_challenge = await session.get(WalletChallengeRow, challenge.nonce)
+        assert stored_challenge is not None and stored_challenge.used_at is None
+        wallets = list(
+            await session.scalars(
+                select(AccountWalletRow).where(AccountWalletRow.account_id == account.account_id)
+            )
+        )
+        assert [wallet.address for wallet in wallets] == (
+            [current.address] if action is WalletAction.ROTATE else []
+        )
     await engine.dispose()
 
 

@@ -7,11 +7,19 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
-async def lock_account_lifecycle(session: AsyncSession, account_id: str) -> None:
+async def lock_account_lifecycle(
+    session: AsyncSession, account_id: str, *, shared: bool = False
+) -> None:
     if session.bind is not None and session.bind.dialect.name == "postgresql":
-        acquired = await session.scalar(text(
-            "SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))"
-        ), {"key": "account-deletion:" + account_id})
+        lock_query = (
+            text("SELECT pg_try_advisory_xact_lock_shared(hashtextextended(:key, 0))")
+            if shared
+            else text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))")
+        )
+        acquired = await session.scalar(
+            lock_query,
+            {"key": "account-deletion:" + account_id},
+        )
         if not acquired:
             raise HTTPException(409, "Account deletion or ownership transfer is in progress; retry later")
 
