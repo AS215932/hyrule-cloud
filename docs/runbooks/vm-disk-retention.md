@@ -31,7 +31,9 @@ revocation from owner-disable refusal.
 
 Accounts with active retention require assisted deletion for either VM policy. Self-service deletion locks the account before its VMs and preserves the retained owner identity and sessions on refusal. Detachment, session revocation and account deletion commit together. The destroy policy releases its initial locks for identity-checked provider operations, then reacquires the account fence and rechecks retention and remaining VMs. Provider failures leave the account available for retry. PostgreSQL tests observe actual lock waiters for retention-first and account-detachment-first orderings; stale retention work refuses a changed owner.
 
-Outstanding before rollout: pending-recovery operator workflow, status/deadline UI integration, explicit purge policy and implementation, protection monitoring, deployed-XO version checks, and disposable data/boot restoration proof. Expiration of the recorded retention deadline alone does not authorize the current code to delete anything. Production promotion remains controlled by network-operations after CI/review and coordinated API/worker quiescence.
+The [pending-recovery operator procedure](retained-recovery-operations.md) covers inspection, exact-request retries and fail-closed escalation. Production validation of that procedure remains required.
+
+Outstanding before rollout: status/deadline UI integration, explicit purge policy and implementation, protection monitoring, deployed-XO version checks, and disposable data/boot restoration proof. Expiration of the recorded retention deadline alone does not authorize the current code to delete anything. Production promotion remains controlled by network-operations after CI/review and coordinated API/worker quiescence.
 
 ## Periodic protection verification
 
