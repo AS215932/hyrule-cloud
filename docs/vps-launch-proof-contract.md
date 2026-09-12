@@ -20,7 +20,7 @@ status fields.
 | `payment_required`| Payment not yet settled; 402 returned on create  | `QuoteStatus.CREATED` + 402       |
 | `provisioning`   | Payment confirmed; VM build in progress           | `VMStatus.PROVISIONING`           |
 | `provisioned`    | VM build completed; ready for SSH                 | `VMStatus.READY` / `RUNNING`      |
-| `degraded`       | VM is up and reachable but a proof failed (today: it cannot resolve DNS) | `VMStatus.READY` + `dns_resolution_status=failed` |
+| `degraded`       | VM provisioned, but the central launch-time resolver probe failed | `VMStatus.READY` + `dns_resolution_status=failed` |
 | `failed`         | Build failed; rollback may be available           | `VMStatus.FAILED`                 |
 | `rolled_back`    | Failed VM was cleaned up / destroyed              | `VMStatus.DESTROYED` after failed |
 
@@ -35,13 +35,14 @@ the existing public status shape:
   confirmed (controlled simulation by default; real DNS check only when
   `HCP_LAUNCH_PROOF_REAL_XCPNG=1`).
 - **`ssh_smoke_status`** — `not_run` | `passed` | `failed` (controlled simulation
-  by default; real SSH smoke only when `HCP_LAUNCH_PROOF_REAL_XCPNG=1`).
+  by default; real TCP connection check to the SSH port only when
+  `HCP_LAUNCH_PROOF_REAL_XCPNG=1`, not an authenticated guest session).
 - **`dns_resolution_status`** — `not_run` | `passed` | `failed`. Whether the
-  resolver the VM was handed (`HYRULE_CUSTOMER_IPV6_DNS`) actually answers a
-  query for `HYRULE_CUSTOMER_DNS_PROBE_HOSTNAME`. `dns_aaaa_verified` and the
-  SSH smoke are both *inbound* proofs: a VM can pass both and still resolve
-  nothing, which makes it unusable (no `apt-get`, no setup script). Never
-  inferred from the VM being READY — `not_run` means no measurement was taken.
+  configured resolver (`HYRULE_CUSTOMER_IPV6_DNS`) answers Hyrule's central
+  launch-time query for `HYRULE_CUSTOMER_DNS_PROBE_HOSTNAME`. Guest routes and
+  ACLs may differ, so this does not establish DNS success or failure inside
+  the guest. Never inferred from the VM being READY — `not_run` means no
+  measurement was taken.
 - **`rollback_available`** — `true` when the VM is in `failed` and has not yet
   been destroyed.
 - **`operator_message`** — Internal detail for operators (raw error, etc.).
@@ -68,8 +69,8 @@ and the degraded state does not mean that provisioning failed:
 4. `operator_message` identifies the configured resolver and central launch-time
    probe. This is not a measurement from inside the guest and does not establish
    fleet-wide impact.
-5. No refund is auto-recorded: the VM was delivered and is usable. A customer
-   who does not want it asks support.
+5. This formatter does not auto-record a refund. Customers can contact support
+   about usability or payment; actual refund status needs separate evidence.
 
 ## Failure Contract
 
