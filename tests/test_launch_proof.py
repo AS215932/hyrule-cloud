@@ -526,6 +526,8 @@ async def test_dns_resolution_failure_reports_degraded_not_ready(lp_state, clien
     # The customer can unblock themselves while the operator fixes the fleet.
     assert "resolv.conf" in customer
     assert "notified" not in customer.lower()
+    assert "not inside your VM" in customer
+    assert "runs centrally" in (body["operator_message"] or "")
     assert "Every VM" not in (body["operator_message"] or "")
     assert "HYRULE_CUSTOMER_IPV6_DNS" in (body["operator_message"] or "")
 

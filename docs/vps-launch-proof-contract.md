@@ -57,15 +57,17 @@ the existing public status shape:
 
 ## Degraded Contract
 
-A VM that is up, reachable and paid for, but fails an outbound proof, is
-reported as `degraded` — not `provisioned` (that would be a lie) and not
-`failed` (that promises a refund for a machine the customer can use):
+A provisioned VM whose launch-time resolver probe fails is reported as
+`degraded`. This central probe does not prove DNS failure inside the guest,
+and the degraded state does not mean that provisioning failed:
 
 1. `launch_proof_status` is `degraded`; `status` stays `ready`.
 2. `dns_resolution_status` is `failed` — the machine-readable reason.
-3. `customer_message` says what does not work and how to unblock it (point the
-   VM at a working DNS64 resolver), and offers support/refund.
-4. `operator_message` names the misconfigured setting.
+3. `customer_message` explains the central probe failure and offers a DNS64
+   resolver workaround if DNS also fails inside the guest, plus support.
+4. `operator_message` identifies the configured resolver and central launch-time
+   probe. This is not a measurement from inside the guest and does not establish
+   fleet-wide impact.
 5. No refund is auto-recorded: the VM was delivered and is usable. A customer
    who does not want it asks support.
 
@@ -75,9 +77,11 @@ When provisioning reaches `failed`:
 
 1. `rollback_available` is `true`.
 2. `customer_message` is a safe, generic message (e.g. *"Provisioning could not
-   be completed. Our team has been notified and your payment will be refunded."*).
-3. `operator_message` contains the internal error detail for operator triage.
-4. No provider-internal strings (XCP-NG UUIDs, RPC errors, etc.) leak to the
+   be completed. Contact support for help and to review any payment or refund."*).
+3. The fallback does not establish that support was notified or a refund was
+   requested/completed; those require separate delivery/payment evidence.
+4. `operator_message` contains the internal error detail for operator triage.
+5. No provider-internal strings (XCP-NG UUIDs, RPC errors, etc.) leak to the
    customer.
 
 ## Example Journey

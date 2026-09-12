@@ -24,22 +24,21 @@ if TYPE_CHECKING:
 
 _LAUNCH_PROOF_REAL = os.environ.get("HCP_LAUNCH_PROOF_REAL_XCPNG") == "1"
 
-# Customer-visible wording for a VM that came up and is reachable but cannot
-# resolve DNS. It names a concrete fix because the resolver is operator-side:
-# the customer cannot wait for us and can unblock themselves in one line.
+# Report the central resolver probe without claiming a guest-side measurement,
+# support delivery, or refund outcome that this formatter does not observe.
 DNS_RESOLUTION_CUSTOMER_MESSAGE = (
-    "Your VM is running and reachable over SSH, but it could not resolve DNS "
-    "names with the resolver we configured. Installing packages and reaching "
-    "hosts by name will fail until it is fixed. You can unblock yourself now "
-    "by putting a working DNS64 resolver in /etc/resolv.conf on the VM (for "
-    "example: nameserver 2001:4860:4860::6464). Please "
-    "contact support if you would rather have a refund."
+    "The launch-time probe could not resolve DNS names using the resolver "
+    "configured for your VM. This check runs from Hyrule, not inside your VM. "
+    "If DNS also fails inside your VM, you can configure a working DNS64 resolver "
+    "in /etc/resolv.conf (for example: nameserver 2001:4860:4860::6464). "
+    "Contact support for help or to discuss a refund."
 )
 
 DNS_RESOLUTION_OPERATOR_MESSAGE = (
-    "customer DNS resolution probe failed: the resolver in "
-    "HYRULE_CUSTOMER_IPV6_DNS did not answer this VM's probe queries. "
-    "Check resolver health and other VM probes to establish the scope."
+    "launch-time resolver probe failed: Hyrule could not resolve the probe "
+    "hostname through HYRULE_CUSTOMER_IPV6_DNS. The probe runs centrally, "
+    "not inside the guest. Check resolver health and guest reachability "
+    "before inferring customer impact or fleet-wide scope."
 )
 
 
