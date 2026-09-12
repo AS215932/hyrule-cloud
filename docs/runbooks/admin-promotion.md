@@ -5,9 +5,12 @@ readiness gates, domain-registration settlement recovery and provisioning events
 alongside the admin PR's audited operations, session CSRF protection and explicit
 payment-waiver accounting. Payment waivers remain disabled by default.
 
-The local migration chain is `020 → 021 → 022 → 023`; the admin migration `023`
+The local migration chain is `020 → 021 → 022 → 023 → 024 → 025`; the admin migration `023`
 follows the integrated guest-receipt migration `022` and expiry deletion-claim migration `021`. Revision `017`
 is already the deployed provisioning-events migration and must not be reused.
+The retention migration `024` follows the admin migration and preserves active
+retention and historical recovery evidence; its downgrade refuses to erase either.
+Migration `025` adds persisted read-only verification evidence and retry scheduling.
 The integrated guest recovery worker scans durable dispatch receipts. Admin
 account enable and ownership-transfer recovery stage that receipt in the same
 transaction as a legacy UUID-less VM's transition to PROVISIONING, then schedule

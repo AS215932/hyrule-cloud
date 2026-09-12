@@ -478,6 +478,10 @@ async def test_guest_completion_controls_public_status_and_launch_proof(
 
     orch._record_vm_refund = AsyncMock(side_effect=record_refund)
     app = FastAPI()
+    from hyrule_cloud.state import AppState
+
+    app.state._typed_state = AppState(config=config, orchestrator=orch, payment_gate=None,
+                                     network_provider=None, session_factory=factory)
     app.include_router(router)
     app.dependency_overrides[get_orch] = lambda: orch
     try:

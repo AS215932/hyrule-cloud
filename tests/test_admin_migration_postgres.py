@@ -53,7 +53,7 @@ def test_admin_postgres_migration_roundtrip():
         VALUES ('vm_paid','fixture','HTEST000001','{22}',2.50),
                ('vm_dev','0xDEV_TEST_WALLET','HTEST000001','{22}',1.25)""")
     migrate("upgrade", "head")
-    assert run("SELECT version_num FROM alembic_version") == [('023',)]
+    assert run("SELECT version_num FROM alembic_version") == [('025',)]
     rows = run("SELECT vm_id,billing_mode,cost_total,retail_cost_total FROM vms ORDER BY vm_id")
     assert [(r[0], r[1], str(r[2]), str(r[3])) for r in rows] == [
         ('vm_dev', 'dev_bypass', '0.000000', '1.250000'),
@@ -65,7 +65,7 @@ def test_admin_postgres_migration_roundtrip():
     assert run("SELECT count(*) FROM admin_audit") == [(1,)]
     run("UPDATE accounts SET disabled_at=now() WHERE account_id='HTEST000001'")
     migrate("downgrade", "020", expected_error="while accounts remain disabled")
-    assert run("SELECT version_num FROM alembic_version") == [('023',)]
+    assert run("SELECT version_num FROM alembic_version") == [('025',)]
     assert run("SELECT count(*) FROM accounts WHERE disabled_at IS NOT NULL") == [(1,)]
     assert run("SELECT count(*) FROM admin_audit") == [(1,)]
     # Explicitly resolve the fixture's restriction before the ordinary rollback.
@@ -106,5 +106,5 @@ def test_admin_postgres_migration_roundtrip():
     assert run("SELECT count(*) FROM accounts") == [(1,)]
     assert run("SELECT count(*) FROM information_schema.columns WHERE table_name='vms' AND column_name='suspension_reason'") == [(0,)]
     migrate("upgrade", "head")
-    assert run("SELECT version_num FROM alembic_version") == [('023',)]
+    assert run("SELECT version_num FROM alembic_version") == [('025',)]
     assert run("SELECT count(*) FROM vms") == [(2,)]

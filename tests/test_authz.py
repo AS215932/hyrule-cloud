@@ -108,6 +108,7 @@ def test_can_manage_vm_rejects_wrong_token():
 
 
 class _Cfg:
+    vm_grace_period_hours = 48
     class Payment:
         price_vm_xs = Decimal("0.05")
         price_vm_sm = Decimal("0.10")

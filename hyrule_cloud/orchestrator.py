@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from ipaddress import IPv6Address, IPv6Network
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 import dns.exception
@@ -37,6 +37,7 @@ from hyrule_cloud.db import (
     PaymentEventRow,
     VMGuestResultRow,
     VMQuoteRow,
+    VMRetentionRow,
     VMRow,
 )
 from hyrule_cloud.middleware.anon_token import VMManagementIdentity, hash_anon_token
@@ -89,6 +90,7 @@ from hyrule_cloud.services.vm_pricing import (
     price_vm_order,
     resources_for_profile,
 )
+from hyrule_cloud.services.vm_retention import prepare_retention, stored_manifest
 
 if TYPE_CHECKING:
     from hyrule_cloud.domains.service import DomainService
@@ -1293,9 +1295,13 @@ class Orchestrator:
             # Update DB with final state
             custom_domain: str | None = None
             custom_account_id: str | None = None
-            async with self.db() as session:
-                row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
-                if row is None or row.status != VMStatus.PROVISIONING:
+            async with self.locked_vm(vm_id) as (session, row):
+                if row is None or row.deletion_started_at is not None:
+                    return
+                admin_suspended = row.suspension_reason in {"account_disabled", "manual_admin"}
+                if row.status != VMStatus.PROVISIONING and not (
+                    admin_suspended and row.status == VMStatus.SUSPENDED
+                ):
                     return
                 receipt = await session.scalar(
                     select(VMGuestResultRow).where(VMGuestResultRow.vm_id == vm_id).with_for_update()
@@ -2611,8 +2617,9 @@ class Orchestrator:
     async def destroy_vm(
         self, vm_id: str, *, expired_before: datetime | None = None,
         management_identity: VMManagementIdentity | None = None,
+        reconcile_retention: bool = False,
         dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
-    ) -> bool:
+    ) -> bool | Literal["retained"]:
         lifecycle_lock = (self.locked_vm(vm_id, dispatch_guard=dispatch_guard)
                           if dispatch_guard is not None else self.locked_vm(vm_id))
         async with lifecycle_lock as (session, row):
@@ -2634,6 +2641,32 @@ class Orchestrator:
                     expiry = expiry.replace(tzinfo=UTC)
                 if expiry >= expired_before:
                     return False
+            retained = await session.get(VMRetentionRow, vm_id)
+            if reconcile_retention and retained is None:
+                # Reconciliation selected before a completed recovery must not
+                # become a fresh customer deletion after its evidence is gone.
+                return False
+            if retained is not None and retained.state == "restoring":
+                return False
+            if retained is not None and retained.state == "retained" and expired_before is not None:
+                # A completed retention is not pending expiry work. Explicit
+                # calls without an expiry cutoff still reconcile protection.
+                return "retained"
+            manifest = stored_manifest(retained) if retained is not None else None
+            # Retention evidence and the initial expiry claim are committed
+            # together. A pre-existing claim without evidence must finish its
+            # original deletion, even when retried by the expiry worker or
+            # after retention is enabled. Never reinterpret an explicit delete.
+            wants_retention = (row.deletion_started_at is None and expired_before is not None
+                               and getattr(self.config, "vm_expiry_retention_enabled", False))
+            if not already_destroyed and row.xcpng_uuid and manifest is None and wants_retention:
+                manifest = await self.xcpng.capture_vm_protection(row.xcpng_uuid)
+                await prepare_retention(
+                    session, vm_id, manifest,
+                    _now() + timedelta(days=self.config.vm_retention_days),
+                )
+            if manifest is not None and row.xcpng_uuid != manifest.vm_uuid:
+                raise RuntimeError("Retention manifest does not match the claimed guest")
             if row.deletion_started_at is None:
                 row.deletion_started_at = _now()
             # Persist before the irreversible provider call. A failed call or
@@ -2657,7 +2690,36 @@ class Orchestrator:
         cleanup_ok = True
 
         if xcpng_uuid:
-            if not deletion_verified:
+            if manifest is not None:
+                # Reacquire the lifecycle fence after persisting intent. Recovery
+                # uses the same fence through provider mutation and finalization.
+                async with self.locked_vm(vm_id) as (retention_session, retained_vm):
+                    if (retained_vm is None or retained_vm.xcpng_uuid != manifest.vm_uuid
+                            or retained_vm.deletion_started_at is None):
+                        return False
+                    retained = await retention_session.get(VMRetentionRow, vm_id)
+                    if retained is None or stored_manifest(retained) != manifest:
+                        raise RuntimeError("Retention evidence changed during provider deletion")
+                    if retained.state == "restoring":
+                        return False
+                    if retained.state == "retained" and expired_before is not None:
+                        return "retained"
+                    await self.xcpng.protect_retained_vm(manifest)
+                    retained.state = "retained"
+                    retained.retained_at = retained.retained_at or _now()
+                    retained.last_verified_at = _now()
+                    retained.verification_attempted_at = retained.last_verified_at
+                    retained.verification_error = None
+                    retained.next_verification_at = retained.last_verified_at + timedelta(
+                        seconds=getattr(self.config, "vm_retention_verify_interval_seconds", 21600))
+                    retained_vm.status = VMStatus.SUSPENDED
+                    if retained_vm.suspension_reason not in {"manual_admin", "account_disabled"}:
+                        retained_vm.suspension_reason = "expired"
+                    # Keep DNS and the prefix: this guest still owns its disks,
+                    # firmware and network configuration throughout retention.
+                    await retention_session.commit()
+                    return "retained"
+            elif not deletion_verified:
                 await self.xcpng.destroy_vm(xcpng_uuid)
         elif status == str(VMStatus.PROVISIONING) or unresolved_guest:
             # Mid-provision race: the clone may exist without xcpng_uuid
@@ -2753,6 +2815,48 @@ class Orchestrator:
                 row.ipv6_prefix = None
                 await session.commit()
 
+    async def verify_retained_vms(self) -> int:
+        """Check a bounded due batch without mutating guests or delaying expiry."""
+        now = _now()
+        async with self.db() as session:
+            due = list(await session.scalars(
+                select(VMRetentionRow.vm_id).where(
+                    VMRetentionRow.state == "retained",
+                    or_(VMRetentionRow.next_verification_at.is_(None), VMRetentionRow.next_verification_at <= now),
+                ).order_by(func.coalesce(VMRetentionRow.next_verification_at, VMRetentionRow.created_at),
+                           VMRetentionRow.vm_id)
+                .limit(self.config.vm_retention_verify_batch_size)
+            ))
+        checked = 0
+        for vm_id in due:
+            async with self.locked_vm(vm_id) as (session, vm):
+                retained = await session.get(VMRetentionRow, vm_id)
+                if retained is None or retained.state != "retained":
+                    continue
+                deadline = retained.next_verification_at
+                if deadline is not None and (deadline.replace(tzinfo=UTC) if deadline.tzinfo is None else deadline) > _now():
+                    continue
+                retained.verification_attempted_at = _now()
+                if (vm is None or vm.deletion_started_at is None or vm.status != VMStatus.SUSPENDED
+                        or vm.xcpng_uuid != retained.source_vm_uuid
+                        or vm.owner_account_id != retained.owner_account_id or vm.owner_wallet != retained.owner_wallet):
+                    retained.verification_error = "lifecycle_state_changed"
+                else:
+                    try:
+                        async with asyncio.timeout(30):
+                            await self.xcpng.verify_retained_vm(stored_manifest(retained))
+                    except Exception:
+                        retained.verification_error = "provider_verification_failed"
+                    else:
+                        retained.last_verified_at = _now()
+                        retained.verification_error = None
+                delay = (self.config.vm_retention_verify_retry_seconds if retained.verification_error
+                         else self.config.vm_retention_verify_interval_seconds)
+                retained.next_verification_at = _now() + timedelta(seconds=delay)
+                await session.commit()
+                checked += 1
+        return checked
+
     # --- Expiry Management ---
 
     async def check_expiries(self) -> None:
@@ -2803,6 +2907,10 @@ class Orchestrator:
                              func.coalesce(VMRow.metadata_["provider_deleted_uuid"].as_string(), "") != VMRow.xcpng_uuid),
                         and_(VMRow.status == VMStatus.DESTROYED,
                              or_(VMRow.ipv6_prefix_index.isnot(None), VMRow.ipv6_prefix.isnot(None)))),
+                    ~select(VMRetentionRow.vm_id).where(
+                        VMRetentionRow.vm_id == VMRow.vm_id,
+                        VMRetentionRow.state.in_(("retained", "restoring")),
+                    ).exists(),
                     or_(
                         VMRow.deletion_started_at.isnot(None),
                         and_(VMRow.status != VMStatus.FAILED, VMRow.expires_at < now),

@@ -22,7 +22,7 @@ import structlog
 from cachetools import TTLCache
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hyrule_cloud.db import (
@@ -33,6 +33,7 @@ from hyrule_cloud.db import (
     RecoveryAttemptRow,
     RecoveryChallengeRow,
     SessionRow,
+    VMRetentionRow,
     VMRow,
     generate_account_id,
 )
@@ -1005,6 +1006,12 @@ async def _account_deletion_snapshot(db: AsyncSession, account_id: str) -> tuple
         .order_by(VMRow.vm_id).with_for_update().execution_options(populate_existing=True)
     )
     owned_vms = list(result.scalars().all())
+    active_retention = await db.scalar(select(VMRetentionRow.vm_id).where(or_(
+        VMRetentionRow.owner_account_id == account_id,
+        VMRetentionRow.vm_id.in_([vm.vm_id for vm in owned_vms]),
+    )).limit(1))
+    if active_retention is not None:
+        raise HTTPException(409, "Accounts with retained VMs require assisted deletion.")
     return acct, owned_vms
 
 
@@ -1146,7 +1153,13 @@ async def claim_vm(
         raise HTTPException(503, "Database not available")
 
     async with factory() as db:
-        vm = await db.get(VMRow, vm_id)
+        # Claiming changes lifecycle ownership: fence the destination account
+        # before the VM, matching disable/delete and retention lock ordering.
+        current_account = await db.scalar(select(AccountRow).where(
+            AccountRow.account_id == account.account_id).with_for_update())
+        if current_account is None or current_account.disabled_at is not None:
+            raise HTTPException(403, "Account is disabled or unavailable")
+        vm = await db.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
         if vm is None:
             raise HTTPException(404, "VM not found")
         if vm.owner_account_id is not None:
@@ -1235,6 +1248,9 @@ async def claim_vm(
         ) != proof_state:
             raise HTTPException(409, "VM claim state changed; retry the claim")
 
+        if (vm.deletion_started_at is not None or vm.status == VMStatus.DESTROYED
+                or await db.get(VMRetentionRow, vm_id) is not None):
+            raise HTTPException(409, "VM deletion or retention is in progress")
         vm.owner_account_id = destination.account_id
         # Burn the anon token once claimed — account auth now supersedes.
         vm.anon_management_token_hash = None

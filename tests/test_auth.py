@@ -82,6 +82,7 @@ class _MockXCPNG:
 
 
 class _MockConfig:
+    vm_grace_period_hours = 48
     payment = _MockPaymentConfig()
     xcpng = _MockXCPNG()
     deploy_domain = "deploy.hyrule.host"
@@ -1083,3 +1084,119 @@ async def test_rotate_recovery_code_invalidates_old_code(auth_state, client):
         json={"account_id": account_id, "recovery_code": new_code, "new_password": "next long pw 1234"},
     )
     assert good.status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('policy', ['detach', 'destroy'])
+@pytest.mark.parametrize('retention_state', ['prepared', 'retained', 'restoring'])
+async def test_account_delete_preserves_active_retention_identity(auth_state, client, policy, retention_state):
+    from hyrule_cloud.db import VMRetentionRow
+
+    reg = await client.post('/v1/auth/register', json={'password': 'retained owner fixture password'})
+    account_id = reg.json()['account_id']
+    vm_id = await _seed_owned_vm(auth_state, account_id)
+    async with auth_state.orchestrator.db.begin() as session:
+        vm = await session.get(VMRow, vm_id)
+        vm.status = VMStatus.SUSPENDED
+        vm.deletion_started_at = _now()
+        original_token = vm.anon_management_token_hash
+        session.add(VMRetentionRow(vm_id=vm_id, source_vm_uuid='retained-provider-guest',
+                                  owner_account_id=account_id, owner_wallet=vm.owner_wallet,
+                                  state=retention_state, manifest={}, restore_config={},
+                                  retain_until=_now() + timedelta(days=30)))
+    response = await client.delete(f'/v1/me?vm_policy={policy}')
+    assert response.status_code == 409
+    assert 'assisted deletion' in response.text
+    assert (await client.get('/v1/me')).status_code == 200
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        retained = await session.get(VMRetentionRow, vm_id)
+        assert vm.owner_account_id == retained.owner_account_id == account_id
+        assert vm.anon_management_token_hash == original_token
+        assert retained.state == retention_state
+        assert await session.get(AccountRow, account_id) is not None
+    assert auth_state.orchestrator.destroy_called == []
+
+
+@pytest.mark.asyncio
+async def test_account_delete_keeps_identity_when_provider_delete_fails(auth_state, client):
+    from unittest.mock import AsyncMock
+
+    reg = await client.post('/v1/auth/register', json={'password': 'failed deletion fixture password'})
+    account_id = reg.json()['account_id']
+    vm_id = await _seed_owned_vm(auth_state, account_id)
+    auth_state.orchestrator.destroy_vm = AsyncMock(side_effect=ConnectionError('provider unavailable'))
+    response = await client.delete('/v1/me?vm_policy=destroy')
+    assert response.status_code == 503
+    assert (await client.get('/v1/me')).status_code == 200
+    async with auth_state.orchestrator.db() as session:
+        assert (await session.get(VMRow, vm_id)).owner_account_id == account_id
+        assert await session.get(AccountRow, account_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_account_delete_rechecks_retention_after_provider_phase(auth_state, client):
+    from unittest.mock import AsyncMock
+
+    from hyrule_cloud.db import VMRetentionRow
+
+    reg = await client.post('/v1/auth/register', json={'password': 'late retention fixture password'})
+    account_id = reg.json()['account_id']
+    vm_id = await _seed_owned_vm(auth_state, account_id)
+
+    async def retain_during_provider_phase(target, *, management_identity):
+        async with auth_state.orchestrator.db.begin() as session:
+            vm = await session.get(VMRow, target)
+            assert management_identity.matches(vm)
+            vm.status = VMStatus.SUSPENDED
+            vm.deletion_started_at = _now()
+            session.add(VMRetentionRow(vm_id=target, source_vm_uuid='late-retained-guest',
+                                      owner_account_id=account_id, owner_wallet=vm.owner_wallet,
+                                      state='retained', manifest={}, restore_config={},
+                                      retain_until=_now() + timedelta(days=30)))
+        return True
+
+    auth_state.orchestrator.destroy_vm = AsyncMock(side_effect=retain_during_provider_phase)
+    response = await client.delete('/v1/me?vm_policy=destroy')
+    assert response.status_code == 409 and 'assisted deletion' in response.text
+    assert (await client.get('/v1/me')).status_code == 200
+    async with auth_state.orchestrator.db() as session:
+        assert (await session.get(VMRow, vm_id)).owner_account_id == account_id
+        assert await session.get(AccountRow, account_id) is not None
+        assert (await session.get(VMRetentionRow, vm_id)).owner_account_id == account_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lifecycle', ['prepared', 'retained', 'restoring', 'claimed', 'destroyed'])
+async def test_claim_preserves_ownerless_retention_and_deletion_identity(auth_state, client, lifecycle):
+    from hyrule_cloud.db import VMRetentionRow
+    from hyrule_cloud.providers.xcpng import VMProtectionManifest
+    from hyrule_cloud.services.vm_retention import prepare_retention
+
+    token = generate_anon_management_token()
+    token_hash = hash_anon_management_token(token)
+    vm_id = generate_vm_id()
+    async with auth_state.orchestrator.db.begin() as session:
+        session.add(VMRow(vm_id=vm_id, owner_wallet='fixture-ownerless', owner_account_id=None,
+                          anon_management_token_hash=token_hash, xcpng_uuid='fixture-guest',
+                          status=VMStatus.DESTROYED if lifecycle == 'destroyed' else VMStatus.SUSPENDED,
+                          deletion_started_at=_now() if lifecycle in ('claimed', 'destroyed') else None))
+    if lifecycle in ('prepared', 'retained', 'restoring'):
+        async with auth_state.orchestrator.db.begin() as session:
+            retained = await prepare_retention(session, vm_id,
+                                               VMProtectionManifest('fixture-guest', ('fixture-disk',), (), False, '', ()),
+                                               _now() + timedelta(days=30))
+            retained.state = lifecycle
+    await client.post('/v1/auth/register', json={'password': 'claim fixture password 12345678'})
+    response = await client.post(f'/v1/me/vms/{vm_id}/claim',
+                                 json={'proof': 'management_token', 'token': token})
+    assert response.status_code == 409
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm.owner_account_id is None
+        assert vm.anon_management_token_hash == token_hash
+        if lifecycle in ('prepared', 'retained', 'restoring'):
+            retained = await session.get(VMRetentionRow, vm_id)
+            assert retained.owner_account_id is None
+            assert retained.owner_wallet == vm.owner_wallet
+            assert retained.state == lifecycle

@@ -335,13 +335,18 @@ async def revoke_tunnel(tunnel_id: str, token: str) -> str:
 
 @mcp.tool()
 async def destroy_vm(vm_id: str, management_token: str | None = None) -> str:
-    """Destroy a VM permanently. This cannot be undone. Requires the one-time
+    """Request permanent VM deletion; retained VMs remain stopped for recovery.
+    Permanent deletion cannot be undone. Requires the one-time
     `management_token` from create_vm unless the VM is owned by the
     authenticated account."""
     try:
         async with _client() as hc:
-            await hc.destroy_vm(vm_id, management_token=management_token)
-            return f"VM {vm_id} destroyed."
+            result = await hc.destroy_vm(vm_id, management_token=management_token)
+            if result.get("status") == "retained":
+                return f"VM {vm_id} is stopped and retained for recovery."
+            if result.get("status") == "ok":
+                return f"VM {vm_id} destroyed."
+            return f"VM {vm_id} deletion completion was not confirmed."
     except HyruleError as e:
         return _err(e)
 
