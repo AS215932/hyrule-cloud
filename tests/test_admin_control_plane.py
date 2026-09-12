@@ -3576,3 +3576,41 @@ async def test_recovery_rechecks_admin_after_committed_request(admin_factory, mo
         audits = list(await session.scalars(select(AdminAuditRow).where(AdminAuditRow.target_id == vm.vm_id)))
         assert [audit.action for audit in audits] == (['vm.restore_requested'] if revoke_after == 1 else
                                                      ['vm.restore_requested', 'vm.restore_authorized'])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('retained', [False, True])
+async def test_admin_destroy_reports_retention_outcome(admin_factory, retained):
+    from hyrule_cloud.providers.xcpng import VMProtectionManifest
+    from hyrule_cloud.services.vm_retention import prepare_retention
+
+    credentials = await _admin_credentials(admin_factory)
+    now = datetime.now(UTC)
+    async with admin_factory.begin() as session:
+        actor = await session.get(AccountRow, 'HAAAAAAAAAA')
+        session.add(VMRow(vm_id='vm_admin_retention', owner_wallet='fixture',
+                          status='suspended', xcpng_uuid='guest-retained',
+                          expires_at=now - timedelta(days=3), deletion_started_at=now))
+    manifest = VMProtectionManifest('guest-retained', ('disk',), (), False, '', ())
+    if retained:
+        async with admin_factory.begin() as session:
+            record = await prepare_retention(session, 'vm_admin_retention', manifest, now + timedelta(days=30))
+            record.state = 'retained'
+    orch = Orchestrator(HyruleConfig(), admin_factory)
+    orch.xcpng.protect_retained_vm = AsyncMock()
+    orch.xcpng.destroy_vm = AsyncMock()
+    state = AppState(config=HyruleConfig(), orchestrator=orch, payment_gate=None,
+                     network_provider=None, session_factory=admin_factory)
+    try:
+        response = await vm_action('vm_admin_retention', 'destroy',
+            ReasonRequest(reason='fixture operator request'),
+            _browser_request(credentials, path='/v1/admin/vms/vm_admin_retention/actions/destroy'), actor, state)
+        assert response['status'] == ('retained' if retained else 'accepted')
+        assert orch.xcpng.destroy_vm.await_count == int(not retained)
+        assert orch.xcpng.protect_retained_vm.await_count == int(retained)
+        async with admin_factory() as session:
+            vm = await session.get(VMRow, 'vm_admin_retention')
+            assert vm.status == ('suspended' if retained else 'destroyed')
+            assert await session.scalar(select(AdminAuditRow).where(AdminAuditRow.action == 'vm.destroy.requested')) is not None
+    finally:
+        await orch.xcpng.close()
