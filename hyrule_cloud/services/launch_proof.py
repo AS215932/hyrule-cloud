@@ -18,6 +18,7 @@ from hyrule_cloud.models import (
     SSHSmokeStatus,
     VMStatus,
 )
+from hyrule_cloud.services.vm_events import normalize_legacy_failure_message
 
 if TYPE_CHECKING:
     from hyrule_cloud.config import HyruleConfig
@@ -186,7 +187,7 @@ def build_launch_proof(
     if vm_status == VMStatus.FAILED:
         if not operator_message:
             err = _safe_getattr(vm_row, "error", None)
-            operator_message = str(err) if err else None
+            operator_message = normalize_legacy_failure_message(str(err)) if err else None
         if not customer_message:
             customer_message = (
                 "Provisioning could not be completed. "

@@ -744,3 +744,22 @@ def test_explicit_dns_verification_failure_is_not_papered_over() -> None:
     _Row.metadata_ = {}
     proof = build_launch_proof(_Row())
     assert proof["dns_aaaa_verified"] is True
+
+
+@pytest.mark.parametrize("reason", [
+    "Your VM did not come online within the provisioning window.",
+    "There was not enough free capacity to build your VM.",
+    "Your VM's DNS record could not be published.",
+    "Provisioning failed because of a problem on our side.",
+])
+def test_legacy_failure_fallback_does_not_repeat_refund_claim(reason):
+    from types import SimpleNamespace
+
+    from hyrule_cloud.services.launch_proof import build_launch_proof
+    legacy = reason + " The order was stopped and any payment is refunded."
+    row = SimpleNamespace(status=VMStatus.FAILED, error=legacy)
+    proof = build_launch_proof(row)
+    assert "is refunded" not in proof["operator_message"]
+    assert "review any payment or refund" in proof["operator_message"]
+    assert "is refunded" not in proof["customer_message"]
+    assert row.error == legacy  # Persisted history is not rewritten.

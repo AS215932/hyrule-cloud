@@ -68,20 +68,36 @@ FAILURE_GUEST_RECOVERY = (
 
 FAILURE_TIMEOUT = (
     "Your VM did not come online within the provisioning window. "
-    "The order was stopped and any payment is refunded."
+    "The order was stopped. Contact support to review any payment or refund."
 )
 FAILURE_CAPACITY = (
     "There was not enough free capacity to build your VM. "
-    "The order was stopped and any payment is refunded."
+    "The order was stopped. Contact support to review any payment or refund."
 )
 FAILURE_DNS = (
     "Your VM's DNS record could not be published. "
-    "The order was stopped and any payment is refunded."
+    "The order was stopped. Contact support to review any payment or refund."
 )
 FAILURE_INTERNAL = (
     "Provisioning failed because of a problem on our side. "
-    "The order was stopped and any payment is refunded."
+    "The order was stopped. Contact support to review any payment or refund."
 )
+
+
+# Exact legacy public templates only: retain arbitrary operator diagnostics and
+# stored history, but do not repeat an obsolete payment claim in new responses.
+_LEGACY_FAILURE_MESSAGES = {
+    message.replace(
+        "The order was stopped. Contact support to review any payment or refund.",
+        "The order was stopped and any payment is refunded.",
+    ): message
+    for message in (FAILURE_TIMEOUT, FAILURE_CAPACITY, FAILURE_DNS, FAILURE_INTERNAL)
+}
+
+
+def normalize_legacy_failure_message(message: str) -> str:
+    return _LEGACY_FAILURE_MESSAGES.get(message, message)
+
 
 # Deliberately NOT keyed on message text — only on exception type, so provider
 # strings can never steer (or leak into) the customer-facing outcome. Failures
