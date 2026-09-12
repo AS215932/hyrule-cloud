@@ -3602,6 +3602,20 @@ async def test_admin_destroy_reports_retention_outcome(admin_factory, retained):
     orch = Orchestrator(HyruleConfig(), admin_factory)
     orch.xcpng.protect_retained_vm = AsyncMock()
     orch.xcpng.destroy_vm = AsyncMock()
+    if retained:
+        from hyrule_cloud.db import VMRetentionRow
+        real_destroy = orch.destroy_vm
+
+        async def recover_after_destroy(*args, **kwargs):
+            outcome = await real_destroy(*args, **kwargs)
+            async with admin_factory.begin() as session:
+                await session.delete(await session.get(VMRetentionRow, 'vm_admin_retention'))
+                vm = await session.get(VMRow, 'vm_admin_retention')
+                vm.deletion_started_at = None
+                vm.expires_at = now + timedelta(days=7)
+            return outcome
+
+        orch.destroy_vm = recover_after_destroy
     state = AppState(config=HyruleConfig(), orchestrator=orch, payment_gate=None,
                      network_provider=None, session_factory=admin_factory)
     try:

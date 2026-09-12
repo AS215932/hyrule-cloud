@@ -1631,9 +1631,7 @@ async def destroy_vm(
         )
     if not accepted:
         raise HTTPException(404, "VM not found")
-    current = await orch.get_vm(vm_id)
-    if (current is not None and current.status == VMStatus.SUSPENDED
-            and getattr(current, "deletion_started_at", None) is not None):
+    if accepted == "retained":
         return GenericActionResponse(status="retained", message=f"VM {vm_id} is stopped and retained for recovery")
     return GenericActionResponse(status="ok", message=f"VM {vm_id} destroyed")
 

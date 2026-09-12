@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from ipaddress import IPv6Address, IPv6Network
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 import dns.exception
@@ -2619,7 +2619,7 @@ class Orchestrator:
         management_identity: VMManagementIdentity | None = None,
         reconcile_retention: bool = False,
         dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
-    ) -> bool:
+    ) -> bool | Literal["retained"]:
         lifecycle_lock = (self.locked_vm(vm_id, dispatch_guard=dispatch_guard)
                           if dispatch_guard is not None else self.locked_vm(vm_id))
         async with lifecycle_lock as (session, row):
@@ -2651,7 +2651,7 @@ class Orchestrator:
             if retained is not None and retained.state == "retained" and expired_before is not None:
                 # A completed retention is not pending expiry work. Explicit
                 # calls without an expiry cutoff still reconcile protection.
-                return True
+                return "retained"
             manifest = stored_manifest(retained) if retained is not None else None
             # Retention evidence and the initial expiry claim are committed
             # together. A pre-existing claim without evidence must finish its
@@ -2703,7 +2703,7 @@ class Orchestrator:
                     if retained.state == "restoring":
                         return False
                     if retained.state == "retained" and expired_before is not None:
-                        return True
+                        return "retained"
                     await self.xcpng.protect_retained_vm(manifest)
                     retained.state = "retained"
                     retained.retained_at = retained.retained_at or _now()
@@ -2718,7 +2718,7 @@ class Orchestrator:
                     # Keep DNS and the prefix: this guest still owns its disks,
                     # firmware and network configuration throughout retention.
                     await retention_session.commit()
-                return True
+                    return "retained"
             elif not deletion_verified:
                 await self.xcpng.destroy_vm(xcpng_uuid)
         elif status == str(VMStatus.PROVISIONING) or unresolved_guest:

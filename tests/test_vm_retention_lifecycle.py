@@ -154,3 +154,41 @@ async def test_stale_retention_reconciliation_cannot_start_fresh_deletion():
             assert vm.deletion_started_at is None
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_customer_destroy_keeps_transaction_outcome_after_recovery():
+    from hyrule_cloud.services.vm_retention import prepare_retention
+
+    orch, engine = await _stored_vm(VMStatus.SUSPENDED)
+    now = datetime.now(UTC)
+    orch.xcpng.protect_retained_vm = AsyncMock()
+    try:
+        async with orch.db.begin() as session:
+            vm = await session.get(VMRow, 'vm_lifecycle')
+            vm.deletion_started_at = now
+            retained = await prepare_retention(session, vm.vm_id,
+                VMProtectionManifest(vm.xcpng_uuid, ('disk',), (), False, '', ()), now + timedelta(days=30))
+            retained.state = 'retained'
+        snapshot = await orch.get_vm('vm_lifecycle')
+        real_destroy = orch.destroy_vm
+
+        async def recover_after_destroy(*args, **kwargs):
+            outcome = await real_destroy(*args, **kwargs)
+            assert outcome == 'retained'
+            # Model a recovery commit after the lifecycle lock was released.
+            async with orch.db.begin() as session:
+                await session.delete(await session.get(VMRetentionRow, 'vm_lifecycle'))
+                vm = await session.get(VMRow, 'vm_lifecycle')
+                vm.deletion_started_at = None
+                vm.expires_at = now + timedelta(days=7)
+            return outcome
+
+        orch.destroy_vm = recover_after_destroy
+        response = await destroy_vm_route('vm_lifecycle',
+            Request({'type': 'http', 'method': 'DELETE', 'path': '/fixture', 'headers': []}),
+            row=snapshot, orch=orch, account=None)
+        assert response.status == 'retained'
+        orch.xcpng.destroy_vm.assert_not_awaited()
+    finally:
+        await engine.dispose()

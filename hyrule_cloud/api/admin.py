@@ -1426,12 +1426,12 @@ async def vm_action(
     if action == "destroy":
         guard = _admin_dispatch_guard(state, request, actor, "vm.destroy", target_type="vm",
                                       target_id=vm_id, reason=body.reason)
-        if not await orch.destroy_vm(vm_id, dispatch_guard=guard):
+        outcome = await orch.destroy_vm(vm_id, dispatch_guard=guard)
+        if not outcome:
             raise HTTPException(409, "VM cannot be destroyed")
-        async with _factory(state)() as session:
-            if await session.get(VMRetentionRow, vm_id) is not None:
-                return {"vm_id": vm_id, "action": action, "status": "retained",
-                        "message": "VM is stopped and retained for recovery"}
+        if outcome == "retained":
+            return {"vm_id": vm_id, "action": action, "status": "retained",
+                    "message": "VM is stopped and retained for recovery"}
     return {"vm_id": vm_id, "action": action, "status": "accepted"}
 
 
