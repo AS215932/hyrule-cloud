@@ -23,15 +23,13 @@ Record the VM ID, observation time, `vm_status`, `retention.state`, `retain_unti
 
 For a new authorized recovery, generate one UUID and preserve the request before submission. For an existing operation, copy `operation_id`, `days` and `reason` from its active or historical status. Submit only those fields to `POST /v1/admin/vms/{vm_id}/actions/restore` using the existing authenticated admin client:
 
-```json
-{
-  "operation_id": "<the recorded UUID>",
-  "days": 7,
-  "reason": "<the recorded authorized recovery reason>"
-}
-```
+| Request field | Required value |
+| --- | --- |
+| `operation_id` | The recorded UUID as a JSON string. |
+| `days` | The recorded authorized number of days as a JSON integer (1–365). |
+| `reason` | The exact recorded authorized recovery reason as a JSON string. |
 
-The example is a shape, not a ready-to-send request. Days must be 1–365. A retry must preserve the recorded value, including the exact reason. Replacing the UUID after a timeout can conflict with an already accepted recovery. The fixed `new_expiry` is computed once; retries do not grant extra days.
+A retry must preserve all three recorded values. Replacing the UUID after a timeout can conflict with an already accepted recovery. The fixed `new_expiry` is computed once; retries do not grant extra days.
 
 After every ambiguous response, read status before retrying. A timeout or lost connection can occur after a commit or provider action. Avoid unattended retry loops; resume only after the failure has been classified and the relevant prerequisite checked.
 
