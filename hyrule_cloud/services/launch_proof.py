@@ -32,14 +32,14 @@ DNS_RESOLUTION_CUSTOMER_MESSAGE = (
     "names with the resolver we configured. Installing packages and reaching "
     "hosts by name will fail until it is fixed. You can unblock yourself now "
     "by putting a working DNS64 resolver in /etc/resolv.conf on the VM (for "
-    "example: nameserver 2001:4860:4860::6464). Our team has been notified — "
+    "example: nameserver 2001:4860:4860::6464). Please "
     "contact support if you would rather have a refund."
 )
 
 DNS_RESOLUTION_OPERATOR_MESSAGE = (
     "customer DNS resolution probe failed: the resolver in "
-    "HYRULE_CUSTOMER_IPV6_DNS did not answer queries. Every VM handed that "
-    "resolver is unable to resolve any hostname."
+    "HYRULE_CUSTOMER_IPV6_DNS did not answer this VM's probe queries. "
+    "Check resolver health and other VM probes to establish the scope."
 )
 
 
@@ -164,7 +164,7 @@ def build_launch_proof(
 
     # A measured resolution failure must not read as a clean `provisioned`.
     # The VM is delivered and usable, so it is not `failed` either (that state
-    # promises a refund and belongs to VMs that never came up) — it is
+    # belongs to VMs that never came up) — it is
     # explicitly degraded.
     if (
         dns_resolution == DNSResolutionStatus.FAILED
@@ -191,7 +191,7 @@ def build_launch_proof(
         if not customer_message:
             customer_message = (
                 "Provisioning could not be completed. "
-                "Our team has been notified and your payment will be refunded."
+                "Contact support for help and to review any payment or refund."
             )
     elif vm_status == VMStatus.PROVISIONING:
         if not customer_message:

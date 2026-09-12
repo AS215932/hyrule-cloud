@@ -332,7 +332,9 @@ async def test_failed_vm_shows_safe_message_and_rollback(lp_state, client):
     assert customer is not None
     assert "sr_not_found" not in customer
     assert "deadbeef" not in customer
-    assert "refunded" in customer.lower() or "notified" in customer.lower()
+    assert "contact support" in customer.lower()
+    assert "notified" not in customer.lower()
+    assert "will be refunded" not in customer.lower()
 
 
 # --- Rolled-back path ---
@@ -513,7 +515,7 @@ async def test_dns_resolution_failure_reports_degraded_not_ready(lp_state, clien
 
     assert body["dns_resolution_status"] == DNSResolutionStatus.FAILED
     # NOT a clean provisioned — but the VM is delivered, so not `failed`
-    # either (that state promises a refund).
+    # either (that state represents a failed launch).
     assert body["launch_proof_status"] == LaunchProofStatus.DEGRADED
     assert body["status"] == VMStatus.READY
     assert body["ssh_smoke_status"] == SSHSmokeStatus.PASSED
@@ -523,6 +525,8 @@ async def test_dns_resolution_failure_reports_degraded_not_ready(lp_state, clien
     assert "resolve" in customer.lower()
     # The customer can unblock themselves while the operator fixes the fleet.
     assert "resolv.conf" in customer
+    assert "notified" not in customer.lower()
+    assert "Every VM" not in (body["operator_message"] or "")
     assert "HYRULE_CUSTOMER_IPV6_DNS" in (body["operator_message"] or "")
 
 
