@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from ipaddress import IPv6Address, IPv6Network
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import dns.exception
 import dns.message
@@ -22,21 +23,23 @@ import dns.query
 import dns.rcode
 import dns.rdatatype
 import structlog
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import (
+    AccountRow,
     CryptoIntentRow,
     DomainOrderRow,
     DomainRow,
     PaymentEventRow,
+    VMGuestResultRow,
     VMQuoteRow,
     VMRow,
 )
-from hyrule_cloud.middleware.anon_token import hash_anon_token
+from hyrule_cloud.middleware.anon_token import VMManagementIdentity, hash_anon_token
 from hyrule_cloud.models import (
     CostBreakdown,
     CryptoIntentStatus,
@@ -67,10 +70,15 @@ from hyrule_cloud.providers.network_config import (
 )
 from hyrule_cloud.providers.openprovider import OpenproviderClient
 from hyrule_cloud.providers.xcpng import XCPNGProvider
+from hyrule_cloud.services.guest_result import prepare_guest_result, utc
 from hyrule_cloud.services.payments_ledger import PaymentLedger
 from hyrule_cloud.services.refunds import RefundService
 from hyrule_cloud.services.vm_events import (
     FAILURE_DNS,
+    FAILURE_GUEST_INIT,
+    FAILURE_GUEST_RECOVERY,
+    FAILURE_GUEST_REPORT,
+    FAILURE_GUEST_SETUP,
     ProvisioningFailedError,
     customer_failure_message,
     internal_failure_detail,
@@ -88,6 +96,9 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 _VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable cross-worker PostgreSQL lock key
+_PROVISIONING_HANDOFF_KEY = "provisioning_handoff_state"
+_EXTENSION_RESUME_KEY = "extension_resume_pending"
+_TRANSFER_RESUME_KEY = "transfer_resume_pending"
 
 # RFC 6052 well-known NAT64 prefix. A DNS64 resolver synthesizes AAAA records
 # inside it for IPv4-only names, which is how an IPv6-only customer VM reaches
@@ -95,8 +106,24 @@ _VM_CAPACITY_ADVISORY_LOCK = 1213809714  # stable cross-worker PostgreSQL lock k
 _NAT64_PREFIX = IPv6Network("64:ff9b::/96")
 
 
+class ExtensionAppliedStateUnavailableError(RuntimeError):
+    """Purchased time committed, but the current guest state is unavailable."""
+
+
+class ExtensionOutcomeUnknownError(RuntimeError):
+    """Paid extension requires reconciliation before retry or refund."""
+
+
 class VMCapacityError(RuntimeError):
     """The requested VM cannot fit within the configured live headroom."""
+
+
+class AccountDisabledError(RuntimeError):
+    """A VM reservation was fenced by its disabled owner account."""
+
+
+class GuestRecoveryPendingError(RuntimeError):
+    """An untracked provider guest must be reconciled before terminal refund."""
 
 
 def _now() -> datetime:
@@ -119,6 +146,10 @@ def _looks_like_evm_wallet(value: str | None) -> bool:
     return True
 
 
+class GuestGenerationChangedError(RuntimeError):
+    """A stale provisioning attempt must not change its replacement's state."""
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -139,6 +170,11 @@ class Orchestrator:
         self._tasks: set[asyncio.Task] = set()
         self._provisioning_vm_ids: set[str] = set()
         self._vm_capacity_reservation_lock = asyncio.Lock()
+        self._provisioning_slots = asyncio.Semaphore(4)
+        self._recovery_cursor = ""
+        self._recovery_cycle_max = ""
+        self._extension_resume_cursor = ""
+        self._transfer_resume_cursor = ""
 
     async def startup(self) -> None:
         # Fail fast on malformed customer-network settings: an operator typo
@@ -155,6 +191,10 @@ class Orchestrator:
         log.info("orchestrator_started")
 
     async def shutdown(self) -> None:
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         try:
             await self.xcpng.close()
         except Exception:
@@ -273,6 +313,11 @@ class Orchestrator:
         vm_id: str | None = None,
         pricing_snapshot: dict | None = None,
         legacy_billing: bool = False,
+        payment_tx: str | None = None,
+        retail_amount: Decimal | None = None,
+        admin_waived: bool = False,
+        provisioning_handoff_ready: bool = True,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> tuple[VMRow, str]:
         """Persist a VM row and atomically claim a customer /64 (unique index).
 
@@ -347,10 +392,35 @@ class Orchestrator:
             hostname = f"{hostname_prefix}.{self.config.deploy_domain}"
 
             async with self.db() as session:
+                if dispatch_guard is not None:
+                    await dispatch_guard(session)
+                if owner_account_id is not None:
+                    owner = (
+                        await session.execute(
+                            select(AccountRow)
+                            .where(AccountRow.account_id == owner_account_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if owner is not None and owner.disabled_at is not None:
+                        raise AccountDisabledError("VM owner account is disabled")
                 if requested_vm_id:
                     existing = await session.get(VMRow, candidate_vm_id)
                     if existing is not None:
                         self._validate_replayed_vm(existing, request, owner_account_id)
+                        self._apply_payment_billing(
+                            existing,
+                            retail_amount=retail_amount,
+                            admin_waived=admin_waived,
+                            payment_tx=payment_tx,
+                        )
+                        if existing.status == VMStatus.PROVISIONING and existing.owner_wallet:
+                            self._set_provisioning_handoff_state(
+                                existing,
+                                ready=provisioning_handoff_ready,
+                            )
+                            await self.prepare_provisioning_dispatch(session, existing)
+                        await session.commit()
                         return existing, ""
                 prefix_index, prefix = await self._allocate_customer_prefix(
                     session, candidate_vm_id
@@ -380,9 +450,27 @@ class Orchestrator:
                     domain=request.domain,
                     expires_at=expires_at,
                     cost_total=total,
+                    retail_cost_total=total,
                 )
+                self._apply_payment_billing(
+                    row,
+                    retail_amount=retail_amount,
+                    admin_waived=admin_waived,
+                    payment_tx=payment_tx,
+                )
+                if row.owner_wallet:
+                    self._set_provisioning_handoff_state(
+                        row,
+                        ready=provisioning_handoff_ready,
+                    )
                 session.add(row)
                 try:
+                    # The durable worker discovers receipt-backed provisioning
+                    # rows. Stage that evidence in the same transaction that
+                    # accepts a paid VM so an API exit before task creation is
+                    # recoverable across processes.
+                    if row.owner_wallet:
+                        await self.prepare_provisioning_dispatch(session, row)
                     await session.commit()
                 except IntegrityError:
                     await session.rollback()
@@ -423,7 +511,61 @@ class Orchestrator:
         ):
             raise RuntimeError("planned VM id is already bound to another order")
 
-    def _spawn_provisioning(self, vm_id: str) -> None:
+    async def prepare_provisioning_dispatch(self, session: AsyncSession, row: VMRow) -> None:
+        """Stage real-guest restart evidence in the caller's locked transaction."""
+        from hyrule_cloud.services.launch_proof import use_real_provisioning
+
+        if row.status != VMStatus.PROVISIONING or not row.owner_wallet:
+            raise ValueError("Provisioning dispatch requires an owned provisioning VM")
+        receipt = await session.get(VMGuestResultRow, row.vm_id)
+        if use_real_provisioning() and receipt is None and row.xcpng_uuid is None:
+            await prepare_guest_result(
+                session, row.vm_id, _now() + timedelta(seconds=self.config.guest_report_timeout_seconds),
+            )
+
+    @staticmethod
+    def _set_provisioning_handoff_state(row: VMRow, *, ready: bool) -> None:
+        metadata = dict(row.metadata_ or {})
+        if not ready and metadata.get(_PROVISIONING_HANDOFF_KEY) == "ready":
+            return
+        metadata[_PROVISIONING_HANDOFF_KEY] = "ready" if ready else "pending"
+        row.metadata_ = metadata
+
+    async def renew_provisioning_report_deadline(
+        self,
+        session: AsyncSession,
+        row: VMRow,
+    ) -> None:
+        """Give a deliberately resumed guest a fresh reporting window.
+
+        The credential and generation are already embedded in the retained
+        guest, so resumption must extend that receipt instead of replacing it.
+        Locking the receipt also orders this update against deadline recovery.
+        """
+        if row.status != VMStatus.PROVISIONING or row.xcpng_uuid is None:
+            raise ValueError("Only provider-backed provisioning guests can be resumed")
+        receipt = await session.scalar(
+            select(VMGuestResultRow)
+            .where(VMGuestResultRow.vm_id == row.vm_id)
+            .with_for_update()
+        )
+        if receipt is not None and receipt.received_at is None:
+            receipt.deadline = _now() + timedelta(
+                seconds=self.config.guest_report_timeout_seconds
+            )
+
+    async def _spawn_provisioning(self, vm_id: str) -> None:
+        if vm_id in self._provisioning_vm_ids:
+            return
+        # Persist dispatch before creating an in-memory task, so semaphore and
+        # capacity-lock waiters remain discoverable after API shutdown. Callers
+        # await this only after linking the paid quote/intent for refund safety.
+        async with self.db() as session:
+            row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+            if row is None or row.status != VMStatus.PROVISIONING or not row.owner_wallet:
+                return
+            await self.prepare_provisioning_dispatch(session, row)
+            await session.commit()
         if vm_id in self._provisioning_vm_ids:
             return
         self._provisioning_vm_ids.add(vm_id)
@@ -433,17 +575,95 @@ class Orchestrator:
         def completed(done: asyncio.Task) -> None:
             self._tasks.discard(done)
             self._provisioning_vm_ids.discard(vm_id)
+            if not done.cancelled() and done.exception() is not None:
+                log.error("provisioning_task_interrupted", vm_id=vm_id,
+                          error_type=type(done.exception()).__name__)
 
         task.add_done_callback(completed)
 
-    def start_provisioning(self, vm_id: str) -> None:
+    async def start_provisioning(self, vm_id: str) -> None:
         """Kick off background provisioning for an already-created VM row.
 
         Used by callers that need to establish a link to the row (e.g. a native
         crypto intent setting its vm_id) BEFORE provisioning can fail, so the
         failure path can always find the paying record.
         """
-        self._spawn_provisioning(vm_id)
+        # Publish the completed quote/intent handoff before task creation. The
+        # recovery worker ignores explicit pending rows, so it cannot race the
+        # caller's pre-handoff refund path. Once this commit succeeds, a local
+        # task-scheduling failure is recoverable and must not become a refund.
+        async with self.db() as session:
+            row = await session.scalar(
+                select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+            )
+            if row is None or row.status != VMStatus.PROVISIONING or not row.owner_wallet:
+                return
+            self._set_provisioning_handoff_state(row, ready=True)
+            await session.commit()
+        try:
+            await self._spawn_provisioning(vm_id)
+        except Exception:
+            log.exception("provisioning_task_schedule_deferred", vm_id=vm_id)
+
+    async def recover_tracked_provisioning(self) -> int:
+        """Incrementally recover ordinary paid guests, including x402 orders.
+
+        The worker calls this periodically, so an API crash is recovered even
+        when the worker itself never restarts. Include receipt-backed attempts
+        before UUID persistence; never replace a running guest's credential.
+        """
+        async with self.db() as session:
+            if not getattr(self, "_recovery_cycle_max", ""):
+                self._recovery_cycle_max = await session.scalar(
+                    select(func.max(VMRow.vm_id))
+                    .join(VMGuestResultRow)
+                    .outerjoin(
+                        CryptoIntentRow,
+                        and_(
+                            CryptoIntentRow.vm_id == VMRow.vm_id,
+                            CryptoIntentRow.resource_type == "vm",
+                            CryptoIntentRow.status == CryptoIntentStatus.PROVISIONING,
+                        ),
+                    )
+                    .where(
+                        VMRow.status == VMStatus.PROVISIONING,
+                        CryptoIntentRow.intent_id.is_(None),
+                        func.coalesce(
+                            VMRow.metadata_[_PROVISIONING_HANDOFF_KEY].as_string(), ""
+                        ) != "pending",
+                    )
+                ) or ""
+            vm_ids = list((await session.scalars(
+                select(VMRow.vm_id)
+                .join(VMGuestResultRow)
+                .outerjoin(
+                    CryptoIntentRow,
+                    and_(
+                        CryptoIntentRow.vm_id == VMRow.vm_id,
+                        CryptoIntentRow.resource_type == "vm",
+                        CryptoIntentRow.status == CryptoIntentStatus.PROVISIONING,
+                    ),
+                )
+                .where(VMRow.status == VMStatus.PROVISIONING,
+                       CryptoIntentRow.intent_id.is_(None),
+                       func.coalesce(
+                           VMRow.metadata_[_PROVISIONING_HANDOFF_KEY].as_string(), ""
+                       ) != "pending",
+                       VMRow.vm_id > getattr(self, "_recovery_cursor", ""),
+                       VMRow.vm_id <= self._recovery_cycle_max)
+                .order_by(VMRow.vm_id).limit(4)
+            )).all())
+        if vm_ids and vm_ids[-1] != self._recovery_cycle_max:
+            self._recovery_cursor = vm_ids[-1]
+        else:
+            # A cycle has a fixed high-water mark. New arrivals cannot keep
+            # extending its tail and starving an older row skipped by another
+            # worker; the next sweep wraps to the beginning.
+            self._recovery_cursor = ""
+            self._recovery_cycle_max = ""
+        for vm_id in vm_ids:
+            await self._spawn_provisioning(vm_id)
+        return len(vm_ids)
 
     async def create_vm(
         self,
@@ -454,6 +674,10 @@ class Orchestrator:
         start_provisioning: bool = True,
         pricing_snapshot: dict | None = None,
         legacy_billing: bool = False,
+        payment_tx: str | None = None,
+        retail_amount: Decimal | None = None,
+        admin_waived: bool = False,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> tuple[VMRow, str]:
         """Create a VM record in DB and start background provisioning.
 
@@ -479,9 +703,14 @@ class Orchestrator:
             vm_id=vm_id,
             pricing_snapshot=pricing_snapshot,
             legacy_billing=legacy_billing,
+            payment_tx=payment_tx,
+            retail_amount=retail_amount,
+            admin_waived=admin_waived,
+            provisioning_handoff_ready=start_provisioning,
+            dispatch_guard=dispatch_guard,
         )
         if start_provisioning:
-            self._spawn_provisioning(row.vm_id)
+            await self.start_provisioning(row.vm_id)
         return row, anon_token
 
     async def reserve_vm(
@@ -584,6 +813,9 @@ class Orchestrator:
         *,
         owner_account_id: str | None = None,
         start_provisioning: bool = True,
+        retail_amount: Decimal | None = None,
+        admin_waived: bool = False,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> VMRow | None:
         """Attach the settled payment to a reservation and start provisioning.
 
@@ -597,18 +829,58 @@ class Orchestrator:
         existing owner is never overwritten.
         """
         async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
+            if dispatch_guard is not None:
+                await dispatch_guard(session)
+            # Account disable takes the account lock before touching owned VMs.
+            # Read the reservation only to discover its owner, then acquire the
+            # same locks in that order so settlement cannot deadlock with (or
+            # slip past) an administrative disable.
+            candidate = await session.get(VMRow, vm_id)
+            if candidate is None:
+                return None
+            expected_owner_account_id = candidate.owner_account_id
+            # An anonymous reservation has no owner yet. Fence the account
+            # resolved from settlement as well, before attaching it.
+            account_ids = {value for value in (expected_owner_account_id, owner_account_id) if value}
+            for account_id in sorted(account_ids):
+                owner = (
+                    await session.execute(
+                        select(AccountRow)
+                        .where(AccountRow.account_id == account_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if owner is None or owner.disabled_at is not None:
+                    raise AccountDisabledError("VM owner account is disabled")
+            row = (
+                await session.execute(
+                    select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                        .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
             if row is None:
                 return None
+            if row.owner_account_id != expected_owner_account_id:
+                raise RuntimeError("VM reservation owner changed during payment")
             row.owner_wallet = owner_wallet
             if owner_account_id and row.owner_account_id is None:
                 row.owner_account_id = owner_account_id
-            if payment_tx:
-                row.payment_tx = payment_tx
+            self._apply_payment_billing(
+                row,
+                retail_amount=retail_amount,
+                admin_waived=admin_waived,
+                payment_tx=payment_tx,
+            )
+            if row.status == VMStatus.PROVISIONING:
+                self._set_provisioning_handoff_state(
+                    row,
+                    ready=start_provisioning,
+                )
+                await self.prepare_provisioning_dispatch(session, row)
             await session.commit()
             await session.refresh(row)
         if start_provisioning:
-            self._spawn_provisioning(vm_id)
+            await self.start_provisioning(vm_id)
         return row
 
     async def release_vm_reservation(self, vm_id: str) -> None:
@@ -644,6 +916,102 @@ class Orchestrator:
         await record_vm_event(self.db, vm_id, event, message=message, detail=detail)
 
     async def _provision_vm(self, vm_id: str) -> None:
+        from hyrule_cloud.services.provisioning_attempt import provisioning_attempt
+
+        async with self._provisioning_slots:
+            async with self.db() as session:
+                engine = session.bind
+            assert engine is not None
+            async with provisioning_attempt(engine, vm_id) as acquired:
+                if acquired:
+                    await self._provision_vm_owned(vm_id)
+
+    async def _recover_pre_uuid_guest(self, vm_id: str) -> str | None:
+        """Caller owns the VM attempt and clone-capacity locks.
+
+        Generation-specific labels bind an orphan to its existing credential.
+        Running means the provider reached start after sizing/configuration.
+        Incomplete or ambiguous guests are retained for operator recovery rather
+        than deleted or blindly restarted. No matching guest can be retried:
+        vm.create uses bootAfterCreate=False, so a late old create stays halted.
+        """
+        async with self.db() as session:
+            receipt = await session.get(VMGuestResultRow, vm_id)
+            if receipt is None:
+                return None
+            generation, received = receipt.generation, receipt.received_at
+        candidates = await self.xcpng.find_vm_ids_by_name_label(f"hyrule-{vm_id}-{generation}")
+        if not candidates:
+            legacy = await self.xcpng.find_vm_ids_by_name_label(f"hyrule-{vm_id}")
+            if received is not None or legacy:
+                raise ProvisioningFailedError(FAILURE_GUEST_RECOVERY)
+            return None
+        if len(candidates) != 1:
+            # Every exact-generation candidate may be customer-accessible. Halt
+            # the ones we can identify, but retain PROVISIONING because no one
+            # UUID can truthfully own the row or drive later cleanup.
+            try:
+                for candidate in candidates:
+                    power = await self.xcpng.get_vm_power_state(candidate)
+                    if power == "Running":
+                        await self.xcpng.suspend_vm(candidate)
+                    elif power != "Halted":
+                        raise RuntimeError(f"unexpected recovery candidate power state: {power}")
+            except Exception as exc:
+                raise GuestRecoveryPendingError() from exc
+            raise GuestRecoveryPendingError()
+        try:
+            power = await self.xcpng.get_vm_power_state(candidates[0])
+        except Exception as exc:
+            raise GuestRecoveryPendingError() from exc
+        if power == "Halted":
+            raise ProvisioningFailedError(FAILURE_GUEST_RECOVERY)
+        if power != "Running":
+            raise GuestRecoveryPendingError()
+        recovered_uuid = candidates[0]
+        async with self.db() as session:
+            row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+            receipt = await session.scalar(
+                select(VMGuestResultRow).where(VMGuestResultRow.vm_id == vm_id).with_for_update()
+            )
+            if row is None or row.status != VMStatus.PROVISIONING or receipt is None or receipt.generation != generation:
+                raise GuestGenerationChangedError()
+            if row.xcpng_uuid is not None and row.xcpng_uuid != recovered_uuid:
+                raise GuestGenerationChangedError()
+            row.xcpng_uuid = recovered_uuid
+            await session.commit()
+        return recovered_uuid
+
+    async def _stop_restricted_provisioned_guest(self, vm_id: str, vm_uuid: str) -> bool:
+        """Stop a newly discovered guest before initialization waits when restricted.
+
+        Keep provisioning and its durable receipt retryable if the stop fails.
+        The owner/VM lock orders this check against account enable/disable.
+        """
+        async with self.locked_vm(vm_id) as (session, row):
+            if row is None or row.xcpng_uuid != vm_uuid:
+                return True
+            claimed = row.deletion_started_at is not None or row.status == VMStatus.DESTROYED
+            if not claimed:
+                restricted = (row.suspension_reason in {"account_disabled", "manual_admin"}
+                              or not await self.vm_owner_enabled(session, row))
+                if not restricted:
+                    return False
+                try:
+                    await self.xcpng.suspend_vm(vm_uuid)
+                except Exception:
+                    log.exception("restricted_provisioned_guest_stop_failed", vm_id=vm_id)
+                # Preserve PROVISIONING and its receipt for another stop attempt.
+                return True
+        # Deletion owns the guest; do not wait for network/guest initialization.
+        # Run outside the lifecycle lock because destroy_vm acquires it itself.
+        try:
+            await self.destroy_vm(vm_id)
+        except Exception:
+            log.exception("late_provisioned_guest_cleanup_failed", vm_id=vm_id)
+        return True
+
+    async def _provision_vm_owned(self, vm_id: str) -> None:
         """Background provisioning: create VM, wait for IPv6, configure DNS.
 
         Issue #28: controlled simulation by default. Real XCP-NG / DNS only
@@ -653,11 +1021,9 @@ class Orchestrator:
         event (see `VMEventKey`) that `GET /v1/vm/{vm_id}/logs` returns. Event
         writes are best-effort by construction: they can never fail a paid VM.
 
-        Limit worth knowing: a supplied `setup_script` is only observable up to
-        the point it is injected into cloud-init user-data. The platform has no
-        channel into the guest, so whether the script actually ran, succeeded,
-        or failed is NOT reported here — the customer reads
-        /var/log/hyrule-setup.log inside their own VM for that.
+        READY requires an authenticated terminal guest completion report.
+        Missing and failed reports preserve the guest for diagnosis and follow
+        the existing failed-provisioning refund path.
         """
         from hyrule_cloud.services.launch_proof import use_real_provisioning
 
@@ -683,6 +1049,14 @@ class Orchestrator:
             )
 
         if not use_real_provisioning():
+            # Switching off real provisioning cannot turn an interrupted real
+            # attempt into simulated success or discard its quarantine evidence.
+            async with self.db() as session:
+                receipt = await session.get(VMGuestResultRow, vm_id)
+                row = await session.get(VMRow, vm_id)
+                if receipt is not None or (row is not None and row.xcpng_uuid):
+                    log.warning("real_guest_recovery_paused_in_simulation", vm_id=vm_id)
+                    return
             await self._simulate_provisioning(vm_id)
             return
 
@@ -744,9 +1118,9 @@ class Orchestrator:
                     VMEventKey.SETUP_SCRIPT_INJECTED,
                     message=(
                         "Your setup script was injected into first-boot user-data and "
-                        "will run as root once the VM boots. Its exit status is not "
-                        "visible to the platform — read /var/log/hyrule-setup.log on "
-                        "the VM to see what it did."
+                        "will run as root once the VM boots. Completion must be "
+                        "verified before the VM is ready; detailed output remains "
+                        "in /var/log/hyrule-setup.log inside your VM."
                     ),
                 )
 
@@ -762,6 +1136,21 @@ class Orchestrator:
                             return
                         xcpng_uuid = current.xcpng_uuid
                     if xcpng_uuid is None:
+                        xcpng_uuid = await self._recover_pre_uuid_guest(vm_id)
+                        if xcpng_uuid is not None:
+                            if await self._stop_restricted_provisioned_guest(vm_id, xcpng_uuid):
+                                return
+                            await self._emit(
+                                vm_id,
+                                VMEventKey.VM_CREATED,
+                                message="Virtual machine created and powered on.",
+                                detail={
+                                    "vcpu": resources.vcpu,
+                                    "ram_mb": resources.ram_mb,
+                                    "disk_gb": resources.disk_gb,
+                                },
+                            )
+                    if xcpng_uuid is None:
                         name_label = f"hyrule-{vm_id}"
                         # XO may contain a clone whose create call completed before the
                         # process could durably store its UUID. It is not safe to adopt
@@ -775,6 +1164,20 @@ class Orchestrator:
                                 xcpng_uuid=stale_uuid,
                             )
                             await self.xcpng.destroy_vm(stale_uuid)
+                        async with self.db() as session:
+                            deadline = _now() + timedelta(seconds=self.config.guest_report_timeout_seconds)
+                            generation, guest_token = await prepare_guest_result(session, vm_id, deadline)
+                            await session.commit()
+                        name_label = f"hyrule-{vm_id}-{generation}"
+                        cloud_config = render_cloud_init(
+                            os_name=os_name, hostname=self._generate_hostname(vm_id),
+                            ssh_pubkey=ssh_pubkey, open_ports=open_ports, setup_script=setup_script,
+                            guest_report={
+                                "url": f"{self.config.public_base_url.rstrip('/')}/v1/vm/{vm_id}/guest-result/{generation}",
+                                "token": guest_token, "deadline": deadline.timestamp(),
+                                "retry_seconds": self.config.guest_report_timeout_seconds,
+                            },
+                        )
                         xcpng_uuid = await self.xcpng.create_vm(
                             template_uuid=template_uuid,
                             name_label=name_label,
@@ -785,11 +1188,15 @@ class Orchestrator:
                             network_config=network_config,
                         )
 
-                        async with self.db() as session:
-                            row = await session.get(VMRow, vm_id)
+                        async with self.locked_vm(vm_id) as (session, row):
                             if row:
+                                if row.xcpng_uuid not in (None, xcpng_uuid):
+                                    raise GuestGenerationChangedError()
                                 row.xcpng_uuid = xcpng_uuid
                                 await session.commit()
+
+                        if await self._stop_restricted_provisioned_guest(vm_id, xcpng_uuid):
+                            return
 
                         # The hypervisor identity of the clone is internal; the
                         # customer only learns their machine exists and started.
@@ -803,6 +1210,15 @@ class Orchestrator:
                                 "disk_gb": resources.disk_gb,
                             },
                         )
+
+            if await self._stop_restricted_provisioned_guest(vm_id, xcpng_uuid):
+                return
+
+            async with self.db() as session:
+                receipt = await session.get(VMGuestResultRow, vm_id)
+                if receipt is None:
+                    raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+                generation = receipt.generation
 
             # Wait for IPv6 (outside DB session to avoid long-held connections)
             ipv6 = await self._wait_for_ipv6(
@@ -858,8 +1274,8 @@ class Orchestrator:
                     VMEventKey.SSH_UNREACHABLE,
                     message=(
                         "SSH was not reachable on port 22 within the check window. "
-                        "The VM is still delivered — first boot may simply not have "
-                        "finished; retry the connection shortly."
+                        "Delivery is pending guest initialization verification; "
+                        "first boot may still be in progress."
                     ),
                 )
             if dns_resolution is DNSResolutionStatus.FAILED:
@@ -871,15 +1287,44 @@ class Orchestrator:
                     probe_hostname=self.config.customer_dns_probe_hostname,
                 )
 
+            # Inbound connectivity cannot establish guest initialization success.
+            generation = await self._wait_for_guest_result(vm_id, generation)
+
             # Update DB with final state
             custom_domain: str | None = None
             custom_account_id: str | None = None
             async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
-                if not row:
+                row = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+                if row is None or row.status != VMStatus.PROVISIONING:
                     return
+                receipt = await session.scalar(
+                    select(VMGuestResultRow).where(VMGuestResultRow.vm_id == vm_id).with_for_update()
+                )
+                if row.xcpng_uuid != xcpng_uuid or receipt is None or receipt.generation != generation:
+                    raise GuestGenerationChangedError()
+                if receipt.outcome != "succeeded":
+                    raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+                must_remain_suspended = row.suspension_reason in {
+                    "expired",
+                    "account_disabled",
+                    "manual_admin",
+                }
+                if must_remain_suspended:
+                    # Serialize with account re-enablement while the row lock is
+                    # held: a disabled account must never observe a newly built
+                    # provider VM transition through READY.
+                    try:
+                        power = await self.xcpng.get_vm_power_state(xcpng_uuid)
+                        if power == "Running":
+                            await self.xcpng.suspend_vm(xcpng_uuid)
+                        elif power != "Halted":
+                            raise GuestRecoveryPendingError()
+                    except GuestRecoveryPendingError:
+                        raise
+                    except Exception as exc:
+                        raise GuestRecoveryPendingError() from exc
                 row.ipv6 = ipv6
-                row.status = VMStatus.READY
+                row.status = VMStatus.SUSPENDED if must_remain_suspended else VMStatus.READY
                 # Block B (Wave 2): timestamp the READY transition so
                 # /v1/stats/runtime can roll a rolling avg over recent
                 # provisioning durations.
@@ -904,7 +1349,15 @@ class Orchestrator:
 
                 hostname = row.hostname
 
-                await session.commit()
+                try:
+                    await session.commit()
+                except Exception as exc:
+                    if must_remain_suspended:
+                        # A successful provider stop followed by a lost commit
+                        # acknowledgement is retryable. Never turn that
+                        # ambiguity into a terminal failure/refund.
+                        raise GuestRecoveryPendingError() from exc
+                    raise
 
             await self._emit(
                 vm_id,
@@ -968,6 +1421,15 @@ class Orchestrator:
 
             log.info("provision_complete", vm_id=vm_id, ipv6=ipv6)
 
+        except GuestGenerationChangedError:
+            log.info("provision_attempt_superseded", vm_id=vm_id)
+            return
+        except GuestRecoveryPendingError:
+            # The worker retries this durable PROVISIONING row. A refund is
+            # unsafe until every matching provider guest is known to be halted
+            # and one identity can be attached or cleaned up deliberately.
+            log.warning("provision_guest_recovery_pending", vm_id=vm_id)
+            return
         except Exception as e:
             log.error("provision_failed", vm_id=vm_id, error=str(e), exc_info=True)
             # The customer sees a fixed, safe message; the operator keeps the
@@ -975,14 +1437,43 @@ class Orchestrator:
             customer_message = customer_failure_message(e)
             internal_reason = internal_failure_detail(e)
             owner_wallet, amount, payment_tx, settled = "", None, None, None
-            async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
+            async with self.locked_vm(vm_id) as (session, row):
                 if row is not None:
+                    if row.status != VMStatus.PROVISIONING:
+                        return
+                    if row.xcpng_uuid:
+                        # Refund only after the provider guest is actually
+                        # stopped. Receipt timeouts and explicit setup failures
+                        # are both customer-controllable; a failed stop leaves
+                        # the durable receipt in PROVISIONING for a later retry.
+                        try:
+                            power = await self.xcpng.get_vm_power_state(row.xcpng_uuid)
+                            if power == "Running":
+                                await self.xcpng.suspend_vm(row.xcpng_uuid)
+                            elif power != "Halted":
+                                log.warning(
+                                    "failed_provision_guest_power_unknown",
+                                    vm_id=vm_id,
+                                    power=power,
+                                )
+                                return
+                        except Exception:
+                            log.warning(
+                                "failed_provision_guest_stop_failed",
+                                vm_id=vm_id,
+                                exc_info=True,
+                            )
+                            return
                     row.status = VMStatus.FAILED
                     # row.error is customer-visible (management status view and
                     # the public launch proof's operator_message), so it stores
                     # the sanitized message — never provider text.
                     row.error = customer_message
+                    meta = dict(row.metadata_ or {})
+                    proof = dict(meta.get("launch_proof", {}))
+                    proof["customer_message"] = customer_message
+                    meta["launch_proof"] = proof
+                    row.metadata_ = meta
                     owner_wallet = row.owner_wallet
                     amount = row.cost_total
                     payment_tx = row.payment_tx
@@ -1016,6 +1507,46 @@ class Orchestrator:
             await self._record_vm_refund(
                 vm_id, owner_wallet, amount, payment_tx, settled, reason=internal_reason
             )
+
+    async def _wait_for_guest_result(self, vm_id: str, generation: str) -> str:
+        """Wait without holding a connection; tracked guests keep their identity."""
+        while True:
+            # Driver cancellation may leave an unfinished cursor. Finish this
+            # read/session cleanup before allowing shutdown to release ownership.
+            poll = asyncio.create_task(self._poll_guest_result(vm_id, generation))
+            try:
+                remaining = await asyncio.shield(poll)
+            except asyncio.CancelledError:
+                await asyncio.gather(poll, return_exceptions=True)
+                raise
+            if remaining is None:
+                return generation
+            await asyncio.sleep(min(2, remaining))
+
+    async def _poll_guest_result(self, vm_id: str, generation: str) -> float | None:
+        async with self.db() as session:
+            row = await session.get(VMGuestResultRow, vm_id)
+            if row is not None and row.received_at is None and utc(row.deadline) <= _now():
+                # A report accepted before the deadline may still be committing.
+                # Lock and refresh the identity-map row before declaring expiry.
+                row = await session.scalar(
+                    select(VMGuestResultRow).where(VMGuestResultRow.vm_id == vm_id)
+                    .with_for_update().execution_options(populate_existing=True)
+                )
+            if row is None:
+                raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+            if row.generation != generation:
+                raise GuestGenerationChangedError()
+            if row.received_at is not None:
+                if row.outcome == "succeeded":
+                    return None
+                raise ProvisioningFailedError(
+                    FAILURE_GUEST_SETUP if row.stage == "setup_script" else FAILURE_GUEST_INIT
+                )
+            remaining = (utc(row.deadline) - _now()).total_seconds()
+            if remaining <= 0:
+                raise ProvisioningFailedError(FAILURE_GUEST_REPORT)
+            return remaining
 
     async def _record_vm_refund(
         self,
@@ -1072,8 +1603,9 @@ class Orchestrator:
         if await self._record_native_refund(vm_id, reason=reason):
             return
         is_dev_bypass = bool(payment_tx and payment_tx.startswith("dev_bypass"))
+        is_admin_bypass = bool(payment_tx and payment_tx.startswith("admin_bypass"))
         was_charged = bool(payment_tx) or (amount is not None and amount > 0)
-        if was_charged and not is_dev_bypass:
+        if was_charged and not is_dev_bypass and not is_admin_bypass:
             # A charge settled but couldn't be attributed to an EVM wallet or a
             # native intent — e.g. the SDK settled exposing neither a payer
             # ("unknown") NOR a tx string AND the best-effort settled ledger row
@@ -1151,7 +1683,52 @@ class Orchestrator:
             row = await session.get(VMRow, vm_id)
             if row is not None:
                 row.cost_total = amount
+                row.retail_cost_total = amount
+                row.billing_mode = "charged"
                 await session.commit()
+
+    async def persist_payment_billing(
+        self,
+        vm_id: str,
+        retail_amount: Decimal,
+        *,
+        admin_waived: bool,
+        payment_tx: str | None = None,
+    ) -> None:
+        """Persist retail value separately from money actually charged."""
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                Orchestrator._apply_payment_billing(
+                    row,
+                    retail_amount=retail_amount,
+                    admin_waived=admin_waived,
+                    payment_tx=payment_tx,
+                )
+                await session.commit()
+
+    @staticmethod
+    def _apply_payment_billing(
+        row: VMRow,
+        *,
+        retail_amount: Decimal | None,
+        admin_waived: bool,
+        payment_tx: str | None,
+    ) -> None:
+        """Apply settlement metadata as part of the caller's DB transaction."""
+        if retail_amount is not None:
+            dev_bypass = bool(payment_tx and payment_tx.startswith("dev_bypass"))
+            row.retail_cost_total = retail_amount
+            row.cost_total = Decimal("0") if admin_waived or dev_bypass else retail_amount
+            row.billing_mode = (
+                "admin_waived"
+                if admin_waived
+                else "dev_bypass"
+                if dev_bypass
+                else "charged"
+            )
+        if payment_tx:
+            row.payment_tx = payment_tx
 
     async def record_create_failure_refund(
         self,
@@ -1176,7 +1753,7 @@ class Orchestrator:
         # exposes no transaction string (middleware stores `settlement.transaction
         # or ""`) still charged the customer, so it must still be refunded using
         # payer + amount.
-        if payment_tx and payment_tx.startswith("dev_bypass"):
+        if payment_tx and payment_tx.startswith(("dev_bypass", "admin_bypass")):
             return
         settled = None
         if payment_tx:
@@ -1211,6 +1788,50 @@ class Orchestrator:
             reason=reason,
             vm_id=vm_id,
         )
+
+    async def record_extension_failure_refund(
+        self,
+        *,
+        vm_id: str,
+        owner_wallet: str,
+        payment_tx: str | None,
+        charged_amount: Decimal,
+        reason: str,
+    ) -> None:
+        """Record a paid VM extension rejected after x402 settlement."""
+        if payment_tx and payment_tx.startswith(("dev_bypass", "admin_bypass")):
+            return
+        settled = None
+        if payment_tx:
+            async with self.db() as session:
+                settled = (
+                    await session.execute(
+                        select(PaymentEventRow)
+                        .where(
+                            PaymentEventRow.tx_hash == payment_tx,
+                            PaymentEventRow.event_type == "settled",
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+        obligation = self.refunds.build_owed_event(
+            resource_path=f"/v1/vm/{vm_id}/extend",
+            payer=(settled.payer_wallet if settled is not None else None)
+            or owner_wallet
+            or "unknown",
+            amount=settled.amount_usd if settled is not None else charged_amount,
+            network=settled.network if settled is not None else None,
+            asset=settled.asset if settled is not None else None,
+            original_tx=payment_tx,
+            reason=reason,
+            vm_id=vm_id,
+        )
+        if obligation is None:
+            raise RuntimeError("Unable to construct the extension refund obligation")
+        async with self.db() as refund_session:
+            refund_session.add(obligation)
+            await refund_session.commit()
+
 
     async def _record_native_refund(self, vm_id: str, *, reason: str) -> bool:
         """Transition a failed native-intent VM's intent to REFUND_MANUAL and
@@ -1355,8 +1976,12 @@ class Orchestrator:
         await asyncio.sleep(0.1)
 
         async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row:
+            row = (
+                await session.execute(
+                    select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
                 return
             # Keep the simulated address consistent with the allocated
             # customer /64 — the status API exposes both, and an address
@@ -1366,7 +1991,11 @@ class Orchestrator:
             else:
                 fake_ipv6 = f"2001:db8::{random.randint(0x1000, 0x9999):04x}"
             row.ipv6 = fake_ipv6
-            row.status = VMStatus.READY
+            row.status = (
+                VMStatus.SUSPENDED
+                if row.suspension_reason in {"account_disabled", "manual_admin"}
+                else VMStatus.READY
+            )
             row.provisioned_at = _now()
             meta = row.metadata_ or {}
             lp = meta.get("launch_proof", {})
@@ -1598,62 +2227,428 @@ class Orchestrator:
             result = await session.execute(select(VMQuoteRow).where(VMQuoteRow.vm_id == vm_id))
             return result.scalar_one_or_none()
 
-    async def extend_vm(self, vm_id: str, days: int) -> VMRow | None:
+    @asynccontextmanager
+    async def locked_vm(
+        self, vm_id: str, *, dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[tuple[AsyncSession, VMRow | None]]:
+        """One PostgreSQL row lock shared by renewal/payment and expiry decisions."""
         async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row or not row.expires_at:
-                return None
+            if dispatch_guard is not None:
+                await dispatch_guard(session)
+            snapshot = await session.get(VMRow, vm_id)
+            owner_id = snapshot.owner_account_id if snapshot is not None else None
+            if owner_id is not None:
+                # Non-key account updates must serialize, while the payment
+                # quota transaction may take a FK key-share lock on this owner.
+                await session.scalar(select(AccountRow).where(AccountRow.account_id == owner_id)
+                                     .with_for_update(key_share=True))
+            row = (await session.execute(
+                select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                .execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if row is not None and row.owner_account_id != owner_id:
+                raise RuntimeError("VM ownership changed; retry the lifecycle action")
+            yield session, row
 
-            now = _now()
-            base = max(row.expires_at, now)
-            row.expires_at = base + timedelta(days=days)
+    @staticmethod
+    async def vm_owner_enabled(session: AsyncSession, row: VMRow | None) -> bool:
+        if row is None:
+            return False
+        if row.owner_account_id is None:
+            return True
+        owner = await session.get(AccountRow, row.owner_account_id)
+        return owner is not None and owner.disabled_at is None
 
-            suspend_status = row.status == VMStatus.SUSPENDED
-            xcpng_uuid = row.xcpng_uuid
+    @staticmethod
+    def vm_can_extend(row: VMRow | None) -> bool:
+        return bool(row is not None and row.expires_at is not None
+                    and row.deletion_started_at is None
+                    and row.status not in (VMStatus.DESTROYED, VMStatus.FAILED, VMStatus.PROVISIONING)
+                    and row.suspension_reason not in ("account_disabled", "manual_admin"))
 
-            await session.commit()
-            await session.refresh(row)
-
-        if suspend_status and xcpng_uuid:
-            power = await self.xcpng.get_vm_power_state(xcpng_uuid)
-            if power == "Halted":
-                await self.xcpng.start_vm(xcpng_uuid)
-
-            async with self.db() as session:
-                row = await session.get(VMRow, vm_id)
-                if row:
-                    row.status = VMStatus.RUNNING
-                    await session.commit()
-                    await session.refresh(row)
-
-        log.info(
-            "vm_extended",
-            vm_id=vm_id,
-            new_expiry=row.expires_at.isoformat() if row.expires_at else "none",
-        )
-        return row
-
-    async def reboot_vm(self, vm_id: str) -> bool:
-        async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row or not row.xcpng_uuid:
-                return False
-            xcpng_uuid = row.xcpng_uuid
-
-        await self.xcpng.reboot_vm(xcpng_uuid)
+    async def reconcile_extension_power(self, row: VMRow | None) -> bool:
+        """Reconcile an expiry stop whose following database commit was lost."""
+        if row is None or row.expires_at is None:
+            return True
+        if (
+            row.deletion_started_at is not None
+            or row.status in {VMStatus.DESTROYED, VMStatus.FAILED, VMStatus.PROVISIONING}
+            or row.suspension_reason in {"account_disabled", "manual_admin"}
+        ):
+            # The normal eligibility check rejects these rows. Do not inspect or
+            # rewrite provider state for a lifecycle that cannot be extended.
+            return True
+        expiry = row.expires_at
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        if (
+            expiry >= _now()
+            or row.xcpng_uuid is None
+            or row.status == VMStatus.SUSPENDED
+        ):
+            return True
+        try:
+            power = await self.xcpng.get_vm_power_state(row.xcpng_uuid)
+        except Exception:
+            log.warning("vm_extension_power_check_failed", vm_id=row.vm_id, exc_info=True)
+            return False
+        if power == "Running":
+            return True
+        if power != "Halted":
+            log.warning("vm_extension_power_unknown", vm_id=row.vm_id, power=power)
+            return False
+        row.status = VMStatus.SUSPENDED
+        if row.suspension_reason not in {"account_disabled", "manual_admin"}:
+            row.suspension_reason = "expired"
+            row.suspended_by_account_id = None
         return True
 
-    async def destroy_vm(self, vm_id: str) -> bool:
+    async def extend_vm(
+        self, vm_id: str, days: int, *, session: AsyncSession | None = None,
+        payment_tx: str | None = None, payer_wallet: str | None = None,
+    ) -> VMRow | None:
+        if days <= 0:
+            raise ValueError("Extension days must be positive")
+        if session is None:
+            async with self.locked_vm(vm_id) as (locked_session, _row):
+                return await self.extend_vm(vm_id, days, session=locked_session,
+                                            payment_tx=payment_tx, payer_wallet=payer_wallet)
+        row = await session.get(VMRow, vm_id)
+        if not await self.reconcile_extension_power(row):
+            return None
+        if not self.vm_can_extend(row) or not await self.vm_owner_enabled(session, row):
+            return None
+        assert row is not None and row.expires_at is not None
+        now = _now()
+        expiry = row.expires_at
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        row.expires_at = max(expiry, now) + timedelta(days=days)
+        suspended = row.status == VMStatus.SUSPENDED
+        xcpng_uuid = row.xcpng_uuid
+        # This receipt and purchased time commit together. It is an application
+        # record, not revenue or a second payment settlement.
+        receipt_id = str(uuid4())
+        if suspended and xcpng_uuid:
+            metadata = dict(row.metadata_ or {})
+            metadata[_EXTENSION_RESUME_KEY] = {
+                "receipt_id": receipt_id,
+                "xcpng_uuid": xcpng_uuid,
+                "owner_account_id": row.owner_account_id,
+                "owner_wallet": row.owner_wallet,
+            }
+            row.metadata_ = metadata
+        session.add(PaymentEventRow(
+            event_id=receipt_id, event_type="extend_applied",
+            resource_path=f"/v1/vm/{vm_id}/extend", method="POST",
+            service_group="vm", amount_usd=Decimal(0),
+            payer_wallet=payer_wallet or row.owner_wallet, tx_hash=payment_tx,
+            extra={"vm_id": vm_id, "days": days,
+                   "previous_expiry": expiry.isoformat(),
+                   "new_expiry": row.expires_at.isoformat()},
+        ))
+        try:
+            await session.commit()
+        except Exception as commit_error:
+            try:
+                await session.rollback()
+                # A fresh connection and lifecycle lock wait for the original
+                # transaction to resolve before absence is treated as failure.
+                async with self.locked_vm(vm_id) as (check_session, current):
+                    receipt = await check_session.get(PaymentEventRow, receipt_id)
+                    if current is None:
+                        raise ExtensionOutcomeUnknownError("VM missing during reconciliation")
+                    if receipt is None:
+                        return None
+            except Exception as reconcile_error:
+                log.error("vm_extension_outcome_unknown", vm_id=vm_id,
+                          receipt_id=receipt_id, exc_info=True)
+                raise ExtensionOutcomeUnknownError(
+                    "Unable to establish whether purchased time committed"
+                ) from reconcile_error
+            log.warning("vm_extension_commit_ack_recovered", vm_id=vm_id,
+                        receipt_id=receipt_id, error_type=type(commit_error).__name__)
+        try:
+            if suspended and xcpng_uuid:
+                await self._reconcile_extension_resume(vm_id, session=session)
+            current = await self.get_vm(vm_id)
+            if current is None:
+                raise ExtensionAppliedStateUnavailableError("Applied extension VM is unavailable")
+            log.info("vm_extended", vm_id=vm_id, receipt_id=receipt_id)
+            return current
+        except Exception as state_error:
+            log.error("vm_extension_applied_state_unavailable", vm_id=vm_id,
+                      receipt_id=receipt_id, exc_info=True)
+            raise ExtensionAppliedStateUnavailableError(
+                "Purchased time committed; guest state requires reconciliation"
+            ) from state_error
+
+    async def _reconcile_extension_resume(
+        self, vm_id: str, *, session: AsyncSession | None = None,
+    ) -> VMRow | None:
+        """Retry a paid extension's post-commit guest start safely."""
+        if session is None:
+            async with self.locked_vm(vm_id) as (locked_session, current):
+                return await self._reconcile_extension_resume_locked(locked_session, current)
+
+        # The caller has just committed purchased time but still owns this
+        # session/connection. Reacquire the standard account-then-VM locks on
+        # that connection; opening a nested session deadlocks single-connection
+        # SQLite and needlessly consumes another production pool slot.
+        session.expire_all()
+        snapshot = await session.scalar(select(VMRow).where(VMRow.vm_id == vm_id))
+        owner_id = snapshot.owner_account_id if snapshot is not None else None
+        if owner_id is not None:
+            await session.scalar(
+                select(AccountRow)
+                .where(AccountRow.account_id == owner_id)
+                .with_for_update(key_share=True)
+            )
+        current = (
+            await session.execute(
+                select(VMRow)
+                .where(VMRow.vm_id == vm_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if current is not None and current.owner_account_id != owner_id:
+            await session.rollback()
+            return current
+        return await self._reconcile_extension_resume_locked(session, current)
+
+    async def _reconcile_extension_resume_locked(
+        self, session: AsyncSession, current: VMRow | None,
+    ) -> VMRow | None:
+        """Apply one handoff while the account and VM lifecycle are fenced."""
+        if current is None:
+            return None
+        metadata = dict(current.metadata_ or {})
+        pending = metadata.get(_EXTENSION_RESUME_KEY)
+        if not isinstance(pending, dict):
+            return current
+        expected_owner = (pending.get("owner_account_id"), pending.get("owner_wallet"))
+        stale = (
+            current.status != VMStatus.SUSPENDED
+            or current.deletion_started_at is not None
+            or current.xcpng_uuid != pending.get("xcpng_uuid")
+            or (current.owner_account_id, current.owner_wallet) != expected_owner
+            or current.suspension_reason in {"account_disabled", "manual_admin"}
+        )
+        if stale:
+            metadata.pop(_EXTENSION_RESUME_KEY, None)
+            current.metadata_ = metadata or None
+            await session.commit()
+            return current
+        if not await self.vm_owner_enabled(session, current):
+            await session.rollback()
+            return current
+        assert current.xcpng_uuid is not None
+        try:
+            power = await self.xcpng.get_vm_power_state(current.xcpng_uuid)
+            if power == "Halted":
+                await self.xcpng.start_vm(current.xcpng_uuid)
+            elif power != "Running":
+                log.warning(
+                    "vm_extension_resume_power_unknown", vm_id=current.vm_id, power=power
+                )
+                await session.rollback()
+                return current
+        except Exception:
+            log.warning("vm_extension_resume_failed", vm_id=current.vm_id, exc_info=True)
+            await session.rollback()
+            return current
+        current.status = VMStatus.RUNNING
+        current.suspension_reason = None
+        current.suspended_by_account_id = None
+        metadata.pop(_EXTENSION_RESUME_KEY, None)
+        current.metadata_ = metadata or None
+        await session.commit()
+        return current
+
+    async def reconcile_extension_resumes(self) -> int:
+        """Process durable paid-extension start handoffs after API restarts."""
         async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
-            if not row:
+            candidates = list(
+                await session.scalars(
+                    select(VMRow.vm_id)
+                    .where(
+                        VMRow.status == VMStatus.SUSPENDED,
+                        VMRow.metadata_[_EXTENSION_RESUME_KEY].as_string().is_not(None),
+                        VMRow.vm_id > getattr(self, "_extension_resume_cursor", ""),
+                    )
+                    .order_by(VMRow.vm_id)
+                    .limit(100)
+                )
+            )
+        self._extension_resume_cursor = candidates[-1] if len(candidates) == 100 else ""
+        resumed = 0
+        for vm_id in candidates:
+            await self._reconcile_extension_resume(vm_id)
+            current = await self.get_vm(vm_id)
+            if current is not None and current.status == VMStatus.RUNNING:
+                resumed += 1
+        return resumed
+
+    async def reconcile_transfer_resume(self, vm_id: str) -> bool:
+        """Finish one ownership-transfer resume handoff idempotently."""
+        restart_provisioning = False
+        async with self.db() as session:
+            snapshot = await session.scalar(
+                select(VMRow.owner_account_id).where(VMRow.vm_id == vm_id)
+            )
+            if snapshot is None:
                 return False
+            recipient = await session.scalar(
+                select(AccountRow)
+                .where(AccountRow.account_id == snapshot)
+                .with_for_update()
+            )
+            current = await session.scalar(
+                select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+            )
+            if current is None:
+                return False
+            metadata = dict(current.metadata_ or {})
+            pending = metadata.get(_TRANSFER_RESUME_KEY)
+            if not isinstance(pending, dict):
+                return False
+            if current.owner_account_id != pending.get("owner_account_id"):
+                metadata.pop(_TRANSFER_RESUME_KEY, None)
+                current.metadata_ = metadata or None
+                await session.commit()
+                return False
+            if recipient is None or recipient.disabled_at is not None:
+                await session.rollback()
+                return False
+            if current.deletion_started_at is not None:
+                metadata.pop(_TRANSFER_RESUME_KEY, None)
+                current.metadata_ = metadata or None
+                await session.commit()
+                return False
+            expiry = current.expires_at
+            if expiry is not None and expiry.replace(tzinfo=expiry.tzinfo or UTC) <= _now():
+                current.suspension_reason = "expired"
+                current.suspended_by_account_id = None
+                metadata.pop(_TRANSFER_RESUME_KEY, None)
+                current.metadata_ = metadata or None
+                await session.commit()
+                return True
+
+            status = str(current.status)
+            if status in {VMStatus.DESTROYED.value, VMStatus.FAILED.value}:
+                current.suspension_reason = None
+                current.suspended_by_account_id = None
+            elif status in {VMStatus.PROVISIONING.value, VMStatus.SUSPENDED.value} and current.xcpng_uuid:
+                try:
+                    power = await self.xcpng.get_vm_power_state(current.xcpng_uuid)
+                    if power == "Halted":
+                        await self.xcpng.start_vm(current.xcpng_uuid)
+                    elif power != "Running":
+                        await session.rollback()
+                        return False
+                except Exception:
+                    log.warning("vm_transfer_resume_failed", vm_id=vm_id, exc_info=True)
+                    await session.rollback()
+                    return False
+                if status == VMStatus.PROVISIONING.value:
+                    await self.renew_provisioning_report_deadline(session, current)
+                else:
+                    current.status = VMStatus.RUNNING
+                current.suspension_reason = None
+                current.suspended_by_account_id = None
+            elif status == VMStatus.SUSPENDED.value:
+                current.status = VMStatus.PROVISIONING
+                current.suspension_reason = None
+                current.suspended_by_account_id = None
+                current.error = None
+                await self.prepare_provisioning_dispatch(session, current)
+                restart_provisioning = True
+            else:
+                current.suspension_reason = None
+                current.suspended_by_account_id = None
+            metadata.pop(_TRANSFER_RESUME_KEY, None)
+            current.metadata_ = metadata or None
+            await session.commit()
+        if restart_provisioning:
+            await self.start_provisioning(vm_id)
+        return True
+
+    async def reconcile_transfer_resumes(self) -> int:
+        """Retry durable ownership-transfer resume handoffs."""
+        async with self.db() as session:
+            candidates = list(await session.scalars(
+                select(VMRow.vm_id)
+                .where(
+                    VMRow.metadata_[_TRANSFER_RESUME_KEY].as_string().is_not(None),
+                    VMRow.vm_id > getattr(self, "_transfer_resume_cursor", ""),
+                )
+                .order_by(VMRow.vm_id)
+                .limit(100)
+            ))
+        self._transfer_resume_cursor = candidates[-1] if len(candidates) == 100 else ""
+        completed = 0
+        for vm_id in candidates:
+            completed += int(await self.reconcile_transfer_resume(vm_id))
+        return completed
+
+    async def reboot_vm(
+        self, vm_id: str, *, management_identity: VMManagementIdentity | None = None,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
+    ) -> bool:
+        lifecycle_lock = (self.locked_vm(vm_id, dispatch_guard=dispatch_guard)
+                          if dispatch_guard is not None else self.locked_vm(vm_id))
+        async with lifecycle_lock as (session, row):
+            if (row is None or not row.xcpng_uuid or row.deletion_started_at is not None
+                    or (management_identity is not None and not management_identity.matches(row))):
+                return False
+            if management_identity is not None and not await self.vm_owner_enabled(session, row):
+                return False
+            # Ownership transfer cannot pass the row lock during the operation.
+            await self.xcpng.reboot_vm(row.xcpng_uuid)
+            return True
+
+    async def destroy_vm(
+        self, vm_id: str, *, expired_before: datetime | None = None,
+        management_identity: VMManagementIdentity | None = None,
+        dispatch_guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
+    ) -> bool:
+        lifecycle_lock = (self.locked_vm(vm_id, dispatch_guard=dispatch_guard)
+                          if dispatch_guard is not None else self.locked_vm(vm_id))
+        async with lifecycle_lock as (session, row):
+            if row is None or (management_identity is not None and not management_identity.matches(row)):
+                return False
+            if management_identity is not None and not await self.vm_owner_enabled(session, row):
+                return False
+            already_destroyed = row.status == VMStatus.DESTROYED
+            deletion_verified = (row.xcpng_uuid is not None
+                                 and (row.metadata_ or {}).get("provider_deleted_uuid") == row.xcpng_uuid)
+            if (already_destroyed and row.ipv6_prefix_index is None and row.ipv6_prefix is None
+                    and (row.xcpng_uuid is None or deletion_verified)):
+                return True
+            if row.deletion_started_at is None and expired_before is not None and not already_destroyed:
+                expiry = row.expires_at
+                if expiry is None or row.status == VMStatus.FAILED:
+                    return False
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=UTC)
+                if expiry >= expired_before:
+                    return False
+            if row.deletion_started_at is None:
+                row.deletion_started_at = _now()
+            # Persist before the irreversible provider call. A failed call or
+            # worker crash retains the claim and prevents a paid renewal.
+            await session.commit()
             xcpng_uuid = row.xcpng_uuid
             hostname = row.hostname
             status = str(row.status)
             domain_mode = row.domain_mode
             domain = row.domain
             owner_account_id = row.owner_account_id
+
+            # A durable attempt with no recorded UUID may still own retained
+            # generation-labeled guests, even after FAILED or DESTROYED.
+            unresolved_guest = xcpng_uuid is None and await session.get(VMGuestResultRow, vm_id) is not None
 
         # Track whether every user of the deterministic ::2 address is
         # verifiably gone; the /64 is only released when they are. A
@@ -1662,8 +2657,9 @@ class Orchestrator:
         cleanup_ok = True
 
         if xcpng_uuid:
-            await self.xcpng.destroy_vm(xcpng_uuid)
-        elif status == str(VMStatus.PROVISIONING):
+            if not deletion_verified:
+                await self.xcpng.destroy_vm(xcpng_uuid)
+        elif status == str(VMStatus.PROVISIONING) or unresolved_guest:
             # Mid-provision race: the clone may exist without xcpng_uuid
             # having been recorded yet — the guest could still come up on
             # this prefix after we look.
@@ -1706,11 +2702,18 @@ class Orchestrator:
                             domain=domain,
                         )
 
-        async with self.db() as session:
-            row = await session.get(VMRow, vm_id)
+        async with self.locked_vm(vm_id) as (session, row):
             if row:
                 row.status = VMStatus.DESTROYED
                 row.destroyed_at = _now()
+                if xcpng_uuid is not None:
+                    meta = dict(row.metadata_ or {})
+                    meta["provider_deleted_uuid"] = xcpng_uuid
+                    row.metadata_ = meta
+                if row.xcpng_uuid != xcpng_uuid:
+                    # A clone finished while provider/DNS cleanup was outside
+                    # the lock. This attempt did not delete that new identity.
+                    cleanup_ok = False
                 if cleanup_ok:
                     # Release the customer /64 for reuse: the unique index on
                     # ipv6_prefix_index would otherwise pin it to this dead
@@ -1738,6 +2741,14 @@ class Orchestrator:
                 )
             ).scalar_one_or_none()
             if row is not None and str(row.status) == VMStatus.DESTROYED.value:
+                if (row.xcpng_uuid is not None
+                        and (row.metadata_ or {}).get("provider_deleted_uuid") != row.xcpng_uuid):
+                    return
+                if row.xcpng_uuid is None and await session.get(VMGuestResultRow, vm_id) is not None:
+                    # DNS convergence cannot prove retained guests are gone.
+                    # Operator reconciliation must establish guest identity and
+                    # cleanup before this prefix can be made reusable.
+                    return
                 row.ipv6_prefix_index = None
                 row.ipv6_prefix = None
                 await session.commit()
@@ -1746,6 +2757,8 @@ class Orchestrator:
 
     async def check_expiries(self) -> None:
         """Suspend expired VMs, destroy those past grace period."""
+        await self.reconcile_extension_resumes()
+        await self.reconcile_transfer_resumes()
         now = _now()
         grace = timedelta(hours=self.config.vm_grace_period_hours)
 
@@ -1757,6 +2770,7 @@ class Orchestrator:
                 await session.scalars(
                     select(VMRow.vm_id).where(
                         VMRow.owner_wallet == "",
+                        VMRow.deletion_started_at.is_(None),
                         VMRow.status == VMStatus.PROVISIONING,
                         VMRow.created_at < now - timedelta(minutes=15),
                     )
@@ -1775,6 +2789,7 @@ class Orchestrator:
                     sql_delete(VMRow).where(
                         VMRow.vm_id.in_(stale_reservations),
                         VMRow.owner_wallet == "",
+                        VMRow.deletion_started_at.is_(None),
                         VMRow.status == VMStatus.PROVISIONING,
                     )
                 )
@@ -1783,9 +2798,15 @@ class Orchestrator:
         async with self.db() as session:
             result = await session.execute(
                 select(VMRow).where(
-                    VMRow.status.notin_([VMStatus.DESTROYED, VMStatus.FAILED]),
-                    VMRow.expires_at.isnot(None),
-                    VMRow.expires_at < now,
+                    or_(VMRow.status != VMStatus.DESTROYED,
+                        and_(VMRow.xcpng_uuid.isnot(None),
+                             func.coalesce(VMRow.metadata_["provider_deleted_uuid"].as_string(), "") != VMRow.xcpng_uuid),
+                        and_(VMRow.status == VMStatus.DESTROYED,
+                             or_(VMRow.ipv6_prefix_index.isnot(None), VMRow.ipv6_prefix.isnot(None)))),
+                    or_(
+                        VMRow.deletion_started_at.isnot(None),
+                        and_(VMRow.status != VMStatus.FAILED, VMRow.expires_at < now),
+                    ),
                 )
             )
             expired_vms = []
@@ -1800,26 +2821,52 @@ class Orchestrator:
                 )
 
         for vm in expired_vms:
-            if not vm["expires_at"]:
-                continue
-            expires_at = vm["expires_at"]
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=UTC)
-
-            if now > expires_at + grace:
-                log.info("vm_expiry_destroy", vm_id=vm["vm_id"])
-                await self.destroy_vm(vm["vm_id"])
-            elif vm["status"] != VMStatus.SUSPENDED:
-                log.info("vm_expiry_suspend", vm_id=vm["vm_id"])
-                if vm["xcpng_uuid"]:
-                    try:
-                        await self.xcpng.suspend_vm(vm["xcpng_uuid"])
-                    except Exception:
-                        log.warning("suspend_failed", vm_id=vm["vm_id"], exc_info=True)
-                async with self.db() as session:
-                    await session.execute(
-                        update(VMRow)
-                        .where(VMRow.vm_id == vm["vm_id"])
-                        .values(status=VMStatus.SUSPENDED)
-                    )
+            async with self.locked_vm(vm["vm_id"]) as (session, current):
+                if current is None:
+                    continue
+                if (current.status == VMStatus.DESTROYED
+                        and current.ipv6_prefix_index is None and current.ipv6_prefix is None
+                        and (current.xcpng_uuid is None
+                             or (current.metadata_ or {}).get("provider_deleted_uuid") == current.xcpng_uuid)):
+                    continue
+                claimed = current.deletion_started_at is not None
+                expiry = current.expires_at
+                if not claimed and (expiry is None or current.status == VMStatus.FAILED):
+                    continue
+                if expiry is not None and expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=UTC)
+                action_now = _now()
+                delete_due = claimed or (expiry is not None and action_now > expiry + grace)
+                if not delete_due:
+                    assert expiry is not None
+                    if expiry >= action_now or current.status == VMStatus.SUSPENDED:
+                        continue
+                    # A receipt-backed attempt without a recorded provider UUID
+                    # may still have an ambiguous generation-labelled guest to
+                    # reconcile. Keep it in PROVISIONING so ordinary recovery
+                    # can identify/stop/finalize that guest; SUSPENDED would make
+                    # both recovery and future extension resumption skip it.
+                    if current.status == VMStatus.PROVISIONING and current.xcpng_uuid is None:
+                        continue
+                    log.info("vm_expiry_suspend", vm_id=current.vm_id)
+                    if current.xcpng_uuid:
+                        # Failure must not be committed as a successful suspend,
+                        # nor prevent later candidates from being processed.
+                        try:
+                            await self.xcpng.suspend_vm(current.xcpng_uuid)
+                        except Exception:
+                            log.warning("suspend_failed", vm_id=current.vm_id, exc_info=True)
+                            continue
+                    if current.status != VMStatus.PROVISIONING:
+                        current.status = VMStatus.SUSPENDED
+                    if current.suspension_reason not in {"account_disabled", "manual_admin"}:
+                        current.suspension_reason = "expired"
+                        current.suspended_by_account_id = None
                     await session.commit()
+                    continue
+            # Reacquire/recheck in destroy_vm: renewal may commit after the
+            # lock above is released but before the deletion claim is written.
+            try:
+                await self.destroy_vm(vm["vm_id"], expired_before=action_now - grace)
+            except Exception:
+                log.warning("vm_expiry_destroy_failed", vm_id=vm["vm_id"], exc_info=True)

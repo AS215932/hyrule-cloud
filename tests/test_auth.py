@@ -9,22 +9,46 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
-from fastapi import Response
+from fastapi import HTTPException, Request, Response
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from hyrule_cloud.api.auth import (
+    ChangePasswordRequest,
+    ClaimByTokenRequest,
+    RotateRecoveryCodeRequest,
+    change_password,
+    claim_vm,
+    delete_me,
+    rotate_recovery_code,
+)
 from hyrule_cloud.app import app
-from hyrule_cloud.db import Base, DomainOrderRow, DomainQuoteRow, DomainRow, VMRow
+from hyrule_cloud.db import (
+    AccountRow,
+    AdminOperationRow,
+    Base,
+    DomainOrderRow,
+    DomainQuoteRow,
+    DomainRow,
+    VMRow,
+)
 from hyrule_cloud.middleware.anon_token import hash_anon_token as hash_anon_management_token
 from hyrule_cloud.models import (
     VMSize,
     VMStatus,
     generate_anon_management_token,
     generate_vm_id,
+)
+from hyrule_cloud.services.passwords import (
+    hash_password,
+    hash_recovery_code,
+    verify_password,
+    verify_recovery_code,
 )
 
 # --- Fixtures: in-process DB + orchestrator stub ---
@@ -80,17 +104,17 @@ class _StubOrchestrator:
         async with self.db() as session:
             return await session.get(VMRow, vm_id)
 
-    async def reboot_vm(self, vm_id: str) -> bool:
+    async def reboot_vm(self, vm_id: str, *, management_identity=None) -> bool:
         self.reboot_called.append(vm_id)
         async with self.db() as session:
             vm = await session.get(VMRow, vm_id)
-        return vm is not None
+        return vm is not None and (management_identity is None or management_identity.matches(vm))
 
-    async def destroy_vm(self, vm_id: str) -> bool:
+    async def destroy_vm(self, vm_id: str, *, management_identity=None) -> bool:
         self.destroy_called.append(vm_id)
         async with self.db() as session:
             vm = await session.get(VMRow, vm_id)
-            if vm is None:
+            if vm is None or (management_identity is not None and not management_identity.matches(vm)):
                 return False
             vm.status = VMStatus.DESTROYED
             vm.destroyed_at = _now()
@@ -291,6 +315,35 @@ async def test_recovery_code_cannot_be_reused(auth_state, client):
     assert again.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_recovery_code_cannot_replace_disabled_account_credentials(auth_state, client):
+    reg = await client.post(
+        "/v1/auth/register", json={"password": "disabled old password long enough"}
+    )
+    account_id = reg.json()["account_id"]
+    recovery_code = reg.json()["recovery_code"]
+    async with auth_state.orchestrator.db.begin() as session:
+        account = await session.get(AccountRow, account_id)
+        account.disabled_at = _now()
+        original_password_hash = account.password_hash
+        original_recovery_hash = account.recovery_code_hash
+
+    recover = await client.post(
+        "/v1/auth/recover/code",
+        json={
+            "account_id": account_id,
+            "recovery_code": recovery_code,
+            "new_password": "disabled replacement password long enough",
+        },
+    )
+    assert recover.status_code == 403
+    async with auth_state.orchestrator.db() as session:
+        account = await session.get(AccountRow, account_id)
+        assert account.password_hash == original_password_hash
+        assert account.recovery_code_hash == original_recovery_hash
+        assert account.recovery_code_used_at is None
+
+
 # --- Test: change password from inside session ---
 
 
@@ -331,6 +384,63 @@ async def test_change_password_rejects_wrong_current_password(auth_state, client
         json={"current_password": "wrong", "new_password": "newer than ever long pw"},
     )
     assert res.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_stale_session_cannot_mutate_disabled_account_credentials(auth_state):
+    password = "existing credential password"
+    async with auth_state.orchestrator.db.begin() as session:
+        session.add_all(
+            [
+                AccountRow(
+                    account_id="HSTALEPASS1",
+                    password_hash=hash_password(password),
+                ),
+                AccountRow(
+                    account_id="HSTALEREC01",
+                    password_hash=hash_password(password),
+                    recovery_code_hash=hash_recovery_code("hyr-rec-original-code"),
+                ),
+            ]
+        )
+    async with auth_state.orchestrator.db() as session:
+        stale_password = await session.get(AccountRow, "HSTALEPASS1")
+        stale_recovery = await session.get(AccountRow, "HSTALEREC01")
+        assert stale_password is not None and stale_recovery is not None
+    async with auth_state.orchestrator.db.begin() as session:
+        for account_id in ("HSTALEPASS1", "HSTALEREC01"):
+            stored = await session.get(AccountRow, account_id)
+            assert stored is not None
+            stored.disabled_at = _now()
+
+    with pytest.raises(HTTPException) as password_denied:
+        await change_password(
+            ChangePasswordRequest(
+                current_password=password,
+                new_password="replacement credential password",
+            ),
+            stale_password,
+            auth_state,
+            None,
+        )
+    assert password_denied.value.status_code == 403
+    with pytest.raises(HTTPException) as recovery_denied:
+        await rotate_recovery_code(
+            RotateRecoveryCodeRequest(current_password=password),
+            stale_recovery,
+            auth_state,
+        )
+    assert recovery_denied.value.status_code == 403
+
+    async with auth_state.orchestrator.db() as session:
+        stored_password = await session.get(AccountRow, "HSTALEPASS1")
+        stored_recovery = await session.get(AccountRow, "HSTALEREC01")
+        assert stored_password is not None and verify_password(
+            stored_password.password_hash, password
+        )
+        assert stored_recovery is not None and verify_recovery_code(
+            stored_recovery.recovery_code_hash, "hyr-rec-original-code"
+        )
 
 
 # --- Test: account-owned VM ownership enforcement ---
@@ -527,6 +637,50 @@ async def test_claim_rejects_wrong_token(auth_state, client):
 
 
 @pytest.mark.asyncio
+async def test_claim_revalidates_stale_destination_account(auth_state):
+    token = generate_anon_management_token()
+    vm_id = generate_vm_id()
+    account_id = "HCLAIMFENCE"
+    async with auth_state.orchestrator.db() as session:
+        stale_account = AccountRow(account_id=account_id, password_hash="fixture")
+        session.add(stale_account)
+        session.add(
+            VMRow(
+                vm_id=vm_id,
+                owner_wallet="0xAnonPayer",
+                anon_management_token_hash=hash_anon_management_token(token),
+                status=VMStatus.READY,
+                size=VMSize.XS,
+                os="debian-13",
+                ssh_pubkey="",
+                open_ports=[22],
+                expires_at=_now() + timedelta(days=7),
+                cost_total=Decimal("0.35"),
+            )
+        )
+        await session.commit()
+    assert stale_account is not None
+    async with auth_state.orchestrator.db() as session:
+        current = await session.get(AccountRow, account_id)
+        current.disabled_at = _now()
+        await session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await claim_vm(
+            vm_id,
+            ClaimByTokenRequest(proof="management_token", token=token),
+            SimpleNamespace(),
+            stale_account,
+            auth_state,
+        )
+    assert exc.value.status_code == 403
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm.owner_account_id is None
+        assert vm.anon_management_token_hash == hash_anon_management_token(token)
+
+
+@pytest.mark.asyncio
 async def test_claim_rejects_already_claimed_vm(auth_state, client):
     # Account A owns the VM
     reg_a = await client.post("/v1/auth/register", json={"password": "alice long pw 1234"})
@@ -571,6 +725,86 @@ async def test_account_delete_detach_returns_fresh_tokens(auth_state, client):
         res = await cx.get(f"/v1/vm/{vm_id}", headers={"Authorization": f"Bearer {fresh_token}"})
         assert res.status_code == 200
         assert res.json()["vm_id"] == vm_id
+
+
+@pytest.mark.asyncio
+async def test_account_delete_detach_rechecks_stale_disabled_session(auth_state, client):
+    reg = await client.post("/v1/auth/register", json={"password": "disabled deletion password"})
+    account_id = reg.json()["account_id"]
+    vm_id = await _seed_owned_vm(auth_state, account_id)
+    async with auth_state.orchestrator.db() as session:
+        stale_account = await session.get(AccountRow, account_id)
+    async with auth_state.orchestrator.db.begin() as session:
+        current = await session.get(AccountRow, account_id)
+        current.disabled_at = _now()
+
+    request = Request({
+        "type": "http", "method": "DELETE", "path": "/v1/me",
+        "query_string": b"vm_policy=detach", "headers": [],
+    })
+    with pytest.raises(HTTPException) as refused:
+        await delete_me(request, Response(), stale_account, auth_state, None)
+    assert refused.value.status_code == 403
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm.owner_account_id == account_id
+        assert vm.anon_management_token_hash is None
+
+
+@pytest.mark.asyncio
+async def test_account_delete_detach_waits_for_account_resource_resume(auth_state, client):
+    reg = await client.post("/v1/auth/register", json={"password": "resuming deletion password"})
+    account_id = reg.json()["account_id"]
+    vm_id = await _seed_owned_vm(auth_state, account_id)
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm is not None
+        vm.status = VMStatus.SUSPENDED
+        vm.suspension_reason = "account_disabled"
+        session.add(
+            AdminOperationRow(
+                operation_id="resume-before-detach",
+                kind="resume_account_resources",
+                account_id=account_id,
+                status="queued",
+            )
+        )
+        await session.commit()
+
+    response = await client.delete("/v1/me?vm_policy=detach")
+
+    assert response.status_code == 409
+    assert "finish resuming" in response.json()["detail"]
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm is not None and vm.owner_account_id == account_id
+        assert vm.anon_management_token_hash is None
+
+
+@pytest.mark.asyncio
+async def test_account_delete_detach_waits_for_extension_resume(auth_state, client):
+    reg = await client.post("/v1/auth/register", json={"password": "extending deletion password"})
+    account_id = reg.json()["account_id"]
+    vm_id = await _seed_owned_vm(auth_state, account_id)
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm is not None
+        vm.metadata_ = {
+            "extension_resume_pending": {
+                "owner_account_id": account_id,
+                "xcpng_uuid": "fixture-guest",
+            }
+        }
+        await session.commit()
+
+    response = await client.delete("/v1/me?vm_policy=detach")
+
+    assert response.status_code == 409
+    assert "finish resuming" in response.json()["detail"]
+    async with auth_state.orchestrator.db() as session:
+        vm = await session.get(VMRow, vm_id)
+        assert vm is not None and vm.owner_account_id == account_id
+        assert vm.anon_management_token_hash is None
 
 
 @pytest.mark.asyncio

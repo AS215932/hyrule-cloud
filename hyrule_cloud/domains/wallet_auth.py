@@ -30,7 +30,12 @@ from hyrule_cloud.middleware.auth import (
     derive_ip_prefix_hash,
     require_browser_session,
 )
-from hyrule_cloud.services.sessions import cookie_kwargs_for_set, create_session
+from hyrule_cloud.services.sessions import (
+    SessionCredentials,
+    cookie_kwargs_for_set,
+    create_session,
+    csrf_cookie_kwargs_for_set,
+)
 from hyrule_cloud.state import AppState, get_app_state
 
 
@@ -125,6 +130,16 @@ class WalletAuthService:
         normalized = _normalize_address(address)
         for _attempt in range(2):
             async with self.db() as session:
+                locked_account: AccountRow | None = None
+                if account is not None:
+                    locked_account = await session.scalar(
+                        select(AccountRow)
+                        .where(AccountRow.account_id == account.account_id)
+                        .with_for_update(key_share=True)
+                        .execution_options(populate_existing=True)
+                    )
+                    if locked_account is None or locked_account.disabled_at is not None:
+                        raise DomainProblem(403, "account_disabled", "This account is disabled.")
                 wallet = (
                     await session.execute(
                         select(AccountWalletRow)
@@ -167,9 +182,8 @@ class WalletAuthService:
                             "wallet_account_mismatch",
                             "This account is linked to a different payment wallet.",
                         )
-                    owner = await session.get(AccountRow, account.account_id)
-                    if owner is None:
-                        raise DomainProblem(401, "authentication_required", "The account is unavailable.")
+                    assert locked_account is not None
+                    owner = locked_account
                 else:
                     owner = AccountRow(
                         account_id=generate_account_id(),
@@ -215,7 +229,14 @@ class WalletAuthService:
         """Create the management session only after checkout settlement."""
 
         async with self.db() as session:
-            token = await create_session(
+            account = await session.scalar(
+                select(AccountRow)
+                .where(AccountRow.account_id == account_id)
+                .with_for_update()
+            )
+            if account is None or account.disabled_at is not None:
+                raise DomainProblem(403, "account_disabled", "This account is disabled.")
+            credentials = await create_session(
                 session,
                 account_id,
                 user_agent=request.headers.get("user-agent"),
@@ -226,7 +247,8 @@ class WalletAuthService:
             "127.0.0.1",
             "::1",
         }
-        response.set_cookie(value=token, **cookie_kwargs_for_set(secure=secure))
+        response.set_cookie(value=credentials.token, **cookie_kwargs_for_set(secure=secure))
+        response.set_cookie(value=credentials.csrf_token, **csrf_cookie_kwargs_for_set(secure=secure))
 
     async def create_challenge(
         self,
@@ -307,7 +329,7 @@ class WalletAuthService:
         *,
         account: AccountRow | None,
         request: Request,
-    ) -> tuple[AccountRow, AccountWalletRow, WalletAction, bool, str | None]:
+    ) -> tuple[AccountRow, AccountWalletRow, WalletAction, bool, SessionCredentials | None]:
         async with self.db() as session:
             challenge = (
                 await session.execute(
@@ -353,21 +375,40 @@ class WalletAuthService:
                     session.add(wallet)
                     created = True
                 else:
-                    loaded_account = await session.get(AccountRow, wallet.account_id)
+                    loaded_account = await session.scalar(
+                        select(AccountRow)
+                        .where(AccountRow.account_id == wallet.account_id)
+                        .with_for_update()
+                    )
                     if loaded_account is None:
                         raise DomainProblem(401, "invalid_wallet_account", "The wallet account is unavailable.")
+                    if loaded_account.disabled_at is not None:
+                        raise DomainProblem(403, "account_disabled", "This account is disabled.")
                     account_row = loaded_account
                 challenge.used_at = _now()
-                await session.commit()
-                token = await create_session(
+                credentials = await create_session(
                     session,
                     account_row.account_id,
                     user_agent=request.headers.get("user-agent"),
                     ip_prefix_hash=derive_ip_prefix_hash(_client_ip(request)),
                 )
-                return account_row, wallet, action, created, token
+                return account_row, wallet, action, created, credentials
             if account is None or challenge.account_id != account.account_id:
                 raise DomainProblem(401, "authentication_required", "The session does not match this challenge.")
+            if action in {WalletAction.LINK, WalletAction.ROTATE}:
+                # Session revocation alone cannot fence an already-running
+                # request. Serialize these identity mutations with account
+                # disable and revalidate inside the challenge transaction.
+                locked_account = await session.scalar(
+                    select(AccountRow)
+                    .where(AccountRow.account_id == account.account_id)
+                    .with_for_update()
+                )
+                if locked_account is None:
+                    raise DomainProblem(401, "invalid_wallet_account", "The wallet account is unavailable.")
+                if locked_account.disabled_at is not None:
+                    raise DomainProblem(403, "account_disabled", "This account is disabled.")
+                account = locked_account
             if action is WalletAction.LINK:
                 if recovered.lower() != challenge.address.lower():
                     raise DomainProblem(401, "invalid_wallet_signature", "The wallet signature is invalid.")
@@ -559,18 +600,23 @@ async def wallet_verify(
             "browser_session_required",
             "Wallet login and account changes require a browser session.",
         )
-    account_row, wallet, action, created, token = await service.verify_login_or_account_action(
+    account_row, wallet, action, created, credentials = await service.verify_login_or_account_action(
         body, account=account, request=request
     )
     if action in {WalletAction.LINK, WalletAction.ROTATE}:
         await require_browser_session(request, account_row)
-    if token:
+    if credentials:
         secure = request.url.scheme == "https" or request.url.hostname not in {
             "localhost",
             "127.0.0.1",
             "::1",
         }
-        response.set_cookie(value=token, **cookie_kwargs_for_set(secure=secure))
+        response.set_cookie(
+            value=credentials.token, **cookie_kwargs_for_set(secure=secure)
+        )
+        response.set_cookie(
+            value=credentials.csrf_token, **csrf_cookie_kwargs_for_set(secure=secure)
+        )
     return WalletAuthResponse(
         account_id=account_row.account_id,
         address=wallet.address,

@@ -158,11 +158,11 @@ class _OrchOK:
             return _row_with_hash(hash_anon_token(_TOKEN_OK))
         return None
 
-    async def reboot_vm(self, vm_id):
+    async def reboot_vm(self, vm_id, *, management_identity=None):
         self.rebooted.append(vm_id)
         return True
 
-    async def destroy_vm(self, vm_id):
+    async def destroy_vm(self, vm_id, *, management_identity=None):
         self.destroyed.append(vm_id)
         return True
 
@@ -175,7 +175,7 @@ class _OrchLegacy:
             return _row_with_hash(None)
         return None
 
-    async def reboot_vm(self, vm_id):
+    async def reboot_vm(self, vm_id, *, management_identity=None):
         return True
 
 
@@ -385,7 +385,7 @@ class _OrchForCreate:
             vm_cost="$1.00", domain_cost="$0.00", total="$1.00",
         )
 
-    def start_provisioning(self, vm_id):
+    async def start_provisioning(self, vm_id):
         self.provisioning_started = getattr(self, "provisioning_started", [])
         self.provisioning_started.append(vm_id)
 
@@ -406,6 +406,16 @@ class _OrchForCreate:
         self.last_row = _Row()
         self.last_token = generate_anon_management_token()
         return self.last_row, self.last_token
+
+    async def persist_payment_billing(
+        self,
+        vm_id: str,
+        retail_amount: Decimal,
+        *,
+        admin_waived: bool,
+        payment_tx: str | None = None,
+    ) -> None:
+        self.last_row.payment_tx = payment_tx
 
 
 @pytest.fixture

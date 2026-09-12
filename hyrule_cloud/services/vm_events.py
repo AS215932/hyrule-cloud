@@ -49,6 +49,23 @@ class ProvisioningFailedError(RuntimeError):
 
 # --- Fixed customer-facing failure messages (the entire allowlist) ---
 
+FAILURE_GUEST_SETUP = (
+    "Your setup script failed. The VM is retained for diagnosis; "
+    "check /var/log/hyrule-setup.log in your VM. Contact support for recovery or refund status."
+)
+FAILURE_GUEST_INIT = (
+    "Cloud-init did not complete successfully. The VM is retained for diagnosis; "
+    "check cloud-init status in your VM. Contact support for recovery or refund status."
+)
+FAILURE_GUEST_REPORT = (
+    "Guest initialization could not be verified before the deadline. "
+    "The VM is retained for diagnosis. Contact support for recovery or refund status."
+)
+FAILURE_GUEST_RECOVERY = (
+    "Provisioning was interrupted and needs operator recovery. "
+    "Contact support for guest recovery or refund status."
+)
+
 FAILURE_TIMEOUT = (
     "Your VM did not come online within the provisioning window. "
     "The order was stopped and any payment is refunded."

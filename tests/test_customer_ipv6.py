@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from decimal import Decimal
 from ipaddress import IPv6Network
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -10,9 +13,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.config import HyruleConfig
-from hyrule_cloud.db import Base, VMRow
+from hyrule_cloud.db import AccountRow, Base, VMRow
 from hyrule_cloud.models import VMSize, VMStatus
-from hyrule_cloud.orchestrator import Orchestrator
+from hyrule_cloud.orchestrator import AccountDisabledError, Orchestrator
 from hyrule_cloud.providers.network_config import (
     prefix_for_index,
     render_debian_network_config,
@@ -20,6 +23,21 @@ from hyrule_cloud.providers.network_config import (
     validate_customer_network_settings,
     vm_address_for_prefix,
 )
+
+
+async def _complete_test_guest(session_factory, kwargs):
+    from hyrule_cloud.services.guest_result import GuestResult, accept_guest_result
+
+    cloud = yaml.safe_load(kwargs["cloud_init_config"])
+    report = json.loads(next(entry["content"] for entry in cloud["write_files"]
+                             if entry["path"] == "/var/lib/hyrule-guest-result/config.json"))
+    async with session_factory() as session:
+        await accept_guest_result(
+            session, report["url"].rsplit("/", 3)[1],
+            report["url"].rsplit("/", 1)[1], report["token"],
+            GuestResult(outcome="succeeded", stage="cloud_init", exit_code=0),
+        )
+        await session.commit()
 
 
 @pytest_asyncio.fixture
@@ -180,6 +198,7 @@ async def test_restarted_provisioner_replaces_untracked_exact_label_clone(
 
         async def create_vm(self, **kwargs) -> str:
             self.created.append(kwargs)
+            await _complete_test_guest(session_factory, kwargs)
             return "fresh-clone"
 
         async def get_vm_ipv6(self, vm_uuid: str) -> str | None:
@@ -238,10 +257,14 @@ async def test_restarted_provisioner_replaces_untracked_exact_label_clone(
 
 
 class _ProvisionStubXCPNG:
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
     async def find_vm_ids_by_name_label(self, name_label: str) -> list[str]:
         return []
 
     async def create_vm(self, **kwargs) -> str:
+        await _complete_test_guest(self.session_factory, kwargs)
         return "clone-uuid"
 
     async def get_vm_ipv6(self, vm_uuid: str) -> str | None:
@@ -263,7 +286,7 @@ async def _run_provision(session_factory, monkeypatch, vm_id: str) -> Orchestrat
     cfg = HyruleConfig()
     cfg.xcpng.templates["debian-13"] = "template"
     orch = Orchestrator(cfg, session_factory)
-    orch.xcpng = _ProvisionStubXCPNG()
+    orch.xcpng = _ProvisionStubXCPNG(session_factory)
     orch.dns = _ProvisionStubDNS()
 
     async def probe_ssh(ipv6: str) -> bool:
@@ -805,7 +828,7 @@ async def test_reservation_lifecycle(session_factory, monkeypatch):
     cfg = HyruleConfig()
     orch = Orchestrator(cfg, session_factory)
     spawned: list[str] = []
-    monkeypatch.setattr(orch, "_spawn_provisioning", spawned.append)
+    monkeypatch.setattr(orch, "_spawn_provisioning", AsyncMock(side_effect=spawned.append))
 
     order = VMCreateRequest(duration_days=1, os="debian-13", ssh_pubkey="ssh-ed25519 AAAA t")
 
@@ -831,6 +854,60 @@ async def test_reservation_lifecycle(session_factory, monkeypatch):
     await orch.release_vm_reservation(reserved2.vm_id)
     async with session_factory() as session:
         assert await session.get(VMRow, reserved2.vm_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_reservation_activation_rechecks_owner_and_persists_waiver_atomically(
+    session_factory,
+):
+    from hyrule_cloud.models import VMCreateRequest
+
+    account_id = "H1234567890"
+    async with session_factory() as session:
+        session.add(AccountRow(account_id=account_id, password_hash="unused"))
+        await session.commit()
+
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    order = VMCreateRequest(
+        duration_days=1,
+        os="debian-13",
+        ssh_pubkey="ssh-ed25519 AAAA t",
+    )
+    reserved, _ = await orch.reserve_vm(order, owner_account_id=account_id)
+    activated = await orch.activate_vm_reservation(
+        reserved.vm_id,
+        owner_wallet=f"admin:{account_id}",
+        payment_tx="admin_bypass_test",
+        start_provisioning=False,
+        retail_amount=Decimal("1.25"),
+        admin_waived=True,
+    )
+    assert activated is not None
+    assert activated.billing_mode == "admin_waived"
+    assert activated.retail_cost_total == Decimal("1.25")
+    assert activated.cost_total == Decimal("0")
+
+    fenced, _ = await orch.reserve_vm(order, owner_account_id=account_id)
+    async with session_factory() as session:
+        owner = await session.get(AccountRow, account_id)
+        assert owner is not None
+        owner.disabled_at = datetime.now(UTC)
+        await session.commit()
+
+    with pytest.raises(AccountDisabledError):
+        await orch.activate_vm_reservation(
+            fenced.vm_id,
+            owner_wallet="0xPAYER",
+            payment_tx="0xSETTLED",
+            start_provisioning=False,
+            retail_amount=Decimal("1.25"),
+        )
+
+    async with session_factory() as session:
+        unchanged = await session.get(VMRow, fenced.vm_id)
+        assert unchanged is not None
+        assert unchanged.owner_wallet == ""
+        assert unchanged.payment_tx is None
 
 
 @pytest.mark.asyncio
@@ -892,3 +969,35 @@ async def test_expiry_sweep_purges_abandoned_reservations(session_factory):
     async with session_factory() as session:
         assert await session.get(VMRow, "vm_stale_res") is None
         assert await session.get(VMRow, "vm_fresh_res") is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('account_state', ['disabled', 'missing', 'enabled'])
+async def test_anonymous_activation_validates_incoming_account(session_factory, account_state):
+    account_id = 'H1234567890'
+    async with session_factory.begin() as session:
+        if account_state != 'missing':
+            session.add(AccountRow(account_id=account_id, password_hash='fixture',
+                                   disabled_at=datetime.now(UTC) if account_state == 'disabled' else None))
+        session.add(VMRow(vm_id='vm_anon_binding', owner_wallet='', status=VMStatus.PROVISIONING))
+    orch = Orchestrator(HyruleConfig(), session_factory)
+    try:
+        if account_state == 'enabled':
+            result = await orch.activate_vm_reservation(
+                'vm_anon_binding', 'fixture-payer', payment_tx='fixture-settlement',
+                owner_account_id=account_id, start_provisioning=False, retail_amount=Decimal('1.00'),
+            )
+            assert result.owner_account_id == account_id
+        else:
+            with pytest.raises(AccountDisabledError):
+                await orch.activate_vm_reservation(
+                    'vm_anon_binding', 'fixture-payer', payment_tx='fixture-settlement',
+                    owner_account_id=account_id, start_provisioning=False, retail_amount=Decimal('1.00'),
+                )
+        async with session_factory() as session:
+            row = await session.get(VMRow, 'vm_anon_binding')
+            assert row.owner_account_id == (account_id if account_state == 'enabled' else None)
+            assert row.owner_wallet == ('fixture-payer' if account_state == 'enabled' else '')
+            assert row.payment_tx == ('fixture-settlement' if account_state == 'enabled' else None)
+    finally:
+        await orch.shutdown()

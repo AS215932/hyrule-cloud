@@ -17,16 +17,20 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
+from weakref import WeakValueDictionary
 
 import structlog
 from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
-from hyrule_cloud.db import CryptoIntentRow, DomainOrderRow
+from hyrule_cloud.db import AccountRow, CryptoIntentRow, DomainOrderRow
 from hyrule_cloud.models import (
     CryptoIntentStatus,
     DomainMode,
@@ -34,8 +38,10 @@ from hyrule_cloud.models import (
     VMCreateRequest,
     generate_vm_id,
 )
+from hyrule_cloud.orchestrator import AccountDisabledError
 from hyrule_cloud.providers.native_crypto import AddressScanResult, NativeCryptoProvider
 from hyrule_cloud.providers.rates import RateProvider
+from hyrule_cloud.services.account_deletion import lock_account_lifecycle
 from hyrule_cloud.services.quotes import (
     claim_quote,
     get_quote,
@@ -67,6 +73,23 @@ EXACT_AMOUNT_TOLERANCE = Decimal("0.001")  # 0.1%
 # VM before another poller treats PROVISIONING as an interrupted handoff.
 VM_PROVISIONING_RECOVERY_DELAY = timedelta(minutes=5)
 
+# SQLite ignores SELECT ... FOR UPDATE, so concurrent poll tasks in the same
+# process also need a keyed lock. Weak values avoid retaining one lock for
+# every intent ever seen; PostgreSQL row locks remain the cross-process fence.
+_poll_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+_guarded_native_accounts: ContextVar[frozenset[tuple[int, int, str]]] = ContextVar(
+    "guarded_native_accounts",
+    default=frozenset(),
+)
+
+
+def _poll_lock(intent_id: str) -> asyncio.Lock:
+    lock = _poll_locks.get(intent_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _poll_locks[intent_id] = lock
+    return lock
+
 
 class _NativeHandoffFencedError(RuntimeError):
     """The recovery scanner superseded an in-flight settlement worker."""
@@ -96,7 +119,75 @@ class IntentExistsError(Exception):
         self.existing = existing
 
 
+@asynccontextmanager
+async def native_intent_account_guard(
+    session_factory: async_sessionmaker,
+    owner_account_id: str | None,
+) -> AsyncIterator[None]:
+    """Fence account disable/delete through native address persistence."""
+    if owner_account_id is None:
+        yield
+        return
+    guarded = _guarded_native_accounts.get()
+    # Child tasks inherit ContextVars but must acquire their own transaction.
+    guard_key = (id(asyncio.current_task()), id(session_factory), owner_account_id)
+    if guard_key in guarded:
+        yield
+        return
+    async with session_factory() as session:
+        await lock_account_lifecycle(session, owner_account_id, shared=True)
+        owner = await session.scalar(
+            select(AccountRow)
+            .where(AccountRow.account_id == owner_account_id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+        if owner is None or owner.disabled_at is not None:
+            raise AccountDisabledError("Account access is disabled")
+        token = _guarded_native_accounts.set(guarded | {guard_key})
+        try:
+            yield
+        finally:
+            _guarded_native_accounts.reset(token)
+
+
 async def create_intent(
+    *,
+    session_factory: async_sessionmaker,
+    provider: NativeCryptoProvider,
+    rates: RateProvider,
+    asset: str,
+    order_payload: BaseModel | dict[str, Any],
+    amount_usd: Decimal,
+    client_order_id: str | None,
+    owner_account_id: str | None,
+    expires_at: datetime | None = None,
+    resource_type: str = "vm",
+    resource_id: str | None = None,
+    refund_address: str | None = None,
+    planned_vm_id: str | None = None,
+    pricing_snapshot: dict[str, Any] | None = None,
+) -> CryptoIntentRow:
+    async with native_intent_account_guard(session_factory, owner_account_id):
+        return await _create_intent_unfenced(
+            session_factory=session_factory,
+            provider=provider,
+            rates=rates,
+            asset=asset,
+            order_payload=order_payload,
+            amount_usd=amount_usd,
+            client_order_id=client_order_id,
+            owner_account_id=owner_account_id,
+            expires_at=expires_at,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            refund_address=refund_address,
+            planned_vm_id=planned_vm_id,
+            pricing_snapshot=pricing_snapshot,
+        )
+
+
+async def _create_intent_unfenced(
     *,
     session_factory: async_sessionmaker,
     provider: NativeCryptoProvider,
@@ -251,9 +342,36 @@ async def poll_one_intent(
         log.exception("intent_scan_failed", intent_id=intent_id, asset=row.asset)
         return row
 
+    async with _poll_lock(intent_id):
+        return await _apply_intent_scan(
+            intent_id=intent_id,
+            session_factory=session_factory,
+            scan=scan,
+            min_confs=min_confs,
+            rates=rates,
+            orch=orch,
+        )
+
+
+async def _apply_intent_scan(
+    *,
+    intent_id: str,
+    session_factory: async_sessionmaker,
+    scan: AddressScanResult,
+    min_confs: int,
+    rates: RateProvider,
+    orch: Orchestrator,
+) -> CryptoIntentRow | None:
+    """Persist one scan and complete any settlement under the intent fence."""
     # Apply LENIENT policy and persist.
     async with session_factory() as db:
-        row = await db.get(CryptoIntentRow, intent_id)
+        row = (
+            await db.execute(
+                select(CryptoIntentRow)
+                .where(CryptoIntentRow.intent_id == intent_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         if row is None:
             return None
         # A concurrent poll may have completed while this network scan was in
@@ -556,6 +674,17 @@ async def _trigger_provisioning(
                 pricing_snapshot=row.pricing_snapshot,
                 legacy_billing=row.pricing_snapshot is None,
             )
+        except AccountDisabledError:
+            log.warning(
+                "native_vm_owner_disabled_at_settlement",
+                intent_id=intent_id,
+            )
+            await orch.record_native_intent_refund(
+                intent_id,
+                reason="account_disabled_at_settlement",
+                vm_id=planned_vm_id,
+            )
+            return
         except RuntimeError:
             log.warning(
                 "native_vm_capacity_unavailable_at_settlement",
@@ -617,11 +746,28 @@ async def _trigger_provisioning(
         # Convert the unpaid reservation into a paid VM but DON'T start
         # provisioning yet: link the intent first, so an immediate XO/API
         # failure can always find the paying record and issue a refund.
-        vm_row = await orch.activate_vm_reservation(
-            reservation_row.vm_id,
-            row.intent_id,
-            start_provisioning=False,
-        )
+        try:
+            vm_row = await orch.activate_vm_reservation(
+                reservation_row.vm_id,
+                row.intent_id,
+                payment_tx=row.tx_hash,
+                start_provisioning=False,
+                retail_amount=row.amount_usd,
+            )
+        except AccountDisabledError:
+            log.warning(
+                "native_vm_owner_disabled_before_activation",
+                intent_id=intent_id,
+            )
+            if claimed_domain and domains is not None:
+                await domains.release_vm_attachment_claim(planned_vm_id)
+            await orch.release_vm_reservation(planned_vm_id)
+            await orch.record_native_intent_refund(
+                intent_id,
+                reason="account_disabled_at_settlement",
+                vm_id=planned_vm_id,
+            )
+            return
         if vm_row is None:
             raise RuntimeError("native VM reservation disappeared before activation")
         await _require_current_vm_handoff(
@@ -708,7 +854,7 @@ async def _trigger_provisioning(
                 raise _NativeHandoffFencedError
             await db.commit()
         # The intent↔vm link is committed; now it is safe to provision.
-        orch.start_provisioning(vm_row.vm_id)
+        await orch.start_provisioning(vm_row.vm_id)
         log.info("intent_provisioned", intent_id=intent_id, vm_id=vm_row.vm_id)
     except _NativeHandoffFencedError:
         log.warning(

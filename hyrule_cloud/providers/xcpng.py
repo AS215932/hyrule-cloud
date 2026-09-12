@@ -668,7 +668,15 @@ disklabel "$disk"
 
     async def destroy_vm(self, vm_uuid: str) -> None:
         """Destroy a VM and all associated VDIs."""
-        await self._xo_call("vm.delete", id=vm_uuid)
+        try:
+            await self._xo_call("vm.delete", id=vm_uuid)
+        except Exception:
+            # A worker may have lost its reply after XO completed deletion.
+            # Only a successful inventory query confirming this exact UUID is
+            # absent can turn that ambiguous failure into idempotent success.
+            objects = await self._xo_objects(id=vm_uuid)
+            if not isinstance(objects, dict) or vm_uuid in objects:
+                raise
         log.info("vm_destroyed", uuid=vm_uuid)
 
     async def list_templates(self) -> dict[str, str]:

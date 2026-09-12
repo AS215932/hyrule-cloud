@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import secrets
 import string
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, update
@@ -24,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from hyrule_cloud.db import SessionRow
 
 SESSION_COOKIE_NAME = "hyr_sess"
+CSRF_COOKIE_NAME = "hyr_csrf"
 SESSION_TTL = timedelta(days=30)
 _SESSION_ALPHABET = string.ascii_letters + string.digits
 
@@ -33,9 +35,24 @@ def generate_session_token() -> str:
     return "hyr_sess_" + "".join(secrets.choice(_SESSION_ALPHABET) for _ in range(43))
 
 
+def generate_csrf_token() -> str:
+    """Independent 256-bit token readable by same-origin browser code."""
+    return "hyr_csrf_" + "".join(secrets.choice(_SESSION_ALPHABET) for _ in range(43))
+
+
 def hash_session_token(token: str) -> str:
     """sha256 hex. Session tokens are high-entropy, fast hash is fine."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def hash_csrf_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class SessionCredentials:
+    token: str
+    csrf_token: str
 
 
 def constant_time_eq(a: str, b: str) -> bool:
@@ -58,11 +75,13 @@ async def create_session(
     *,
     user_agent: str | None = None,
     ip_prefix_hash: str | None = None,
-) -> str:
-    """Insert a fresh session row and return the cleartext token."""
+) -> SessionCredentials:
+    """Insert a fresh session row and return its one-time cookie values."""
     token = generate_session_token()
+    csrf_token = generate_csrf_token()
     row = SessionRow(
         token_hash=hash_session_token(token),
+        csrf_token_hash=hash_csrf_token(csrf_token),
         account_id=account_id,
         expires_at=_now() + SESSION_TTL,
         user_agent=(user_agent or "")[:256] or None,
@@ -70,7 +89,7 @@ async def create_session(
     )
     session.add(row)
     await session.commit()
-    return token
+    return SessionCredentials(token=token, csrf_token=csrf_token)
 
 
 async def lookup_session(
@@ -147,6 +166,18 @@ def cookie_kwargs_for_set(*, secure: bool = True) -> dict:
         "httponly": True,
         "secure": secure,
         "samesite": "lax",
+        "path": "/",
+        "max_age": int(SESSION_TTL.total_seconds()),
+    }
+
+
+def csrf_cookie_kwargs_for_set(*, secure: bool = True) -> dict:
+    """Readable double-submit cookie bound to the opaque server session."""
+    return {
+        "key": CSRF_COOKIE_NAME,
+        "httponly": False,
+        "secure": secure,
+        "samesite": "strict",
         "path": "/",
         "max_age": int(SESSION_TTL.total_seconds()),
     }
