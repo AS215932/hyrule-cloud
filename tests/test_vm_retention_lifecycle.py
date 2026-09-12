@@ -141,3 +141,16 @@ async def test_expiry_skips_completed_retention_but_retries_prepared_and_allows_
             assert (await session.get(VMRetentionRow, 'vm_lifecycle')).retained_at == retained_at
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_retention_reconciliation_cannot_start_fresh_deletion():
+    orch, engine = await _stored_vm(VMStatus.SUSPENDED)
+    try:
+        assert not await orch.destroy_vm('vm_lifecycle', reconcile_retention=True)
+        orch.xcpng.destroy_vm.assert_not_awaited()
+        async with orch.db() as session:
+            vm = await session.get(VMRow, 'vm_lifecycle')
+            assert vm.deletion_started_at is None
+    finally:
+        await engine.dispose()

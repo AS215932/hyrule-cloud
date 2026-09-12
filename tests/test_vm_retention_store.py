@@ -55,3 +55,36 @@ async def test_retention_is_transactional_and_survives_resource_deletion(rollbac
             assert saved.manifest['mode'] == 'whole_vm'
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_restore_authorization_preserves_changed_expiry():
+    from uuid import uuid4
+
+    from hyrule_cloud.services.vm_retention import authorize_restore, prepare_restore
+    from tests.test_vm_expiry_renewal import _stored_vm
+
+    orch, engine = await _stored_vm(VMStatus.SUSPENDED)
+    now = datetime.now(UTC)
+    try:
+        async with orch.db.begin() as session:
+            vm = await session.get(VMRow, 'vm_lifecycle')
+            vm.deletion_started_at = now
+            retained = await prepare_retention(session, vm.vm_id,
+                VMProtectionManifest(vm.xcpng_uuid, ('disk',), (), False, '', ()), now + timedelta(days=30))
+            retained.state = 'retained'
+            operation = await prepare_restore(session, vm, operation_id=str(uuid4()), actor_account_id='fixture-admin', days=7, reason='fixture restore')
+            await session.commit()
+        async with orch.db.begin() as session:
+            vm = await session.get(VMRow, 'vm_lifecycle')
+            vm.expires_at = now + timedelta(days=60)
+        async with orch.db.begin() as session:
+            from hyrule_cloud.db import VMRestoreRow
+            vm = await session.get(VMRow, 'vm_lifecycle')
+            operation = await session.get(VMRestoreRow, operation.operation_id)
+            with pytest.raises(ValueError, match='Recovery identity'):
+                await authorize_restore(session, vm, operation)
+            assert vm.expires_at.replace(tzinfo=UTC) == now + timedelta(days=60)
+            assert operation.state == 'pending'
+    finally:
+        await engine.dispose()

@@ -115,6 +115,8 @@ async def authorize_restore(session: AsyncSession, vm: VMRow, operation: VMResto
             or retained.state != "restoring" or retained.restore_operation_id != operation.operation_id
             or vm.deletion_started_at is None or vm.xcpng_uuid != retained.source_vm_uuid
             or vm.owner_account_id != retained.owner_account_id or vm.owner_wallet != retained.owner_wallet
+            or vm.expires_at is None
+            or _aware(vm.expires_at) != _aware(datetime.fromisoformat(operation.retention_snapshot["previous_expiry"]))
             or _aware(operation.new_expiry) <= datetime.now(UTC)):
         raise ValueError("Recovery identity or authorization deadline changed")
     vm.expires_at = operation.new_expiry
