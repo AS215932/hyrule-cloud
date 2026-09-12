@@ -3016,6 +3016,9 @@ async def test_retention_status_exposes_pending_retry_without_sensitive_manifest
             response = await client.get(path)
             assert response.status_code == 200
             payload = response.json()
+            public_fields = {'operation_id', 'state', 'days', 'reason', 'new_expiry', 'created_at', 'completed_at'}
+            assert set(payload['active_recovery']) == public_fields
+            assert set(payload['history'][0]) == public_fields
             assert payload['active_recovery']['operation_id'] == 'pending-old'
             assert payload['active_recovery']['days'] == 7
             assert payload['active_recovery']['reason'] == 'Operator recovery'

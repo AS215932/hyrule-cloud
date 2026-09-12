@@ -62,3 +62,45 @@ async def test_verification_persists_failures_bounds_work_and_recovers_after_res
         orch.xcpng.start_vm.assert_not_awaited()
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_slow_verification_times_out_and_persists_retry(monkeypatch):
+    import asyncio
+
+    orch, engine = await _stored_vm()
+    orch.config = HyruleConfig()
+    now = datetime.now(UTC)
+    entered = asyncio.Event()
+
+    async def slow_provider(manifest):
+        entered.set()
+        await asyncio.Event().wait()
+
+    original_timeout = asyncio.timeout
+
+    def short_test_timeout(seconds):
+        assert seconds == 30
+        return original_timeout(0.01)
+
+    orch.xcpng.verify_retained_vm = AsyncMock(side_effect=slow_provider)
+    try:
+        async with orch.db.begin() as session:
+            vm = await session.get(VMRow, 'vm_lifecycle')
+            vm.status = 'suspended'
+            vm.deletion_started_at = now
+            retained = await prepare_retention(session, vm.vm_id,
+                VMProtectionManifest(vm.xcpng_uuid, ('disk',), (), False, '', ()), now + timedelta(days=30))
+            retained.state = 'retained'
+        monkeypatch.setattr(asyncio, 'timeout', short_test_timeout)
+        assert await orch.verify_retained_vms() == 1
+        assert entered.is_set()
+        async with orch.db() as session:
+            retained = await session.get(VMRetentionRow, 'vm_lifecycle')
+            assert retained.verification_error == 'provider_verification_failed'
+            assert retained.last_verified_at is None
+            assert retained.next_verification_at.replace(tzinfo=UTC) > now
+        assert await orch.verify_retained_vms() == 0
+        orch.xcpng.verify_retained_vm.assert_awaited_once()
+    finally:
+        await engine.dispose()
