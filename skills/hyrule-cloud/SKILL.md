@@ -422,7 +422,7 @@ meaning). Treat unknown keys as informational.
 | `ssh_reachable` / `ssh_unreachable` | TCP :22 answered / did not answer within the check window. `ssh_unreachable` is not fatal — the VM is still delivered. |
 | `custom_domain_attached` / `custom_domain_attach_failed` | Custom domain pointed at the VM, or attachment deferred to retry. |
 | `ready` | Terminal success. `detail` carries hostname, ipv6, `dns_aaaa_verified`, `ssh_reachable`. |
-| `provisioning_failed` | Terminal failure. `message` is the customer-facing reason; a paid VM is refunded. |
+| `provisioning_failed` | Terminal failure. `message` is the customer-facing reason; check separate payment/refund evidence. |
 
 What this endpoint **cannot** tell you:
 
@@ -498,9 +498,11 @@ getent ahosts deb.debian.org        # must return addresses
 ```
 
 `GET /v1/vm/{vm_id}/status` reports this as `dns_resolution_status`
-(`passed` | `failed` | `not_run`). A VM whose resolver does not answer is
-returned as `launch_proof_status: degraded` rather than `provisioned` — it is
-reachable over SSH but cannot resolve names.
+(`passed` | `failed` | `not_run`) for Hyrule's central launch-time resolver
+probe, not a query inside the guest. A failed probe yields
+`launch_proof_status: degraded`; differing routes or ACLs can affect this
+result. Verify DNS inside your VM before concluding it cannot resolve names,
+and verify other guests before inferring fleet-wide impact.
 
 To override with your own DNS64 resolver (e.g. Google's public DNS64):
 

@@ -5,10 +5,18 @@ readiness gates, domain-registration settlement recovery and provisioning events
 alongside the admin PR's audited operations, session CSRF protection and explicit
 payment-waiver accounting. Payment waivers remain disabled by default.
 
-The admin migration is revision `023`, currently following `020`. Revision `017`
+The local migration chain is `020 → 021 → 022 → 023 → 024 → 025`; the admin migration `023`
+follows the integrated guest-receipt migration `022` and expiry deletion-claim migration `021`. Revision `017`
 is already the deployed provisioning-events migration and must not be reused.
-Before merging with pending expiry or guest-receipt migrations, reconcile the
-parent to produce a single ordered head and rerun the real PostgreSQL checks.
+The retention migration `024` follows the admin migration and preserves active
+retention and historical recovery evidence; its downgrade refuses to erase either.
+Migration `025` adds persisted read-only verification evidence and retry scheduling.
+The integrated guest recovery worker scans durable dispatch receipts. Admin
+account enable and ownership-transfer recovery stage that receipt in the same
+transaction as a legacy UUID-less VM's transition to PROVISIONING, then schedule
+the task after commit. A process exit between commit and scheduling leaves the
+restart discoverable. Before reconciling another migration, preserve a single
+ordered head and rerun the real PostgreSQL checks.
 Do not stamp over a conflicting migration history.
 
 Use the infrastructure repository's app promotion workflow and pinned SHA after
@@ -30,6 +38,28 @@ before considering a schema downgrade. A compatible application rollback that
 retains the schema should be evaluated first. Never use the disposable test's
 database-reset procedure on production.
 
-This foundation does not implement the operator expiry-extension endpoint from
-issue #110. That endpoint still needs explicit authorization, step-up checks,
-audit evidence and serialization with expiry/deletion before rollout.
+The operator endpoint `POST /v1/admin/vms/{vm_id}/actions/extend` implements
+issue #110 expiry extension with current administrator authorization, CSRF,
+step-up authentication, reason/audit evidence and serialization with deletion.
+After promotion, verify rejection of unauthenticated or revoked administrators
+and deletion-claimed VMs, the recorded expiry and audit, and unchanged guest
+power state. The endpoint does not charge a customer or start the guest.
+
+### Administrator revocation during a request
+
+Privileged mutations reload the actor inside their accepting transaction. They
+lock the enabled-administrator set in account-ID order before actor, owner,
+target and resource locks, and refuse a missing, disabled or demoted actor.
+These account locks use PostgreSQL `FOR NO KEY UPDATE` so payment quota foreign-key
+checks can still finish. Power actions hold the fence through provider dispatch.
+Deletion claims and domain jobs validate before durable acceptance; already
+accepted work remains eligible for worker retries after later revocation.
+DNS changes hold the actor fence through the provider call. Request audits commit
+independently before external effects while the accepting transaction retains the
+actor fence.
+
+The opt-in `tests/test_admin_revocation_postgres.py` requires a fresh local
+`admin_revocation_test` database via `HCP_ADMIN_REVOCATION_TEST_DATABASE_URL`.
+It observes actual PostgreSQL lock waiters for dispatch-first and demotion-first
+orderings. Run the existing admin-expiry PostgreSQL test too: it verifies that
+these locks do not block the separate payment-quota foreign-key transaction.

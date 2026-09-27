@@ -108,6 +108,7 @@ def test_can_manage_vm_rejects_wrong_token():
 
 
 class _Cfg:
+    vm_grace_period_hours = 48
     class Payment:
         price_vm_xs = Decimal("0.05")
         price_vm_sm = Decimal("0.10")
@@ -158,11 +159,11 @@ class _OrchOK:
             return _row_with_hash(hash_anon_token(_TOKEN_OK))
         return None
 
-    async def reboot_vm(self, vm_id):
+    async def reboot_vm(self, vm_id, *, management_identity=None):
         self.rebooted.append(vm_id)
         return True
 
-    async def destroy_vm(self, vm_id):
+    async def destroy_vm(self, vm_id, *, management_identity=None):
         self.destroyed.append(vm_id)
         return True
 
@@ -175,7 +176,7 @@ class _OrchLegacy:
             return _row_with_hash(None)
         return None
 
-    async def reboot_vm(self, vm_id):
+    async def reboot_vm(self, vm_id, *, management_identity=None):
         return True
 
 
@@ -385,7 +386,7 @@ class _OrchForCreate:
             vm_cost="$1.00", domain_cost="$0.00", total="$1.00",
         )
 
-    def start_provisioning(self, vm_id):
+    async def start_provisioning(self, vm_id):
         self.provisioning_started = getattr(self, "provisioning_started", [])
         self.provisioning_started.append(vm_id)
 

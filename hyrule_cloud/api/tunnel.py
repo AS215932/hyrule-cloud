@@ -27,6 +27,7 @@ from hyrule_cloud.api._contract import config_from_request, not_implemented, pay
 from hyrule_cloud.config import HyruleConfig
 from hyrule_cloud.db import ReverseTunnelRow
 from hyrule_cloud.middleware.anon_token import hash_anon_token
+from hyrule_cloud.middleware.x402 import external_admin_waiver_guard
 from hyrule_cloud.models import (
     CapabilityEndpoint,
     PaidEndpointQuote,
@@ -174,7 +175,7 @@ async def create_tunnel(body: TunnelCreateRequest, request: Request) -> TunnelRe
     idem = _idempotency_key(request)
     req_hash = _request_hash(body)
 
-    async with _tunnel_authorization_guard(request):
+    async with _tunnel_authorization_guard(request), external_admin_waiver_guard(request, gate):
         # Idempotent replay: a prior attempt with this exact payment authorization
         # already provisioned a tunnel. Recover its one-time token from the daemon
         # (create is idempotent on tunnel_id) so a client that lost the original
@@ -296,7 +297,7 @@ async def extend_tunnel(tunnel_id: str, body: TunnelExtendRequest, request: Requ
     _require_hours_in_bounds(body.hours, cfg)
     amount = payment_price(request, "price_tunnel_hourly", "0.05") * body.hours
 
-    async with _tunnel_authorization_guard(request):
+    async with _tunnel_authorization_guard(request), external_admin_waiver_guard(request, gate):
         # Pre-flight: confirm the daemon still has this lease and is reachable
         # BEFORE charging, so a daemon-down / lease-gone extend never charges for
         # time that can't be delivered.
@@ -338,6 +339,8 @@ async def _extend_failed_after_payment(
     the refund was durably 'recorded' — we always CRITICAL-log the obligation so
     an operator/reconciler can pick it up, and tell the customer a refund is owed
     and has been logged, not that it succeeded."""
+    if getattr(request.state, "payment_mode", None) in {"admin-bypass", "dev-bypass"}:
+        return HTTPException(status, "extend failed; no payment was collected")
     await _record_extend_refund(request, gate, tunnel_id, amount, payer)
     log.critical("tunnel_extend_refund_owed", tunnel_id=tunnel_id, amount=str(amount), payer=payer)
     return HTTPException(status, "extend failed after payment; a refund is owed and has been logged for manual processing")

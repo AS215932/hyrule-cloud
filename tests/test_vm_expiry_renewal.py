@@ -1,0 +1,463 @@
+"""Renewal must win over an expiry sweep that read an older deadline."""
+
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from hyrule_cloud.db import Base, VMRow
+from hyrule_cloud.models import VMStatus
+from hyrule_cloud.orchestrator import Orchestrator
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expired_days", [1, 3])
+async def test_committed_renewal_is_rechecked_before_expiry_action(expired_days):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC)
+    vm_id = "vm_renewed_before_action"
+    async with sessions() as session:
+        session.add(VMRow(
+            vm_id=vm_id, owner_wallet="test-owner", status=VMStatus.RUNNING,
+            xcpng_uuid="test-guest", ssh_pubkey="ssh-ed25519 test",
+            expires_at=now - timedelta(days=expired_days),
+        ))
+        await session.commit()
+
+    # Commit a renewal as the sweep closes the transaction that selected its
+    # candidates. This models a separate API process, without touching a guest.
+    class RenewAfterSelection:
+        def __init__(self):
+            self.session = sessions()
+            self.selected = False
+
+        async def __aenter__(self):
+            await self.session.__aenter__()
+            original_execute = self.session.execute
+
+            async def execute(statement, *args, **kwargs):
+                result = await original_execute(statement, *args, **kwargs)
+                if "vms.expires_at <" in str(statement):
+                    self.selected = True
+                return result
+
+            self.session.execute = execute
+            return self.session
+
+        async def __aexit__(self, *args):
+            await self.session.__aexit__(*args)
+            if self.selected:
+                async with sessions() as renewal:
+                    row = await renewal.get(VMRow, vm_id)
+                    row.expires_at = now + timedelta(days=30)
+                    await renewal.commit()
+
+    orch = object.__new__(Orchestrator)
+    orch.db = RenewAfterSelection
+    orch.config = SimpleNamespace(vm_grace_period_hours=48)
+    orch.xcpng = SimpleNamespace(suspend_vm=AsyncMock(), destroy_vm=AsyncMock())
+    try:
+        await orch.check_expiries()
+        orch.xcpng.suspend_vm.assert_not_awaited()
+        orch.xcpng.destroy_vm.assert_not_awaited()
+        async with sessions() as session:
+            row = await session.get(VMRow, vm_id)
+            assert row.status == VMStatus.RUNNING
+    finally:
+        await engine.dispose()
+
+
+async def _stored_vm(status=VMStatus.RUNNING):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessions() as session:
+        session.add(VMRow(
+            vm_id="vm_lifecycle", owner_wallet="test-owner", status=status,
+            xcpng_uuid="test-guest", ssh_pubkey="ssh-ed25519 test",
+            expires_at=datetime.now(UTC) - timedelta(days=3),
+        ))
+        await session.commit()
+    orch = object.__new__(Orchestrator)
+    orch.db = sessions
+    orch.config = SimpleNamespace(vm_grace_period_hours=48)
+    orch.xcpng = SimpleNamespace(
+        destroy_vm=AsyncMock(), suspend_vm=AsyncMock(),
+        get_vm_power_state=AsyncMock(return_value="Halted"), start_vm=AsyncMock(),
+    )
+    return orch, engine
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_uuid", [None, "test-guest"])
+async def test_expiry_keeps_provisioning_guest_recoverable(provider_uuid):
+    orch, engine = await _stored_vm(VMStatus.PROVISIONING)
+    try:
+        async with orch.db.begin() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            row.xcpng_uuid = provider_uuid
+            row.expires_at = datetime.now(UTC) - timedelta(days=1)
+
+        await orch.check_expiries()
+
+        async with orch.db() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            assert row.status == VMStatus.PROVISIONING
+            assert not orch.vm_can_extend(row)
+            assert row.suspension_reason == ("expired" if provider_uuid else None)
+        if provider_uuid:
+            orch.xcpng.suspend_vm.assert_awaited_once_with(provider_uuid)
+        else:
+            orch.xcpng.suspend_vm.assert_not_awaited()
+        orch.xcpng.destroy_vm.assert_not_awaited()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_delete_retains_claim_and_refuses_renewal_after_restart():
+    orch, engine = await _stored_vm()
+    orch.xcpng.destroy_vm.side_effect = RuntimeError("provider unavailable")
+    try:
+        with pytest.raises(RuntimeError, match="provider unavailable"):
+            await orch.destroy_vm("vm_lifecycle")
+        restarted = object.__new__(Orchestrator)
+        restarted.db = orch.db
+        async with restarted.locked_vm("vm_lifecycle") as (_, row):
+            assert row.deletion_started_at is not None
+            assert not restarted.vm_can_extend(row)
+        assert await restarted.extend_vm("vm_lifecycle", 5) is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_resume_preserves_committed_extension():
+    orch, engine = await _stored_vm(VMStatus.SUSPENDED)
+    orch.xcpng.start_vm.side_effect = RuntimeError("provider unavailable")
+    before = datetime.now(UTC)
+    try:
+        updated = await orch.extend_vm("vm_lifecycle", 5)
+        assert updated is not None and updated.status == VMStatus.SUSPENDED
+        async with orch.db() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            assert row.expires_at.replace(tzinfo=UTC) >= before + timedelta(days=5)
+            assert row.status == VMStatus.SUSPENDED
+            assert row.deletion_started_at is None
+            assert row.metadata_["extension_resume_pending"]["xcpng_uuid"] == "test-guest"
+            session.add(
+                VMRow(
+                    vm_id="vm_unrelated_suspension",
+                    owner_wallet="test-owner",
+                    status=VMStatus.SUSPENDED,
+                    suspension_reason="manual_admin",
+                )
+            )
+            await session.commit()
+        orch.xcpng.start_vm.side_effect = None
+        original_reconcile = orch._reconcile_extension_resume
+        orch._reconcile_extension_resume = AsyncMock(wraps=original_reconcile)
+        assert await orch.reconcile_extension_resumes() == 1
+        orch._reconcile_extension_resume.assert_awaited_once_with("vm_lifecycle")
+        async with orch.db() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            assert row.status == VMStatus.RUNNING
+            assert not (row.metadata_ or {}).get("extension_resume_pending")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_extension_resume_batches_advance_past_failing_first_page():
+    orch, engine = await _stored_vm(VMStatus.SUSPENDED)
+    orch._extension_resume_cursor = ""
+    orch._reconcile_extension_resume = AsyncMock()
+    try:
+        async with orch.db.begin() as session:
+            for index in range(101):
+                session.add(VMRow(
+                    vm_id=f"vm_pending_{index:03d}", owner_wallet="test-owner",
+                    status=VMStatus.SUSPENDED,
+                    metadata_={"extension_resume_pending": {"xcpng_uuid": "guest"}},
+                ))
+        assert await orch.reconcile_extension_resumes() == 0
+        assert orch._reconcile_extension_resume.await_count == 100
+        assert await orch.reconcile_extension_resumes() == 0
+        assert orch._reconcile_extension_resume.await_count == 101
+        assert orch._reconcile_extension_resume.await_args_list[-1].args == ("vm_pending_100",)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_suspend_is_not_recorded_as_suspended():
+    orch, engine = await _stored_vm()
+    async with orch.db() as session:
+        row = await session.get(VMRow, "vm_lifecycle")
+        row.expires_at = datetime.now(UTC) - timedelta(hours=1)
+        await session.commit()
+    orch.xcpng.suspend_vm.side_effect = RuntimeError("provider unavailable")
+    try:
+        await orch.check_expiries()
+        async with orch.db() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            assert row.status == VMStatus.RUNNING
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_destroyed_vm_retries_quarantined_dns_cleanup_without_deleting_again():
+    orch, engine = await _stored_vm()
+    orch.dns = SimpleNamespace(delete_aaaa=AsyncMock(side_effect=RuntimeError("DNS unavailable")))
+    async with orch.db() as session:
+        row = await session.get(VMRow, "vm_lifecycle")
+        row.hostname = "test.deploy.hyrule.host"
+        row.ipv6_prefix_index = 5
+        row.ipv6_prefix = "2001:db8:5::/64"
+        await session.commit()
+    try:
+        assert await orch.destroy_vm("vm_lifecycle")
+        async with orch.db() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            assert row.status == VMStatus.DESTROYED
+            assert row.ipv6_prefix_index == 5
+        orch.dns.delete_aaaa.side_effect = None
+        await orch.check_expiries()
+        orch.xcpng.destroy_vm.assert_awaited_once()
+        async with orch.db() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            assert row.ipv6_prefix_index is None
+            assert row.ipv6_prefix is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_worker_resumes_claim_even_before_original_expiry():
+    orch, engine = await _stored_vm()
+    async with orch.db() as session:
+        row = await session.get(VMRow, "vm_lifecycle")
+        row.expires_at = datetime.now(UTC) + timedelta(days=30)
+        await session.commit()
+    orch.xcpng.destroy_vm.side_effect = RuntimeError("provider unavailable")
+    try:
+        with pytest.raises(RuntimeError):
+            await orch.destroy_vm("vm_lifecycle")
+        orch.xcpng.destroy_vm.side_effect = None
+        await orch.check_expiries()
+        assert orch.xcpng.destroy_vm.await_count == 2
+        async with orch.db() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            assert row.status == VMStatus.DESTROYED
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_extension_reconciles_lost_commit_acknowledgment(committed):
+    from sqlalchemy import select
+
+    from hyrule_cloud.db import PaymentEventRow
+
+    orch, engine = await _stored_vm()
+    # This regression isolates the extension receipt commit. Provider power is
+    # coherent with the stored RUNNING state; stale Halted-state reconciliation
+    # has its own route-level coverage.
+    orch.xcpng.get_vm_power_state.return_value = "Running"
+    try:
+        async with orch.locked_vm("vm_lifecycle") as (session, row):
+            old_expiry = row.expires_at
+            real_commit = session.commit
+
+            async def broken_commit():
+                if committed:
+                    await real_commit()
+                raise ConnectionError("simulated lost commit acknowledgment")
+
+            session.commit = broken_commit
+            updated = await orch.extend_vm("vm_lifecycle", 5, session=session)
+        async with orch.db() as check:
+            stored = await check.get(VMRow, "vm_lifecycle")
+            receipts = list(await check.scalars(select(PaymentEventRow)))
+            if committed:
+                assert updated is not None
+                assert stored.expires_at > old_expiry
+                assert len(receipts) == 1
+                assert receipts[0].event_type == "extend_applied"
+                assert receipts[0].amount_usd == 0
+                assert receipts[0].extra["days"] == 5
+            else:
+                assert updated is None
+                assert stored.expires_at == old_expiry
+                assert receipts == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_extension_does_not_authorize_refund_when_reconciliation_fails():
+    from hyrule_cloud.orchestrator import ExtensionOutcomeUnknownError
+
+    orch, engine = await _stored_vm()
+    try:
+        async with orch.locked_vm("vm_lifecycle") as (session, _row):
+            session.commit = AsyncMock(side_effect=ConnectionError("commit outcome unknown"))
+            session.rollback = AsyncMock(side_effect=ConnectionError("connection unavailable"))
+            with pytest.raises(ExtensionOutcomeUnknownError):
+                await orch.extend_vm("vm_lifecycle", 5, session=session)
+        orch.xcpng.start_vm.assert_not_awaited()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_owner_transfer_after_paid_commit_does_not_resume_guest():
+    orch, engine = await _stored_vm(VMStatus.SUSPENDED)
+    try:
+        async with orch.locked_vm("vm_lifecycle") as (session, _row):
+            commit = session.commit
+
+            async def commit_then_transfer():
+                await commit()
+                async with orch.db() as transfer:
+                    row = await transfer.get(VMRow, "vm_lifecycle")
+                    row.owner_wallet = "new-owner"
+                    await transfer.commit()
+
+            session.commit = commit_then_transfer
+            updated = await orch.extend_vm("vm_lifecycle", 5, session=session)
+        assert updated is not None
+        expiry = updated.expires_at.replace(tzinfo=UTC)
+        assert expiry > datetime.now(UTC) + timedelta(days=4)
+        assert updated.owner_wallet == "new-owner"
+        orch.xcpng.start_vm.assert_not_awaited()
+        assert updated.status == VMStatus.SUSPENDED
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('prefix_released', [False, True])
+async def test_late_uuid_is_deleted_by_worker_even_after_destroyed_state(prefix_released):
+    orch, engine = await _stored_vm(VMStatus.PROVISIONING)
+    async with orch.db.begin() as session:
+        row = await session.get(VMRow, 'vm_lifecycle')
+        row.xcpng_uuid = None
+        row.ipv6_prefix_index = 5
+        row.ipv6_prefix = '2001:db8:5::/64'
+    try:
+        assert await orch.destroy_vm('vm_lifecycle')
+        orch.xcpng.destroy_vm.assert_not_awaited()
+        async with orch.db.begin() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            assert row.status == VMStatus.DESTROYED
+            assert row.ipv6_prefix_index == 5
+            # The clone call returns after the deletion attempt committed.
+            row.xcpng_uuid = 'late-guest'
+            if prefix_released:
+                row.ipv6_prefix_index = None
+                row.ipv6_prefix = None
+        await orch.release_destroyed_prefix('vm_lifecycle')
+        async with orch.db() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            if not prefix_released:
+                assert row.ipv6_prefix_index == 5
+        orch.xcpng.destroy_vm.side_effect = RuntimeError('provider unavailable')
+        await orch.check_expiries()
+        async with orch.db() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            assert (row.metadata_ or {}).get('provider_deleted_uuid') is None
+        orch.xcpng.destroy_vm.side_effect = None
+        await orch.check_expiries()
+        assert orch.xcpng.destroy_vm.await_count == 2
+        async with orch.db() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            assert row.metadata_['provider_deleted_uuid'] == 'late-guest'
+            assert row.ipv6_prefix_index is None
+        await orch.check_expiries()
+        assert await orch.destroy_vm('vm_lifecycle')
+        assert orch.xcpng.destroy_vm.await_count == 2
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_late_uuid_during_cleanup_cannot_release_prefix():
+    orch, engine = await _stored_vm(VMStatus.PROVISIONING)
+    async with orch.db.begin() as session:
+        row = await session.get(VMRow, 'vm_lifecycle')
+        row.xcpng_uuid = None
+        row.hostname = 'test.deploy.hyrule.host'
+        row.ipv6_prefix_index = 5
+        row.ipv6_prefix = '2001:db8:5::/64'
+
+    async def late_uuid(*args):
+        async with orch.db.begin() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            row.xcpng_uuid = 'late-guest'
+
+    orch.dns = SimpleNamespace(delete_aaaa=AsyncMock(side_effect=late_uuid))
+    try:
+        assert await orch.destroy_vm('vm_lifecycle')
+        async with orch.db() as session:
+            row = await session.get(VMRow, 'vm_lifecycle')
+            assert row.ipv6_prefix_index == 5
+            assert (row.metadata_ or {}).get('provider_deleted_uuid') is None
+        await orch.release_destroyed_prefix('vm_lifecycle')
+        async with orch.db() as session:
+            assert (await session.get(VMRow, 'vm_lifecycle')).ipv6_prefix_index == 5
+        orch.dns.delete_aaaa.side_effect = None
+        assert await orch.destroy_vm('vm_lifecycle')
+        orch.xcpng.destroy_vm.assert_awaited_once_with('late-guest')
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_worker_recovers_provider_delete_followed_by_lost_commit(monkeypatch, committed):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from hyrule_cloud.providers.xcpng import XCPNGProvider, XOError
+
+    orch, engine = await _stored_vm()
+    provider = object.__new__(XCPNGProvider)
+    provider._xo_call = AsyncMock(side_effect=[{}, XOError("vm.delete", {"message": "missing"}), {}])
+    orch.xcpng = provider
+    async with orch.db.begin() as session:
+        row = await session.get(VMRow, "vm_lifecycle")
+        row.ipv6_prefix_index = 5
+        row.ipv6_prefix = "2001:db8:5::/64"
+    real_commit = AsyncSession.commit
+    failed = False
+
+    async def lose_final_commit(session):
+        nonlocal failed
+        if not failed and any(isinstance(row, VMRow) and row.status == VMStatus.DESTROYED for row in session.dirty):
+            failed = True
+            if committed:
+                await real_commit(session)
+            raise ConnectionError("lost final delete commit acknowledgment")
+        await real_commit(session)
+
+    monkeypatch.setattr(AsyncSession, "commit", lose_final_commit)
+    try:
+        with pytest.raises(ConnectionError, match="lost final delete"):
+            await orch.destroy_vm("vm_lifecycle")
+        await orch.check_expiries()
+        async with orch.db() as session:
+            row = await session.get(VMRow, "vm_lifecycle")
+            assert row.status == VMStatus.DESTROYED
+            assert row.metadata_["provider_deleted_uuid"] == "test-guest"
+            assert row.ipv6_prefix_index is None and row.ipv6_prefix is None
+        assert provider._xo_call.await_count == (1 if committed else 3)
+    finally:
+        await engine.dispose()

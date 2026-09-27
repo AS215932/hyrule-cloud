@@ -1,6 +1,9 @@
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 
 from hyrule_cloud.app import app
@@ -13,6 +16,74 @@ def test_bgp_prefix_lookup_contract_does_not_require_asn():
     assert req.subject.type == BGPSubjectType.PREFIX
     assert req.subject.value == "2a0c:b641:b50::/44"
     assert req.assertions.expected_origin_asns == []
+
+
+@pytest.mark.asyncio
+async def test_paid_intelligence_handlers_fence_external_delivery(monkeypatch):
+    from hyrule_cloud.api import bgp, dns, ip, mx, registry
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/fixture", "headers": [], "app": app}
+    )
+    active = 0
+    entries = 0
+
+    @asynccontextmanager
+    async def delivery_guard(_request):
+        nonlocal active, entries
+        active += 1
+        entries += 1
+        try:
+            yield
+        finally:
+            active -= 1
+
+    async def delivered(*_args, **_kwargs):
+        assert active == 1
+        return SimpleNamespace()
+
+    async def no_payment(*_args, **_kwargs):
+        return None
+
+    for module in (bgp, dns, ip, mx, registry):
+        monkeypatch.setattr(module, "paid_diagnostic_delivery_guard", delivery_guard)
+
+    monkeypatch.setattr(bgp, "_paid_lookup", no_payment)
+    monkeypatch.setattr(bgp, "lookup_bgp", delivered)
+    await bgp.bgp_lookup(
+        request,
+        BGPLookupRequest(subject={"type": "asn", "value": "AS215932"}),
+    )
+
+    monkeypatch.setattr(dns, "_paid", no_payment)
+    monkeypatch.setattr(dns, "dns_lookup_service", delivered)
+    await dns.dns_lookup(request, SimpleNamespace())
+
+    monkeypatch.setattr(ip, "_paid", no_payment)
+    monkeypatch.setattr(ip, "ip_lookup_service", delivered)
+    await ip.ip_lookup(request, SimpleNamespace(views=[]))
+
+    monkeypatch.setattr(mx, "_paid_check", no_payment)
+    monkeypatch.setattr(mx, "run_check", delivered)
+    await mx.mx_check(request, SimpleNamespace())
+
+    monkeypatch.setattr(registry, "_paid_rdap", no_payment)
+    monkeypatch.setattr(registry, "rdap_lookup_service", delivered)
+    await registry.rdap_lookup(request, SimpleNamespace())
+
+    monkeypatch.setattr(bgp, "bgpstream_worker_enabled", lambda: True)
+    monkeypatch.setattr(bgp, "require_payment", AsyncMock(return_value="admin:HADMIN00001"))
+    monkeypatch.setattr(bgp, "_session_factory", lambda _request: None)
+    await bgp.create_bgpstream_job(
+        request,
+        SimpleNamespace(
+            record_type=SimpleNamespace(value="updates"),
+            model_dump=lambda **_kwargs: {},
+        ),
+    )
+
+    assert active == 0
+    assert entries == 6
 
 
 def test_openapi_exposes_only_enabled_paid_launch_contracts():

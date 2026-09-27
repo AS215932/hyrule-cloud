@@ -10,6 +10,7 @@ from fastapi import APIRouter, Request, Response
 from hyrule_cloud.api._contract import (
     not_implemented,
     now_utc,
+    paid_diagnostic_delivery_guard,
     payment_price,
     quote,
     require_payment,
@@ -178,14 +179,16 @@ async def _run_job_check(body: MXJobRequest, tool: MXTool) -> MXCheckResponse:
 async def mx_check(request: Request, body: MXCheckRequest) -> MXCheckResponse | Response:
     if payment := await _paid_check(request):
         return payment
-    return await run_check(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await run_check(body)
 
 
 @router.post("/bounce/parse", response_model=MailBounceParseResponse)
 async def parse_mx_bounce(request: Request, body: MailBounceParseRequest) -> MailBounceParseResponse | Response:
     if payment := await _paid_check(request):
         return payment
-    return parse_bounce(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return parse_bounce(body)
 
 
 @router.post("/reports/mail-delivery", response_model=MXJobResponse)
@@ -198,23 +201,24 @@ async def create_mx_mail_delivery_report(request: Request, body: MXJobRequest) -
 async def create_mx_job(request: Request, body: MXJobRequest) -> MXJobResponse | Response:
     if payment := await _paid_job(request):
         return payment
-    checks = body.checks or _DEFAULT_DOMAIN_JOB_CHECKS
-    results = [await _run_job_check(body, tool) for tool in checks]
-    created = now_utc()
-    return MXJobResponse(
-        job_id="mxj_inline_contract",
-        status=MXJobStatus.COMPLETED,
-        target=body.target,
-        profile=body.profile,
-        results=results,
-        recommendations=(
-            derive_recommendations(body.target, results)
-            if body.options.include_recommendations
-            else []
-        ),
-        created_at=created,
-        expires_at=created + timedelta(hours=24),
-    )
+    async with paid_diagnostic_delivery_guard(request):
+        checks = body.checks or _DEFAULT_DOMAIN_JOB_CHECKS
+        results = [await _run_job_check(body, tool) for tool in checks]
+        created = now_utc()
+        return MXJobResponse(
+            job_id="mxj_inline_contract",
+            status=MXJobStatus.COMPLETED,
+            target=body.target,
+            profile=body.profile,
+            results=results,
+            recommendations=(
+                derive_recommendations(body.target, results)
+                if body.options.include_recommendations
+                else []
+            ),
+            created_at=created,
+            expires_at=created + timedelta(hours=24),
+        )
 
 
 @router.get("/jobs/{job_id}", response_model=MXJobResponse)
@@ -231,4 +235,5 @@ async def download_mx_job(job_id: str, token: str | None = None) -> Response:
 async def mx_tool(request: Request, tool: MXTool, target: str) -> MXCheckResponse | Response:
     if payment := await _paid_check(request):
         return payment
-    return await run_check(MXCheckRequest(tool=tool, target=target))
+    async with paid_diagnostic_delivery_guard(request):
+        return await run_check(MXCheckRequest(tool=tool, target=target))

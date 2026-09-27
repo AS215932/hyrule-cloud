@@ -19,10 +19,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Request, Response
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from hyrule_cloud.api.status import ServiceState, probe_live_readiness
-from hyrule_cloud.db import DomainRow, PaymentEventRow, VMRow
+from hyrule_cloud.db import DomainRow, PaymentEventRow, VMRetentionRow, VMRow
 from hyrule_cloud.models import VMStatus
 
 router = APIRouter(tags=["Observability"])
@@ -273,6 +273,19 @@ async def _render(session_factory: Any, state: Any | None = None) -> str:
             )
         ).scalar_one()
         lines.append(f"hyrule_payment_unique_payers_24h {unique_24h}")
+
+        for name, description, condition in (
+            ("hyrule_retention_verification_failures", "Retained VMs whose last verification failed.",
+             VMRetentionRow.verification_error.isnot(None)),
+            ("hyrule_retention_verification_overdue", "Retained VMs due for verification more than five minutes ago.",
+             or_(VMRetentionRow.next_verification_at < now - timedelta(minutes=5),
+                 (VMRetentionRow.next_verification_at.is_(None)
+                  & (VMRetentionRow.created_at < now - timedelta(minutes=5))))),
+        ):
+            _metric(lines, name, description, "gauge")
+            count = await session.scalar(select(func.count()).select_from(VMRetentionRow).where(
+                VMRetentionRow.state == "retained", condition))
+            lines.append(f"{name} {count or 0}")
 
         _metric(
             lines,

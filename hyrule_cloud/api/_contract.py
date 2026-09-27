@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
@@ -106,6 +108,17 @@ async def require_paid_diagnostic(
     amount = payment_price(request, price_attr, default)
     result = await require_payment(request, amount, description, extra_body or {})
     return result if isinstance(result, Response) else None
+
+
+@asynccontextmanager
+async def paid_diagnostic_delivery_guard(request: Request) -> AsyncIterator[None]:
+    """Keep an administrator waiver valid for the external diagnostic call."""
+    state = getattr(request.app.state, "_typed_state", None)
+    gate = getattr(state, "payment_gate", None)
+    from hyrule_cloud.middleware.x402 import external_admin_waiver_guard
+
+    async with external_admin_waiver_guard(request, gate):
+        yield
 
 
 async def require_payment(

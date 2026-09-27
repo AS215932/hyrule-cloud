@@ -77,6 +77,19 @@ async def _run_admin_operations_loop(
             pass
 
 
+async def _run_retention_verification_loop(stop: asyncio.Event, orchestrator: Orchestrator) -> None:
+    """Independent bounded checks; existing retention remains checked with rollout off."""
+    while not stop.is_set():
+        try:
+            await orchestrator.verify_retained_vms()
+        except Exception:
+            log.exception("retention_verification_failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=60.0)
+        except TimeoutError:
+            pass
+
+
 async def run_worker() -> None:
     config = HyruleConfig()
     engine = create_db_engine(config.database_url)
@@ -117,6 +130,7 @@ async def run_worker() -> None:
     now = datetime.now(UTC)
     next_intents = now
     next_payment_handoffs = now
+    next_provisioning_recovery = now
     next_jobs = now
     next_expiry = now
     next_quotes = now
@@ -136,9 +150,18 @@ async def run_worker() -> None:
         _run_admin_operations_loop(stop, sessions, orchestrator),
         name="admin-operations",
     )
+    retention_verification_task = asyncio.create_task(
+        _run_retention_verification_loop(stop, orchestrator), name="retention-verification",
+    )
     try:
         while not stop.is_set():
             now = datetime.now(UTC)
+            if now >= next_provisioning_recovery:
+                try:
+                    await orchestrator.recover_tracked_provisioning()
+                except Exception:
+                    log.exception("tracked_provisioning_recovery_failed")
+                next_provisioning_recovery = now + timedelta(seconds=15)
             if now >= next_intents:
                 try:
                     await scan_pending_intents(
@@ -233,6 +256,8 @@ async def run_worker() -> None:
             await asyncio.gather(dns_blocklist_task, return_exceptions=True)
         stop.set()
         await admin_operations_task
+        retention_verification_task.cancel()
+        await asyncio.gather(retention_verification_task, return_exceptions=True)
         await domains.close()
         await native.close()
         await rates.close()

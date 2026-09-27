@@ -136,6 +136,8 @@ class VMRow(Base):
     provisioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     destroyed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Durable fence: renewal cannot race a provider deletion after commit/crash.
+    deletion_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Error tracking
     error: Mapped[str | None] = mapped_column(Text)
@@ -168,6 +170,20 @@ class VMRow(Base):
         Index("ix_vms_ipv6_prefix_index", "ipv6_prefix_index", unique=True),
         Index("ix_vms_ipv6_prefix", "ipv6_prefix", unique=True),
     )
+
+
+class VMGuestResultRow(Base):
+    """Scoped first-boot receipt, separate from concurrently edited VM metadata."""
+
+    __tablename__ = "vm_guest_results"
+    vm_id: Mapped[str] = mapped_column(String(32), ForeignKey("vms.vm_id", ondelete="CASCADE"), primary_key=True)
+    generation: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    outcome: Mapped[str | None] = mapped_column(String(16))
+    stage: Mapped[str | None] = mapped_column(String(16))
+    exit_code: Mapped[int | None] = mapped_column(Integer)
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class VMEventRow(Base):
@@ -688,7 +704,7 @@ class PaymentEventRow(Base):
         DateTime(timezone=True), server_default=func.now(), index=True
     )
     # required_402 | verify_failed | settle_failed | settled | dev_bypass |
-    # admin_bypass | refund_owed
+    # admin_bypass | refund_owed | extend_applied
     event_type: Mapped[str] = mapped_column(String(16), index=True)
     resource_path: Mapped[str] = mapped_column(String(256))
     method: Mapped[str] = mapped_column(String(8))
@@ -1298,3 +1314,42 @@ class RecoveryChallengeRow(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class VMRetentionRow(Base):
+    """Recovery evidence survives deletion of the application VM/account rows."""
+
+    __tablename__ = "vm_retention"
+
+    vm_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    source_vm_uuid: Mapped[str] = mapped_column(String(36), unique=True)
+    owner_account_id: Mapped[str | None] = mapped_column(String(11))
+    owner_wallet: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(24), default="prepared", server_default="prepared")
+    manifest: Mapped[dict] = mapped_column(_JSONB)
+    restore_config: Mapped[dict] = mapped_column(_JSONB)
+    retain_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    retained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    restore_operation_id: Mapped[str | None] = mapped_column(String(36), unique=True)
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verification_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verification_error: Mapped[str | None] = mapped_column(String(64))
+    next_verification_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class VMRestoreRow(Base):
+    """Immutable recovery request and retention evidence, independent of owners."""
+
+    __tablename__ = "vm_restores"
+
+    operation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    vm_id: Mapped[str] = mapped_column(String(32), index=True)
+    actor_account_id: Mapped[str] = mapped_column(String(11))
+    days: Mapped[int] = mapped_column(Integer)
+    reason: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(24), default="pending", server_default="pending")
+    retention_snapshot: Mapped[dict] = mapped_column(_JSONB)
+    new_expiry: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Request, Response
 from hyrule_cloud.api._contract import (
     diagnostic_quote,
     not_implemented,
+    paid_diagnostic_delivery_guard,
     payment_price,
     require_paid_diagnostic,
 )
@@ -89,7 +90,8 @@ async def run_threat_lookup(request: Request, body: ThreatLookupRequest) -> Diag
         return not_implemented("threat.lookup")
     if payment := await require_paid_diagnostic(request, price_attr="price_threat_lookup", default="0.01", description="Hyrule threat/reputation lookup"):
         return payment
-    return await threat_lookup(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await threat_lookup(body)
 
 
 @router.get("/domain/{domain}", response_model=DiagnosticResponse)

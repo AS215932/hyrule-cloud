@@ -8,6 +8,8 @@ payloads never enter a response model.
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal, cast
@@ -34,6 +36,8 @@ from hyrule_cloud.db import (
     PaymentEventRow,
     RefundResolutionRow,
     SessionRow,
+    VMRestoreRow,
+    VMRetentionRow,
     VMRow,
 )
 from hyrule_cloud.domains.models import (
@@ -50,7 +54,17 @@ from hyrule_cloud.middleware.auth import (
     require_admin_step_up,
 )
 from hyrule_cloud.models import VMStatus
+from hyrule_cloud.services.account_deletion import lock_account_lifecycle
+from hyrule_cloud.services.admin_authorization import (
+    validate_admin_dispatch as _validate_admin_dispatch,
+)
 from hyrule_cloud.services.passwords import verify_password
+from hyrule_cloud.services.vm_retention import (
+    authorize_restore,
+    complete_restore,
+    prepare_restore,
+    stored_manifest,
+)
 from hyrule_cloud.state import AppState, get_app_state
 
 router = APIRouter(
@@ -61,6 +75,8 @@ router = APIRouter(
 
 _ADMIN_STEP_UP_ATTEMPT_LIMIT = 5
 _ADMIN_STEP_UP_ATTEMPT_WINDOW = timedelta(minutes=15)
+_TRANSFER_RESUME_KEY = "transfer_resume_pending"
+_EXTENSION_RESUME_KEY = "extension_resume_pending"
 
 
 def _now() -> datetime:
@@ -182,12 +198,33 @@ async def _audit_before_dispatch(
     return audit_id
 
 
+def _admin_dispatch_guard(
+    state: AppState, request: Request, actor: AccountRow, action: str, *,
+    target_type: str, target_id: str, reason: str, details: dict[str, Any] | None = None,
+) -> Callable[[AsyncSession], Awaitable[None]]:
+    async def guard(session: AsyncSession) -> None:
+        await _validate_admin_dispatch(session, actor.account_id)
+        # Keep the actor fence in the caller transaction while independently
+        # committing the request audit before an external side effect.
+        await _audit_before_dispatch(state, request, actor, action, target_type=target_type,
+                                     target_id=target_id, reason=reason, details=details)
+    return guard
+
+
 class StepUpRequest(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
 class ReasonRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
+
+
+class ExpiryExtensionRequest(ReasonRequest):
+    days: int = Field(gt=0, le=365, strict=True)
+
+
+class RetainedRestoreRequest(ExpiryExtensionRequest):
+    operation_id: uuid.UUID
 
 
 class RoleRequest(ReasonRequest):
@@ -293,6 +330,23 @@ async def step_up(
         raise HTTPException(401, "Browser session required")
     now = _now()
     async with _factory(state)() as session:
+        # Password changes take the account lock before touching sessions.
+        # Use the same order and refresh the credential so an in-flight
+        # step-up cannot elevate with a password that has just been rotated.
+        current_account = (
+            await session.execute(
+                select(AccountRow)
+                .where(AccountRow.account_id == account.account_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if (
+            current_account is None
+            or not current_account.is_admin
+            or current_account.disabled_at is not None
+        ):
+            raise HTTPException(403, "Administrator access was revoked")
         row = (
             await session.execute(
                 select(SessionRow)
@@ -315,11 +369,11 @@ async def step_up(
         # Hold the session row lock across Argon verification so concurrent
         # requests cannot each slip through the same pre-verification limit.
         row.admin_step_up_attempts += 1
-        if not verify_password(account.password_hash, body.password):
+        if not verify_password(current_account.password_hash, body.password):
             _audit(
                 session,
                 request,
-                account,
+                current_account,
                 "admin.step_up_failed",
                 target_type="session",
                 succeeded=False,
@@ -330,7 +384,7 @@ async def step_up(
         row.admin_step_up_attempts = 0
         row.admin_step_up_window_started_at = None
         row.admin_elevated_at = now
-        _audit(session, request, account, "admin.step_up", target_type="session")
+        _audit(session, request, current_account, "admin.step_up", target_type="session")
         await session.commit()
     request.state.admin_elevated_at = now
     return {
@@ -780,7 +834,8 @@ async def _enabled_admin_count(session: AsyncSession, *, lock: bool = False) -> 
                 select(AccountRow.account_id)
                 .where(*predicate)
                 .order_by(AccountRow.account_id)
-                .with_for_update()
+                # key_share=True without read=True is FOR NO KEY UPDATE.
+                .with_for_update(key_share=True)
             )
         )
         return len(rows)
@@ -794,9 +849,62 @@ async def _locked_account(session: AsyncSession, account_id: str) -> AccountRow 
         await session.execute(
             select(AccountRow)
             .where(AccountRow.account_id == account_id)
-            .with_for_update()
+            .with_for_update(key_share=True)
         )
     ).scalar_one_or_none()
+
+
+async def _supersede_failed_inverse_operations(
+    session: AsyncSession,
+    *,
+    account_id: str,
+    inverse_kind: str,
+    replacement: AdminOperationRow,
+) -> None:
+    failed = list(
+        await session.scalars(
+            select(AdminOperationRow)
+            .where(
+                AdminOperationRow.account_id == account_id,
+                AdminOperationRow.kind == inverse_kind,
+                AdminOperationRow.status == "failed",
+            )
+            .with_for_update()
+        )
+    )
+    for operation in failed:
+        progress = dict(operation.progress or {})
+        progress["superseded"] = {
+            "by_operation_id": replacement.operation_id,
+            "by_kind": replacement.kind,
+            "actor_account_id": replacement.actor_account_id,
+            "at": replacement.created_at.isoformat(),
+            "reason": replacement.reason,
+        }
+        operation.progress = progress
+        operation.status = "completed"
+        operation.completed_at = replacement.created_at
+
+
+
+
+@asynccontextmanager
+async def _locked_admin_vm(
+    state: AppState, actor_id: str, vm_id: str,
+) -> AsyncIterator[tuple[AsyncSession, VMRow | None]]:
+    async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor_id)
+        snapshot = await session.get(VMRow, vm_id)
+        owner_id = snapshot.owner_account_id if snapshot is not None else None
+        if owner_id is not None:
+            await _locked_account(session, owner_id)
+        row = await session.scalar(
+            select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if row is not None and row.owner_account_id != owner_id:
+            raise HTTPException(409, "VM ownership changed; retry the action")
+        yield session, row
 
 
 @router.post("/accounts/{account_id}/disable")
@@ -810,6 +918,7 @@ async def disable_account(
     if account_id == actor.account_id:
         raise HTTPException(409, "You cannot disable your current Admin account")
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         # Always acquire the common enabled-Admin lock set before the target
         # row. Concurrent requests disabling different Admins must share one
         # lock order or each can hold its target while waiting on the other.
@@ -860,6 +969,12 @@ async def disable_account(
             reason=body.reason,
             created_at=now,
         )
+        await _supersede_failed_inverse_operations(
+            session,
+            account_id=account_id,
+            inverse_kind="resume_account_resources",
+            replacement=operation,
+        )
         session.add(operation)
         _audit(
             session,
@@ -883,6 +998,7 @@ async def enable_account(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         target = await _locked_account(session, account_id)
         if target is None:
             raise HTTPException(404, "Account not found")
@@ -897,6 +1013,12 @@ async def enable_account(
             actor_account_id=actor.account_id,
             reason=body.reason,
             created_at=now,
+        )
+        await _supersede_failed_inverse_operations(
+            session,
+            account_id=account_id,
+            inverse_kind="suspend_account_resources",
+            replacement=operation,
         )
         session.add(operation)
         _audit(
@@ -923,6 +1045,7 @@ async def set_account_role(
     if account_id == actor.account_id and not body.is_admin:
         raise HTTPException(409, "You cannot demote your current Admin account")
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         # Demotions use the same enabled-Admin lock set and ordering as account
         # disable. Promotions only increase the invariant and need the target.
         enabled_admin_count = (
@@ -962,7 +1085,8 @@ async def revoke_account_sessions(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
-        if await session.get(AccountRow, account_id) is None:
+        await _validate_admin_dispatch(session, actor.account_id)
+        if await _locked_account(session, account_id) is None:
             raise HTTPException(404, "Account not found")
         result = cast(
             CursorResult[Any],
@@ -991,7 +1115,8 @@ async def revoke_account_keys(
 ) -> dict[str, Any]:
     now = _now()
     async with _factory(state)() as session:
-        if await session.get(AccountRow, account_id) is None:
+        await _validate_admin_dispatch(session, actor.account_id)
+        if await _locked_account(session, account_id) is None:
             raise HTTPException(404, "Account not found")
         result = cast(
             CursorResult[Any],
@@ -1017,6 +1142,167 @@ async def revoke_account_keys(
     return {"revoked": int(result.rowcount or 0)}
 
 
+@router.post("/vms/{vm_id}/actions/extend")
+async def extend_vm_expiry(
+    vm_id: str,
+    body: ExpiryExtensionRequest,
+    request: Request,
+    actor: AccountRow = Depends(require_admin_step_up()),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    """Grant recovery time atomically with its audit; preserve suspension state."""
+    async with _locked_admin_vm(state, actor.account_id, vm_id) as (session, row):
+        if row is None:
+            raise HTTPException(404, "VM not found")
+        if (row.deletion_started_at is not None or row.expires_at is None
+                or row.status in {VMStatus.PROVISIONING, VMStatus.FAILED, VMStatus.DESTROYED}):
+            raise HTTPException(409, "This VM can no longer be extended")
+        previous = _aware(row.expires_at)
+        expiry = max(previous, _now()) + timedelta(days=body.days)
+        row.expires_at = expiry
+        _audit(
+            session, request, actor, "vm.extend", target_type="vm", target_id=vm_id,
+            reason=body.reason,
+            details={"days": body.days, "previous_expiry": previous.isoformat(),
+                     "new_expiry": expiry.isoformat(), "payment_taken": False},
+        )
+        await session.commit()
+        return {"vm_id": vm_id, "new_expiry": expiry.isoformat(), "status": row.status,
+                "power_changed": False}
+
+
+def _restore_status(operation: VMRestoreRow) -> dict[str, Any]:
+    return {
+        "operation_id": operation.operation_id, "state": operation.state,
+        "days": operation.days, "reason": operation.reason,
+        "new_expiry": _aware(operation.new_expiry).isoformat(),
+        "created_at": _aware(operation.created_at).isoformat(),
+        "completed_at": _aware(operation.completed_at).isoformat() if operation.completed_at else None,
+    }
+
+
+@router.get("/vms/{vm_id}/retention")
+async def retained_vm_status(
+    vm_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    actor: AccountRow = Depends(require_admin_session),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    """Expose actionable recovery state without provider manifests or credentials."""
+    async with _factory(state)() as session:
+        retained = await session.get(VMRetentionRow, vm_id)
+        history = list(await session.scalars(
+            select(VMRestoreRow).where(VMRestoreRow.vm_id == vm_id)
+            .order_by(VMRestoreRow.created_at.desc(), VMRestoreRow.operation_id.desc())
+            .offset(offset).limit(limit + 1)
+        ))
+        vm = await session.get(VMRow, vm_id)
+        if vm is None and retained is None and not history:
+            has_history = await session.scalar(
+                select(exists().where(VMRestoreRow.vm_id == vm_id))
+            )
+            if not has_history:
+                raise HTTPException(404, "VM recovery history not found")
+        active_recovery = None
+        if retained is not None and retained.restore_operation_id:
+            active_recovery = await session.get(VMRestoreRow, retained.restore_operation_id)
+        return {
+            "vm_id": vm_id, "vm_status": vm.status if vm is not None else None,
+            "retention": {
+                "state": retained.state,
+                "retain_until": _aware(retained.retain_until).isoformat(),
+                "verification": {
+                    "last_success_at": _aware(retained.last_verified_at).isoformat() if retained.last_verified_at else None,
+                    "last_attempt_at": _aware(retained.verification_attempted_at).isoformat() if retained.verification_attempted_at else None,
+                    "error": retained.verification_error,
+                    "next_due_at": _aware(retained.next_verification_at).isoformat() if retained.next_verification_at else None,
+                },
+                "retained_at": _aware(retained.retained_at).isoformat() if retained.retained_at else None,
+            } if retained is not None else None,
+            "active_recovery": _restore_status(active_recovery) if active_recovery is not None else None,
+            "history": [_restore_status(operation) for operation in history[:limit]],
+            "has_more_history": len(history) > limit,
+            "next_offset": offset + limit if len(history) > limit else None,
+        }
+
+
+@router.post("/vms/{vm_id}/actions/restore")
+async def restore_retained_vm(
+    vm_id: str,
+    body: RetainedRestoreRequest,
+    request: Request,
+    actor: AccountRow = Depends(require_admin_step_up()),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    """Resume an audited recovery request; never automatically power on a guest."""
+    orch = state.orchestrator
+    operation_id = str(body.operation_id)
+    async with _locked_admin_vm(state, actor.account_id, vm_id) as (session, vm):
+        if vm is None:
+            raise HTTPException(404, "VM not found")
+        previous = await session.get(VMRestoreRow, operation_id)
+        try:
+            operation = await prepare_restore(
+                session, vm, operation_id=operation_id, actor_account_id=actor.account_id,
+                days=body.days, reason=body.reason,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if previous is None:
+            _audit(session, request, actor, "vm.restore_requested", target_type="vm", target_id=vm_id,
+                   reason=body.reason, details={"operation_id": operation_id,
+                                               "new_expiry": _aware(operation.new_expiry).isoformat()})
+        await session.commit()
+
+    # Authorization commits the future expiry while protections remain intact.
+    # Finalization reacquires actor/owner/VM locks and is replayable after failure.
+    for finalize in (False, True):
+        async with _locked_admin_vm(state, actor.account_id, vm_id) as (session, vm):
+            recovered_operation = await session.get(VMRestoreRow, operation_id)
+            if recovered_operation is None:
+                raise HTTPException(409, "Restore request is unavailable")
+            operation = recovered_operation
+            if operation.state != "completed":
+                retained = await session.get(VMRetentionRow, vm_id)
+                if (vm is None or retained is None or retained.state != "restoring"
+                        or retained.restore_operation_id != operation_id
+                        or vm.deletion_started_at is None or vm.xcpng_uuid != retained.source_vm_uuid
+                        or vm.owner_account_id != retained.owner_account_id or vm.owner_wallet != retained.owner_wallet
+                        or vm.status != VMStatus.SUSPENDED):
+                    raise HTTPException(409, "Retained recovery state changed")
+                owner = await session.get(AccountRow, vm.owner_account_id) if vm.owner_account_id else None
+                if ((vm.owner_account_id and (owner is None or owner.disabled_at is not None))
+                        or (not vm.owner_account_id and vm.suspension_reason == "account_disabled")):
+                    raise HTTPException(409, "Enable the owner account before restoring this VM")
+                if operation.state == "pending":
+                    try:
+                        await authorize_restore(session, vm, operation)
+                    except ValueError as exc:
+                        raise HTTPException(409, str(exc)) from exc
+                    _audit(session, request, actor, "vm.restore_authorized", target_type="vm", target_id=vm_id,
+                           reason=body.reason, details={"operation_id": operation_id,
+                                                       "new_expiry": _aware(operation.new_expiry).isoformat()})
+                    await session.commit()
+                    continue
+                if (operation.state != "authorized" or _aware(operation.new_expiry) <= datetime.now(UTC)
+                        or vm.expires_at is None or _aware(vm.expires_at) != _aware(operation.new_expiry)):
+                    raise HTTPException(409, "Recovery authorization expired or changed; operator reconciliation required")
+                if not finalize:
+                    continue
+                try:
+                    await orch.xcpng.restore_retained_vm(stored_manifest(retained))
+                except Exception as exc:
+                    raise HTTPException(503, "Recovery is pending; retry the same operation ID") from exc
+                await complete_restore(session, vm, operation)
+                _audit(session, request, actor, "vm.restore_completed", target_type="vm", target_id=vm_id,
+                       reason=body.reason, details={"operation_id": operation_id, "power_changed": False})
+                await session.commit()
+            return {"vm_id": vm_id, "operation_id": operation_id, "state": operation.state,
+                    "new_expiry": _aware(operation.new_expiry).isoformat(), "power_changed": False}
+    raise HTTPException(409, "Recovery did not reach a terminal state")
+
+
 @router.post("/vms/{vm_id}/actions/{action}")
 async def vm_action(
     vm_id: str,
@@ -1034,6 +1320,7 @@ async def vm_action(
         # so start/reboot/shutdown/suspend cannot cross and leave provider/database
         # state describing different outcomes.
         async with _factory(state)() as session:
+            await _validate_admin_dispatch(session, actor.account_id)
             snapshot = await session.get(VMRow, vm_id)
             if snapshot is None:
                 raise HTTPException(404, "VM not found")
@@ -1057,18 +1344,23 @@ async def vm_action(
             current = (
                 await session.execute(
                     select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
             if current is None:
                 raise HTTPException(404, "VM not found")
             if current.owner_account_id != owner_account_id:
                 raise HTTPException(409, "VM ownership changed; retry the action")
+            if current.deletion_started_at is not None:
+                raise HTTPException(409, "Deletion-claimed VMs cannot accept power actions")
+            if current.status == VMStatus.DESTROYED:
+                raise HTTPException(409, "Destroyed VMs cannot accept power actions")
+            status = str(current.status)
             if action in {"start", "reboot"}:
-                status = str(current.status)
                 if status in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
                     raise HTTPException(409, "Terminal VMs cannot be powered on")
-                if status == VMStatus.PROVISIONING.value:
-                    raise HTTPException(409, "Provisioning VMs cannot be powered manually")
+            if status == VMStatus.PROVISIONING.value:
+                raise HTTPException(409, "Provisioning VMs cannot be powered manually")
             if action == "start":
                 if current.expires_at is not None and _aware(current.expires_at) <= _now():
                     raise HTTPException(409, "Expired VMs cannot be started")
@@ -1090,18 +1382,38 @@ async def vm_action(
                 reason=body.reason,
             )
             if action == "start":
-                await orch.xcpng.start_vm(current.xcpng_uuid)
+                power = await orch.xcpng.get_vm_power_state(current.xcpng_uuid)
+                if power == "Halted":
+                    await orch.xcpng.start_vm(current.xcpng_uuid)
+                elif power != "Running":
+                    raise RuntimeError(
+                        f"unexpected VM power state during admin start: {power}"
+                    )
                 current.status = VMStatus.RUNNING
                 current.suspension_reason = None
                 current.suspended_by_account_id = None
             elif action == "reboot":
                 await orch.xcpng.reboot_vm(current.xcpng_uuid)
             elif action == "shutdown":
-                await orch.xcpng.shutdown_vm(current.xcpng_uuid)
-                current.status = VMStatus.SUSPENDED
+                power = await orch.xcpng.get_vm_power_state(current.xcpng_uuid)
+                if power == "Running":
+                    await orch.xcpng.shutdown_vm(current.xcpng_uuid)
+                elif power != "Halted":
+                    raise RuntimeError(
+                        f"unexpected VM power state during admin shutdown: {power}"
+                    )
+                if current.status not in {VMStatus.FAILED, VMStatus.PROVISIONING}:
+                    current.status = VMStatus.SUSPENDED
             else:
-                await orch.xcpng.suspend_vm(current.xcpng_uuid)
-                current.status = VMStatus.SUSPENDED
+                power = await orch.xcpng.get_vm_power_state(current.xcpng_uuid)
+                if power == "Running":
+                    await orch.xcpng.suspend_vm(current.xcpng_uuid)
+                elif power != "Halted":
+                    raise RuntimeError(
+                        f"unexpected VM power state during admin suspension: {power}"
+                    )
+                if current.status not in {VMStatus.FAILED, VMStatus.PROVISIONING}:
+                    current.status = VMStatus.SUSPENDED
             if (
                 action in {"shutdown", "suspend"}
                 and current.suspension_reason != "account_disabled"
@@ -1111,36 +1423,48 @@ async def vm_action(
             await session.commit()
         return {"vm_id": vm_id, "action": action, "status": "accepted"}
 
-    async with _factory(state)() as session:
-        row = await session.get(VMRow, vm_id)
-        if row is None:
-            raise HTTPException(404, "VM not found")
-    await _audit_before_dispatch(
-        state,
-        request,
-        actor,
-        f"vm.{action}",
-        target_type="vm",
-        target_id=vm_id,
-        reason=body.reason,
-    )
     if action == "destroy":
-        if not await orch.destroy_vm(vm_id):
+        guard = _admin_dispatch_guard(state, request, actor, "vm.destroy", target_type="vm",
+                                      target_id=vm_id, reason=body.reason)
+        outcome = await orch.destroy_vm(vm_id, dispatch_guard=guard)
+        if not outcome:
             raise HTTPException(409, "VM cannot be destroyed")
+        if outcome == "retained":
+            return {"vm_id": vm_id, "action": action, "status": "retained",
+                    "message": "VM is stopped and retained for recovery"}
     return {"vm_id": vm_id, "action": action, "status": "accepted"}
 
 
-async def _assert_transfer_target(session: AsyncSession, account_id: str) -> AccountRow:
+async def _assert_transfer_accounts(
+    session: AsyncSession,
+    target_account_id: str,
+    *source_account_ids: str | None,
+) -> AccountRow:
+    # Account deletion holds this advisory guard across its complete detach or
+    # destroy flow. Acquire every source and target guard in stable order before
+    # resource rows so a completed deletion cannot return a stale credential.
+    account_ids = {
+        account_id
+        for account_id in (*source_account_ids, target_account_id)
+        if account_id is not None
+    }
+    for account_id in sorted(account_ids):
+        await lock_account_lifecycle(session, account_id)
     target = (
         await session.execute(
             select(AccountRow)
-            .where(AccountRow.account_id == account_id)
+            .where(AccountRow.account_id == target_account_id)
             .with_for_update()
         )
     ).scalar_one_or_none()
     if target is None or target.disabled_at is not None:
         raise HTTPException(409, "Target account is missing or disabled")
     return target
+
+
+async def _assert_transfer_target(session: AsyncSession, account_id: str) -> AccountRow:
+    """Compatibility helper for callers that have no source account."""
+    return await _assert_transfer_accounts(session, account_id)
 
 
 async def _transfer_wallet_identity(session: AsyncSession, account_id: str) -> str:
@@ -1155,6 +1479,9 @@ async def _transfer_wallet_identity(session: AsyncSession, account_id: str) -> s
 
 async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
     """Clear an old owner's account suspension after a successful transfer."""
+    if state.orchestrator is not None and hasattr(state.orchestrator, "reconcile_transfer_resume"):
+        await state.orchestrator.reconcile_transfer_resume(vm_id)
+        return
     restart_provisioning = False
     async with _factory(state)() as session:
         snapshot = (
@@ -1183,6 +1510,7 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
             or recipient is None
             or recipient.disabled_at is not None
             or current.suspension_reason != "account_disabled"
+            or current.deletion_started_at is not None
         ):
             return
         if current.expires_at is not None and _aware(current.expires_at) <= _now():
@@ -1197,6 +1525,12 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
         if status == VMStatus.PROVISIONING.value:
             # The in-flight provisioner will observe the cleared marker and
             # complete normally for the enabled recipient.
+            if current.xcpng_uuid:
+                orchestrator = state.orchestrator
+                if orchestrator is None:
+                    raise HTTPException(503, "VM service unavailable")
+                await orchestrator.xcpng.start_vm(current.xcpng_uuid)
+                await orchestrator.renew_provisioning_report_deadline(session, current)
             current.suspension_reason = None
             current.suspended_by_account_id = None
         elif status == VMStatus.SUSPENDED.value and current.xcpng_uuid:
@@ -1217,6 +1551,7 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
             current.suspension_reason = None
             current.suspended_by_account_id = None
             current.error = None
+            await orchestrator.prepare_provisioning_dispatch(session, current)
             restart_provisioning = True
         else:
             # A stale provenance marker on an already-live VM should not block
@@ -1230,7 +1565,7 @@ async def _resume_transferred_vm(state: AppState, vm_id: str) -> None:
         # state; AppState does not replace a live orchestrator at runtime.
         orchestrator = state.orchestrator
         assert orchestrator is not None
-        orchestrator.start_provisioning(vm_id)
+        await orchestrator.start_provisioning(vm_id)
 
 
 async def _pending_domain_work(
@@ -1307,13 +1642,33 @@ async def transfer_vm(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
-        await _assert_transfer_target(session, body.target_account_id)
+        await _validate_admin_dispatch(session, actor.account_id)
+        source_snapshot = (
+            await session.execute(
+                select(VMRow.owner_account_id).where(VMRow.vm_id == vm_id)
+            )
+        ).one_or_none()
+        if source_snapshot is None:
+            raise HTTPException(404, "VM not found")
+        expected_source_account_id = source_snapshot[0]
+        await _assert_transfer_accounts(
+            session, body.target_account_id, expected_source_account_id
+        )
         new_owner_wallet = await _transfer_wallet_identity(session, body.target_account_id)
         vm = (
-            await session.execute(select(VMRow).where(VMRow.vm_id == vm_id).with_for_update())
+            await session.execute(
+                select(VMRow).where(VMRow.vm_id == vm_id).with_for_update()
+                .execution_options(populate_existing=True)
+            )
         ).scalar_one_or_none()
         if vm is None:
             raise HTTPException(404, "VM not found")
+        if vm.owner_account_id != expected_source_account_id:
+            raise HTTPException(409, "VM ownership changed; retry the transfer")
+        if vm.deletion_started_at is not None or vm.status == VMStatus.DESTROYED:
+            raise HTTPException(409, "Deleting or destroyed VMs cannot be transferred")
+        if (vm.metadata_ or {}).get(_EXTENSION_RESUME_KEY) is not None:
+            raise HTTPException(409, "VM extension resumption must finish before transfer")
         if str(vm.status) == VMStatus.PROVISIONING.value:
             raise HTTPException(409, "Provisioning VMs cannot be transferred")
         domain = (
@@ -1331,6 +1686,17 @@ async def transfer_vm(
         vm.owner_account_id = body.target_account_id
         vm.owner_wallet = new_owner_wallet
         vm.anon_management_token_hash = None
+        if vm.suspension_reason == "account_disabled":
+            if str(vm.status) in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
+                vm.suspension_reason = None
+                vm.suspended_by_account_id = None
+            else:
+                metadata = dict(vm.metadata_ or {})
+                metadata[_TRANSFER_RESUME_KEY] = {
+                    "owner_account_id": body.target_account_id,
+                    "xcpng_uuid": vm.xcpng_uuid,
+                }
+                vm.metadata_ = metadata
         if domain is not None:
             domain.owner_account_id = body.target_account_id
             domain.owner_wallet = new_owner_wallet
@@ -1365,13 +1731,43 @@ async def transfer_domain(
     fqdn = fqdn.lower().rstrip(".")
     attached_vm_id: str | None = None
     async with _factory(state)() as session:
-        await _assert_transfer_target(session, body.target_account_id)
+        await _validate_admin_dispatch(session, actor.account_id)
+        source_snapshot = (
+            await session.execute(
+                select(DomainRow.owner_account_id, DomainRow.vm_id)
+                .where(DomainRow.fqdn == fqdn)
+            )
+        ).one_or_none()
+        if source_snapshot is None:
+            raise HTTPException(404, "Domain not found")
+        expected_source_account_id, expected_vm_id = source_snapshot
+        expected_vm_owner_account_id = None
+        if expected_vm_id is not None:
+            expected_vm_owner_account_id = await session.scalar(
+                select(VMRow.owner_account_id).where(VMRow.vm_id == expected_vm_id)
+            )
+        await _assert_transfer_accounts(
+            session,
+            body.target_account_id,
+            expected_source_account_id,
+            expected_vm_owner_account_id,
+        )
         new_owner_wallet = await _transfer_wallet_identity(session, body.target_account_id)
         domain, vm = await _lock_domain_transfer_bundle(session, fqdn)
+        if (
+            domain.owner_account_id != expected_source_account_id
+            or domain.vm_id != expected_vm_id
+            or (vm is not None and vm.owner_account_id != expected_vm_owner_account_id)
+        ):
+            raise HTTPException(409, "Domain ownership changed; retry the transfer")
         if await _pending_domain_work(session, fqdn=fqdn, vm_id=domain.vm_id):
             raise HTTPException(409, "Domain has a pending operation")
         if domain.vm_id:
             attached_vm_id = domain.vm_id
+            if vm is not None and (vm.deletion_started_at is not None or vm.status == VMStatus.DESTROYED):
+                raise HTTPException(409, "Deletion-claimed or destroyed VMs cannot be transferred")
+            if vm is not None and (vm.metadata_ or {}).get(_EXTENSION_RESUME_KEY) is not None:
+                raise HTTPException(409, "VM extension resumption must finish before transfer")
             if vm is not None and str(vm.status) == VMStatus.PROVISIONING.value:
                 raise HTTPException(409, "Provisioning VMs cannot be transferred")
         previous_account_id = domain.owner_account_id
@@ -1382,6 +1778,17 @@ async def transfer_domain(
             vm.owner_account_id = body.target_account_id
             vm.owner_wallet = new_owner_wallet
             vm.anon_management_token_hash = None
+            if vm.suspension_reason == "account_disabled":
+                if str(vm.status) in {VMStatus.FAILED.value, VMStatus.DESTROYED.value}:
+                    vm.suspension_reason = None
+                    vm.suspended_by_account_id = None
+                else:
+                    metadata = dict(vm.metadata_ or {})
+                    metadata[_TRANSFER_RESUME_KEY] = {
+                        "owner_account_id": body.target_account_id,
+                        "xcpng_uuid": vm.xcpng_uuid,
+                    }
+                    vm.metadata_ = metadata
         _audit(
             session,
             request,
@@ -1426,7 +1833,7 @@ async def admin_nameservers(
         raise HTTPException(503, "Domain service unavailable")
     owner = await _domain_owner(state, fqdn)
     idempotency_key = str(uuid.uuid4())
-    await _audit_before_dispatch(
+    guard = _admin_dispatch_guard(
         state,
         request,
         actor,
@@ -1437,7 +1844,7 @@ async def admin_nameservers(
         details={"idempotency_key": idempotency_key},
     )
     result = await state.domains.enqueue_nameserver_update(
-        owner, fqdn, body.request, idempotency_key
+        owner, fqdn, body.request, idempotency_key, dispatch_guard=guard
     )
     return result
 
@@ -1454,7 +1861,7 @@ async def admin_dns(
         raise HTTPException(503, "Domain service unavailable")
     owner = await _domain_owner(state, fqdn)
     idempotency_key = str(uuid.uuid4())
-    await _audit_before_dispatch(
+    guard = _admin_dispatch_guard(
         state,
         request,
         actor,
@@ -1472,7 +1879,7 @@ async def admin_dns(
         fqdn,
         body.expected_revision,
         body.request,
-        idempotency_key=idempotency_key,
+        idempotency_key=idempotency_key, dispatch_guard=guard,
     )
     return result
 
@@ -1489,7 +1896,7 @@ async def admin_dnssec(
         raise HTTPException(503, "Domain service unavailable")
     owner = await _domain_owner(state, fqdn)
     idempotency_key = str(uuid.uuid4())
-    await _audit_before_dispatch(
+    guard = _admin_dispatch_guard(
         state,
         request,
         actor,
@@ -1504,6 +1911,7 @@ async def admin_dnssec(
         fqdn,
         body.request,
         idempotency_key,
+        dispatch_guard=guard,
     )
     return result
 
@@ -1518,6 +1926,7 @@ async def reconcile_domain(
 ) -> dict[str, Any]:
     fqdn = fqdn.lower().rstrip(".")
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         if await session.scalar(select(DomainRow.id).where(DomainRow.fqdn == fqdn)) is None:
             raise HTTPException(404, "Domain not found")
         job = DomainJobRow(
@@ -1550,6 +1959,7 @@ async def retry_job(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
         job = (
             await session.execute(
                 select(DomainJobRow)
@@ -1620,7 +2030,13 @@ async def retry_admin_operation(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
-        operation = await session.get(AdminOperationRow, operation_id)
+        await _validate_admin_dispatch(session, actor.account_id)
+        operation = await session.scalar(
+            select(AdminOperationRow)
+            .where(AdminOperationRow.operation_id == operation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if operation is None:
             raise HTTPException(404, "Operation not found")
         if operation.status != "failed":
@@ -1658,15 +2074,39 @@ async def resolve_refund(
     state: AppState = Depends(get_app_state),
 ) -> dict[str, Any]:
     async with _factory(state)() as session:
+        await _validate_admin_dispatch(session, actor.account_id)
+        snapshot = await session.get(PaymentEventRow, event_id)
+        if snapshot is None or snapshot.event_type != "refund_owed":
+            raise HTTPException(404, "Refund obligation not found")
+        snapshot_extra = snapshot.extra if isinstance(snapshot.extra, dict) else {}
+        linked_order_id = _bounded_text(snapshot_extra.get("order_id"), max_length=32)
+        linked_order = None
+        if body.status == "resolved" and linked_order_id is not None:
+            # Domain refund creation holds the order before appending its
+            # payment event. Preserve that lock order here while advancing
+            # customer-visible order state in the same resolution transaction.
+            linked_order = (
+                await session.execute(
+                    select(DomainOrderRow)
+                    .where(DomainOrderRow.order_id == linked_order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if linked_order is None:
+                raise HTTPException(409, "Linked domain order no longer exists")
         event = (
             await session.execute(
                 select(PaymentEventRow)
                 .where(PaymentEventRow.event_id == event_id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if event is None or event.event_type != "refund_owed":
             raise HTTPException(404, "Refund obligation not found")
+        event_extra = event.extra if isinstance(event.extra, dict) else {}
+        if _bounded_text(event_extra.get("order_id"), max_length=32) != linked_order_id:
+            raise HTTPException(409, "Refund obligation changed; retry the resolution")
         existing = await session.scalar(
             select(RefundResolutionRow.resolution_id).where(
                 RefundResolutionRow.payment_event_id == event_id
@@ -1696,6 +2136,8 @@ async def resolve_refund(
             actor_account_id=actor.account_id,
         )
         session.add(resolution)
+        if linked_order is not None:
+            linked_order.status = DomainOrderStatus.REFUNDED.value
         _audit(
             session,
             request,

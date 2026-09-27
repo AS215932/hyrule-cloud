@@ -230,8 +230,10 @@ by `/v1/dns/filtering/resolvers`; keep that disclosure in customer-facing copy.
      with `ssh_smoke_status=passed`, `dns_aaaa_verified=true` and
      `dns_resolution_status=passed` (all measured, not inferred).
      `launch_proof_status=degraded` + `dns_resolution_status=failed` means
-     `HYRULE_CUSTOMER_IPV6_DNS` is not answering — the VM is up but resolves
-     nothing, which is a launch blocker, not a per-VM incident.
+     the central launch-time query through `HYRULE_CUSTOMER_IPV6_DNS` failed.
+     Keep the launch gate closed pending diagnosis, but verify DNS inside an
+     authorized test guest before inferring guest impact or fleet-wide scope;
+     Hyrule and the guest may have different routes or ACLs.
    - **manually `ssh root@<hostname>` over IPv6**, then on the VM:
      `getent ahosts deb.debian.org` (IPv6-only + NAT64 needs a working DNS64
      resolver; without it `apt-get` and every setup_script die)
@@ -243,10 +245,11 @@ by `/v1/dns/filtering/resolvers`; keep that disclosure in customer-facing copy.
 
 ### Refunds (manual until automated)
 
-The FAILED customer message promises a refund. Keep it:
-`payment_events` gives payer wallet + amount + tx hash — send USDC back from
-the receiver wallet the same day. The Grafana provisioning panel and the
-`HyrulePaymentSettlementFailures` / provision-failure alerts are the worklist.
+A FAILED status does not establish a refund outcome. Follow the authorized
+refund procedure and reconcile payment/refund records before reporting a
+refund as requested or completed. The Grafana provisioning panel and the
+`HyrulePaymentSettlementFailures` / provision-failure alerts are the worklist;
+customer-facing failure text is not payment evidence.
 
 ## Phase 4 — Bazaar indexing
 

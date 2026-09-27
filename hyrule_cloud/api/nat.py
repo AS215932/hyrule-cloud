@@ -6,7 +6,12 @@ import ipaddress
 
 from fastapi import APIRouter, Request, Response
 
-from hyrule_cloud.api._contract import diagnostic_quote, payment_price, require_paid_diagnostic
+from hyrule_cloud.api._contract import (
+    diagnostic_quote,
+    paid_diagnostic_delivery_guard,
+    payment_price,
+    require_paid_diagnostic,
+)
 from hyrule_cloud.models import (
     CapabilityEndpoint,
     DiagnosticResponse,
@@ -74,4 +79,5 @@ async def quote_nat_port_forward(request: Request, body: NATPortForwardCheckRequ
 async def nat_port_forward_check(request: Request, body: NATPortForwardCheckRequest) -> DiagnosticResponse | Response:
     if payment := await require_paid_diagnostic(request, price_attr="price_nat_port_forward_check", default="0.005", description="Hyrule NAT port-forward outside-in check"):
         return payment
-    return await run_port_check(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await run_port_check(body)

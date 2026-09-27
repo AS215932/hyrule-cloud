@@ -15,6 +15,7 @@ from sqlalchemy import select
 from hyrule_cloud.api._contract import (
     not_implemented,
     now_utc,
+    paid_diagnostic_delivery_guard,
     payment_price,
     quote,
     require_payment,
@@ -205,39 +206,43 @@ async def bgp_lookup(request: Request, body: BGPLookupRequest) -> BGPLookupRespo
     amount = payment_price(request, attr, default)
     if payment := await _paid_lookup(request, body):
         return payment
-    result = await lookup_bgp(body)
-    result.charged_amount_usd = str(amount)
-    return result
+    async with paid_diagnostic_delivery_guard(request):
+        result = await lookup_bgp(body)
+        result.charged_amount_usd = str(amount)
+        return result
 
 
 @router.get("/prefix", response_model=BGPLookupResponse)
 async def bgp_prefix(request: Request, prefix: str) -> BGPLookupResponse | Response:
     if payment := await _paid_lookup(request):
         return payment
-    body = BGPLookupRequest.model_validate({"subject": {"type": "prefix", "value": prefix}})
-    result = await lookup_bgp(body)
-    result.charged_amount_usd = str(payment_price(request, "price_bgp_lookup", "0.005"))
-    return result
+    async with paid_diagnostic_delivery_guard(request):
+        body = BGPLookupRequest.model_validate({"subject": {"type": "prefix", "value": prefix}})
+        result = await lookup_bgp(body)
+        result.charged_amount_usd = str(payment_price(request, "price_bgp_lookup", "0.005"))
+        return result
 
 
 @router.get("/ip", response_model=BGPLookupResponse)
 async def bgp_ip(request: Request, address: str) -> BGPLookupResponse | Response:
     if payment := await _paid_lookup(request):
         return payment
-    body = BGPLookupRequest.model_validate({"subject": {"type": "ip", "value": address}})
-    result = await lookup_bgp(body)
-    result.charged_amount_usd = str(payment_price(request, "price_bgp_lookup", "0.005"))
-    return result
+    async with paid_diagnostic_delivery_guard(request):
+        body = BGPLookupRequest.model_validate({"subject": {"type": "ip", "value": address}})
+        result = await lookup_bgp(body)
+        result.charged_amount_usd = str(payment_price(request, "price_bgp_lookup", "0.005"))
+        return result
 
 
 @router.get("/asn/{asn}", response_model=BGPLookupResponse)
 async def bgp_asn(request: Request, asn: str) -> BGPLookupResponse | Response:
     if payment := await _paid_lookup(request):
         return payment
-    body = BGPLookupRequest.model_validate({"subject": {"type": "asn", "value": asn}})
-    result = await lookup_bgp(body)
-    result.charged_amount_usd = str(payment_price(request, "price_bgp_lookup", "0.005"))
-    return result
+    async with paid_diagnostic_delivery_guard(request):
+        body = BGPLookupRequest.model_validate({"subject": {"type": "asn", "value": asn}})
+        result = await lookup_bgp(body)
+        result.charged_amount_usd = str(payment_price(request, "price_bgp_lookup", "0.005"))
+        return result
 
 
 @router.post("/jobs", response_model=BGPJobResponse)
@@ -256,37 +261,38 @@ async def create_bgpstream_job(request: Request, body: BGPStreamJobRequest) -> B
     payment = await require_payment(request, amount, "Hyrule BGPStream historical job")
     if isinstance(payment, Response):
         return payment
-    job_id = "bgpj_" + secrets.token_urlsafe(16)
-    token = "hyr_bgp_job_" + secrets.token_urlsafe(24)
-    created = now_utc()
-    expires = created + timedelta(days=7)
-    factory = _session_factory(request)
-    if factory is not None:
-        async with factory() as session:
-            session.add(
-                BGPJobRow(
-                    job_id=job_id,
-                    status="queued",
-                    owner_wallet=str(payment),
-                    payment_tx=getattr(request.state, "payment_tx", None),
-                    access_token_hash=_hash_token(token),
-                    query=body.model_dump(mode="json"),
-                    price_usd=amount,
-                    created_at=created,
-                    expires_at=expires,
+    async with paid_diagnostic_delivery_guard(request):
+        job_id = "bgpj_" + secrets.token_urlsafe(16)
+        token = "hyr_bgp_job_" + secrets.token_urlsafe(24)
+        created = now_utc()
+        expires = created + timedelta(days=7)
+        factory = _session_factory(request)
+        if factory is not None:
+            async with factory() as session:
+                session.add(
+                    BGPJobRow(
+                        job_id=job_id,
+                        status="queued",
+                        owner_wallet=str(payment),
+                        payment_tx=getattr(request.state, "payment_tx", None),
+                        access_token_hash=_hash_token(token),
+                        query=body.model_dump(mode="json"),
+                        price_usd=amount,
+                        created_at=created,
+                        expires_at=expires,
+                    )
                 )
-            )
-            await session.commit()
-    return BGPJobResponse(
-        job_id=job_id,
-        job_access_token=token,
-        status=BGPJobStatus.QUEUED,
-        charged_amount_usd=str(amount),
-        status_url=f"/v1/bgp/jobs/{job_id}",
-        download_url=f"/v1/bgp/jobs/{job_id}/download",
-        created_at=created,
-        expires_at=expires,
-    )
+                await session.commit()
+        return BGPJobResponse(
+            job_id=job_id,
+            job_access_token=token,
+            status=BGPJobStatus.QUEUED,
+            charged_amount_usd=str(amount),
+            status_url=f"/v1/bgp/jobs/{job_id}",
+            download_url=f"/v1/bgp/jobs/{job_id}/download",
+            created_at=created,
+            expires_at=expires,
+        )
 
 
 @router.get("/jobs/{job_id}", response_model=BGPJobResponse)
@@ -355,14 +361,15 @@ async def download_bgp_router_snapshot(request: Request, snapshot_id: str, forma
     )
     if isinstance(result, Response):
         return result
-    factory = _session_factory(request)
-    if factory is None:
-        raise HTTPException(404, "snapshot not found")
-    async with factory() as session:
-        row = await session.get(BGPSnapshotRow, snapshot_id)
-    if row is None or not row.artifact_path:
-        raise HTTPException(404, "snapshot not found")
-    path = Path(row.artifact_path)
-    if not path.exists():
-        raise HTTPException(410, "snapshot artifact expired")
-    return FileResponse(path, media_type="application/gzip", filename=path.name)
+    async with paid_diagnostic_delivery_guard(request):
+        factory = _session_factory(request)
+        if factory is None:
+            raise HTTPException(404, "snapshot not found")
+        async with factory() as session:
+            row = await session.get(BGPSnapshotRow, snapshot_id)
+        if row is None or not row.artifact_path:
+            raise HTTPException(404, "snapshot not found")
+        path = Path(row.artifact_path)
+        if not path.exists():
+            raise HTTPException(410, "snapshot artifact expired")
+        return FileResponse(path, media_type="application/gzip", filename=path.name)

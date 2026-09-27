@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from hyrule_cloud.api._contract import (
     diagnostic_quote,
     not_implemented,
+    paid_diagnostic_delivery_guard,
     payment_price,
 )
 from hyrule_cloud.models import (
@@ -73,17 +74,18 @@ async def _charge_then_deliver(
     verified = await gate.verify_only(request, amount, description=description)
     if isinstance(verified, Response):
         return verified
-    try:
-        result = await deliver()
-    except ProbeRejectedError as exc:
-        # Prober defense-in-depth rejected the target as unsafe/invalid.
-        raise HTTPException(400, str(exc)) from exc
-    except ProbeUnavailableError as exc:
-        # Never delivered a measurement — do not settle.
-        raise HTTPException(502, str(exc)) from exc
-    if not await gate.settle_verified(request, verified):
-        raise HTTPException(402, "payment settlement failed")
-    return result
+    async with paid_diagnostic_delivery_guard(request):
+        try:
+            result = await deliver()
+        except ProbeRejectedError as exc:
+            # Prober defense-in-depth rejected the target as unsafe/invalid.
+            raise HTTPException(400, str(exc)) from exc
+        except ProbeUnavailableError as exc:
+            # Never delivered a measurement — do not settle.
+            raise HTTPException(502, str(exc)) from exc
+        if not await gate.settle_verified(request, verified):
+            raise HTTPException(402, "payment settlement failed")
+        return result
 
 
 @router.get("/capabilities", response_model=ProductCapabilityResponse)

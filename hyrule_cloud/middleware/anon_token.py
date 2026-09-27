@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from fastapi import Request
@@ -92,3 +93,21 @@ def can_manage_vm(vm: VMRow, presented_token: str | None) -> bool:
         vm.anon_management_token_hash,
         hash_anon_token(presented_token),
     )
+
+
+@dataclass(frozen=True)
+class VMManagementIdentity:
+    """Snapshot of the resource identity whose access was authorized."""
+
+    vm_id: str
+    account_id: str | None
+    wallet: str | None
+    token_hash: str | None
+
+    @classmethod
+    def capture(cls, vm: VMRow) -> VMManagementIdentity:
+        return cls(vm.vm_id, getattr(vm, "owner_account_id", None),
+                   getattr(vm, "owner_wallet", None), getattr(vm, "anon_management_token_hash", None))
+
+    def matches(self, vm: VMRow) -> bool:
+        return self == self.capture(vm)

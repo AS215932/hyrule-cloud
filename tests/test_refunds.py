@@ -141,6 +141,10 @@ async def test_extension_rejected_after_settlement_records_refund(
         expires_at=datetime.now(UTC) + timedelta(days=1),
     )
 
+    async with session_factory() as session:
+        session.add(row)
+        await session.commit()
+
     with pytest.raises(HTTPException) as exc:
         await extend_vm_route(
             "vm_extension_refund",
@@ -195,6 +199,10 @@ async def test_rejected_waived_extension_does_not_claim_a_refund(
         expires_at=datetime.now(UTC) + timedelta(days=1),
     )
 
+    async with session_factory() as session:
+        session.add(row)
+        await session.commit()
+
     with pytest.raises(HTTPException) as exc:
         await extend_vm_route(
             "vm_waived_extension",
@@ -212,7 +220,7 @@ async def test_rejected_waived_extension_does_not_claim_a_refund(
 
 
 @pytest.mark.asyncio
-async def test_extension_restart_failure_rolls_back_days_before_refund(
+async def test_extension_restart_failure_preserves_days_without_refund(
     session_factory,
 ) -> None:
     cfg = HyruleConfig()
@@ -266,8 +274,8 @@ async def test_extension_restart_failure_rolls_back_days_before_refund(
             "headers": [],
         }
     )
-    with pytest.raises(HTTPException) as exc:
-        await extend_vm_route(
+    before = datetime.now(UTC)
+    result = await extend_vm_route(
             "vm_extension_restart_failure",
             VMExtendRequest(days=3),
             request,
@@ -277,9 +285,9 @@ async def test_extension_restart_failure_rolls_back_days_before_refund(
             SettlingGate(),
         )
 
-    assert exc.value.status_code == 500
+    assert result["status"] == VMStatus.SUSPENDED
     assert xcpng.started == ["uuid-extension-restart-failure"]
-    assert xcpng.suspended == ["uuid-extension-restart-failure"]
+    assert xcpng.suspended == []
     async with session_factory() as session:
         stored = await session.get(VMRow, "vm_extension_restart_failure")
     assert stored is not None and stored.expires_at is not None
@@ -288,15 +296,16 @@ async def test_extension_restart_failure_rolls_back_days_before_refund(
         if stored.expires_at.tzinfo is None
         else stored.expires_at
     )
-    assert stored_expiry == original_expiry
+    assert stored_expiry >= before + timedelta(days=3)
     assert str(stored.status) == "suspended"
     assert stored.suspension_reason == "expired"
     events = await _events(session_factory)
-    assert len(events) == 1 and events[0].event_type == "refund_owed"
+    assert [event.event_type for event in events] == ["extend_applied"]
+    assert events[0].amount_usd == 0
 
 
 @pytest.mark.asyncio
-async def test_expired_suspended_extension_commits_after_provider_restart(
+async def test_expired_suspended_extension_resumes_after_committing_days(
     session_factory,
 ) -> None:
     cfg = HyruleConfig()
@@ -624,14 +633,28 @@ async def test_create_vm_can_defer_provisioning(session_factory, monkeypatch) ->
     )
     orch = Orchestrator(HyruleConfig(), session_factory)
     spawned: list[str] = []
-    monkeypatch.setattr(orch, "_spawn_provisioning", lambda vm_id: spawned.append(vm_id))
+    monkeypatch.setattr(orch, "_spawn_provisioning", AsyncMock(side_effect=lambda vm_id: spawned.append(vm_id)))
     order = VMCreateRequest(duration_days=1, size=VMSize.XS, os="debian-13", ssh_pubkey="ssh-ed25519 AAAA test")
 
     row, _ = await orch.create_vm(order, owner_wallet=EVM_WALLET, start_provisioning=False)
     assert spawned == []  # deferred — nothing provisioning yet
+    assert row.metadata_["provisioning_handoff_state"] == "pending"
 
-    orch.start_provisioning(row.vm_id)
+    await orch.start_provisioning(row.vm_id)
     assert spawned == [row.vm_id]  # explicit start works
+    async with session_factory() as session:
+        stored = await session.get(VMRow, row.vm_id)
+        assert stored.metadata_["provisioning_handoff_state"] == "ready"
+
+    # An idempotent replay cannot hide a handoff that has already been
+    # published, even if the replaying caller asks to defer local scheduling.
+    replayed, _ = await orch.create_vm(
+        order,
+        owner_wallet=EVM_WALLET,
+        vm_id=row.vm_id,
+        start_provisioning=False,
+    )
+    assert replayed.metadata_["provisioning_handoff_state"] == "ready"
 
 
 @pytest.mark.asyncio
@@ -766,7 +789,7 @@ async def test_activate_reservation_can_defer_provisioning(session_factory, monk
     start_provisioning=False and only spawn on the explicit start."""
     orch = Orchestrator(HyruleConfig(), session_factory)
     spawned: list[str] = []
-    monkeypatch.setattr(orch, "_spawn_provisioning", lambda vm_id: spawned.append(vm_id))
+    monkeypatch.setattr(orch, "_spawn_provisioning", AsyncMock(side_effect=lambda vm_id: spawned.append(vm_id)))
     async with session_factory() as session:
         session.add(_paid_provisioning_vm("vm_res", wallet="", tx=None, cost="0.05"))
         await session.commit()
@@ -776,9 +799,13 @@ async def test_activate_reservation_can_defer_provisioning(session_factory, monk
     )
     assert row is not None
     assert spawned == []  # deferred until the quote is linked
+    assert row.metadata_["provisioning_handoff_state"] == "pending"
 
-    orch.start_provisioning("vm_res")
+    await orch.start_provisioning("vm_res")
     assert spawned == ["vm_res"]
+    async with session_factory() as session:
+        stored = await session.get(VMRow, "vm_res")
+        assert stored.metadata_["provisioning_handoff_state"] == "ready"
 
 
 @pytest.mark.asyncio
@@ -1085,3 +1112,130 @@ async def test_native_refund_is_atomic_no_partial_flip_on_ledger_failure(
     assert intent.status == CryptoIntentStatus.PROVISIONING  # NOT flipped
     owed = [e for e in await _events(session_factory) if e.event_type == "refund_owed"]
     assert owed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["unapplied", "applied", "unknown", "refund_unavailable"])
+async def test_paid_extension_route_reconciles_commit_before_refund(session_factory, outcome):
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    class CommitFailureSession(AsyncSession):
+        async def commit(self):
+            receipt = next((event for event in self.new if isinstance(event, PaymentEventRow)
+                            and event.event_type == "extend_applied"), None)
+            if receipt is None:
+                if outcome == "refund_unavailable":
+                    for event in self.new:
+                        if isinstance(event, PaymentEventRow) and event.event_type == "refund_owed":
+                            event.event_type = None  # Actual NOT NULL failure, not a successful write.
+                return await super().commit()
+            if outcome == "applied":
+                await super().commit()
+            if outcome == "unknown":
+                self.rollback = AsyncMock(side_effect=ConnectionError("reconciliation unavailable"))
+            raise ConnectionError("lost commit acknowledgment")
+
+    cfg = HyruleConfig()
+    failing_sessions = async_sessionmaker(session_factory.kw["bind"],
+                                         class_=CommitFailureSession, expire_on_commit=False)
+    orch = Orchestrator(cfg, failing_sessions)
+    old_expiry = datetime.now(UTC) + timedelta(days=1)
+    async with session_factory() as session:
+        row = VMRow(vm_id="vm_commit_refund", owner_wallet=EVM_WALLET,
+                    status=VMStatus.RUNNING, size=VMSize.XS, expires_at=old_expiry)
+        session.add(row)
+        await session.commit()
+
+    class SettlingGate:
+        async def check_payment(self, request, **_kwargs):
+            request.state.payment_tx = "0xEXTENSION_COMMIT"
+            return EVM_WALLET
+
+    request = Request({"type": "http", "method": "POST",
+                       "path": "/v1/vm/vm_commit_refund/extend", "headers": []})
+    try:
+        if outcome == "applied":
+            result = await extend_vm_route(row.vm_id, VMExtendRequest(days=3), request,
+                                           row, orch, cfg, SettlingGate())
+            assert result["status"] == VMStatus.RUNNING
+        else:
+            with pytest.raises(HTTPException) as exc:
+                await extend_vm_route(row.vm_id, VMExtendRequest(days=3), request,
+                                      row, orch, cfg, SettlingGate())
+            assert exc.value.status_code == (409 if outcome == "unapplied" else 503)
+            if outcome in ("unknown", "refund_unavailable"):
+                assert "before paying again" in exc.value.detail
+            if outcome == "refund_unavailable":
+                assert "refund could not be confirmed" in exc.value.detail
+        events = await _events(session_factory)
+        expected = {"applied": ["extend_applied"], "unapplied": ["refund_owed"], "unknown": [], "refund_unavailable": []}
+        assert [event.event_type for event in events] == expected[outcome]
+        if events:
+            assert events[0].tx_hash == "0xEXTENSION_COMMIT"
+            assert events[0].payer_wallet == EVM_WALLET
+            assert (events[0].amount_usd == 0) == (outcome == "applied")
+        async with session_factory() as session:
+            stored = await session.get(VMRow, row.vm_id)
+            expiry = stored.expires_at.replace(tzinfo=UTC)
+            assert expiry == old_expiry + timedelta(days=3 if outcome == "applied" else 0)
+    finally:
+        await orch.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["resume_commit", "final_read"])
+async def test_applied_extension_state_failure_does_not_refund_or_invite_payment(
+    session_factory, failure,
+):
+    from types import SimpleNamespace
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    class ResumeCommitFailure(AsyncSession):
+        async def commit(self):
+            if failure == "resume_commit" and any(
+                isinstance(row, VMRow) and row.status == VMStatus.RUNNING for row in self.dirty
+            ):
+                raise ConnectionError("resume state commit failed")
+            return await super().commit()
+
+    cfg = HyruleConfig()
+    sessions = async_sessionmaker(session_factory.kw["bind"], class_=ResumeCommitFailure,
+                                 expire_on_commit=False)
+    orch = Orchestrator(cfg, sessions)
+    provider = SimpleNamespace(get_vm_power_state=AsyncMock(return_value="Halted"),
+                               start_vm=AsyncMock(), close=AsyncMock())
+    await orch.xcpng.close()
+    orch.xcpng = provider
+    old_expiry = datetime.now(UTC) + timedelta(days=1)
+    async with session_factory() as session:
+        row = VMRow(vm_id="vm_resume_commit", owner_wallet=EVM_WALLET,
+                    status=VMStatus.SUSPENDED, suspension_reason="expired",
+                    xcpng_uuid="fixture-guest", size=VMSize.XS, expires_at=old_expiry)
+        session.add(row)
+        await session.commit()
+    if failure == "final_read":
+        orch.get_vm = AsyncMock(side_effect=ConnectionError("read unavailable"))
+
+    class SettlingGate:
+        async def check_payment(self, request, **_kwargs):
+            request.state.payment_tx = "0xRESUME_STATE"
+            return EVM_WALLET
+
+    request = Request({"type": "http", "method": "POST", "path": "/fixture", "headers": []})
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await extend_vm_route(row.vm_id, VMExtendRequest(days=3), request,
+                                  row, orch, cfg, SettlingGate())
+        assert exc.value.status_code == 503
+        assert "extension was applied" in exc.value.detail
+        assert "Do not pay again" in exc.value.detail
+        events = await _events(session_factory)
+        assert [event.event_type for event in events] == ["extend_applied"]
+        assert events[0].tx_hash == "0xRESUME_STATE"
+        provider.start_vm.assert_awaited_once_with("fixture-guest")
+        async with session_factory() as session:
+            stored = await session.get(VMRow, row.vm_id)
+            assert stored.expires_at.replace(tzinfo=UTC) == old_expiry + timedelta(days=3)
+    finally:
+        await orch.shutdown()

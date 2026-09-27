@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from hyrule_cloud.api._contract import (
     config_from_request,
+    paid_diagnostic_delivery_guard,
     payment_price,
     quote,
     require_payment,
@@ -268,13 +269,14 @@ async def dns_blocklist_check(
         )
         if isinstance(verified, Response):
             return verified
-        try:
-            result = await service.check(body.domain)
-        except BlocklistUnavailableError as exc:
-            raise HTTPException(503, str(exc)) from exc
-        if not await _settle_deferred(request, verified):
-            raise HTTPException(402, "payment settlement failed")
-        return result
+        async with paid_diagnostic_delivery_guard(request):
+            try:
+                result = await service.check(body.domain)
+            except BlocklistUnavailableError as exc:
+                raise HTTPException(503, str(exc)) from exc
+            if not await _settle_deferred(request, verified):
+                raise HTTPException(402, "payment settlement failed")
+            return result
 
 
 @router.post("/filtering/check", response_model=DNSFilteringCheckResponse)
@@ -297,21 +299,22 @@ async def dns_filtering_check(
         )
         if isinstance(verified, Response):
             return verified
-        service = _filtering_service(request)
-        if service is None:
-            raise HTTPException(503, "DNS filtering service is unavailable")
-        try:
-            result = await service.check(body.domain)
-        except DomainNotResolvableError as exc:
-            raise HTTPException(422, str(exc)) from exc
-        if not service.meets_quality_floor(result):
-            raise HTTPException(
-                503,
-                "fewer than the required DNS filtering profiles returned conclusive evidence",
-            )
-        if not await _settle_deferred(request, verified):
-            raise HTTPException(402, "payment settlement failed")
-        return result
+        async with paid_diagnostic_delivery_guard(request):
+            service = _filtering_service(request)
+            if service is None:
+                raise HTTPException(503, "DNS filtering service is unavailable")
+            try:
+                result = await service.check(body.domain)
+            except DomainNotResolvableError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            if not service.meets_quality_floor(result):
+                raise HTTPException(
+                    503,
+                    "fewer than the required DNS filtering profiles returned conclusive evidence",
+                )
+            if not await _settle_deferred(request, verified):
+                raise HTTPException(402, "payment settlement failed")
+            return result
 
 
 async def _paid(request: Request) -> Response | None:
@@ -324,74 +327,85 @@ async def _paid(request: Request) -> Response | None:
 async def dns_lookup(request: Request, body: DNSLookupRequest) -> DNSLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await dns_lookup_service(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await dns_lookup_service(body)
 
 
 @router.get("/resolve", response_model=DNSLookupResponse)
 async def dns_resolve(request: Request, name: str, type: DNSLookupRecordType = DNSLookupRecordType.A) -> DNSLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await dns_lookup_service(DNSLookupRequest(name=name, type=type))
+    async with paid_diagnostic_delivery_guard(request):
+        return await dns_lookup_service(DNSLookupRequest(name=name, type=type))
 
 
 @router.get("/reverse", response_model=DNSLookupResponse)
 async def dns_reverse(request: Request, address: str) -> DNSLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await dns_reverse_service(address)
+    async with paid_diagnostic_delivery_guard(request):
+        return await dns_reverse_service(address)
 
 
 @router.get("/trace", response_model=DNSLookupResponse)
 async def dns_trace(request: Request, name: str, type: DNSLookupRecordType = DNSLookupRecordType.A) -> DNSLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await dns_lookup_service(DNSLookupRequest(name=name, type=type, trace=True))
+    async with paid_diagnostic_delivery_guard(request):
+        return await dns_lookup_service(DNSLookupRequest(name=name, type=type, trace=True))
 
 
 @router.get("/dnssec", response_model=DNSLookupResponse)
 async def dns_dnssec(request: Request, name: str) -> DNSLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await dns_lookup_service(DNSLookupRequest(name=name, type=DNSLookupRecordType.DS, dnssec=True))
+    async with paid_diagnostic_delivery_guard(request):
+        return await dns_lookup_service(DNSLookupRequest(name=name, type=DNSLookupRecordType.DS, dnssec=True))
 
 
 @router.get("/servers", response_model=DNSLookupResponse)
 async def dns_servers(request: Request, domain: str) -> DNSLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await dns_lookup_service(DNSLookupRequest(name=domain, type=DNSLookupRecordType.NS))
+    async with paid_diagnostic_delivery_guard(request):
+        return await dns_lookup_service(DNSLookupRequest(name=domain, type=DNSLookupRecordType.NS))
 
 
 @router.get("/zone-check", response_model=DNSLookupResponse)
 async def dns_zone_check(request: Request, domain: str) -> DNSLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await dns_lookup_service(DNSLookupRequest(name=domain, type=DNSLookupRecordType.SOA, dnssec=True))
+    async with paid_diagnostic_delivery_guard(request):
+        return await dns_lookup_service(DNSLookupRequest(name=domain, type=DNSLookupRecordType.SOA, dnssec=True))
 
 
 @router.post("/propagation", response_model=DNSDiagnosticResponse)
 async def dns_propagation(request: Request, body: DNSPropagationRequest) -> DNSDiagnosticResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await propagation(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await propagation(body)
 
 
 @router.post("/authority-vs-recursive", response_model=DNSDiagnosticResponse)
 async def dns_authority_vs_recursive(request: Request, body: DNSAuthorityCompareRequest) -> DNSDiagnosticResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await authority_vs_recursive(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await authority_vs_recursive(body)
 
 
 @router.post("/resolver-detect", response_model=DNSDiagnosticResponse)
 async def dns_resolver_detect(request: Request) -> DNSDiagnosticResponse | Response:
     if payment := await _paid(request):
         return payment
-    return resolver_detect(dict(request.headers))
+    async with paid_diagnostic_delivery_guard(request):
+        return resolver_detect(dict(request.headers))
 
 
 @router.post("/dnssec/report", response_model=DNSDiagnosticResponse)
 async def dns_dnssec_report(request: Request, name: str) -> DNSDiagnosticResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await dnssec_report(name)
+    async with paid_diagnostic_delivery_guard(request):
+        return await dnssec_report(name)
