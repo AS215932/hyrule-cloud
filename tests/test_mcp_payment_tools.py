@@ -58,7 +58,7 @@ async def test_list_payment_networks_lists_evm_and_svm(monkeypatch):
                     },
                 ],
                 "receiver_address": "0xabc",
-                "facilitator_url": "https://x402.org/facilitator",
+                "facilitator_url": "https://facilitator.payai.network",
             }
 
     _patch_client_factory(monkeypatch, _Stub())
