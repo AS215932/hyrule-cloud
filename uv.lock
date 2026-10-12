@@ -1,11 +1,14 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14'",
     "python_full_version == '3.13.*'",
     "python_full_version < '3.13'",
 ]
+
+[manifest]
+build-constraints = [{ name = "scikit-build-core", specifier = "<0.10" }]
 
 [[package]]
 name = "aiohappyeyeballs"

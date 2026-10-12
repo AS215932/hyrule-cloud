@@ -126,3 +126,8 @@ module = [
     "hyrule_cloud.state",
 ]
 ignore_errors = true
+
+[tool.uv]
+# coincurve 20.0.0 sdist sets cmake.verbose, which scikit-build-core >= 0.10
+# rejects; pin the build backend so the wheel builds on fresh runners.
+build-constraint-dependencies = ["scikit-build-core<0.10"]
