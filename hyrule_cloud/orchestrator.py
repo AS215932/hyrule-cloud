@@ -82,6 +82,9 @@ from hyrule_cloud.services.vm_events import (
     FAILURE_GUEST_SETUP,
     ProvisioningFailedError,
     customer_failure_message,
+    deletion_warning_message,
+    expiry_suspended_message,
+    expiry_warning_message,
     internal_failure_detail,
     record_vm_event,
 )
@@ -130,6 +133,32 @@ class GuestRecoveryPendingError(RuntimeError):
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _expiry_notice_sent(row: VMRow, marker: str, expiry_iso: str) -> bool:
+    """Whether an expiry notice (issue #110) already fired for this deadline.
+
+    Markers are keyed on the VM's current ``expires_at``: a renewal moves the
+    deadline, so every marker tied to the old deadline is considered unsent for
+    the new one, which re-arms the warnings without any separate cleanup.
+    """
+    meta = getattr(row, "metadata_", None) or {}
+    notices = meta.get("expiry_notices")
+    return isinstance(notices, dict) and notices.get(marker) == expiry_iso
+
+
+def _mark_expiry_notice(row: VMRow, marker: str, expiry_iso: str) -> None:
+    """Record an expiry notice, pruning markers tied to a superseded deadline."""
+    meta = dict(getattr(row, "metadata_", None) or {})
+    existing = meta.get("expiry_notices")
+    notices = {
+        key: value
+        for key, value in (existing.items() if isinstance(existing, dict) else ())
+        if value == expiry_iso
+    }
+    notices[marker] = expiry_iso
+    meta["expiry_notices"] = notices
+    row.metadata_ = meta
 
 
 def _looks_like_evm_wallet(value: str | None) -> bool:
@@ -2859,12 +2888,105 @@ class Orchestrator:
 
     # --- Expiry Management ---
 
+    async def _warn_upcoming_expiries(self, now: datetime) -> None:
+        """Emit a pre-expiry notice per configured threshold (issue #110).
+
+        Scans live VMs whose expiry falls inside the widest warning window and
+        emits one EXPIRY_WARNING per VM for the most urgent threshold that has
+        been crossed but not yet announced for the current deadline. Markers are
+        keyed on ``expires_at`` so a renewal re-arms the warnings automatically.
+        """
+        thresholds = sorted(
+            {
+                int(hours)
+                for hours in getattr(self.config, "vm_expiry_warning_hours", [72, 24])
+                if int(hours) > 0
+            },
+            reverse=True,
+        )
+        if not thresholds:
+            return
+        window = timedelta(hours=thresholds[0])
+        async with self.db() as session:
+            candidates = list(
+                await session.scalars(
+                    select(VMRow.vm_id).where(
+                        VMRow.status.in_((VMStatus.READY, VMStatus.RUNNING)),
+                        VMRow.deletion_started_at.is_(None),
+                        VMRow.expires_at.isnot(None),
+                        VMRow.expires_at > now,
+                        VMRow.expires_at <= now + window,
+                    )
+                )
+            )
+        for vm_id in candidates:
+            async with self.locked_vm(vm_id) as (session, row):
+                if (
+                    row is None
+                    or row.expires_at is None
+                    or row.deletion_started_at is not None
+                    or row.status not in (VMStatus.READY, VMStatus.RUNNING)
+                ):
+                    continue
+                expiry = row.expires_at
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=UTC)
+                action_now = _now()
+                remaining = expiry - action_now
+                if remaining <= timedelta(0):
+                    # Raced past expiry; the destroy/suspend sweep owns it now.
+                    continue
+                due = [hours for hours in thresholds if remaining <= timedelta(hours=hours)]
+                if not due:
+                    continue
+                expiry_iso = expiry.isoformat()
+                marker = f"warn:{min(due)}"
+                if _expiry_notice_sent(row, marker, expiry_iso):
+                    continue
+                _mark_expiry_notice(row, marker, expiry_iso)
+                await session.commit()
+                hours_remaining = max(1, int(remaining.total_seconds() // 3600))
+                await self._emit(
+                    vm_id,
+                    VMEventKey.EXPIRY_WARNING,
+                    message=expiry_warning_message(hours_remaining),
+                    detail={"expires_at": expiry_iso, "hours_remaining": hours_remaining},
+                )
+
+    async def _warn_pending_deletion(
+        self, session, row: VMRow, expiry: datetime, grace: timedelta, action_now: datetime,
+    ) -> None:
+        """Last-call notice before the irreversible grace-period delete (issue #110)."""
+        warn_hours = int(getattr(self.config, "vm_deletion_warning_hours", 12) or 0)
+        if warn_hours <= 0:
+            return
+        grace_end = expiry + grace
+        if action_now < grace_end - timedelta(hours=warn_hours) or action_now >= grace_end:
+            return
+        expiry_iso = expiry.isoformat()
+        if _expiry_notice_sent(row, "destroy", expiry_iso):
+            return
+        _mark_expiry_notice(row, "destroy", expiry_iso)
+        await session.commit()
+        hours_remaining = max(1, int((grace_end - action_now).total_seconds() // 3600))
+        await self._emit(
+            row.vm_id,
+            VMEventKey.DELETION_WARNING,
+            message=deletion_warning_message(hours_remaining),
+            detail={"grace_ends_at": grace_end.isoformat(), "hours_remaining": hours_remaining},
+        )
+
     async def check_expiries(self) -> None:
         """Suspend expired VMs, destroy those past grace period."""
         await self.reconcile_extension_resumes()
         await self.reconcile_transfer_resumes()
         now = _now()
         grace = timedelta(hours=self.config.vm_grace_period_hours)
+        # Issue #110: tell owners before anything irreversible happens.
+        try:
+            await self._warn_upcoming_expiries(now)
+        except Exception:
+            log.warning("vm_expiry_warning_pass_failed", exc_info=True)
 
         # Purge abandoned pre-payment reservations (a crash between
         # reserve_vm and settlement leaves an unpaid placeholder pinning a
@@ -2948,6 +3070,21 @@ class Orchestrator:
                 if not delete_due:
                     assert expiry is not None
                     if expiry >= action_now or current.status == VMStatus.SUSPENDED:
+                        # Already suspended for expiry (or not yet expired). Warn
+                        # the owner before the irreversible grace-period delete.
+                        if (
+                            current.status == VMStatus.SUSPENDED
+                            and current.suspension_reason == "expired"
+                        ):
+                            try:
+                                await self._warn_pending_deletion(
+                                    session, current, expiry, grace, action_now
+                                )
+                            except Exception:
+                                log.warning(
+                                    "vm_deletion_warning_failed", vm_id=current.vm_id,
+                                    exc_info=True,
+                                )
                         continue
                     # A receipt-backed attempt without a recorded provider UUID
                     # may still have an ambiguous generation-labelled guest to
@@ -2967,10 +3104,32 @@ class Orchestrator:
                             continue
                     if current.status != VMStatus.PROVISIONING:
                         current.status = VMStatus.SUSPENDED
+                    suspended_for_expiry = False
                     if current.suspension_reason not in {"account_disabled", "manual_admin"}:
                         current.suspension_reason = "expired"
                         current.suspended_by_account_id = None
+                        suspended_for_expiry = current.status == VMStatus.SUSPENDED
                     await session.commit()
+                    # Issue #110: a suspended owner's first signal used to be the
+                    # service going dark. Tell them at suspend time.
+                    if suspended_for_expiry:
+                        try:
+                            await self._emit(
+                                current.vm_id,
+                                VMEventKey.EXPIRY_SUSPENDED,
+                                message=expiry_suspended_message(
+                                    self.config.vm_grace_period_hours
+                                ),
+                                detail={
+                                    "expires_at": expiry.isoformat(),
+                                    "grace_ends_at": (expiry + grace).isoformat(),
+                                },
+                            )
+                        except Exception:
+                            log.warning(
+                                "vm_expiry_suspended_notice_failed",
+                                vm_id=current.vm_id, exc_info=True,
+                            )
                     continue
             # Reacquire/recheck in destroy_vm: renewal may commit after the
             # lock above is released but before the deletion claim is written.
