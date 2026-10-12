@@ -426,6 +426,12 @@ class HyruleConfig(BaseSettings):
     # VM lifecycle
     guest_report_timeout_seconds: int = Field(default=900, ge=60, le=3600)
     vm_grace_period_hours: int = 48
+    # Issue #110: owner-facing expiry notices. Hours-before-expiry at which a
+    # pre-expiry warning is emitted (largest first is fine; each fires once per
+    # expiry deadline), and how many hours before the grace-period deletion a
+    # last-call warning is emitted. Empty list / 0 disables the respective notice.
+    vm_expiry_warning_hours: list[int] = Field(default_factory=lambda: [72, 24])
+    vm_deletion_warning_hours: int = Field(default=12, ge=0, le=168)
     vm_expiry_retention_enabled: bool = False
     vm_retention_days: int = Field(default=30, ge=1, le=365)
     vm_retention_verify_interval_seconds: int = Field(default=21600, ge=300, le=86400)
