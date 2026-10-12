@@ -23,7 +23,7 @@ curl https://cloud.hyrule.host/v1/ports/pricing
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/ports/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"target":"example.com","port":443,"protocol":"tcp","profile":"https","vantage":"extmon"}'
 ```
 
