@@ -15,6 +15,8 @@ outside the catalog and therefore outside the curated OpenAPI document.
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
@@ -1093,7 +1095,47 @@ DISCOVERY: dict[tuple[str, str], dict[str, Any]] = {
 }
 
 
+# Readiness gates are evaluated on every 402 challenge, /openapi.json and
+# /.well-known/x402.json request. Several gates build a fresh pydantic
+# ``HyruleConfig()`` (re-reading and re-validating the whole .env) or stat the
+# blocklist catalog, so one curated OpenAPI build cost ~1 s of synchronous CPU
+# on the event loop. Under x402scan probe bursts that starved the uvicorn
+# workers into upstream 504s. Gate results for the live AppState config are
+# therefore memoised for a short TTL: readiness flips (operator seeding a
+# token, a blocklist sync finishing) still surface within the TTL.
+GATE_CACHE_TTL_SECONDS = 30.0
+_gate_cache: dict[tuple[str, int], tuple[float, HyruleConfig, bool]] = {}
+_gate_cache_lock = threading.Lock()
+
+
+def clear_gate_cache() -> None:
+    """Drop memoised gate results (tests and operator reloads)."""
+
+    with _gate_cache_lock:
+        _gate_cache.clear()
+
+
 def _gate_enabled(gate: str, config: HyruleConfig | None = None) -> bool:
+    if gate == "always":
+        return True
+    # domain_marketplace is a cheap, pure function of the (mutable) config
+    # object itself, so it is always evaluated live.
+    if config is None or gate == "domain_marketplace" or GATE_CACHE_TTL_SECONDS <= 0:
+        return _evaluate_gate(gate, config)
+    key = (gate, id(config))
+    now = time.monotonic()
+    with _gate_cache_lock:
+        cached = _gate_cache.get(key)
+    # Identity check guards against id() reuse after a config is collected.
+    if cached is not None and cached[1] is config and now - cached[0] < GATE_CACHE_TTL_SECONDS:
+        return cached[2]
+    result = bool(_evaluate_gate(gate, config))
+    with _gate_cache_lock:
+        _gate_cache[key] = (now, config, result)
+    return result
+
+
+def _evaluate_gate(gate: str, config: HyruleConfig | None = None) -> bool:
     if gate == "always":
         return True
     if gate == "domain_marketplace":
@@ -1189,11 +1231,15 @@ def enabled_paid_operations(
     )
 
 
-def enabled_supporting_operations() -> tuple[SupportingOperation, ...]:
+def enabled_supporting_operations(
+    config: HyruleConfig | None = None,
+) -> tuple[SupportingOperation, ...]:
     """Free workflow routes whose readiness gate passes."""
 
     return tuple(
-        operation for operation in SUPPORTING_OPERATIONS if _gate_enabled(operation.gate)
+        operation
+        for operation in SUPPORTING_OPERATIONS
+        if _gate_enabled(operation.gate, config)
     )
 
 
@@ -1661,7 +1707,7 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
 
     enabled = enabled_paid_operations(config)
     enabled_keys = {operation.key for operation in enabled}
-    supporting = enabled_supporting_operations()
+    supporting = enabled_supporting_operations(config)
     supporting_keys = {operation.key for operation in supporting}
     documented_keys = enabled_keys | supporting_keys
     selected_routes = [

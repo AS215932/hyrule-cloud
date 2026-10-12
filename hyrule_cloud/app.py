@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -476,6 +477,7 @@ async def health():
 
 
 @app.get("/.well-known/x402.json", include_in_schema=False)
+@app.get("/.well-known/x402", include_in_schema=False)
 async def x402_manifest():
     """Compatibility manifest generated from the curated paid-operation catalog."""
     from hyrule_cloud.services.discovery import build_x402_manifest
@@ -497,8 +499,20 @@ async def agent_card(request: Request):
     return build_agent_card(config)
 
 
+_OPENAPI_CACHE_TTL_SECONDS = 60.0
+_openapi_cache: tuple[float, object, dict] | None = None
+
+
 def curated_openapi() -> dict:
-    """Build x402scan's sole, curated OpenAPI document."""
+    """Build x402scan's sole, curated OpenAPI document (memoised per worker).
+
+    Overriding ``app.openapi`` bypasses FastAPI's own ``openapi_schema`` cache,
+    so without this every /openapi.json hit regenerated the whole document
+    synchronously on the event loop. The document only depends on the route
+    table and the live config's readiness gates, so a short TTL keeps gate
+    flips visible while serving repeat requests from memory.
+    """
+    global _openapi_cache
     from hyrule_cloud.services.discovery import build_curated_openapi
 
     state = getattr(app.state, "_typed_state", None)
@@ -507,8 +521,16 @@ def curated_openapi() -> dict:
     # import-time schema tooling and tests usable without starting databases or
     # providers; it still reads the deployment environment rather than using a
     # separate hard-coded price table.
-    config = state.config if state is not None else HyruleConfig()
-    return build_curated_openapi(app, config)
+    if state is None:
+        return build_curated_openapi(app, HyruleConfig())
+    config = state.config
+    now = time.monotonic()
+    cached = _openapi_cache
+    if cached is not None and cached[1] is config and now - cached[0] < _OPENAPI_CACHE_TTL_SECONDS:
+        return cached[2]
+    schema = build_curated_openapi(app, config)
+    _openapi_cache = (now, config, schema)
+    return schema
 
 
 app.openapi = curated_openapi
