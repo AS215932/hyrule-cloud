@@ -180,6 +180,10 @@ def test_llms_txt_lists_live_operations_and_never_gated_ones(
         "hyrule_cloud.services.dns.filtering.dns_filtering_enabled",
         lambda: True,
     )
+    # Gate results are memoised for a short TTL; drop them to observe the flip now.
+    from hyrule_cloud.services.discovery import clear_gate_cache
+
+    clear_gate_cache()
     assert "/v1/dns/filtering/check" in build_llms_txt(config)
 
 

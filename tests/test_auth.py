@@ -70,7 +70,7 @@ class _MockPaymentConfig:
     price_proxy_yggdrasil = Decimal("0.03")
     dev_bypass_secret = ""
     receiver_address = ""
-    facilitator_url = "https://x402.org/facilitator"
+    facilitator_url = "https://facilitator.payai.network"
     payment_networks: list = []
 
     def enabled_networks(self) -> list:

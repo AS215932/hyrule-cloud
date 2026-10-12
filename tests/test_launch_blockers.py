@@ -495,6 +495,10 @@ async def test_manifest_hides_vm_create_until_real_provisioning(launch_state, mo
         monkeypatch.setattr(
             "hyrule_cloud.services.launch_proof.use_real_provisioning", lambda: True
         )
+        # Gate results are memoised for a short TTL; drop them to observe the flip now.
+        from hyrule_cloud.services.discovery import clear_gate_cache
+
+        clear_gate_cache()
         real = await client.get("/.well-known/x402.json")
         real_paths = {r["path"] for r in real.json()["resources"]}
     assert "/v1/vm/create" in real_paths
