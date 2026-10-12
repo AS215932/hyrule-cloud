@@ -36,7 +36,7 @@ curl https://cloud.hyrule.host/v1/mx/tools
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/mx/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"tool":"spf","target":"example.com"}'
 ```
 
@@ -45,7 +45,7 @@ SuperTool-compatible command form:
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/mx/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"command":"mx:example.com"}'
 ```
 
@@ -54,7 +54,7 @@ Full mail-delivery report:
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/mx/jobs \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"profile":"mail_delivery","target":"example.com"}'
 ```
 

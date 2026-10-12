@@ -1600,7 +1600,7 @@ def build_llms_txt(config: HyruleConfig) -> str:
         "    -H 'Content-Type: application/json' -d '{\"name\":\"example.com\",\"type\":\"AAAA\"}'",
         "  -> HTTP 402 with payment requirements (JSON body + Payment-Required header).",
         "  Pay the challenge with an x402 client, then retry the same method, URL, and",
-        "  body with the X-PAYMENT header; the response settles and carries settlement headers.",
+        "  body with the PAYMENT-SIGNATURE header; the response settles and carries settlement headers.",
         "",
         "Paid operations (method path — min USD — description):",
     ]

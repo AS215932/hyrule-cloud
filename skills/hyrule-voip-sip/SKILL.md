@@ -28,7 +28,7 @@ curl https://cloud.hyrule.host/v1/voip/pricing
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/voip/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"target":"example.com","checks":["sip_dns","sip_tls"],"sip_port":5061}'
 ```
 

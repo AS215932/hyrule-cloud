@@ -215,7 +215,7 @@ async def test_prebuilt_payment_header_still_works_without_a_settlement_check() 
         created = await hc.create_vm(duration_days=7, ssh_pubkey="ssh-ed25519 AAAA")
 
     assert created["vm_id"] == _VM_ID
-    assert api.requests[0].headers["X-PAYMENT"] == "pre-built"
+    assert api.requests[0].headers["PAYMENT-SIGNATURE"] == "pre-built"
     assert hc.last_settlement is None
 
 

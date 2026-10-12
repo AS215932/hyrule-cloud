@@ -47,16 +47,16 @@ curl https://cloud.hyrule.host/v1/threat/pricing
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/threat/lookup \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"subject":{"type":"domain","value":"example.com"},"views":["rbl","ct","rdap","whois","dns","reputation"]}'
 ```
 
 ## Shortcuts
 
 ```bash
-curl -H 'X-PAYMENT: <x402-payment>' https://cloud.hyrule.host/v1/threat/domain/example.com
-curl -H 'X-PAYMENT: <x402-payment>' https://cloud.hyrule.host/v1/threat/rbl?target=203.0.113.10
-curl -H 'X-PAYMENT: <x402-payment>' https://cloud.hyrule.host/v1/threat/ct?domain=example.com
+curl -H 'PAYMENT-SIGNATURE: <x402-payment>' https://cloud.hyrule.host/v1/threat/domain/example.com
+curl -H 'PAYMENT-SIGNATURE: <x402-payment>' https://cloud.hyrule.host/v1/threat/rbl?target=203.0.113.10
+curl -H 'PAYMENT-SIGNATURE: <x402-payment>' https://cloud.hyrule.host/v1/threat/ct?domain=example.com
 ```
 
 ## Agent guidance
