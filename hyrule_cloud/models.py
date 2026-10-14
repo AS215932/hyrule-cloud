@@ -725,6 +725,13 @@ class VMEventKey(enum.StrEnum):
     SSH_UNREACHABLE = "ssh_unreachable"
     CUSTOM_DOMAIN_ATTACHED = "custom_domain_attached"
     CUSTOM_DOMAIN_ATTACH_FAILED = "custom_domain_attach_failed"
+    # Expiry lifecycle (issue #110): owner-facing notices emitted by the
+    # expiry sweep so a customer polling /logs or /status learns their VM is
+    # approaching expiry, was suspended at expiry, or is approaching the
+    # irreversible grace-period deletion — before data is lost.
+    EXPIRY_WARNING = "expiry_warning"
+    EXPIRY_SUSPENDED = "expiry_suspended"
+    DELETION_WARNING = "deletion_warning"
     # Terminal
     READY = "ready"
     PROVISIONING_FAILED = "provisioning_failed"

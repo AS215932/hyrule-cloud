@@ -84,6 +84,34 @@ FAILURE_INTERNAL = (
 )
 
 
+# --- Expiry lifecycle notices (issue #110) ---
+# Customer-safe, owner-facing messages emitted by the expiry sweep so a VM is
+# never suspended or (irreversibly) deleted without the owner being told first.
+def expiry_warning_message(hours_remaining: int) -> str:
+    return (
+        f"Your VM expires in about {hours_remaining} hours. "
+        "Renew it with POST /v1/vm/{id}/extend before it expires to avoid "
+        "suspension and, after the grace period, permanent deletion."
+    )
+
+
+def expiry_suspended_message(grace_hours: int) -> str:
+    return (
+        "Your VM has expired and is now suspended (stopped). Your data is "
+        f"still retained. Renew within the {grace_hours}-hour grace period to "
+        "restore it; after the grace period the VM is eligible for permanent "
+        "deletion."
+    )
+
+
+def deletion_warning_message(hours_remaining: int) -> str:
+    return (
+        f"Your expired VM will be permanently deleted in about {hours_remaining} "
+        "hours when the grace period ends. Renew it now with "
+        "POST /v1/vm/{id}/extend, or contact support, to avoid irreversible data loss."
+    )
+
+
 # Exact legacy public templates only: retain arbitrary operator diagnostics and
 # stored history, but do not repeat an obsolete payment claim in new responses.
 _LEGACY_FAILURE_MESSAGES = {

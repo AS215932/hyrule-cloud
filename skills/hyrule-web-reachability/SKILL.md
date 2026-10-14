@@ -37,7 +37,7 @@ curl https://cloud.hyrule.host/v1/web/pricing
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/web/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{
     "target":"https://example.com",
     "checks":["dns","http","tls","cert","headers","cdn_waf"],
@@ -53,7 +53,7 @@ SSL Labs output and do not imply affiliation.
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/web/tls/deep \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"host":"example.com","port":443,"scan_profile":"ssl_labs_style"}'
 ```
 

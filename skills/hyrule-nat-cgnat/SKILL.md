@@ -24,7 +24,7 @@ Hyrule only classifies addresses it actually observes.
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/nat/port-forward/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"target":"customer.example.net","port":443,"protocol":"tcp","profile":"https"}'
 ```
 

@@ -170,7 +170,7 @@ def test_llms_txt_lists_live_operations_and_never_gated_ones(
     assert f"{base}/.well-known/x402.json" in text
     assert f"{base}/openapi.json" in text
     assert f"{base}/.well-known/agent-card.json" in text
-    assert "HTTP 402" in text and "X-PAYMENT" in text  # golden path
+    assert "HTTP 402" in text and "PAYMENT-SIGNATURE" in text  # golden path
     assert '"mcpServers"' in text and "hyrule_cloud.mcp_server" in text
     assert "https://hyrule.host/llms.txt" in text
     assert "HYRULE_DEV_BYPASS" not in text

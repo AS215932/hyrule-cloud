@@ -312,7 +312,8 @@ class HyruleClient:
         the SDK from signing against whichever chain a challenge advertises
         first, which would otherwise mean a wrong-chain spend.
 
-        `payment_header`: pre-built `X-PAYMENT` header for callers that sign
+        `payment_header`: pre-built x402 payment payload, sent as the
+        canonical `PAYMENT-SIGNATURE` header, for callers that sign
         elsewhere. Still supported and unchanged; it is sent on the first
         attempt, so no 402 round-trip happens at all.
 
@@ -322,7 +323,7 @@ class HyruleClient:
         """
         headers: dict[str, str] = {}
         if payment_header:
-            headers["X-PAYMENT"] = payment_header
+            headers["PAYMENT-SIGNATURE"] = payment_header
         if dev_bypass:
             headers["X-DEV-BYPASS"] = dev_bypass
         if api_key:

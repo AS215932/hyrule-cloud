@@ -38,7 +38,7 @@ mcp = FastMCP(
         "domains and manage DNS, run network-intelligence lookups (BGP/routing, "
         "IP/ASN & reputation, DNS, RDAP/WHOIS, web & deep TLS, mail "
         "deliverability, ports/NAT/CGNAT, VoIP/SIP), and proxy requests over "
-        "Direct/Tor/I2P/Yggdrasil. Payment via x402 (USDC on Base)."
+        "Direct/Tor/I2P/Yggdrasil. Payment via x402 (USDC on Base/Polygon/Arbitrum)."
     ),
 )
 
@@ -79,8 +79,8 @@ def _err(e: HyruleError) -> str:
         return (
             f"Payment required. The API returned a 402 response with payment instructions:\n"
             f"{e.detail}\n\n"
-            f"To complete this action, pay via the x402 facilitator (USDC on Base) "
-            f"and retry with the payment proof."
+            f"To complete this action, pay via the x402 facilitator (USDC on Base, Polygon, or Arbitrum) "
+            f"and retry the same request with the proof in the PAYMENT-SIGNATURE header."
         )
     return f"Error {e.status_code}: {e.detail}"
 
