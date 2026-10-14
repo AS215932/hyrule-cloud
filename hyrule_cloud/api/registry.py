@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request, Response
 
-from hyrule_cloud.api._contract import payment_price, quote, require_payment
+from hyrule_cloud.api._contract import (
+    paid_diagnostic_delivery_guard,
+    payment_price,
+    quote,
+    require_payment,
+)
 from hyrule_cloud.models import (
     CapabilityEndpoint,
     PaidEndpointQuote,
@@ -88,74 +93,85 @@ async def _paid_whois(request: Request) -> Response | None:
 async def rdap_lookup(request: Request, body: RDAPLookupRequest) -> RDAPLookupResponse | Response:
     if payment := await _paid_rdap(request):
         return payment
-    return await rdap_lookup_service(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await rdap_lookup_service(body)
 
 
 @router.get("/rdap/domain/{domain}", response_model=RDAPLookupResponse)
 async def rdap_domain(request: Request, domain: str) -> RDAPLookupResponse | Response:
     if payment := await _paid_rdap(request):
         return payment
-    return await rdap_lookup_service(RDAPLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.DOMAIN, value=domain)))
+    async with paid_diagnostic_delivery_guard(request):
+        return await rdap_lookup_service(RDAPLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.DOMAIN, value=domain)))
 
 
 @router.get("/rdap/ip/{address}", response_model=RDAPLookupResponse)
 async def rdap_ip(request: Request, address: str) -> RDAPLookupResponse | Response:
     if payment := await _paid_rdap(request):
         return payment
-    return await rdap_lookup_service(RDAPLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.IP, value=address)))
+    async with paid_diagnostic_delivery_guard(request):
+        return await rdap_lookup_service(RDAPLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.IP, value=address)))
 
 
 @router.get("/rdap/prefix", response_model=RDAPLookupResponse)
 async def rdap_prefix(request: Request, prefix: str) -> RDAPLookupResponse | Response:
     if payment := await _paid_rdap(request):
         return payment
-    return await rdap_lookup_service(RDAPLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.PREFIX, value=prefix)))
+    async with paid_diagnostic_delivery_guard(request):
+        return await rdap_lookup_service(RDAPLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.PREFIX, value=prefix)))
 
 
 @router.get("/rdap/asn/{asn}", response_model=RDAPLookupResponse)
 async def rdap_asn(request: Request, asn: int) -> RDAPLookupResponse | Response:
     if payment := await _paid_rdap(request):
         return payment
-    return await rdap_lookup_service(RDAPLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.ASN, value=asn)))
+    async with paid_diagnostic_delivery_guard(request):
+        return await rdap_lookup_service(RDAPLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.ASN, value=asn)))
 
 
 @router.get("/rdap/entity/{handle}", response_model=RDAPLookupResponse)
 async def rdap_entity(request: Request, handle: str) -> RDAPLookupResponse | Response:
     if payment := await _paid_rdap(request):
         return payment
-    return await rdap_lookup_service(RDAPLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.ENTITY, value=handle)))
+    async with paid_diagnostic_delivery_guard(request):
+        return await rdap_lookup_service(RDAPLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.ENTITY, value=handle)))
 
 
 @router.post("/whois/lookup", response_model=WhoisLookupResponse)
 async def whois_lookup(request: Request, body: WhoisLookupRequest) -> WhoisLookupResponse | Response:
     if payment := await _paid_whois(request):
         return payment
-    return await whois_lookup_service(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await whois_lookup_service(body)
 
 
 @router.get("/whois/domain/{domain}", response_model=WhoisLookupResponse)
 async def whois_domain(request: Request, domain: str) -> WhoisLookupResponse | Response:
     if payment := await _paid_whois(request):
         return payment
-    return await whois_lookup_service(WhoisLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.DOMAIN, value=domain)))
+    async with paid_diagnostic_delivery_guard(request):
+        return await whois_lookup_service(WhoisLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.DOMAIN, value=domain)))
 
 
 @router.get("/whois/ip/{address}", response_model=WhoisLookupResponse)
 async def whois_ip(request: Request, address: str) -> WhoisLookupResponse | Response:
     if payment := await _paid_whois(request):
         return payment
-    return await whois_lookup_service(WhoisLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.IP, value=address)))
+    async with paid_diagnostic_delivery_guard(request):
+        return await whois_lookup_service(WhoisLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.IP, value=address)))
 
 
 @router.get("/whois/prefix", response_model=WhoisLookupResponse)
 async def whois_prefix(request: Request, prefix: str) -> WhoisLookupResponse | Response:
     if payment := await _paid_whois(request):
         return payment
-    return await whois_lookup_service(WhoisLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.PREFIX, value=prefix)))
+    async with paid_diagnostic_delivery_guard(request):
+        return await whois_lookup_service(WhoisLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.PREFIX, value=prefix)))
 
 
 @router.get("/whois/asn/{asn}", response_model=WhoisLookupResponse)
 async def whois_asn(request: Request, asn: int) -> WhoisLookupResponse | Response:
     if payment := await _paid_whois(request):
         return payment
-    return await whois_lookup_service(WhoisLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.ASN, value=asn)))
+    async with paid_diagnostic_delivery_guard(request):
+        return await whois_lookup_service(WhoisLookupRequest(subject=RegistrySubject(type=RegistrySubjectType.ASN, value=asn)))

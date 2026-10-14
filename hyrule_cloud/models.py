@@ -334,6 +334,29 @@ class VMQuoteResponse(BaseModel):
     expires_at: datetime
 
 
+class VMExpiryState(enum.StrEnum):
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    DELETION_ELIGIBLE = "deletion_eligible"
+    DELETING = "deleting"
+    RETAINING = "retaining"
+    RETAINED = "retained"
+    RESTORING = "restoring"
+    NOT_SET = "not_set"
+    NOT_APPLICABLE = "not_applicable"
+    DESTROYED = "destroyed"
+
+
+class VMExpiryInfo(BaseModel):
+    """Expiry policy assessment, independent of reported runtime status."""
+    state: VMExpiryState
+    observed_at: datetime
+    grace_ends_at: datetime | None = None
+    retained_until: datetime | None = None
+    deletion_eligible: bool = False
+    message: str
+
+
 class VMStatusResponse(BaseModel):
     vm_id: str
     status: VMStatus
@@ -347,6 +370,7 @@ class VMStatusResponse(BaseModel):
     firewall: FirewallState | None = None
     error: str | None = None
     cost_breakdown: CostBreakdown | None = None
+    expiry: VMExpiryInfo | None = None
 
 
 class VMPublicStatusResponse(BaseModel):
@@ -379,6 +403,7 @@ class VMPublicStatusResponse(BaseModel):
     rollback_available: bool = False
     operator_message: str | None = None
     customer_message: str | None = None
+    expiry: VMExpiryInfo | None = None
 
 
 class FirewallState(BaseModel):
@@ -700,6 +725,13 @@ class VMEventKey(enum.StrEnum):
     SSH_UNREACHABLE = "ssh_unreachable"
     CUSTOM_DOMAIN_ATTACHED = "custom_domain_attached"
     CUSTOM_DOMAIN_ATTACH_FAILED = "custom_domain_attach_failed"
+    # Expiry lifecycle (issue #110): owner-facing notices emitted by the
+    # expiry sweep so a customer polling /logs or /status learns their VM is
+    # approaching expiry, was suspended at expiry, or is approaching the
+    # irreversible grace-period deletion — before data is lost.
+    EXPIRY_WARNING = "expiry_warning"
+    EXPIRY_SUSPENDED = "expiry_suspended"
+    DELETION_WARNING = "deletion_warning"
     # Terminal
     READY = "ready"
     PROVISIONING_FAILED = "provisioning_failed"

@@ -5,7 +5,7 @@ description: "Deploy bare VMs with x402 payment and a free auto subdomain. Domai
 
 # Hyrule Cloud — Agentic VPS Hosting
 
-Deploy bare VMs with x402 payment (USDC on Base). Every VM gets a free auto
+Deploy bare VMs with x402 payment (USDC on Base, Polygon, or Arbitrum). Every VM gets a free auto
 subdomain under `deploy.hyrule.host`.
 
 ## When to Use
@@ -30,16 +30,18 @@ Service discovery: `GET /.well-known/x402.json`
 
 VMs and network services use the **x402** protocol:
 1. Send the request without payment → get a `402` response with pricing + payment instructions
-2. Pay via the x402 facilitator (USDC on Base, chain `eip155:8453`)
-3. Resend the request with the `X-PAYMENT` header containing the payment proof
+2. Pay via the x402 facilitator (USDC on Base `eip155:8453`, Polygon `eip155:137`, or Arbitrum `eip155:42161` — pick from the live `accepts` list)
+3. Resend the request with the `PAYMENT-SIGNATURE` header containing the payment proof
 
-The `402` carries an `X-PAYMENT-REQUIRED` header (base64-encoded JSON) plus a
-JSON body. Example for `POST /v1/vm/create` (xs, 7 days — values illustrative;
+The `402` carries an `PAYMENT-REQUIRED` header (base64-encoded JSON) plus a
+JSON body. (The server still emits/accepts the legacy V1 `X-PAYMENT-REQUIRED` /
+`X-PAYMENT` headers for older clients; new agents should use `PAYMENT-REQUIRED` /
+`PAYMENT-SIGNATURE`.) Example for `POST /v1/vm/create` (xs, 7 days — values illustrative;
 always read the live header):
 
 ```
 HTTP/1.1 402 Payment Required
-X-PAYMENT-REQUIRED: eyJ4NDAyVmVyc2lvbiI6Mn0...   # base64 of the body below
+PAYMENT-REQUIRED: eyJ4NDAyVmVyc2lvbiI6Mn0...   # base64 of the body below
 ```
 
 ```json
@@ -62,7 +64,7 @@ X-PAYMENT-REQUIRED: eyJ4NDAyVmVyc2lvbiI6Mn0...   # base64 of the body below
 
 Sign an EIP-3009 `TransferWithAuthorization` for the `accepts[].price`, base64-
 encode the x402 payment payload, and resend the same request with
-`X-PAYMENT: <base64>`.
+`PAYMENT-SIGNATURE: <base64>`.
 
 **Durable quotes (recommended):** call `POST /v1/vm/quote` first to lock a price
 and get a `quote_id`, then pass `quote_id` to `POST /v1/vm/create`. The server
@@ -319,7 +321,7 @@ needed) while the VM provisions.
   Yet Launched"); use `auto`
 
 **Workflow:**
-1. POST /v1/vm/create → 402 (get price) → pay → POST again with X-PAYMENT → 202
+1. POST /v1/vm/create → 402 (get price) → pay → POST again with PAYMENT-SIGNATURE → 202
 2. Store the one-time `management_token` from the 202 — it is shown once
 3. Poll GET /v1/vm/{id}/status until `status` is `ready`
 4. SSH in: `ssh root@<hostname>`
@@ -422,7 +424,7 @@ meaning). Treat unknown keys as informational.
 | `ssh_reachable` / `ssh_unreachable` | TCP :22 answered / did not answer within the check window. `ssh_unreachable` is not fatal — the VM is still delivered. |
 | `custom_domain_attached` / `custom_domain_attach_failed` | Custom domain pointed at the VM, or attachment deferred to retry. |
 | `ready` | Terminal success. `detail` carries hostname, ipv6, `dns_aaaa_verified`, `ssh_reachable`. |
-| `provisioning_failed` | Terminal failure. `message` is the customer-facing reason; a paid VM is refunded. |
+| `provisioning_failed` | Terminal failure. `message` is the customer-facing reason; check separate payment/refund evidence. |
 
 What this endpoint **cannot** tell you:
 
@@ -464,8 +466,8 @@ in `/.well-known/x402.json` and this skill will document them again.
 ```
 1. GET /v1/pricing                          # check prices
 2. POST /v1/vm/create                       # → 402 with price
-3. Pay via x402 facilitator                 # USDC on Base
-4. POST /v1/vm/create + X-PAYMENT header    # → 202 + status_url + one-time management_token (store it!)
+3. Pay via x402 facilitator                 # USDC on Base/Polygon/Arbitrum
+4. POST /v1/vm/create + PAYMENT-SIGNATURE header   # → 202 + status_url + one-time management_token (store it!)
 5. Poll GET /v1/vm/{id}/status              # wait for "ready" (public, no auth)
 6. ssh root@<hostname>                      # deploy your app
 7. (optional) POST /v1/network/request      # paid Direct/Tor/I2P/Yggdrasil request
@@ -498,9 +500,11 @@ getent ahosts deb.debian.org        # must return addresses
 ```
 
 `GET /v1/vm/{vm_id}/status` reports this as `dns_resolution_status`
-(`passed` | `failed` | `not_run`). A VM whose resolver does not answer is
-returned as `launch_proof_status: degraded` rather than `provisioned` — it is
-reachable over SSH but cannot resolve names.
+(`passed` | `failed` | `not_run`) for Hyrule's central launch-time resolver
+probe, not a query inside the guest. A failed probe yields
+`launch_proof_status: degraded`; differing routes or ACLs can affect this
+result. Verify DNS inside your VM before concluding it cannot resolve names,
+and verify other guests before inferring fleet-wide impact.
 
 To override with your own DNS64 resolver (e.g. Google's public DNS64):
 

@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request, Response
 
-from hyrule_cloud.api._contract import not_implemented, payment_price, quote, require_payment
+from hyrule_cloud.api._contract import (
+    not_implemented,
+    paid_diagnostic_delivery_guard,
+    payment_price,
+    quote,
+    require_payment,
+)
 from hyrule_cloud.models import (
     CapabilityEndpoint,
     IPLookupRequest,
@@ -95,7 +101,8 @@ async def ip_lookup(request: Request, body: IPLookupRequest) -> IPLookupResponse
         return refusal
     if payment := await _paid(request):
         return payment
-    return await ip_lookup_service(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await ip_lookup_service(body)
 
 
 @router.get("/{address}/geo", response_model=IPLookupResponse)
@@ -104,21 +111,24 @@ async def ip_geo(request: Request, address: str) -> IPLookupResponse | Response:
         return refusal
     if payment := await _paid(request):
         return payment
-    return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.GEO]))
+    async with paid_diagnostic_delivery_guard(request):
+        return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.GEO]))
 
 
 @router.get("/{address}/asn", response_model=IPLookupResponse)
 async def ip_asn(request: Request, address: str) -> IPLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.ASN]))
+    async with paid_diagnostic_delivery_guard(request):
+        return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.ASN]))
 
 
 @router.get("/{address}/rdns", response_model=IPLookupResponse)
 async def ip_rdns(request: Request, address: str) -> IPLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.RDNS]))
+    async with paid_diagnostic_delivery_guard(request):
+        return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.RDNS]))
 
 
 @router.get("/{address}/reputation", response_model=IPLookupResponse)
@@ -127,11 +137,13 @@ async def ip_reputation(request: Request, address: str) -> IPLookupResponse | Re
         return refusal
     if payment := await _paid(request):
         return payment
-    return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.REPUTATION]))
+    async with paid_diagnostic_delivery_guard(request):
+        return await ip_lookup_service(IPLookupRequest(address=address, views=[IPLookupView.REPUTATION]))
 
 
 @router.get("/{address}", response_model=IPLookupResponse)
 async def ip_get(request: Request, address: str) -> IPLookupResponse | Response:
     if payment := await _paid(request):
         return payment
-    return await ip_lookup_service(IPLookupRequest(address=address))
+    async with paid_diagnostic_delivery_guard(request):
+        return await ip_lookup_service(IPLookupRequest(address=address))

@@ -18,28 +18,28 @@ from hyrule_cloud.models import (
     SSHSmokeStatus,
     VMStatus,
 )
+from hyrule_cloud.services.vm_events import normalize_legacy_failure_message
 
 if TYPE_CHECKING:
     from hyrule_cloud.config import HyruleConfig
 
 _LAUNCH_PROOF_REAL = os.environ.get("HCP_LAUNCH_PROOF_REAL_XCPNG") == "1"
 
-# Customer-visible wording for a VM that came up and is reachable but cannot
-# resolve DNS. It names a concrete fix because the resolver is operator-side:
-# the customer cannot wait for us and can unblock themselves in one line.
+# Report the central resolver probe without claiming a guest-side measurement,
+# support delivery, or refund outcome that this formatter does not observe.
 DNS_RESOLUTION_CUSTOMER_MESSAGE = (
-    "Your VM is running and reachable over SSH, but it could not resolve DNS "
-    "names with the resolver we configured. Installing packages and reaching "
-    "hosts by name will fail until it is fixed. You can unblock yourself now "
-    "by putting a working DNS64 resolver in /etc/resolv.conf on the VM (for "
-    "example: nameserver 2001:4860:4860::6464). Our team has been notified — "
-    "contact support if you would rather have a refund."
+    "The launch-time probe could not resolve DNS names using the resolver "
+    "configured for your VM. This check runs from Hyrule, not inside your VM. "
+    "If DNS also fails inside your VM, you can configure a working DNS64 resolver "
+    "in /etc/resolv.conf (for example: nameserver 2001:4860:4860::6464). "
+    "Contact support for help or to discuss a refund."
 )
 
 DNS_RESOLUTION_OPERATOR_MESSAGE = (
-    "customer DNS resolution probe failed: the resolver in "
-    "HYRULE_CUSTOMER_IPV6_DNS did not answer queries. Every VM handed that "
-    "resolver is unable to resolve any hostname."
+    "launch-time resolver probe failed: Hyrule could not resolve the probe "
+    "hostname through HYRULE_CUSTOMER_IPV6_DNS. The probe runs centrally, "
+    "not inside the guest. Check resolver health and guest reachability "
+    "before inferring customer impact or fleet-wide scope."
 )
 
 
@@ -164,7 +164,7 @@ def build_launch_proof(
 
     # A measured resolution failure must not read as a clean `provisioned`.
     # The VM is delivered and usable, so it is not `failed` either (that state
-    # promises a refund and belongs to VMs that never came up) — it is
+    # belongs to VMs that never came up) — it is
     # explicitly degraded.
     if (
         dns_resolution == DNSResolutionStatus.FAILED
@@ -183,15 +183,19 @@ def build_launch_proof(
     # --- Messages ---
     operator_message: str | None = lp_meta.get("operator_message")
     customer_message: str | None = lp_meta.get("customer_message")
+    if operator_message:
+        operator_message = normalize_legacy_failure_message(operator_message)
+    if customer_message:
+        customer_message = normalize_legacy_failure_message(customer_message)
 
     if vm_status == VMStatus.FAILED:
         if not operator_message:
             err = _safe_getattr(vm_row, "error", None)
-            operator_message = str(err) if err else None
+            operator_message = normalize_legacy_failure_message(str(err)) if err else None
         if not customer_message:
             customer_message = (
                 "Provisioning could not be completed. "
-                "Our team has been notified and your payment will be refunded."
+                "Contact support for help and to review any payment or refund."
             )
     elif vm_status == VMStatus.PROVISIONING:
         if not customer_message:

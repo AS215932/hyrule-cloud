@@ -74,7 +74,7 @@ class _StubOrchestrator:
             total=f"${total:.2f}",
         )
 
-    def start_provisioning(self, vm_id: str) -> None:
+    async def start_provisioning(self, vm_id: str) -> None:
         self.provisioning_started.append(vm_id)
 
     async def create_vm(
@@ -116,6 +116,23 @@ class _StubOrchestrator:
             row = await session.get(VMRow, vm_id)
             if row is not None:
                 row.cost_total = amount
+                await session.commit()
+
+    async def persist_payment_billing(
+        self,
+        vm_id: str,
+        retail_amount: Decimal,
+        *,
+        admin_waived: bool,
+        payment_tx: str | None = None,
+    ) -> None:
+        async with self.db() as session:
+            row = await session.get(VMRow, vm_id)
+            if row is not None:
+                row.retail_cost_total = retail_amount
+                row.cost_total = Decimal("0") if admin_waived else retail_amount
+                row.billing_mode = "admin_waived" if admin_waived else "charged"
+                row.payment_tx = payment_tx
                 await session.commit()
 
     async def record_create_failure_refund(
@@ -315,7 +332,9 @@ async def test_failed_vm_shows_safe_message_and_rollback(lp_state, client):
     assert customer is not None
     assert "sr_not_found" not in customer
     assert "deadbeef" not in customer
-    assert "refunded" in customer.lower() or "notified" in customer.lower()
+    assert "contact support" in customer.lower()
+    assert "notified" not in customer.lower()
+    assert "will be refunded" not in customer.lower()
 
 
 # --- Rolled-back path ---
@@ -496,7 +515,7 @@ async def test_dns_resolution_failure_reports_degraded_not_ready(lp_state, clien
 
     assert body["dns_resolution_status"] == DNSResolutionStatus.FAILED
     # NOT a clean provisioned — but the VM is delivered, so not `failed`
-    # either (that state promises a refund).
+    # either (that state represents a failed launch).
     assert body["launch_proof_status"] == LaunchProofStatus.DEGRADED
     assert body["status"] == VMStatus.READY
     assert body["ssh_smoke_status"] == SSHSmokeStatus.PASSED
@@ -506,6 +525,10 @@ async def test_dns_resolution_failure_reports_degraded_not_ready(lp_state, clien
     assert "resolve" in customer.lower()
     # The customer can unblock themselves while the operator fixes the fleet.
     assert "resolv.conf" in customer
+    assert "notified" not in customer.lower()
+    assert "not inside your VM" in customer
+    assert "runs centrally" in (body["operator_message"] or "")
+    assert "Every VM" not in (body["operator_message"] or "")
     assert "HYRULE_CUSTOMER_IPV6_DNS" in (body["operator_message"] or "")
 
 
@@ -721,3 +744,27 @@ def test_explicit_dns_verification_failure_is_not_papered_over() -> None:
     _Row.metadata_ = {}
     proof = build_launch_proof(_Row())
     assert proof["dns_aaaa_verified"] is True
+
+
+@pytest.mark.parametrize("reason", [
+    "Your VM did not come online within the provisioning window.",
+    "There was not enough free capacity to build your VM.",
+    "Your VM's DNS record could not be published.",
+    "Provisioning failed because of a problem on our side.",
+])
+@pytest.mark.parametrize("stored_metadata", [False, True])
+def test_legacy_failure_fallback_does_not_repeat_refund_claim(reason, stored_metadata):
+    from types import SimpleNamespace
+
+    from hyrule_cloud.services.launch_proof import build_launch_proof
+    legacy = reason + " The order was stopped and any payment is refunded."
+    metadata = {"launch_proof": {"customer_message": legacy, "operator_message": legacy}} if stored_metadata else {}
+    row = SimpleNamespace(status=VMStatus.FAILED, error=legacy, metadata_=metadata)
+    proof = build_launch_proof(row)
+    assert "is refunded" not in proof["operator_message"]
+    assert "review any payment or refund" in proof["operator_message"]
+    assert "is refunded" not in proof["customer_message"]
+    assert row.error == legacy  # Persisted history is not rewritten.
+    if stored_metadata:
+        assert row.metadata_["launch_proof"]["customer_message"] == legacy
+        assert row.metadata_["launch_proof"]["operator_message"] == legacy

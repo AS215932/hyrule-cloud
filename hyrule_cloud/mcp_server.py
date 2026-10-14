@@ -38,7 +38,7 @@ mcp = FastMCP(
         "domains and manage DNS, run network-intelligence lookups (BGP/routing, "
         "IP/ASN & reputation, DNS, RDAP/WHOIS, web & deep TLS, mail "
         "deliverability, ports/NAT/CGNAT, VoIP/SIP), and proxy requests over "
-        "Direct/Tor/I2P/Yggdrasil. Payment via x402 (USDC on Base)."
+        "Direct/Tor/I2P/Yggdrasil. Payment via x402 (USDC on Base/Polygon/Arbitrum)."
     ),
 )
 
@@ -79,8 +79,8 @@ def _err(e: HyruleError) -> str:
         return (
             f"Payment required. The API returned a 402 response with payment instructions:\n"
             f"{e.detail}\n\n"
-            f"To complete this action, pay via the x402 facilitator (USDC on Base) "
-            f"and retry with the payment proof."
+            f"To complete this action, pay via the x402 facilitator (USDC on Base, Polygon, or Arbitrum) "
+            f"and retry the same request with the proof in the PAYMENT-SIGNATURE header."
         )
     return f"Error {e.status_code}: {e.detail}"
 
@@ -335,13 +335,18 @@ async def revoke_tunnel(tunnel_id: str, token: str) -> str:
 
 @mcp.tool()
 async def destroy_vm(vm_id: str, management_token: str | None = None) -> str:
-    """Destroy a VM permanently. This cannot be undone. Requires the one-time
+    """Request permanent VM deletion; retained VMs remain stopped for recovery.
+    Permanent deletion cannot be undone. Requires the one-time
     `management_token` from create_vm unless the VM is owned by the
     authenticated account."""
     try:
         async with _client() as hc:
-            await hc.destroy_vm(vm_id, management_token=management_token)
-            return f"VM {vm_id} destroyed."
+            result = await hc.destroy_vm(vm_id, management_token=management_token)
+            if result.get("status") == "retained":
+                return f"VM {vm_id} is stopped and retained for recovery."
+            if result.get("status") == "ok":
+                return f"VM {vm_id} destroyed."
+            return f"VM {vm_id} deletion completion was not confirmed."
     except HyruleError as e:
         return _err(e)
 

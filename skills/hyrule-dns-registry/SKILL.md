@@ -25,7 +25,7 @@ This Skill must not mutate zones or register domains.
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/dns/propagation \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"name":"www.example.com","type":"A","expected":["203.0.113.10"],"resolvers":["cloudflare","google","quad9","system"]}'
 ```
 
@@ -34,7 +34,7 @@ curl -X POST https://cloud.hyrule.host/v1/dns/propagation \
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/dns/authority-vs-recursive \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"name":"example.com","type":"MX","recursive_resolvers":["1.1.1.1","8.8.8.8","9.9.9.9"]}'
 ```
 
@@ -42,7 +42,7 @@ curl -X POST https://cloud.hyrule.host/v1/dns/authority-vs-recursive \
 
 ```bash
 curl -X POST 'https://cloud.hyrule.host/v1/dns/dnssec/report?name=example.com' \
-  -H 'X-PAYMENT: <x402-payment>'
+  -H 'PAYMENT-SIGNATURE: <x402-payment>'
 ```
 
 ### Domain blocklist membership
@@ -55,7 +55,7 @@ curl https://cloud.hyrule.host/v1/dns/blocklists/sources
 
 curl -X POST https://cloud.hyrule.host/v1/dns/blocklists/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"domain":"example.com"}'
 ```
 
@@ -71,7 +71,7 @@ curl https://cloud.hyrule.host/v1/dns/filtering/resolvers
 
 curl -X POST https://cloud.hyrule.host/v1/dns/filtering/check \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"domain":"example.com"}'
 ```
 
@@ -84,12 +84,12 @@ This operation sends the submitted domain to the named public DNS providers.
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/rdap/lookup \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"subject":{"type":"domain","value":"example.com"}}'
 
 curl -X POST https://cloud.hyrule.host/v1/whois/lookup \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"subject":{"type":"domain","value":"example.com"}}'
 ```
 

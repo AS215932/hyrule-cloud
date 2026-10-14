@@ -25,7 +25,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from hyrule_cloud.app import app
-from hyrule_cloud.db import Base, RecoveryChallengeRow, VMRow
+from hyrule_cloud.db import AccountRow, Base, RecoveryChallengeRow, VMRow
 from hyrule_cloud.models import (
     VMSize,
     VMStatus,
@@ -276,6 +276,41 @@ async def test_recovery_succeeds_when_signer_owns_a_vm_on_account(
         json={"account_id": account_id, "password": "before-pw correct horse"},
     )
     assert bad.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_wallet_recovery_cannot_replace_disabled_account_credentials(
+    auth_state, client
+):
+    reg = await client.post(
+        "/v1/auth/register", json={"password": "disabled wallet password long enough"}
+    )
+    account_id = reg.json()["account_id"]
+    await _seed_owned_vm(auth_state, account_id)
+    chal = await client.post(
+        "/v1/auth/recover/wallet/challenge", json={"account_id": account_id}
+    )
+    nonce = chal.json()["nonce"]
+    signature = _sign(chal.json()["challenge_text"])
+    async with auth_state.orchestrator.db.begin() as session:
+        account = await session.get(AccountRow, account_id)
+        account.disabled_at = _now()
+        original_password_hash = account.password_hash
+
+    verify = await client.post(
+        "/v1/auth/recover/wallet/verify",
+        json={
+            "nonce": nonce,
+            "signature": signature,
+            "new_password": "disabled replacement password long enough",
+        },
+    )
+    assert verify.status_code == 403
+    async with auth_state.orchestrator.db() as session:
+        account = await session.get(AccountRow, account_id)
+        challenge = await session.get(RecoveryChallengeRow, nonce)
+        assert account.password_hash == original_password_hash
+        assert challenge.used_at is None
 
 
 # --- Tests: payment-history requirement (Block F's headline guarantee) ---

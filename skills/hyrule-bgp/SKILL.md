@@ -27,7 +27,7 @@ IP lookups do not require the caller to know the ASN.
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/bgp/lookup \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"subject":{"type":"prefix","value":"2a0c:b641:b50::/44"},"views":["origins","rpki","visibility"]}'
 ```
 
@@ -49,5 +49,5 @@ snapshots.
 
 ## x402
 
-Call a paid endpoint without `X-PAYMENT` to receive a `402 Payment Required`
-challenge. Pay through an x402 facilitator and retry with `X-PAYMENT`.
+Call a paid endpoint without `PAYMENT-SIGNATURE` to receive a `402 Payment Required`
+challenge. Pay through an x402 facilitator and retry with `PAYMENT-SIGNATURE`.

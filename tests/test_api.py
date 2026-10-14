@@ -15,6 +15,7 @@ from hyrule_cloud.models import NetworkResponse, ProxyMode, VMStatus
 _TEST_TOKEN = "hyr_vm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 class MockConfig:
+    vm_grace_period_hours = 48
     class Payment:
         price_vm_xs = Decimal("0.20")
         price_vm_sm = Decimal("0.40")

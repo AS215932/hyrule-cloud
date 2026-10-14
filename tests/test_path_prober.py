@@ -8,6 +8,7 @@ the prober fails to deliver).
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -419,6 +420,43 @@ async def test_ping_route_delivers_then_settles(monkeypatch):
     assert gate.verify_calls == 1
     assert gate.settle_calls == 1  # settled exactly once, after delivery
     assert any(f["code"] == "ping_reachable_as215932" for f in res.json()["findings"])
+
+
+@pytest.mark.asyncio
+async def test_ping_route_holds_admin_waiver_guard_through_delivery(monkeypatch):
+    monkeypatch.setenv("HYRULE_PROBER_TOKEN", "x")
+    held = False
+
+    @asynccontextmanager
+    async def guard(_request):
+        nonlocal held
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    gate = _FakeGate()
+    prober = _FakeProber(outcomes={"ping": [_ping_result("as215932", 0.0)]})
+    real_probe = prober.probe
+
+    async def guarded_probe(**kwargs):
+        assert held
+        return await real_probe(**kwargs)
+
+    prober.probe = guarded_probe
+    monkeypatch.setattr("hyrule_cloud.api.path.paid_diagnostic_delivery_guard", guard)
+    old = getattr(app.state, "_typed_state", None)
+    app.state._typed_state = _wire_state(gate, prober)
+    try:
+        res = await _post({"target": "example.com"})
+    finally:
+        if old is not None:
+            app.state._typed_state = old
+        else:
+            delattr(app.state, "_typed_state")
+    assert res.status_code == 200, res.text
+    assert not held
 
 
 @pytest.mark.asyncio

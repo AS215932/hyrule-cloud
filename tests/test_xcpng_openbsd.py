@@ -162,6 +162,9 @@ async def test_debian_create_skips_openbsd_prep():
     )
 
     assert provider.events == ["vm.create", "resize", "vm.start"]
+    # A create request completing after its caller crashes must stay halted;
+    # recovery may already have issued a fresh generation on the same prefix.
+    assert provider.vm_create_params["bootAfterCreate"] is False
     assert "networkConfig" not in provider.vm_create_params
 
 

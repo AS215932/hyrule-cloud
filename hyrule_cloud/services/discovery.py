@@ -15,6 +15,8 @@ outside the catalog and therefore outside the curated OpenAPI document.
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
 
 
 PriceMode = Literal["fixed", "dynamic"]
+AdminOperationClass = Literal["diagnostic", "real_cost"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +123,7 @@ class PaidOperation:
     output_example: Any
     path_examples: dict[str, Any]
     gate: str = "always"
+    admin_operation_class: AdminOperationClass = "diagnostic"
     tags: tuple[str, ...] = ()
 
     @property
@@ -316,6 +320,7 @@ def _body_operation(
     *,
     gate: str = "always",
     input_schema: dict[str, Any] | None = None,
+    admin_operation_class: AdminOperationClass = "diagnostic",
 ) -> PaidOperation:
     resolved_input_schema = input_schema or _inline_defs(request_model.model_json_schema())
     return PaidOperation(
@@ -336,6 +341,7 @@ def _body_operation(
         output_example=output_example,
         path_examples={},
         gate=gate,
+        admin_operation_class=admin_operation_class,
         tags=_default_tags(path),
     )
 
@@ -627,6 +633,7 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
             "status_url": "/v1/vm/vm_a1b2c3d4e5f6/status",
         },
         gate="real_vm",
+        admin_operation_class="real_cost",
     ),
     _body_operation(
         "/v1/domains/registrations",
@@ -675,6 +682,7 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
             "elapsed_seconds": 0.12,
             "proxy_mode": "direct",
         },
+        admin_operation_class="real_cost",
     ),
     _body_operation(
         "/v1/tunnel/create",
@@ -696,6 +704,7 @@ PAID_OPERATIONS: tuple[PaidOperation, ...] = (
             "visitor_conns": 0,
         },
         gate="tunnel",
+        admin_operation_class="real_cost",
     ),
     _body_operation(
         "/v1/bgp/lookup",
@@ -1086,7 +1095,47 @@ DISCOVERY: dict[tuple[str, str], dict[str, Any]] = {
 }
 
 
+# Readiness gates are evaluated on every 402 challenge, /openapi.json and
+# /.well-known/x402.json request. Several gates build a fresh pydantic
+# ``HyruleConfig()`` (re-reading and re-validating the whole .env) or stat the
+# blocklist catalog, so one curated OpenAPI build cost ~1 s of synchronous CPU
+# on the event loop. Under x402scan probe bursts that starved the uvicorn
+# workers into upstream 504s. Gate results for the live AppState config are
+# therefore memoised for a short TTL: readiness flips (operator seeding a
+# token, a blocklist sync finishing) still surface within the TTL.
+GATE_CACHE_TTL_SECONDS = 30.0
+_gate_cache: dict[tuple[str, int], tuple[float, HyruleConfig, bool]] = {}
+_gate_cache_lock = threading.Lock()
+
+
+def clear_gate_cache() -> None:
+    """Drop memoised gate results (tests and operator reloads)."""
+
+    with _gate_cache_lock:
+        _gate_cache.clear()
+
+
 def _gate_enabled(gate: str, config: HyruleConfig | None = None) -> bool:
+    if gate == "always":
+        return True
+    # domain_marketplace is a cheap, pure function of the (mutable) config
+    # object itself, so it is always evaluated live.
+    if config is None or gate == "domain_marketplace" or GATE_CACHE_TTL_SECONDS <= 0:
+        return _evaluate_gate(gate, config)
+    key = (gate, id(config))
+    now = time.monotonic()
+    with _gate_cache_lock:
+        cached = _gate_cache.get(key)
+    # Identity check guards against id() reuse after a config is collected.
+    if cached is not None and cached[1] is config and now - cached[0] < GATE_CACHE_TTL_SECONDS:
+        return cached[2]
+    result = bool(_evaluate_gate(gate, config))
+    with _gate_cache_lock:
+        _gate_cache[key] = (now, config, result)
+    return result
+
+
+def _evaluate_gate(gate: str, config: HyruleConfig | None = None) -> bool:
     if gate == "always":
         return True
     if gate == "domain_marketplace":
@@ -1182,11 +1231,15 @@ def enabled_paid_operations(
     )
 
 
-def enabled_supporting_operations() -> tuple[SupportingOperation, ...]:
+def enabled_supporting_operations(
+    config: HyruleConfig | None = None,
+) -> tuple[SupportingOperation, ...]:
     """Free workflow routes whose readiness gate passes."""
 
     return tuple(
-        operation for operation in SUPPORTING_OPERATIONS if _gate_enabled(operation.gate)
+        operation
+        for operation in SUPPORTING_OPERATIONS
+        if _gate_enabled(operation.gate, config)
     )
 
 
@@ -1199,6 +1252,22 @@ def discovery_for(
     if operation is None or not _gate_enabled(operation.gate, config):
         return None
     return operation.declaration
+
+
+def match_paid_operation(method: str, concrete_path: str) -> PaidOperation | None:
+    """Match any catalog operation without applying its readiness gate.
+
+    Admin payment waivers classify risk at the handler boundary, where even a
+    deployment-gated operation must retain its explicit cost classification.
+    Public discovery and preflight challenges must use ``match_enabled_operation``.
+    """
+
+    wanted_method = method.upper()
+    normalized_path = concrete_path.rstrip("/") or "/"
+    for operation, path_regex in _PATH_MATCHERS:
+        if operation.method == wanted_method and path_regex.fullmatch(normalized_path):
+            return operation
+    return None
 
 
 def match_enabled_operation(
@@ -1217,7 +1286,7 @@ def match_enabled_operation(
             continue
         if not path_regex.fullmatch(normalized_path):
             continue
-        return operation if _gate_enabled(operation.gate) else None
+        return operation
     return None
 
 
@@ -1531,7 +1600,7 @@ def build_llms_txt(config: HyruleConfig) -> str:
         "    -H 'Content-Type: application/json' -d '{\"name\":\"example.com\",\"type\":\"AAAA\"}'",
         "  -> HTTP 402 with payment requirements (JSON body + Payment-Required header).",
         "  Pay the challenge with an x402 client, then retry the same method, URL, and",
-        "  body with the X-PAYMENT header; the response settles and carries settlement headers.",
+        "  body with the PAYMENT-SIGNATURE header; the response settles and carries settlement headers.",
         "",
         "Paid operations (method path — min USD — description):",
     ]
@@ -1638,7 +1707,7 @@ def build_curated_openapi(application: FastAPI, config: HyruleConfig) -> dict[st
 
     enabled = enabled_paid_operations(config)
     enabled_keys = {operation.key for operation in enabled}
-    supporting = enabled_supporting_operations()
+    supporting = enabled_supporting_operations(config)
     supporting_keys = {operation.key for operation in supporting}
     documented_keys = enabled_keys | supporting_keys
     selected_routes = [

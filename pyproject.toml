@@ -58,6 +58,7 @@ dev = [
 [project.scripts]
 hyrule-mcp = "hyrule_cloud.mcp_server:main"
 hyrule-cloud-worker = "hyrule_cloud.worker:main"
+hyrule-admin = "hyrule_cloud.admin_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["hyrule_cloud*"]
@@ -125,3 +126,8 @@ module = [
     "hyrule_cloud.state",
 ]
 ignore_errors = true
+
+[tool.uv]
+# coincurve 20.0.0 sdist sets cmake.verbose, which scikit-build-core >= 0.10
+# rejects; pin the build backend so the wheel builds on fresh runners.
+build-constraint-dependencies = ["scikit-build-core<0.10"]

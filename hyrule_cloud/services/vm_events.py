@@ -49,22 +49,83 @@ class ProvisioningFailedError(RuntimeError):
 
 # --- Fixed customer-facing failure messages (the entire allowlist) ---
 
+FAILURE_GUEST_SETUP = (
+    "Your setup script failed. The VM is retained for diagnosis; "
+    "check /var/log/hyrule-setup.log in your VM. Contact support for recovery or refund status."
+)
+FAILURE_GUEST_INIT = (
+    "Cloud-init did not complete successfully. The VM is retained for diagnosis; "
+    "check cloud-init status in your VM. Contact support for recovery or refund status."
+)
+FAILURE_GUEST_REPORT = (
+    "Guest initialization could not be verified before the deadline. "
+    "The VM is retained for diagnosis. Contact support for recovery or refund status."
+)
+FAILURE_GUEST_RECOVERY = (
+    "Provisioning was interrupted and needs operator recovery. "
+    "Contact support for guest recovery or refund status."
+)
+
 FAILURE_TIMEOUT = (
     "Your VM did not come online within the provisioning window. "
-    "The order was stopped and any payment is refunded."
+    "The order was stopped. Contact support to review any payment or refund."
 )
 FAILURE_CAPACITY = (
     "There was not enough free capacity to build your VM. "
-    "The order was stopped and any payment is refunded."
+    "The order was stopped. Contact support to review any payment or refund."
 )
 FAILURE_DNS = (
     "Your VM's DNS record could not be published. "
-    "The order was stopped and any payment is refunded."
+    "The order was stopped. Contact support to review any payment or refund."
 )
 FAILURE_INTERNAL = (
     "Provisioning failed because of a problem on our side. "
-    "The order was stopped and any payment is refunded."
+    "The order was stopped. Contact support to review any payment or refund."
 )
+
+
+# --- Expiry lifecycle notices (issue #110) ---
+# Customer-safe, owner-facing messages emitted by the expiry sweep so a VM is
+# never suspended or (irreversibly) deleted without the owner being told first.
+def expiry_warning_message(hours_remaining: int) -> str:
+    return (
+        f"Your VM expires in about {hours_remaining} hours. "
+        "Renew it with POST /v1/vm/{id}/extend before it expires to avoid "
+        "suspension and, after the grace period, permanent deletion."
+    )
+
+
+def expiry_suspended_message(grace_hours: int) -> str:
+    return (
+        "Your VM has expired and is now suspended (stopped). Your data is "
+        f"still retained. Renew within the {grace_hours}-hour grace period to "
+        "restore it; after the grace period the VM is eligible for permanent "
+        "deletion."
+    )
+
+
+def deletion_warning_message(hours_remaining: int) -> str:
+    return (
+        f"Your expired VM will be permanently deleted in about {hours_remaining} "
+        "hours when the grace period ends. Renew it now with "
+        "POST /v1/vm/{id}/extend, or contact support, to avoid irreversible data loss."
+    )
+
+
+# Exact legacy public templates only: retain arbitrary operator diagnostics and
+# stored history, but do not repeat an obsolete payment claim in new responses.
+_LEGACY_FAILURE_MESSAGES = {
+    message.replace(
+        "The order was stopped. Contact support to review any payment or refund.",
+        "The order was stopped and any payment is refunded.",
+    ): message
+    for message in (FAILURE_TIMEOUT, FAILURE_CAPACITY, FAILURE_DNS, FAILURE_INTERNAL)
+}
+
+
+def normalize_legacy_failure_message(message: str) -> str:
+    return _LEGACY_FAILURE_MESSAGES.get(message, message)
+
 
 # Deliberately NOT keyed on message text — only on exception type, so provider
 # strings can never steer (or leak into) the customer-facing outcome. Failures
@@ -171,7 +232,7 @@ async def vm_log_events(orchestrator: object, row: object) -> list[VMLogEvent]:
             VMLogEvent(
                 ts=r.created_at.isoformat(),
                 event=r.event,
-                message=r.message,
+                message=normalize_legacy_failure_message(r.message) if r.message else r.message,
                 detail=r.detail,
             )
             for r in rows

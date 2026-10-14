@@ -310,7 +310,7 @@ class _OrchRecording:
             vm_cost="$1.00", domain_cost="$0.00", total="$1.00"
         )
 
-    def start_provisioning(self, vm_id):
+    async def start_provisioning(self, vm_id):
         return None
 
     async def create_vm(

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Request, Response
 from hyrule_cloud.api._contract import (
     diagnostic_quote,
     not_implemented,
+    paid_diagnostic_delivery_guard,
     payment_price,
     require_paid_diagnostic,
 )
@@ -102,7 +103,8 @@ async def run_voip_check(request: Request, body: VoIPCheckRequest) -> Diagnostic
         return not_implemented("voip.check.active", _VOIP_CHECK_NO_LIVE_BACKEND)
     if payment := await require_paid_diagnostic(request, price_attr="price_voip_check", default="0.01", description="Hyrule VoIP/SIP diagnostic check"):
         return payment
-    return await voip_check(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await voip_check(body)
 
 
 @router.post("/number/lookup", response_model=DiagnosticResponse)
@@ -113,7 +115,8 @@ async def run_voip_number_lookup(request: Request, body: VoIPNumberLookupRequest
         return not_implemented("voip.number.lookup")
     if payment := await require_paid_diagnostic(request, price_attr="price_voip_number_lookup", default="0.05", description="Hyrule VoIP number intelligence lookup"):
         return payment
-    return await voip_number_lookup(body)
+    async with paid_diagnostic_delivery_guard(request):
+        return await voip_number_lookup(body)
 
 
 @router.post("/report", response_model=DiagnosticResponse)

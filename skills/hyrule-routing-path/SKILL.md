@@ -43,7 +43,7 @@ curl https://cloud.hyrule.host/v1/path/pricing
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/path/report \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{
     "target":"example.com",
     "address_family":"auto",
@@ -57,7 +57,7 @@ curl -X POST https://cloud.hyrule.host/v1/path/report \
 ```bash
 curl -X POST https://cloud.hyrule.host/v1/path/trace \
   -H 'Content-Type: application/json' \
-  -H 'X-PAYMENT: <x402-payment>' \
+  -H 'PAYMENT-SIGNATURE: <x402-payment>' \
   -d '{"target":"example.com","vantages":["extmon"]}'
 ```
 
