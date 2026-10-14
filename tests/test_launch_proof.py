@@ -461,6 +461,55 @@ async def test_probe_ssh_fails_closed_when_unreachable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_probe_ssh_succeeds_when_close_hangs(monkeypatch) -> None:
+    """#122: a wait_closed() that never returns must not block provisioning."""
+    from hyrule_cloud.orchestrator import Orchestrator
+
+    class _HangingWriter:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            await asyncio.Event().wait()  # never set
+
+    writer = _HangingWriter()
+
+    async def _open_connection(host, port):
+        return object(), writer
+
+    monkeypatch.setattr(asyncio, "open_connection", _open_connection)
+    ok = await asyncio.wait_for(
+        Orchestrator._probe_ssh(
+            object(), "2001:db8::2", timeout_seconds=5, interval_seconds=1, close_timeout_seconds=0.05
+        ),
+        timeout=2,
+    )
+    assert ok is True
+    assert writer.closed is True
+
+
+@pytest.mark.asyncio
+async def test_probe_ssh_close_error_still_counts_as_reachable(monkeypatch) -> None:
+    from hyrule_cloud.orchestrator import Orchestrator
+
+    class _ResetWriter:
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            raise ConnectionResetError("peer reset during close")
+
+    async def _open_connection(host, port):
+        return object(), _ResetWriter()
+
+    monkeypatch.setattr(asyncio, "open_connection", _open_connection)
+    ok = await Orchestrator._probe_ssh(object(), "2001:db8::2", timeout_seconds=2, interval_seconds=1)
+    assert ok is True
+
+
+@pytest.mark.asyncio
 async def test_verify_aaaa_fails_closed_without_dns_server() -> None:
     from hyrule_cloud.config import HyruleConfig
     from hyrule_cloud.providers.dns import DNSProvider
