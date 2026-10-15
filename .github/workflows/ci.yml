@@ -19,7 +19,7 @@ jobs:
     # Branch protection requires this exact check name. Don't rename without
     # updating the rule in repo settings.
     name: test
-    runs-on: [self-hosted, linux, x64, hyrule-public-pr]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
       postgres:
@@ -43,9 +43,10 @@ jobs:
           # runner caches the .git anyway.
           fetch-depth: 0
 
-      # actions/setup-python has no Debian 13 build for 3.12; the runner
-      # ships system Python 3.13 which satisfies requires-python = ">=3.12"
-      # and matches the api VM in production.
+      # GitHub-hosted runner: pin Python 3.13 to match production.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
