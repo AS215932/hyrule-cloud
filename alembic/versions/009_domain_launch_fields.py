@@ -74,8 +74,8 @@ def downgrade() -> None:
     op.drop_index("ix_domains_client_order_id", table_name="domains")
     op.drop_index("ix_domains_status", table_name="domains")
     op.drop_index("ix_domains_anon_management_token_hash", table_name="domains")
-    op.drop_index("ix_domains_owner_account_id", table_name="domains")
-    op.drop_constraint("domains_owner_account_id_fkey", "domains", type_="foreignkey")
+    # Ownership column, index and FK belong to migration 003. Preserve them
+    # when returning to 008; 003 will remove them when downgrading further.
     op.drop_column("domains", "error")
     op.drop_column("domains", "currency")
     op.drop_column("domains", "total_price")
@@ -84,5 +84,4 @@ def downgrade() -> None:
     op.drop_column("domains", "client_order_id")
     op.drop_column("domains", "status")
     op.drop_column("domains", "anon_management_token_hash")
-    op.drop_column("domains", "owner_account_id")
     sa.Enum(name="domain_status").drop(op.get_bind(), checkfirst=True)
