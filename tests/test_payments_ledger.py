@@ -250,6 +250,10 @@ async def test_metrics_renders_ledger_and_fleet_counters(metrics_app_state) -> N
         in body
     )
     assert 'hyrule_payment_revenue_usd_total{service_group="vm",network="eip155:8453"} 0.05' in body
+    assert 'hyrule_payment_events_by_type_total{event_type="settled"} 1' in body
+    assert 'hyrule_payment_events_by_type_total{event_type="settle_failed"} 0' in body
+    assert 'hyrule_payment_events_by_type_total{event_type="dev_bypass"} 0' in body
+    assert 'hyrule_payment_events_by_type_total{event_type="verify_failed"} 0' in body
     assert "hyrule_payment_unique_payers 1" in body
     assert "hyrule_payment_unique_payers_24h 1" in body
     assert 'hyrule_vms_active{status="ready"} 1' in body

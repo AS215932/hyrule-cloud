@@ -188,6 +188,18 @@ async def _render_commerce_readiness(lines: list[str], state: Any | None) -> Non
         lines.append(f"hyrule_domains_discovery_ready {1 if ready else 0}")
 
 
+KNOWN_PAYMENT_EVENT_TYPES: tuple[str, ...] = (
+    "required_402",
+    "verify_failed",
+    "settle_failed",
+    "settled",
+    "dev_bypass",
+    "admin_bypass",
+    "refund_owed",
+    "extend_applied",
+)
+
+
 async def _render(session_factory: Any, state: Any | None = None) -> str:
     lines: list[str] = []
     now = datetime.now(UTC)
@@ -216,6 +228,23 @@ async def _render(session_factory: Any, state: Any | None = None) -> str:
             lines.append(
                 f'hyrule_payment_events_total{{event_type="{_esc(event_type)}",'
                 f'service_group="{_esc(group)}",network="{_esc(network or "")}"}} {count}'
+            )
+
+        # Per-type totals seeded at 0 for every known event type (issue #47):
+        # a counter born at 1 hides the first event from increase()-based alerts.
+        _metric(
+            lines,
+            "hyrule_payment_events_by_type_total",
+            "x402 payment-gate outcomes per event type, seeded at 0 for known types.",
+            "counter",
+        )
+        by_type: dict[str, int] = dict.fromkeys(KNOWN_PAYMENT_EVENT_TYPES, 0)
+        for event_type, _group, _network, count in rows:
+            by_type[event_type] = by_type.get(event_type, 0) + int(count)
+        for event_type in sorted(by_type):
+            lines.append(
+                f'hyrule_payment_events_by_type_total{{event_type="{_esc(event_type)}"}} '
+                f"{by_type[event_type]}"
             )
 
         _metric(
