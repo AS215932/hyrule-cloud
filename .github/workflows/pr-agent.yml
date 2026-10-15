@@ -35,7 +35,7 @@ jobs:
        github.event.issue.pull_request &&
        startsWith(github.event.comment.body, '/') &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
-    runs-on: [self-hosted, linux, x64, hyrule-public-pr]
+    runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
       - name: PR-Agent
