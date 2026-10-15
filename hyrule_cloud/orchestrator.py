@@ -2058,6 +2058,7 @@ class Orchestrator:
         timeout_seconds: int = 90,
         interval_seconds: int = 5,
         port: int = 22,
+        close_timeout_seconds: float = 2.0,
     ) -> bool:
         """TCP reachability probe of the VM's sshd for the launch proof.
 
@@ -2072,13 +2073,21 @@ class Orchestrator:
         while True:
             try:
                 _, writer = await asyncio.wait_for(asyncio.open_connection(ipv6, port), timeout=5)
-                writer.close()
-                await writer.wait_closed()
-                return True
             except (TimeoutError, OSError):
                 if loop.time() + interval_seconds >= deadline:
                     return False
                 await asyncio.sleep(interval_seconds)
+                continue
+            # The connect succeeded, so the guest is reachable. Closing is
+            # best effort: wait_closed() has no deadline of its own and can
+            # hang after sshd accepts, which used to block provisioning
+            # forever (#122). A slow or failed close still counts as reachable.
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=close_timeout_seconds)
+            except (TimeoutError, OSError):
+                log.warning("ssh_probe_close_timeout", ipv6=ipv6, port=port)
+            return True
 
     async def _probe_customer_dns_resolution(
         self,
